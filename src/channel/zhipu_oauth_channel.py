@@ -8,7 +8,7 @@ import json
 import uuid
 
 from .. import config, model_names, oauth_manager
-from ..oauth.zhipu import common as c, request_context, runtime, signing
+from ..oauth.zhipu import common as c, request_context, runtime, signing, project_tokens
 from ..oauth.zhipu.response import BusinessContext, BusinessStream
 from ..oauth_ids import account_key
 from ..openai import anthropic_reasoning_replay
@@ -44,6 +44,13 @@ class ZhipuOAuthChannel(ApiChannel):
         resolved_model = model_names.canonical_id(self.provider, resolved_model)
         token = await oauth_manager.ensure_channel_token(self)
         current = oauth_manager.get_account(self.account_key)
+        if current:
+            # ensure_channel_token awaits IO. Do not attach its old token to a
+            # login replaced between that await and this request snapshot.
+            bound_token = (current.get("model_key") if current.get("credential_mode") == "api_key"
+                           else project_tokens.cached_token(current))
+            if bound_token != token:
+                raise c.ZhipuError("model_request", "scope_invalidated")
         if not current or resolved_model not in oauth_manager.account_model_selection(current)["effective_models"]:
             raise guard.GuardError(400, "invalid_request_error", "Zhipu model unavailable for this account", param="model", scope="candidate")
         source = request_context.ensure_request_context(copy.deepcopy(requested_body))
@@ -99,9 +106,12 @@ class ZhipuOAuthChannel(ApiChannel):
         cfg = config.get()
         network_revision = hashlib.sha256(json.dumps({k: cfg.get(k) for k in ("network", "proxy", "proxies", "socks5")}, sort_keys=True).encode()).hexdigest()
         signer = signing.for_account(dict(current, model_key=token), self.account_key, network_revision=network_revision)
-        ctx = {**(ctx or {}), "zhipu_stream": BusinessStream()}
+        observation = {"resolved": True, "scope": project_tokens.scope(current),
+            "state_key": oauth_manager.account_state_key(current),
+            "fingerprint": project_tokens.token_fingerprint(token), "mode": current.get("credential_mode")}
+        ctx = {**(ctx or {}), "zhipu_stream": BusinessStream(), "zhipu_auth": observation}
         def wire_context(request, factory):
-            return BusinessContext(signer.wrap(request, factory))
+            return BusinessContext(signer.wrap(request, factory), observation)
         return UpstreamRequest(c.MODEL_ORIGINS[c.site_of(current)] + "/api/anthropic/v1/messages", headers,
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(), translator_ctx=ctx,
             dispatch_metadata=build_dispatch_metadata(payload, "anthropic", headers), stream_context_hook=wire_context)

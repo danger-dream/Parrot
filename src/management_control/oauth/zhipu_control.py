@@ -36,7 +36,7 @@ class ZhipuControlMixin:
                    "model_sync_future": None, "model_selection_before": None, "model_sync_error": None,
                    "usage": None, "usage_error": None, "quota_action": None,
                    "enrichment_error": None, "key_action": None, "reset": None, "reset_error": None}
-        if (account.get("credential_mode") == "oauth" and not account.get("model_key")
+        if (account.get("credential_mode") == "oauth" and not account.get("project_key_id")
                 and account.get("plan_scope") == "personal"
                 and not account.get("organization_id") and not account.get("project_id")):
             try:
@@ -48,14 +48,14 @@ class ZhipuControlMixin:
             except Exception as exc:
                 effects["enrichment_error"] = exc
         account = self._account(account_id)
-        if (account.get("credential_mode") == "oauth" and not account.get("model_key")
+        if (account.get("credential_mode") == "oauth" and not account.get("project_key_id")
                 and account.get("organization_id") and account.get("project_id")):
             try:
                 self.backend.zhipu_enrich_account(account_id)
             except Exception as exc:
                 effects["enrichment_error"] = exc
             account = self._account(account_id)  # Keep successful Key/subscription changes even after a partial failure.
-            if (not account.get("model_key") and
+            if (not (account.get("model_key") or account.get("project_key_id")) and
                     getattr(effects.get("enrichment_error"), "kind", "") == "creation_confirmation_required"):
                 # Login/explicit initialization owns creation of its dedicated
                 # Key. Reuse durable action reconciliation, never a naked POST.
@@ -69,7 +69,7 @@ class ZhipuControlMixin:
                 except Exception as exc:
                     effects["enrichment_error"] = exc
                 account = self._account(account_id)
-        if account.get("model_key"):
+        if (account.get("model_key") or account.get("project_key_id")):
             effects.update(self._start_post_save_model_sync(account_id))
             try:
                 if usage is None:
@@ -119,7 +119,7 @@ class ZhipuControlMixin:
         if key_action and key_action.get("status") != "succeeded":
             errors["key"] = key_action.get("status", "failed")
         account = self._account(effects["account_id"])
-        return {"account_id": effects["account_id"], "model_key_configured": bool(account.get("model_key")),
+        return {"account_id": effects["account_id"], "model_key_configured": bool((account.get("model_key") or account.get("project_key_id"))),
                 "models": len(self.backend.account_model_selection(effects["account_id"])["effective_models"]),
                 "usage_ready": effects.get("usage") is not None, "reset_ready": effects.get("reset") is not None,
                 "errors": errors}

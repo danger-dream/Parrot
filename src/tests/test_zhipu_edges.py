@@ -11,6 +11,7 @@ import pytest
 from src import config, oauth_manager as om, cooldown
 from src.channel.zhipu_oauth_channel import ZhipuOAuthChannel
 from src.oauth.zhipu import auth, common, signing
+from src.tests.zhipu_pat_fixtures import pat, envelope
 from src.tests import test_protocol_fake_upstreams as fake
 from src.tests.test_zhipu_signing import local_upstream
 from src.tests.test_zhipu_provider import account_env, credential, window, quota
@@ -48,7 +49,7 @@ async def test_full_production_entry_real_local_http_crypto(account_env, local_u
             response = await m["openai_handler"].handle(request, ingress_protocol=ingress)
         text = await fake._consume_streaming_to_string(response) if hasattr(response, "body_iterator") else response.body.decode()
         assert response.status_code == 200 and "loopback" in text, text
-    assert len(state["requests"]) == 2 and state["handshakes"] == 2 and state["gates"] == 1
+    assert len(state["requests"]) == 2 and state["handshakes"] == 2 and state["gates"] == 0
     assert state["requests"][0][0] == state["requests"][1][0]
     fake._install_channels(m, [])
 
@@ -92,7 +93,9 @@ def test_actual_oauth_wire_read_only_existing_team(site, monkeypatch):
         if url.endswith("/api/auth/z/login"):
             assert kwargs["body"] == {"token": "oauth-fixture"}
             return {"access_token": "business-fixture", "expires_in": 3600}
-        assert kwargs["headers"]["Authorization"] == ("oauth-fixture" if site == "bigmodel" else "Bearer business-fixture")
+        token = "oauth-fixture" if site == "bigmodel" else "business-fixture"
+        prefix = "Bearer " if url.endswith(("/access_tokens", "/api/oauth/userinfo")) or (site == "zai" and url.endswith("querySubscribeDetail")) else ""
+        assert kwargs["headers"]["Authorization"] == prefix + token
         if url.endswith("/api/oauth/userinfo"):
             return {"sub": "user-fixture", "name": "Fixture account"}
         if url.endswith("getCustomerInfo"):
@@ -100,10 +103,10 @@ def test_actual_oauth_wire_read_only_existing_team(site, monkeypatch):
         if url.endswith("querySubscribeDetail"):
             assert kwargs["headers"]["bigmodel-organization"] == "org"
             return {"hasSubscription": True, "status": "EFFECTIVE", "memberGrantStatus": "VALID"}
-        if "/copy/" in url:
-            return {"secretKey": "secret"}
+        if url.endswith("/access_tokens"):
+            return envelope("existing")
         if url.endswith("/api_keys"):
-            return [{"apiKey": "existing", "name": "zcode-api-key"}]
+            return [{"apiKey": "existing", "name": "zcode-team-api-key", "keyType": 2}]
         pytest.fail(url)
     monkeypatch.setattr(common, "request", wire)
     payload = auth.start_login_sync(site=site); auth.poll_login_sync(payload)
@@ -112,7 +115,7 @@ def test_actual_oauth_wire_read_only_existing_team(site, monkeypatch):
     choices = auth.project_choices(payload["credential"])
     account = OAuthBackend().zhipu_select_project(payload["credential"], choices[0])
     assert not account.get("model_key")
-    assert auth.resolve_model_key(account) == "existing.secret" and auth.entitlement(account) == "available"
+    assert auth.resolve_model_key(account) == pat("existing") and auth.entitlement(account) == "available"
     assert not any(kw.get("method") == "POST" and url.endswith("/api_keys") for url,kw in calls)
 
 

@@ -98,7 +98,7 @@ def provider_line(account, *, detail=False):
             line += " · 项目: <code>" + ui.escape_html(str(account.get("project_id") or "—")) + "</code>"
         if account.get("management_status") == "relogin_required":
             line += "\n⚠️ 管理登录已过期，请重新登录。"
-        if not account.get("model_key"):
+        if not (account.get("model_key") or account.get("project_key_id")):
             line += "\n⚠️ 初始化未完成，可继续自动配置模型 Key。"
     if account.get("management_status") == "model_key_rejected":
         line += "\n⚠️ 模型 Key 认证失败，请更新凭据。"
@@ -118,7 +118,7 @@ def provider_line(account, *, detail=False):
 
 def credential_lines(account):
     mode = "API Key" if account.get("credential_mode") == "api_key" else "OAuth"
-    state = "已配置" if account.get("model_key") else "未配置"
+    state = "已配置" if (account.get("model_key") or account.get("project_key_id")) else "未配置"
     line = f"🔑 凭据: <code>{mode}</code> · 模型 Key {state}\n"
     if mode == "OAuth":
         if parent()._parse_iso(account.get("expired")) is not None:
@@ -388,7 +388,7 @@ def _login_saved(chat_id, message_id, data, poll):
 def refresh_usage(chat_id, message_id, key, page=1, filter_key="all"):
     """Resume incomplete setup; run quota IO outside Telegram dispatch."""
     account = control.account_snapshot(key) or {}
-    if account.get("credential_mode") == "oauth" and not account.get("model_key"):
+    if account.get("credential_mode") == "oauth" and not (account.get("model_key") or account.get("project_key_id")):
         _initialize_account(chat_id, message_id, key)
         return
     discard_state(chat_id)
@@ -463,7 +463,7 @@ def _initialize_account(chat_id, message_id, key, *, result=None):
         current = control.account_snapshot(saved.account_id) or {}
         selection = control.account_model_selection_snapshot(current)
         count = len(selection.get("effective_models") or [])
-        configured = bool(count and current.get("model_key") and model_route_available(current))
+        configured = bool(count and (current.get("model_key") or current.get("project_key_id")) and model_route_available(current))
         text = ("✅ 账户已就绪" if current.get("enabled", True) else "⏸ 账户配置已完成，当前已暂停") if configured else "✅ 登录已保存"
         key_action = effects.get("key_action")
         if key_action and key_action.get("status") != "succeeded":
@@ -472,7 +472,7 @@ def _initialize_account(chat_id, message_id, key, *, result=None):
                      else "\n已保存的登录保留，可继续初始化。")
         elif effects.get("enrichment_error"):
             text += "\n" + parent()._oauth_error_html(effects["enrichment_error"], provider="zhipu", operation="initialize")
-        elif not current.get("model_key"):
+        elif not (current.get("model_key") or current.get("project_key_id")):
             text += "\n模型 Key 暂未取得，可重试初始化。"
         elif model_error or effects.get("model_sync_error"):
             text += "\n⚠️ 模型目录同步未完成。"
@@ -697,7 +697,7 @@ def handle_callback(chat_id, message_id, cb_id, callback):
                 text = {"key_list": "🔄 正在检查已有 Key，尚未提交创建请求…",
                         "checking": "🔄 正在核对操作条件，尚未提交…",
                         "submitted": "🔄 已进入提交阶段，正在等待上游结果…",
-                        "key_copy": "🔄 正在读取并保存模型 Key…"}.get(stage, "🔄 正在处理…")
+                        "project_token": "🔄 正在获取项目访问令牌…"}.get(stage, "🔄 正在处理…")
                 text += "\n提交前可以取消；提交后只能停止等待，不能撤销。"
                 ui.edit(chat_id, message_id, text, reply_markup=ui.inline_kb([
                     [ui.btn("停止等待" if cancellation.submitted else "取消操作", PREFIX + "cancel_action:" + data["nonce"])],

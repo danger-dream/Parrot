@@ -2142,7 +2142,7 @@ def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
     if not row:
         if provider == "zhipu":
             account = oauth_control.account_snapshot(account_key) or {}
-            pending = "初始化完成后自动获取额度。" if not account.get("model_key") else "尚未获取用量，可点「刷新额度」。"
+            pending = "初始化完成后自动获取额度。" if not (account.get("model_key") or account.get("project_key_id")) else "尚未获取用量，可点「刷新额度」。"
             return "\n".join([pending, *zhipu_menu.extra_usage_lines(account_key, detail=True)])
         return "尚未获取用量（点「刷新用量/重置卡」试试）"
 
@@ -3568,7 +3568,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
             account_actions.append(ui.btn("♻️ 官方重置卡", f"oa:zh:reset:{short}"))
         rows.append(account_actions)
         if acc.get("credential_mode") == "oauth":
-            if not acc.get("model_key"):
+            if not (acc.get("model_key") or acc.get("project_key_id")):
                 rows.append([ui.btn("🔄 重试初始化", f"oa:zh:initialize:{short}"),
                              ui.btn("选择团队/项目", f"oa:zh:projects:{short}")])
             else:

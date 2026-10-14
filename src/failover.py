@@ -2223,6 +2223,7 @@ async def run_failover(
     transient_retry_limit = _transient_retry_limit(cfg)
     transient_retries_used = 0
     refreshed_once: set[str] = set()
+    zhipu_pat_retried = False
     codex_ws_recovered: set[str] = set()
     codex_http_fallback: set[str] = set()
     retried_without_context_1m: set[tuple[str, str]] = set()
@@ -2476,6 +2477,17 @@ async def run_failover(
         # 非成功：立即释放 slot，进入下一候选
         _release_once()
 
+        # Accepted Zhipu bodies cannot be replayed, even before downstream
+        # output. Still pass through the normal terminal request-error mapping;
+        # stopping retries must not turn an already classified 400 into 503.
+        zhipu_body_started = False
+        if getattr(ch, "provider", "") == "zhipu":
+            observed = (result.translator_ctx or {}).get("zhipu_auth") or {}
+            zhipu_body_started = observed.get("phase") == "response_body"
+            if zhipu_body_started and result.http_status == 401 and not observed.get("quota"):
+                from .oauth.zhipu.runtime import mark_model_auth_error
+                await asyncio.to_thread(mark_model_auth_error, ch, observed)
+
         if isinstance(ch, OpenAIOAuthChannel) and use_responses_ws:
             recovery_code = result.error_code in WS_RESET_CODES
             fallback = result.http_status == 426
@@ -2525,6 +2537,7 @@ async def run_failover(
         from .openai import anthropic_reasoning_replay
         if (
             not retried_without_anthropic_thinking
+            and not zhipu_body_started
             and ingress_protocol in {"responses", "anthropic"}
             and getattr(ch, "protocol", "") == "anthropic"
             and not result.success and not result.stream_started
@@ -2562,7 +2575,7 @@ async def run_failover(
         # 让下游 transcript owner 在成功响应中拿到新的 EC；失败则返回 400。
         if result.outcome == "request_invalid":
             msg = result.error_detail or "invalid request"
-            if _invalid_ec_cleanup_retry_allowed(
+            if not zhipu_body_started and _invalid_ec_cleanup_retry_allowed(
                 body, msg, cfg, retried_without_encrypted_content,
             ):
                 cleared_replay = _maybe_clear_codex_reasoning_replay(result.translator_ctx)
@@ -2608,11 +2621,36 @@ async def run_failover(
                 ),
             )
 
-        # Zhipu model credentials are independent of management OAuth. A final
-        # model 401 (after raw VERIFY handling) asks for key repair, never JWT renewal.
-        if getattr(ch, "provider", "") == "zhipu" and result.http_status == 401 and not result.stream_started:
-            from .oauth.zhipu.runtime import mark_model_auth_error
-            await asyncio.to_thread(mark_model_auth_error, ch)
+        if zhipu_body_started:
+            break  # No transient retry, PAT recovery or alternate candidate.
+
+        # Only a raw request-setup model 401 may reject a PAT. A mapped 2xx
+        # business error/SSE error is already response-body and cannot replay.
+        if getattr(ch, "provider", "") == "zhipu":
+            from .oauth.zhipu import runtime as zhipu_runtime
+            from .oauth.zhipu.response import replayable_rejection
+            observed = (result.translator_ctx or {}).get("zhipu_auth") or {}
+            failed_recovery = False
+            if (not zhipu_pat_retried and observed.get("mode") == "oauth"
+                    and replayable_rejection(result) and quota_exhaustion is None
+                    and _recovery_retry_allowed("oauthRefresh", cfg)
+                    and os.environ.get("PARROT_NO_REFRESH") != "1"
+                    and getattr(getattr(result, "error_advice", None), "kind", "") not in {
+                        "usage_limit", "quota", "entitlement", "rate_limit"}):
+                zhipu_pat_retried = True
+                try:
+                    await asyncio.to_thread(zhipu_runtime.recover_project_token, ch.account_key, observed)
+                    retry_count += 1
+                    continue  # Rebuild body/auth/signer; request context survives.
+                except Exception:
+                    # Management auth errors set relogin_required under CAS;
+                    # neither those nor a network failure prove model rejection
+                    # of a newly issued token. Never disable based on the old 401.
+                    failed_recovery = True
+            if (not failed_recovery and not observed.get("quota")
+                    and result.http_status == 401 and not result.stream_started
+                    and observed.get("status") == 401 and observed.get("phase") == "request_setup"):
+                await asyncio.to_thread(zhipu_runtime.mark_model_auth_error, ch, observed)
 
         # 未发首包失败：判断是否 OAuth 401/403 可刷一次
         if (
@@ -4561,6 +4599,18 @@ async def _try_channel(
     dynamic_map = upstream_req.dynamic_tool_map
     cancel_state: dict[str, Any] = {}
 
+    def observed_result(result: AttemptResult) -> AttemptResult:
+        # Body readers/parsers may return a new error without translator_ctx.
+        # Preserve the raw Zhipu response boundary on every transport/result
+        # exit, including empty/malformed bodies and unexpected exceptions.
+        if getattr(ch, "provider", "") == "zhipu":
+            source_ctx = upstream_req.translator_ctx or {}
+            result.translator_ctx = {
+                **source_ctx, **(result.translator_ctx or {}),
+                "zhipu_auth": source_ctx.get("zhipu_auth") or {},
+            }
+        return result
+
     async def finish_cancelled_http_attempt(
         result: AttemptResult,
         *,
@@ -4686,7 +4736,7 @@ async def _try_channel(
             traceback.print_exc()
         raise
     if opened.error is not None:
-        return opened.error
+        return observed_result(opened.error)
 
     ctx = opened.ctx
     upstream_resp = opened.response
@@ -4737,7 +4787,7 @@ async def _try_channel(
             result = _request_invalid_result_if_needed(result, ch)
             result = await _finalize_http_attempt(opened, result)
             await _close_proxy_client(_proxy_client)
-            return result
+            return observed_result(result)
 
         # 3. 非流式分支
         if not is_stream:
@@ -4760,7 +4810,7 @@ async def _try_channel(
             result = _attach_retry_after_from_response(result, upstream_resp, ch)
             result = await _finalize_http_attempt(opened, result)
             await _close_proxy_client(_proxy_client)
-            return result
+            return observed_result(result)
 
         # 4. 流式分支
         result = await _consume_stream(
@@ -4789,7 +4839,7 @@ async def _try_channel(
         if not result.stream_started:
             result = await _finalize_http_attempt(opened, result)
             await _close_proxy_client(_proxy_client)
-        return result
+        return observed_result(result)
     except asyncio.CancelledError:
         await asyncio.shield(_safe_exit(ctx))
         await asyncio.shield(_close_proxy_client(_proxy_client))
@@ -4821,7 +4871,7 @@ async def _try_channel(
             outcome=lifecycle or "transport_error",
             error_detail=f"unexpected: {exc}",
         )
-        return await _finalize_http_attempt(opened, result)
+        return observed_result(await _finalize_http_attempt(opened, result))
 
 
 async def _finalize_http_attempt(opened, result: AttemptResult) -> AttemptResult:

@@ -61,16 +61,16 @@ def test_saved_login_refresh_initializes_default_personal_project_without_relogi
     key = om.get_account_key(saved)
     refresh(key)
     if existing_key:
-        assert saved["model_key"] == "existing-id.existing-secret"
+        assert saved["project_key_id"] == "existing-id"
         assert any("✅ 额度已更新" in text for text in display)
         assert state_db.quota_load(key)
     else:
-        assert saved["model_key"] == "new-id.existing-secret"
+        assert saved["project_key_id"] == "new-id"
         assert created == [True]
         assert any("账户已就绪" in text for text in display)
         assert not any("创建并继续" in text for text in display)
     assert sum(url.endswith("/oauth/token") for url, _ in calls) == 1
-    assert all(kw.get("method", "GET") == "GET" for url, kw in calls if "/api_keys" in url or "/reset/" in url)
+    assert all(kw.get("method", "GET") == "GET" for url, kw in calls if url.endswith("/api_keys") or "/reset/" in url)
 
 
 def test_project_network_failure_keeps_login_and_refresh_can_retry(callback_env, display, monkeypatch):
@@ -89,7 +89,7 @@ def test_project_network_failure_keeps_login_and_refresh_can_retry(callback_env,
     monkeypatch.setattr(common, "request", wire)
     refresh(key)
     assert states.get_state(42) is None
-    assert om.list_accounts()[0]["model_key"] == "existing-id.existing-secret"
+    assert om.list_accounts()[0]["project_key_id"] == "existing-id"
 
 
 def test_key_usage_io_is_background_and_leaving_menu_suppresses_late_result(callback_env, display, monkeypatch):

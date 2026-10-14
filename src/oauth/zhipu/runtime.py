@@ -8,7 +8,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from . import auth, common as c, signing
+from . import auth, common as c, signing, project_tokens
 
 
 def ensure_device_id(account_key, expected_account):
@@ -30,36 +30,61 @@ def ensure_device_id(account_key, expected_account):
         return device_id
 
 
-def refresh_locked(account, account_key, force):
-    from ... import oauth_manager
-    if not force and account.get("model_key"):
-        return account["model_key"]
-    signing.forget(account_key)
+def key_patch(account):
+    key_id = project_tokens.location_id(account)
+    if not key_id:
+        raise c.ZhipuError("project_token", "location_missing")
+    return {"model_key": "", "project_key_id": key_id, "management_status": "ready"}
+
+
+def refresh_locked(account, account_key, force, *, rejected_fingerprint=None):
+    from ... import config, oauth_manager
     if account.get("credential_mode") == "api_key":
-        return account["model_key"]  # No OAuth renewal exists for key mode.
+        if force:
+            signing.forget(account_key)
+        return account["model_key"]  # No management credential: no renewal.
     try:
-        key = auth.resolve_model_key(account, account_key=account_key)
+        key = auth.resolve_model_key(account, account_key=account_key, force=force,
+                                     rejected_fingerprint=rejected_fingerprint)
     except c.ZhipuError as exc:
         if exc.auth_error:
             oauth_manager.mutate_account_if_unchanged(account_key, account,
                 lambda value: value.update(management_status="relogin_required"))
         raise
-    patch = {"model_key": key, "management_status": "ready"}
-    try:
-        patch["entitlement"] = auth.entitlement(account, account_key=account_key)
-    except c.ZhipuError as exc:
-        if exc.auth_error:
-            patch["management_status"] = "relogin_required"
-    def repaired(value):
-        value.update(patch)
-        # Only the authentication incident repaired by this exact snapshot may
-        # be lifted. A user/quota pause (including a concurrent one) is retained.
-        if value.get("disabled_reason") == "auth_error":
-            value.update(enabled=True, disabled_reason=None, disabled_until=None)
-    result = oauth_manager.mutate_account_if_unchanged(account_key, account, repaired)
-    if result.get("status") != "updated":
-        raise c.ZhipuError("model_key", "stale_generation")
+    patch = key_patch(account)
+    if force:
+        signing.forget(account_key)
+    with config.serialized_updates():
+        current = copy.deepcopy(oauth_manager.get_account(account_key))
+        if (not current or project_tokens.scope(current) != project_tokens.scope(account)
+                or any(current.get(k) != account.get(k) for k in ("enabled", "disabled_reason", "disabled_until"))):
+            raise c.ZhipuError("project_token", "stale_generation")
+        def repaired(value):
+            value.update(patch)
+            if value.get("disabled_reason") == "auth_error":
+                value.update(enabled=True, disabled_reason=None, disabled_until=None)
+        # skip_if_unchanged avoids disk writes on every normal cache hit.
+        result = oauth_manager.mutate_account_if_unchanged(account_key, current, repaired)
+        if result.get("status") != "updated":
+            raise c.ZhipuError("model_key", "stale_generation")
     return key
+
+
+def forget(account_key):
+    signing.forget(account_key)
+    project_tokens.forget(account_key)
+
+
+def recover_project_token(account_key, observation):
+    """Serialize with normal refresh, never borrow a new login or user pause."""
+    from ... import oauth_manager
+    state = observation["state_key"]
+    with oauth_manager._get_refresh_lock(state):
+        current = copy.deepcopy(oauth_manager.get_account(account_key))
+        if (not current or project_tokens.scope(current) != observation["scope"]
+                or not current.get("enabled", True) or current.get("disabled_reason")):
+            raise c.ZhipuError("project_token", "scope_invalidated")
+        return refresh_locked(current, account_key, False, rejected_fingerprint=observation["fingerprint"])
 
 
 def enrich_account(account_key):
@@ -75,10 +100,11 @@ def enrich_account(account_key):
         failures.append(exc)
         if exc.auth_error:
             patch["management_status"] = "relogin_required"
-    if not account.get("model_key"):
+    if not account.get("project_key_id"):
         if account.get("organization_id") and account.get("project_id"):
             try:
-                patch["model_key"] = auth.resolve_model_key(account, account_key=account_key)
+                auth.resolve_model_key(account, account_key=account_key)
+                patch.update(key_patch(account))
                 patch.setdefault("management_status", "ready")
             except (c.ZhipuError, ValueError) as exc:
                 failures.insert(0, exc)
@@ -119,7 +145,7 @@ def fetch_reset_status(account, account_key):
 
 
 def model_route_available(account):
-    if not account.get("model_key"):
+    if not c.has_model_key(account):
         return False
     if account.get("plan_scope") == "team":
         if not account.get("organization_id") or not account.get("project_id"):
@@ -146,7 +172,7 @@ def bind_project(account_key, source, entry):
         # Only credentials/scope from the selected snapshot may be applied;
         # concurrent display/model/enabled preferences remain authoritative.
         fields = {key: copy.deepcopy(entry[key]) for key in (*auth.ACCOUNT_FIELDS, "provider", "type", "access_token", "refresh_token", "email") if key in entry}
-        shell = not current.get("organization_id") and not current.get("project_id") and not current.get("model_key")
+        shell = not current.get("organization_id") and not current.get("project_id") and not c.has_model_key(current)
         if target is not None:
             result = om.replace_exact_identity(target_key, fields, expected_account=target)
             if result.get("status") != "replaced":
@@ -177,14 +203,32 @@ def bind_project(account_key, source, entry):
         return target_key, "updated"
 
 
-def mark_model_auth_error(channel):
+def mark_model_auth_error(channel, observation=None):
     from ... import config, oauth_manager
-    with config.serialized_updates():
+    # Same lock order as credential publication: config then the token cache.
+    # Keep the fingerprint check and disable atomic against a peer's PAT refresh.
+    with config.serialized_updates(), project_tokens._lock:
         current = oauth_manager.get_account(channel.account_key)
-        if not current or c.fingerprint(current) != c.fingerprint(channel.account):
+        snapshot = channel.account
+        expected_scope = observation["scope"] if observation else project_tokens.scope(snapshot)
+        if (not current or project_tokens.scope(current) != expected_scope
+                or not current.get("enabled", True) or current.get("disabled_reason")):
             return
-        oauth_manager.mutate_account_if_unchanged(channel.account_key, current,
+        entry = project_tokens._entries.get(expected_scope) or {}
+        value = entry.get("value")
+        if observation:
+            rejected = observation.get("fingerprint")
+            if current.get("credential_mode") == "api_key":
+                if rejected != project_tokens.token_fingerprint(current.get("model_key", "")):
+                    return
+            elif not value or value["fingerprint"] != rejected:
+                return
+        elif c.fingerprint(current) != c.fingerprint(snapshot):
+            return
+        result = oauth_manager.mutate_account_if_unchanged(channel.account_key, current,
             lambda account: account.update(enabled=False, disabled_reason="auth_error", management_status="model_key_rejected"))
+        if result.get("status") == "updated":
+            entry.pop("value", None)  # A later read cannot revive the rejected PAT.
 
 
 def number(value):
@@ -220,7 +264,8 @@ def fetch_usage_sync(account, account_key):
     from ... import oauth_manager
     observed = time.time() * 1000
     query = "?type=2" if account.get("plan_scope") == "team" else ""
-    headers = {"authorization": account.get("model_key") or ""}
+    token = auth.resolve_model_key(account, account_key=account_key)
+    headers = {"authorization": token}
     if query:
         headers.update(c.scope_headers(account))
     data = c.request(c.MODEL_ORIGINS[c.site_of(account)] + "/api/monitor/usage/quota/limit" + query,
@@ -344,4 +389,4 @@ def public_snapshot(account, row):
     return {**{key: copy.deepcopy(block.get(key)) for key in ("windows", "limits", "fetched_at", "status", "mcp", "errors")},
             **{key: account.get(key) for key in ("site", "credential_mode", "plan_scope", "organization_id", "project_id", "entitlement", "management_status")},
             "reset": copy.deepcopy(account.get("zhipu_reset_status") or {}),
-            "model_key_configured": bool(account.get("model_key")), "oauth_renewal_supported": False}
+            "model_key_configured": c.has_model_key(account), "oauth_renewal_supported": False}

@@ -109,11 +109,11 @@ def execute(account_key, account, observation, *, actor, cancellation=None, on_s
         old = state_db.zhipu_action_load(key)
         now = time.time() * 1000
         # A failed read before dispatch is safe to retry on a new initialization
-        # or confirmed attempt. An uncertain create may only look up/copy an existing
+        # or confirmed attempt. An uncertain create may only look up/use an existing
         # key; an uncertain consumption must never be resubmitted.
         # Older create records recorded the dispatch intent before a connect
         # timeout. That specific error is pre-HTTP; never apply this migration to
-        # read/write timeouts, reset operations or a failure while copying a Key.
+        # read/write timeouts, reset operations or a failure while issuing a PAT.
         old_unsent = _known_unsent_creation(old)
         reconcile_key = bool(old and action == "create_key" and
             old.get("status") in {"unknown", "key_pending"} and not old_unsent)
@@ -146,12 +146,12 @@ def execute(account_key, account, observation, *, actor, cancellation=None, on_s
 
     def remember_key(key_id, created):
         nonlocal intent
-        # Persist only the remote identifier, never its secret. A failed copy or
+        # Persist only the remote identifier, never its secret. A failed PAT request or
         # local credential save resumes by reading this Key, not by creating one.
         updated = dict(intent, key_id=key_id)
         result["key_id"] = key_id
         if not state_db.zhipu_action_save(key, updated, expected=intent):
-            raise c.ZhipuError("key_copy", "save_failed_result_unknown")
+            raise c.ZhipuError("project_token", "save_failed_result_unknown")
         intent = updated
 
     def commit_dispatch():
@@ -177,13 +177,14 @@ def execute(account_key, account, observation, *, actor, cancellation=None, on_s
 
     try:
         if action == "create_key":
-            model_key = auth.resolve_model_key(account, account_key=account_key,
+            auth.resolve_model_key(account, account_key=account_key,
                 create=not reconcile_key, before_create=commit_dispatch, on_stage=progress,
                 known_key_id=intent.get("key_id"), on_key=remember_key)
             if cancellation is not None:
                 cancellation.check()
+            from .runtime import key_patch
             saved = oauth_manager.mutate_account_if_unchanged(account_key, account,
-                lambda current: current.update(model_key=model_key, management_status="ready"))
+                lambda current: current.update(key_patch(account)))
             result["status"] = "succeeded" if saved.get("status") == "updated" else "created_but_account_changed"
         else:
             progress("checking")
@@ -223,6 +224,10 @@ def execute(account_key, account, observation, *, actor, cancellation=None, on_s
             else:
                 result["status"] = "unknown"
     except c.ZhipuError as exc:
+        if action == "create_key" and exc.stage == "project_token" and exc.status_code == 404:
+            # A vanished location must relist on the next confirmed resume;
+            # retain submitted intent so an uncertain creation is not repeated.
+            result.pop("key_id", None)
         if (not reconcile_key and exc.request_not_sent and
                 exc.stage == ("key_create" if action == "create_key" else "reset_" + action)):
             result["submitted"] = False

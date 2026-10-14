@@ -232,6 +232,9 @@ def test_auto_metadata_sync_protects_manual_case_variant(account_env, monkeypatc
 
 
 def test_duplicate_legacy_cooldowns_keep_strongest_and_clear_atomically(account_env, monkeypatch):
+    from types import SimpleNamespace
+    now = time.time()
+    monkeypatch.setattr(cooldown, "time", SimpleNamespace(time=lambda: now))
     scope = 'oauth:' + om.get_account_key(credential())
     until = int(time.time() * 1000) + 600000
     for model, deadline in [('GLM-5.3', until), ('glm-5.3', -1)]:

@@ -270,13 +270,13 @@ class OAuthControl(
             disabled_reason=sanitize_text(reason) if reason else None,
             disabled_until=utc_datetime(account.get("disabled_until")),
             max_concurrent=max(0, int(account.get("maxConcurrent") or 0)),
-            available=bool(account.get("enabled", True)) and not reason and (provider is not OAuthProvider.ZHIPU or bool(account.get("model_key")) and (account.get("credential_mode") == "api_key" or account.get("entitlement") == "available")),
+            available=bool(account.get("enabled", True)) and not reason and (provider is not OAuthProvider.ZHIPU or bool((account.get("model_key") or account.get("project_key_id"))) and (account.get("credential_mode") == "api_key" or account.get("entitlement") == "available")),
             quota_limited=reason == "quota",
             invalid=invalid_account(account),
             model_count=len(models),
             disabled_model_count=len(disabled),
             credential_configured=bool(
-                account.get("refresh_token") or account.get("access_token") or account.get("model_key")
+                account.get("refresh_token") or account.get("access_token") or (account.get("model_key") or account.get("project_key_id"))
             ),
             revision=_revision(account),
         )
@@ -376,7 +376,7 @@ class OAuthControl(
                 cost_usd=(stats["cost_ticks"] / TICKS_PER_USD if stats.get("costed_success") else None),
             ),
             runtime_errors=tuple(runtime_errors),
-            credential_configured=bool(account.get("refresh_token") or account.get("access_token") or account.get("model_key")),
+            credential_configured=bool(account.get("refresh_token") or account.get("access_token") or (account.get("model_key") or account.get("project_key_id"))),
             last_model_sync=utc_datetime(account.get("last_model_sync")),
             workbuddy=self.backend.workbuddy_snapshot(account_id) if summary.provider is OAuthProvider.WORKBUDDY else None,
             zhipu=self.backend.zhipu_snapshot(account_id) if summary.provider is OAuthProvider.ZHIPU else None,
@@ -500,7 +500,7 @@ class OAuthControl(
         if self.backend.provider_of(account) == "workbuddy" and not self.backend.workbuddy_refresh_enabled():
             raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE,
                 fields=[ErrorField("instance", "REFRESH_DISABLED", "PARROT_NO_REFRESH=1; no refresh was performed")])
-        if self.backend.provider_of(account) == "zhipu" and not account.get("model_key"):
+        if self.backend.provider_of(account) == "zhipu" and not (account.get("model_key") or account.get("project_key_id")):
             return self.initialize_zhipu_account(context, account_id)
         try:
             asyncio.run(self.backend.force_refresh(account_id))

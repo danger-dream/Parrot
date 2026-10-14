@@ -9,9 +9,9 @@ from datetime import datetime, timezone
 
 import pytest
 from src import config, oauth_manager as om, cooldown, state_db
-from src.oauth.zhipu import auth, actions, common, catalog
+from src.oauth.zhipu import runtime, auth, actions, common, catalog
 from src.tests.test_zhipu_provider import account_env, credential, window, quota
-from src.tests.test_zhipu_management import ctl, reset_env
+from src.tests.test_zhipu_management import ctl, reset_env, ready_reset_env
 from src.tests.test_workbuddy_lifecycle import context
 
 
@@ -24,9 +24,9 @@ def _pause(key, windows=("five_hour",)):
     om.set_disabled_by_quota(key, None, observation={"source": "zhipu_quota", "windows": list(windows)})
 
 
-def test_reset_success_refreshes_cache_and_restores_actual_channel(reset_env):
+def test_reset_success_refreshes_cache_and_restores_actual_channel(ready_reset_env):
     from src.channel import registry
-    control, key, state, _ = reset_env
+    control, key, state, _ = ready_reset_env
     current = copy.deepcopy(om.get_account(key))
     om.mutate_account_if_unchanged(key, current, lambda a: a.update(models=["GLM-5.3"]))
     _pause(key)
@@ -42,8 +42,8 @@ def test_reset_success_refreshes_cache_and_restores_actual_channel(reset_env):
 
 @pytest.mark.parametrize("case,expected", [("failure", "refresh_failed"), ("missing_week", "noop_unknown"),
     ("over", "still_over_quota"), ("user", "noop_user"), ("new_incident", "account_changed"), ("replaced", "account_changed")])
-def test_reset_success_does_not_claim_unsafe_recovery(reset_env, monkeypatch, case, expected):
-    control, key, state, _ = reset_env
+def test_reset_success_does_not_claim_unsafe_recovery(ready_reset_env, monkeypatch, case, expected):
+    control, key, state, _ = ready_reset_env
     _pause(key, ("five_hour", "seven_day") if case == "missing_week" else ("five_hour",))
     if case == "over":
         state["quota"] = quota(window(100))
@@ -74,6 +74,7 @@ def test_key_repair_only_restores_auth_incident(account_env, monkeypatch, reason
     om.add_account(a); key = om.get_account_key(a)
     monkeypatch.delenv("PARROT_NO_REFRESH", raising=False)
     monkeypatch.setattr(auth, "entitlement", lambda *a, **k: "available")
+    monkeypatch.setattr(runtime.project_tokens, "location_id", lambda a: "fixture")
     monkeypatch.setattr(auth, "resolve_model_key", lambda *a, **k: "repaired.secret")
     assert asyncio.run(om.force_refresh(key)) == "repaired.secret"
     current = om.get_account(key)
@@ -91,18 +92,19 @@ def test_key_repair_cannot_override_concurrent_manual_disable(account_env, monke
     def resolve(*a, **k):
         om.set_enabled(key, False)
         return "repaired.secret"
+    monkeypatch.setattr(runtime.project_tokens, "location_id", lambda a: "fixture")
     monkeypatch.setattr(auth, "resolve_model_key", resolve)
     with pytest.raises(common.ZhipuError, match="stale_generation"):
         asyncio.run(om.force_refresh(key))
     assert om.get_account(key)["disabled_reason"] == "user"
 
 
-def test_http_reset_exposes_quota_recovery_status(reset_env, tmp_path):
+def test_http_reset_exposes_quota_recovery_status(ready_reset_env, tmp_path):
     from fastapi.testclient import TestClient
     from src.management_api.routers.oauth import router
     from src.management_api.routers.oauth_support import get_oauth_control_dependency
     from src.tests.test_management_api_foundation import build_app, bearer, create_session
-    control, key, _, _ = reset_env
+    control, key, _, _ = ready_reset_env
     _pause(key)
     app, _, _ = build_app(tmp_path)
     app.include_router(router, prefix="/api/management/v1")
@@ -156,7 +158,7 @@ def test_pre_creation_read_failure_allows_new_confirmation(reset_env, monkeypatc
     monkeypatch.setattr(common, "request", original)
     plan = control.plan_zhipu_action(context(), key, "create_key")
     assert control.execute_zhipu_action_now(context(), key, plan["plan_token"])["status"] == "succeeded"
-    assert len([kw for _, kw in state["calls"] if kw.get("method") == "POST"]) == 1
+    assert len([kw for url, kw in state["calls"] if kw.get("method") == "POST" and url.endswith("/api_keys")]) == 1
 
 
 @pytest.mark.parametrize("created", [False, True])
@@ -165,7 +167,7 @@ def test_uncertain_creation_only_reconciles_by_reading(reset_env, monkeypatch, c
     original = common.request
     posts = []
     def failed_response(url, **kw):
-        if kw.get("method") == "POST":
+        if kw.get("method") == "POST" and url.endswith("/api_keys"):
             posts.append(url)
             if created:
                 original(url, **kw)
@@ -179,7 +181,7 @@ def test_uncertain_creation_only_reconciles_by_reading(reset_env, monkeypatch, c
     assert result["status"] == ("succeeded" if created else "unknown")
     assert len(posts) == 1
     if created:
-        assert om.get_account(key)["model_key"] == "new-id.new-secret"
+        assert om.get_account(key)["project_key_id"] == "new-id"
 
 
 @pytest.mark.parametrize("action", ["use", "create_key"])

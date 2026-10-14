@@ -59,7 +59,7 @@ def _accounts(backend: dict) -> list[dict]:
     result = []
     for account in config.get().get("oauthAccounts") or []:
         actual = account.get("provider") or "claude"
-        if actual != provider or not account.get("model_key" if provider == "zhipu" else "access_token"):
+        if actual != provider or not ((account.get("model_key") or account.get("project_key_id")) if provider == "zhipu" else account.get("access_token")):
             continue
         if provider == "zhipu" and account.get("site") not in ("bigmodel", "zai"):
             continue
@@ -85,11 +85,12 @@ def _credentials(backend: dict) -> list:
         # Do not try the same Key twice when it is both explicitly configured
         # and referenced by an account on the same site.
         from .oauth.zhipu.common import MODEL_ORIGINS
+        from .oauth_ids import account_key
         origin = str(backend.get("endpoint") or MODEL_ORIGINS["bigmodel"]).rstrip("/")
         seen = {(origin, key) for key in keys}
         unique = []
         for account in accounts:
-            identity = (MODEL_ORIGINS[account["site"]], account["model_key"])
+            identity = (MODEL_ORIGINS[account["site"]], account.get("model_key") or ("oauth", account_key(account)))
             if identity not in seen:
                 seen.add(identity)
                 unique.append(account)

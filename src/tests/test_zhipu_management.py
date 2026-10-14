@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from src.tests.zhipu_pat_fixtures import envelope, pat
 from fastapi.testclient import TestClient
 from src import config, oauth_manager as om
 from src.management_api.routers.oauth import router
@@ -57,8 +58,8 @@ def reset_env(ctl, monkeypatch):
             return {"total_usage": {"used": 0, "limit": 10, "remaining": 10}}
         if url.endswith("/opportunity"):
             return {"code": 0, "data": {"granted": True}}
-        if "/copy/" in url:
-            return {"secretKey": "new-secret"}
+        if url.endswith("/access_tokens"):
+            return envelope(url.split("/")[-2])
         if url.endswith("/api_keys"):
             if kw.get("method") == "POST":
                 state["keys"] = [{"apiKey": "new-id", "name": "zcode-api-key"}]
@@ -66,6 +67,17 @@ def reset_env(ctl, monkeypatch):
             return state["keys"]
         pytest.fail("unexpected endpoint " + url)
     monkeypatch.setattr(common, "request", wire)
+    return control, key, state, clock
+
+
+@pytest.fixture
+def ready_reset_env(reset_env):
+    # Reset/quota tests own an already resolved Key location, not permission to
+    # create one. Separate from the empty-Key creation confirmation fixture.
+    control, key, state, clock = reset_env
+    current = copy.deepcopy(om.get_account(key))
+    om.mutate_account_if_unchanged(key, current,
+        lambda a: a.update(model_key="", project_key_id="fixture", management_status="ready"))
     return control, key, state, clock
 
 
@@ -153,8 +165,8 @@ def test_confirm_creation_only_after_org_project_bound_plan(reset_env):
     plan = control.plan_zhipu_action(context(), key, "create_key")
     assert not any(kw.get("method") == "POST" for _,kw in state["calls"])
     result = control.execute_zhipu_action_now(context(), key, plan["plan_token"])
-    assert result["status"] == "succeeded" and om.get_account(key)["model_key"] == "new-id.new-secret"
-    assert len([url for url,kw in state["calls"] if kw.get("method") == "POST"]) == 1
+    assert result["status"] == "succeeded" and om.get_account(key)["project_key_id"] == "new-id"
+    assert len([url for url,kw in state["calls"] if kw.get("method") == "POST" and url.endswith("/api_keys")]) == 1
     assert "new-secret" not in str(control.get_zhipu(context(), key))
 
 

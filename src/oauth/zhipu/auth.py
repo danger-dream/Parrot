@@ -13,7 +13,7 @@ from . import common as c
 
 ACCOUNT_FIELDS = ("site", "credential_mode", "subject", "label", "model_key", "zcode_token",
                   "organization_id", "project_id", "plan_scope", "entitlement", "management_status",
-                  "zcode_device_id")
+                  "zcode_device_id", "project_key_id", "zhipu_oauth_token")
 
 
 def normalize_credential(entry):
@@ -34,9 +34,10 @@ def normalize_credential(entry):
     if mode == "api_key":
         key = c.text(entry.get("model_key"), "model_key", required=True)
         entry["subject"] = "key-" + hashlib.sha256(key.encode()).hexdigest()[:24]
-        for field in ("access_token", "refresh_token", "zcode_token"):
+        for field in ("access_token", "refresh_token", "zcode_token", "zhipu_oauth_token", "project_key_id"):
             entry.pop(field, None)
     else:
+        entry.setdefault("zhipu_oauth_token", "")
         c.text(entry.get("subject"), "subject", required=True)
         c.text(entry.get("access_token"), "access_token", required=True)
         c.text(entry.get("zcode_token"), "zcode_token", required=True)
@@ -121,6 +122,7 @@ def credential_from_login(data, site):
         raise c.ZhipuError("login", "invalid_data")
     user, tokens = data.get("user") or {}, data.get(site) or {}
     business = c.text(tokens.get("access_token"), "access_token", required=True)
+    source_token = business if site == "zai" else ""
     if site == "zai":
         if not data.get("_business_token"):
             exchanged = c.request(c.BIZ_ORIGINS[site] + "/api/auth/z/login", method="POST", body={"token": business})
@@ -145,6 +147,7 @@ def credential_from_login(data, site):
         email = email or profile.get("email") or ""
     return normalize_credential({"site": site, "credential_mode": "oauth", "subject": subject,
         "label": name or email or subject, "email": email, "access_token": business,
+        "zhipu_oauth_token": source_token,
         "refresh_token": tokens.get("refresh_token") or "", "zcode_token": data.get("token")})
 
 
@@ -174,8 +177,9 @@ def poll_login_sync(payload):
 
 def project_choices(account, *, account_key=""):
     site = c.site_of(account)
-    data = c.request(c.BIZ_ORIGINS[site] + "/api/biz/customer/getCustomerInfo",
-                     headers=c.biz_headers(account), account_key=account_key, read_attempts=3, stage="projects")
+    from .project_tokens import business_request
+    data = business_request(account, c.BIZ_ORIGINS[site] + "/api/biz/customer/getCustomerInfo",
+                     header_kind="customer", account_key=account_key, read_attempts=3, stage="projects")
     choices = []
     for org in (data or {}).get("organizations") or []:
         for project in org.get("projects") or []:
@@ -201,7 +205,8 @@ def entitlement(account, *, account_key=""):
     host = c.BIZ_ORIGINS[c.site_of(account)]
     team = account.get("plan_scope") == "team"
     path = "/api/biz/team/subscribe/product/querySubscribeDetail" if team else "/api/biz/subscription/list"
-    data = c.request(host + path, headers=c.biz_headers(account), account_key=account_key,
+    from .project_tokens import business_request
+    data = business_request(account, host + path, account_key=account_key,
                      read_attempts=3, stage="subscription")
     if team:
         if not isinstance(data, dict):
@@ -227,37 +232,50 @@ def key_path(account):
 
 
 def resolve_model_key(account, *, account_key="", create=False, before_create=None, on_stage=None,
-                      known_key_id=None, on_key=None):
-    """Creation is owned by durable actions, including automatic login setup."""
+                      known_key_id=None, on_key=None, rejected_fingerprint=None, force=False):
+    """Only durable actions authorize creation. PATs and flights stay in memory."""
+    from . import project_tokens
+    if account.get("credential_mode") == "api_key":
+        return account["model_key"]
     if not account.get("organization_id") or not account.get("project_id"):
         raise c.ZhipuError("model_key", "project_required")
-    base = c.BIZ_ORIGINS[c.site_of(account)] + key_path(account)
-    headers = c.biz_headers(account)
-    key = {"apiKey": c.text(known_key_id, "apiKey", required=True)} if known_key_id else None
-    created = False
-    if key is None:
-        if on_stage is not None:
-            on_stage("key_list")
-        keys = c.request(base, headers=headers, account_key=account_key, read_attempts=3, stage="key_list")
-        if not isinstance(keys, list):
-            raise c.ZhipuError("model_key", "invalid_data")
-        key = next((row for row in keys if isinstance(row, dict) and row.get("name") == "zcode-api-key"), None)
+
+    known_key_id = c.text(known_key_id, "apiKey", required=True) if known_key_id else None
+    recovery_budget = {"remaining": 1}
+
+    def location():
+        base = c.BIZ_ORIGINS[c.site_of(account)] + key_path(account)
+        team = account.get("plan_scope") == "team"
+        name = "zcode-team-api-key" if team else "zcode-api-key"
+        key = None
+        created = False
         if key is None:
-            if not create:
-                raise c.ZhipuError("model_key", "creation_confirmation_required")
-            if before_create is not None:
-                before_create()
-            key = c.request(base, method="POST", headers=headers, body={"name": "zcode-api-key"},
-                            account_key=account_key, stage="key_create")
-            created = True
-    key_id = c.text((key or {}).get("apiKey"), "apiKey", required=True)
-    if on_key is not None:
-        on_key(key_id, created)
-    if on_stage is not None:
-        on_stage("key_copy")
-    data = c.request(base + "/copy/" + quote(key_id, safe=""), headers=headers, account_key=account_key,
-                     read_attempts=3, stage="key_copy")
-    secret = c.text((data or {}).get("secretKey"), "secretKey")
-    if not secret and c.site_of(account) == "zai":
-        raise c.ZhipuError("model_key", "secret_missing")
-    return key_id + "." + secret if secret else key_id
+            if on_stage is not None:
+                on_stage("key_list")
+            keys = project_tokens.business_request(account, base, header_kind="keys", account_key=account_key,
+                                                   read_attempts=3, stage="key_list", recovery_budget=recovery_budget)
+            if not isinstance(keys, list):
+                raise c.ZhipuError("model_key", "invalid_data")
+            key = next((row for row in keys if isinstance(row, dict) and row.get("name") == name
+                        and (not team or type(row.get("keyType")) is int and row["keyType"] == 2)), None)
+            if key is None:
+                if not create:
+                    raise c.ZhipuError("model_key", "creation_confirmation_required")
+                if before_create is not None:
+                    before_create()
+                body = {"name": name, "usageScene": 1}
+                if team:
+                    body["keyType"] = 2
+                key = project_tokens.business_request(account, base, method="POST", header_kind="keys", body=body,
+                                                       account_key=account_key, stage="key_create", recovery_budget=recovery_budget)
+                created = True
+                if team and (not isinstance(key, dict) or key.get("name") != name or type(key.get("keyType")) is not int or key["keyType"] != 2):
+                    raise c.ZhipuError("key_create", "invalid_data")
+        key_id = c.text((key or {}).get("apiKey"), "apiKey", required=True)
+        if on_key is not None:
+            on_key(key_id, created)
+        return key_id
+
+    return project_tokens.resolve(account, account_key=account_key, location=location,
+        on_stage=on_stage, on_key=on_key, rejected_fingerprint=rejected_fingerprint, force=force,
+        known_key_id=known_key_id, recovery_budget=recovery_budget)

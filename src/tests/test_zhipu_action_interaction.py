@@ -65,7 +65,7 @@ def test_missing_key_auto_creation_continues_to_ready_on_same_card(callback_env,
     saved = om.list_accounts()[0]
     key = om.get_account_key(saved)
     assert created == [True]
-    assert saved["model_key"] == "new-id.existing-secret"
+    assert saved["project_key_id"] == "new-id"
     assert saved["models"] and state_db.quota_load(key)
     assert "账户已就绪" in cards[-1][0]
     assert states.get_state(42) is None
@@ -142,9 +142,9 @@ def test_stop_after_dispatch_preserves_result_and_does_not_claim_rollback(reset_
         for future in futures:
             future.result(5)
     assert cards == before
-    assert om.get_account(key)["model_key"] == "new-id.new-secret"
+    assert om.get_account(key)["project_key_id"] == "new-id"
     assert actions.history(om.get_account(key))[-1]["status"] == "succeeded"
-    assert sum(kw.get("method") == "POST" for _, kw in state["calls"]) == 1
+    assert sum(kw.get("method") == "POST" and url.endswith("/api_keys") for url, kw in state["calls"]) == 1
 
 
 def test_preflight_timeout_shows_reason_and_direct_retry_confirmation(reset_env, cards, monkeypatch):

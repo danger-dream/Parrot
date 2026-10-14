@@ -40,7 +40,7 @@ def test_auto_setup_retries_unsent_but_only_reconciles_uncertain_create(callback
     resumed = control.initialize_zhipu_account(ctx, poll.account_id)
     if unsent:
         resumed.post_save["model_sync_future"].result(10)
-        assert len(posts) == 2 and om.get_account(poll.account_id)["model_key"] == "created-id.existing-secret"
+        assert len(posts) == 2 and om.get_account(poll.account_id)["project_key_id"] == "created-id"
     else:
         assert len(posts) == 1 and not om.get_account(poll.account_id).get("model_key")
         assert resumed.post_save["key_action"]["status"] == "unknown"

@@ -7,6 +7,7 @@ import time
 from urllib.parse import parse_qs, urlsplit, urlencode
 
 import pytest
+from src.tests.zhipu_pat_fixtures import envelope, pat
 from src import oauth_manager as om, state_db
 from src.management_control.errors import ManagementError
 from src.management_control.oauth import OAuthProvider
@@ -53,8 +54,9 @@ def callback_env(onboarding, monkeypatch):
         if url.endswith("/api_keys"):
             assert kw.get("method", "GET") == "GET", "login must never create a Key"
             return [{"apiKey": "existing-id", "name": "zcode-api-key"}]
-        if "/api_keys/copy/" in url:
-            return {"secretKey": "existing-secret"}
+        if url.endswith("/access_tokens"):
+            assert kw["method"] == "POST"
+            return envelope(url.split("/")[-2])
         return wire(url, **kw)
     monkeypatch.setattr(common, "request", request)
     yield control, observed, profile
@@ -74,13 +76,13 @@ def test_callback_flow_preserves_user_name_and_custom_rename(callback_env, site)
     assert query["redirect" if site == "bigmodel" else "redirect_uri"] == [auth.CALLBACK_URI]
     poll = control.submit_zhipu_callback(ctx, flow.flow_id, flow.flow_secret, callback(flow, site=site))
     assert poll.status == "completed" and poll.account_preview["label"] == "官方用户名"
-    assert om.get_account(poll.account_id)["model_key"] == "existing-id.existing-secret"
+    assert om.get_account(poll.account_id)["project_key_id"] == "existing-id"
     assert om.get_account(poll.account_id)["project_id"] == "project"
     project_flow = control.start_zhipu_project_selection(ctx, poll.account_id)
     result = control.select_zhipu_project(ctx, project_flow.flow_id, project_flow.flow_secret, organization_id="org", project_id="project")
     result.post_save["model_sync_future"].result(10)
     saved = om.get_account(result.account_id)
-    assert saved["label"] == "官方用户名" and saved["model_key"] == "existing-id.existing-secret"
+    assert saved["label"] == "官方用户名" and saved["project_key_id"] == "existing-id"
     assert state_db.quota_load(result.account_id) and saved["models"]
     assert len([url for url, kw in observed if url.endswith("/oauth/token")]) == 1
     assert not any("/cli/poll/" in url for url, _ in observed)
@@ -165,7 +167,7 @@ def test_actual_tg_login_automatically_initializes_in_one_message(callback_env, 
     assert any("无需粘贴回调地址" in text for text, _ in messages)
     assert states.get_state(42) is None
     saved = om.list_accounts()[0]
-    assert saved["model_key"] == "existing-id.existing-secret"
+    assert saved["project_key_id"] == "existing-id"
     assert saved["entitlement"] == "available"
     assert len(om.account_model_selection(saved)["effective_models"]) == 2
     assert state_db.quota_load(om.get_account_key(saved))
@@ -177,9 +179,9 @@ def test_actual_tg_login_automatically_initializes_in_one_message(callback_env, 
     assert "官方用户名" in messages[-1][0]
     assert not any("请选择目标组织/项目" in text or "账户初始化结果" in text for text, _ in messages)
     assert "模型目录: 2 个 · 已启用 2 · 禁用 0" in messages[-1][0]
-    assert all(kw.get("method", "GET") == "GET" for url, kw in observed if "/api_keys" in url)
+    assert all(kw.get("method", "GET") == "GET" for url, kw in observed if url.endswith("/api_keys"))
     assert sum("client/configs" in url for url, _ in observed) == 1
-    assert sum("/api_keys/copy/" in url for url, _ in observed) == 1
+    assert sum(url.endswith("/access_tokens") for url, _ in observed) == 1
     assert om.list_accounts()[0]["label"] == "官方用户名"
     assert any("/cli/poll/" in url for url, _ in observed)
     assert not any(url.endswith("/oauth/token") for url, _ in observed)
@@ -262,7 +264,7 @@ def test_project_lookup_failure_reuses_credentials_without_reauthorizing(callbac
     now[0] += 360  # Original login TTL no longer owns the saved credentials.
     assert menu.handle_callback(42, 500, "retry", "oa:zh:initialize:" + short)
     assert "账户已就绪" in messages[-1][0]
-    assert om.list_accounts()[0]["model_key"] == "existing-id.existing-secret"
+    assert om.list_accounts()[0]["project_key_id"] == "existing-id"
     assert "官方用户名" in messages[-1][0]
     assert sum("/cli/poll/" in url for url, _ in observed) == 1
     assert sum(url.endswith("/cli/init") for url, _ in observed) == 1

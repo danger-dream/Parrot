@@ -32,6 +32,7 @@ def test_three_accounts_have_distinct_persisted_devices_after_reload_and_relogin
         # Login returns no device ID; the account's own ID must survive.
         om.add_account({**entry, "access_token": "renewed-biz", "zcode_token": "renewed-platform"})
         assert runtime.ensure_device_id(key, om.get_account(key)) == device
+        monkeypatch.setattr(runtime.project_tokens, "location_id", lambda a: "fixture")
         monkeypatch.setattr(auth, "resolve_model_key", lambda *a, **k: "rotated.secret")
         monkeypatch.setattr(auth, "entitlement", lambda *a, **k: "available")
         runtime.refresh_locked(copy.deepcopy(om.get_account(key)), key, True)

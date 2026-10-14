@@ -151,3 +151,45 @@ def test_runner_fast_defaults_preserve_explicit_options(monkeypatch, argv, extra
 def test_runner_without_xdist_does_not_add_unknown_options(monkeypatch):
     monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
     assert runner._pytest_defaults(["src/tests"], xdist_available=False) == ["--durations=10"]
+
+
+def test_snapshots_are_explicitly_isolated():
+    from src.tests._isolation import minimal_config
+    root = Path(os.environ["PARROT_TEST_ROOT"])
+    for name in ("runtimeStatePath", "durableStatePath"):
+        path = Path(minimal_config()[name])
+        assert path.is_absolute()
+        path.relative_to(root)
+
+
+@pytest.mark.parametrize("name", ["config.json", "state.db", "durable-state.json",
+    ".durable-state.json.synthetic.tmp", ".durable-state.json.synthetic.old-main",
+    ".durable-state.json.synthetic.old-bak", "management-state.db-wal"])
+def test_repository_account_state_access_blocked_without_io(name):
+    import sys
+    path = Path(__file__).resolve().parents[2] / name
+    # Synthetic audit events exercise the guard without opening or changing a file.
+    with pytest.raises(RuntimeError, match="blocked repository account state"):
+        sys.audit("open", str(path), "r", 0)
+    with pytest.raises(RuntimeError, match="blocked repository account state"):
+        sys.audit("os.rename", str(path) + ".tmp", str(path), -1, -1)
+
+
+def test_repository_guard_resolves_directory_relative_paths(tmp_path):
+    import sys
+    repository = Path(__file__).resolve().parents[2]
+    temporary_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    repository_fd = os.open(repository, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        sys.audit("os.remove", "config.json", temporary_fd)
+        sys.audit("os.rename", "config.json.tmp", "config.json", temporary_fd, temporary_fd)
+        with pytest.raises(RuntimeError, match="blocked repository account state"):
+            sys.audit("os.remove", "config.json", repository_fd)
+        with pytest.raises(RuntimeError, match="blocked repository account state"):
+            sys.audit("os.rename", "other.tmp", "config.json", temporary_fd, repository_fd)
+        (tmp_path / "config.json").write_text("{}")
+        os.unlink("config.json", dir_fd=temporary_fd)
+        assert not (tmp_path / "config.json").exists()
+    finally:
+        os.close(temporary_fd)
+        os.close(repository_fd)

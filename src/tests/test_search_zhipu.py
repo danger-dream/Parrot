@@ -101,6 +101,15 @@ async def test_account_model_key_site_and_proxy(setup, monkeypatch, mode, site):
     cfg["search"]["backends"] = [backend("zhipu", apiKeys=[], endpoint="https://open.bigmodel.cn")]
     before = copy.deepcopy(cfg)
     wire(install)
+    from src.tests.zhipu_pat_fixtures import pat
+    expected_token = pat() if mode == "oauth" else "fixture.secret"
+    async def ensure(key, *, expected_state_key=None):
+        assert key == account_key(account)
+        assert expected_state_key == oauth_manager.account_state_key(account)
+        return expected_token
+    monkeypatch.setattr(oauth_manager, "ensure_valid_token", ensure)
+    from src.oauth.zhipu import project_tokens
+    monkeypatch.setattr(project_tokens, "cached_token", lambda current: expected_token)
     factory = search.network.async_client
     def client(**kw):
         assert kw["proxy_purpose"] == "oauth_zhipu"
@@ -109,7 +118,7 @@ async def test_account_model_key_site_and_proxy(setup, monkeypatch, mode, site):
         return factory(**kw)
     monkeypatch.setattr(search.network, "async_client", client)
     await search.search({"query": "Python"})
-    assert all(r.headers["authorization"] == "Bearer fixture.secret" for r in calls)
+    assert all(r.headers["authorization"] == "Bearer " + expected_token for r in calls)
     assert all(r.url.host == ("api.z.ai" if site == "zai" else "open.bigmodel.cn") for r in calls)
     assert cfg == before
 

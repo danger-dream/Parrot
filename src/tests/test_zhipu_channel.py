@@ -22,9 +22,9 @@ def env(monkeypatch):
         timeouts={"connect": 2, "firstByte": 2, "idle": 2, "total": 5}, protocolBridge={"enabled": True}))
     fake._install_keys(m, fake._default_key())
     ch = ZhipuOAuthChannel(a); fake._install_channels(m, [ch])
-    async def disabled(self):
-        return False
-    monkeypatch.setattr(signing.Signer, "gate", disabled)
+    async def headers(self, request):
+        return dict(request.headers)
+    monkeypatch.setattr(signing.Signer, "headers", headers)
     yield m, ch
     signing.forget(ch.account_key)
     config.update(lambda c: (c.clear(), c.update(before)))
@@ -60,7 +60,7 @@ async def test_six_real_ingress_paths(env, ingress, stream):
         assert str(req.url).endswith("/api/anthropic/v1/messages")
         assert req.headers["x-api-key"] == "fixture.secret"
         assert req.headers["authorization"] == "Bearer fixture.secret"
-        assert req.headers["user-agent"] == "ZCode/3.14.3 ai-sdk/provider-utils/4.0.27 runtime/node.js/24"
+        assert req.headers["user-agent"] == "ZCode/3.15.3 ai-sdk/provider-utils/4.0.27 runtime/node.js/24"
         assert all(req.headers.get(k) for k in ("x-session-id", "x-query-id", "x-request-id", "x-zcode-trace-id"))
         assert str(uuid.UUID(req.headers["x-session-id"])) == req.headers["x-session-id"]
         assert "anthropic-beta" not in req.headers
@@ -95,11 +95,8 @@ async def test_no_message_reorder_or_claude_rewrite_explicit_params(env):
 
 async def test_production_http_hook_raw401_before_business_wrapper(env, monkeypatch):
     signer = signing.for_account(om.get_account(env[1].account_key), env[1].account_key)
-    async def gate(self):
-        return True
     async def headers(self, request):
         return {**request.headers, "X-Client-Sig": "fixture-signature"}
-    monkeypatch.setattr(signing.Signer, "gate", gate)
     monkeypatch.setattr(signing.Signer, "headers", headers)
     attempts = []
     def wire(req):
@@ -140,7 +137,7 @@ async def test_beta_depends_on_final_messages_and_preserves_cache(env, mid_syste
     assert json.loads(sent["metadata"]["user_id"])["session_id"] == request.headers["x-session-id"]
     assert request.headers.get("anthropic-beta") == (request_context.MID_SYSTEM_BETA if mid_system else None)
     assert payload == original
-    assert common.identity_headers()["User-Agent"] == "ZCode/3.14.3"
+    assert common.identity_headers()["User-Agent"] == "ZCode/3.15.3"
 
 
 async def test_logical_retry_keeps_attribution_but_changes_request_id(env):

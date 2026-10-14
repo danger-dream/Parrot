@@ -176,6 +176,8 @@ def main(argv: list[str]) -> int:
         "oauthAccounts": [],
         "channels": [],
         "stateDbPath": str(state_path),
+        "runtimeStatePath": str(data_dir / "runtime-cache.json"),
+        "durableStatePath": str(data_dir / "durable-state.json"),
         "logDir": str(log_dir),
         "telegram": {"botToken": "", "adminIds": []},
         "oauth": {"mockMode": True},

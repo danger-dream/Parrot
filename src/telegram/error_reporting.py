@@ -82,7 +82,7 @@ def report(exc: BaseException, *, operation: str, event_kind="background", route
     code = exc.code.value if isinstance(exc, ManagementError) else exc.code if isinstance(exc, ZhipuError) else ""
     stage = exc.stage if isinstance(exc, ZhipuError) and exc.stage in {
         "request", "response", "login", "project_lookup", "model_key", "quota", "network",
-        "projects", "profile", "subscription", "key_list", "key_copy", "key_create", "key_save", "mcp",
+        "projects", "profile", "subscription", "key_list", "key_copy", "project_token", "business_token", "key_create", "key_save", "mcp",
         "reset_status", "reset_use", "reset_opportunity",
     } else ""
     kind = exc.kind if isinstance(exc, ZhipuError) and exc.kind in {

@@ -347,7 +347,7 @@ class ModelCenterControl(DomainControl):
                     effective_metadata=metadata, value_source=value_source,
                     constrained_by=constrained,
                     unavailable_reason=(
-                        "model_key_missing" if not account.get("model_key") else
+                        "model_key_missing" if not (account.get("model_key") or account.get("project_key_id")) else
                         "entitlement_" + str(account.get("entitlement") or "unknown")
                     ) if zhipu_effective is not None and outbound not in zhipu_effective and source_enabled else None,
                 ))

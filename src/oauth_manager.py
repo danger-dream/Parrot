@@ -54,7 +54,7 @@ from .oauth import workbuddy as workbuddy_provider
 from .oauth.workbuddy import runtime as workbuddy_runtime
 from .oauth import zhipu as zhipu_provider
 from .oauth.plan_labels import openai_plan_label
-from .oauth.zhipu import runtime as zhipu_runtime
+from .oauth.zhipu import common as zhipu_common, runtime as zhipu_runtime
 from .openai.codex_constants import (
     codex_backend_base_url,
     codex_cli_version,
@@ -874,8 +874,11 @@ def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: s
     if os.environ.get("PARROT_NO_REFRESH") == "1":
         _acc = get_account(_resolve_existing_account_key_or_raise(account_key))
         if _acc and provider_of(_acc) == "zhipu":
-            if not force and _acc.get("model_key"):
-                return _acc["model_key"]
+            if not force:
+                token = (_acc.get("model_key") if _acc.get("credential_mode") == "api_key"
+                         else zhipu_runtime.project_tokens.cached_token(_acc))
+                if token:
+                    return token
             raise zhipu_provider.ZhipuError("refresh", "disabled")
         if _acc and _acc.get("access_token"):
             return _acc["access_token"]
@@ -1132,8 +1135,6 @@ async def ensure_valid_token(account_key: str, *, expected_state_key: str | None
             raise ValueError(f"unknown OAuth account: {account_key}")
         expected_state_key = account_state_key(acc)
 
-    if provider_of(acc) == "zhipu" and acc.get("model_key"):
-        return acc["model_key"]
     if provider_of(acc) in {"workbuddy", "zhipu"}:
         return await asyncio.to_thread(_refresh_sync_locked, account_key, False, expected_state_key=expected_state_key)
     if _token_is_fresh(acc) and not _has_pending_refresh(expected_state_key):
@@ -4606,7 +4607,7 @@ def delete_invalid_accounts_batch_if_unchanged(
                 pass
             forget_openai_probe(account_key)
             workbuddy_runtime.forget(account_key)
-            zhipu_runtime.signing.forget(account_key)
+            zhipu_runtime.forget(account_key)
             if account_key.startswith("cursor:"):
                 try:
                     from .cursor_bridge import runtime as cursor_bridge_runtime
@@ -4754,7 +4755,7 @@ def _delete_account_serialized(account_key: str) -> None:
             # OpenAI probe 节流桶（fetch_usage 统一路径后新增）
             forget_openai_probe(cleanup_key)
             workbuddy_runtime.forget(cleanup_key)
-            zhipu_runtime.signing.forget(cleanup_key)
+            zhipu_runtime.forget(cleanup_key)
             if cleanup_key.startswith("cursor:"):
                 try:
                     from .cursor_bridge import runtime as cursor_bridge_runtime
@@ -5569,7 +5570,7 @@ def _discovery_generation(account: dict) -> str:
         _canonical_key(account), provider,
         str(account.get("generationId") or ""),
         str(account.get("access_token") or ""),
-        str(account.get("model_key") or "") if provider == "zhipu" else "",
+        zhipu_common.fingerprint(account) if provider == "zhipu" else "",
         str(account.get("project_id") or account.get("workspace_id") or ""),
         client_identity,
         json.dumps(_model_catalog_write_state(account), sort_keys=True, ensure_ascii=False),
@@ -5613,7 +5614,7 @@ async def _discover_account_models_once(account_key: str, *, timeout_s: float) -
         return {"action": "stale", "account_key": canonical}
     initial_generation = _discovery_generation(initial)
     try:
-        if provider_of(initial) != "zhipu":
+        if provider_of(initial) != "zhipu" or not mock_mode_enabled():
             await ensure_valid_token(canonical)
     except asyncio.TimeoutError:
         _persist_model_discovery_failure(canonical, initial_generation, "timeout")

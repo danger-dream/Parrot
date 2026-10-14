@@ -12,6 +12,7 @@ from src.channel import registry
 from src.management_control.errors import ManagementError
 from src.management_control.oauth import OAuthControl, OAuthProvider, CreateOAuthAccountCommand, JsonCredential
 from src.oauth.zhipu import common
+from src.tests.zhipu_pat_fixtures import envelope
 from src.telegram import states, ui
 from src.telegram.menus import oauth_menu as menu, zhipu_oauth_menu as zh
 from src.tests.test_workbuddy_lifecycle import context
@@ -41,8 +42,13 @@ def onboarding(account_env, monkeypatch):
     monkeypatch.delenv("PARROT_NO_REFRESH", raising=False)
 
     def wire(url, **kwargs):
-        assert kwargs.get("method", "GET") == "GET"
         calls.append(url)
+        if url.endswith("/access_tokens"):
+            assert kwargs["method"] == "POST"
+            return envelope("fixture")
+        assert kwargs.get("method", "GET") == "GET"
+        if url.endswith("/api_keys"):
+            return [{"apiKey": "fixture", "name": "zcode-api-key"}]
         if "/quota/limit" in url:
             if failure["quota"]:
                 raise common.ZhipuError("quota", "network")
@@ -99,7 +105,7 @@ def onboarding(account_env, monkeypatch):
 
 def create(control, mode="api_key", site="bigmodel"):
     return control.create_account(context(), CreateOAuthAccountCommand(
-        JsonCredential(OAuthProvider.ZHIPU, json.dumps(credential(mode, site)))))
+        JsonCredential(OAuthProvider.ZHIPU, json.dumps(credential(mode, site, **({"organization_id":"org", "project_id":"project"} if mode == "oauth" else {}))))))
 
 
 def assert_initialized(result, calls, downloads):

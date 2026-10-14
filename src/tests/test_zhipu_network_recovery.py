@@ -96,8 +96,8 @@ def test_created_key_copy_retry_uses_saved_id_not_another_post(reset_env, monkey
     wire = common.request
     failed = [True]
     def request(url, **kw):
-        if "/copy/" in url and failed[0]:
-            raise common.ZhipuError("key_copy", "timeout", timeout_phase="connect", request_not_sent=True)
+        if url.endswith("/access_tokens") and failed[0]:
+            raise common.ZhipuError("project_token", "timeout", timeout_phase="connect", request_not_sent=True)
         if url.endswith("/api_keys") and kw.get("method", "GET") == "GET" and not failed[0]:
             pytest.fail("saved Key ID must resume copy directly")
         return wire(url, **kw)
@@ -110,8 +110,8 @@ def test_created_key_copy_retry_uses_saved_id_not_another_post(reset_env, monkey
     plan = control.plan_zhipu_action(context(), key, "create_key")
     assert plan["resume_only"]
     result = control.execute_zhipu_action_now(context(), key, plan["plan_token"])
-    assert result["status"] == "succeeded" and om.get_account(key)["model_key"] == "new-id.new-secret"
-    assert len([kw for _, kw in state["calls"] if kw.get("method") == "POST"]) == 1
+    assert result["status"] == "succeeded" and om.get_account(key)["project_key_id"] == "new-id"
+    assert len([kw for url, kw in state["calls"] if kw.get("method") == "POST" and url.endswith("/api_keys")]) == 1
 
 
 def test_legacy_connect_failure_is_recoverable_but_read_failure_is_not():
@@ -130,11 +130,11 @@ def test_fresh_login_initializes_in_shared_control_without_tg_repair(callback_en
     result = control._flows.zhipu.completed_result(telegram_context(42).actor.subject_id, flow.flow_id, flow.flow_secret)
     result.post_save["model_sync_future"].result(10)
     saved = om.get_account(poll.account_id)
-    assert saved["project_id"] == "project" and saved["model_key"] == "existing-id.existing-secret"
+    assert saved["project_id"] == "project" and saved["project_key_id"] == "existing-id"
     assert saved["zhipu_reset_status"]["data"]["available_week_resets"] == []
     assert result.post_save["usage"] and om.account_model_selection(saved)["effective_models"]
     assert sum("client/configs" in url for url, _ in observed) == 1
-    assert sum("/api_keys/copy/" in url for url, _ in observed) == 1
+    assert sum(url.endswith("/access_tokens") for url, _ in observed) == 1
 
 
 def test_card_network_failure_does_not_discard_previous_snapshot_or_key(reset_env, monkeypatch):
@@ -183,3 +183,26 @@ def test_card_timestamps_and_history_are_human_readable(reset_env, monkeypatch):
     assert "到期 20" in rendered and str(state["calls"][0][1].get("account_key")) not in rendered
     assert "create_key" not in rendered
     states.pop_state(42)
+
+
+def test_created_location_404_relists_on_resume_without_recreating(reset_env, monkeypatch):
+    control, key, state, _ = reset_env
+    wire = common.request
+    attempts = []
+    def request(url, **kw):
+        if url.endswith("/access_tokens"):
+            attempts.append(url)
+            if len(attempts) == 1:
+                raise common.ZhipuError("project_token", status=404)
+        return wire(url, **kw)
+    monkeypatch.setattr(common, "request", request)
+    monkeypatch.setattr(control, "_post_save_zhipu_effects", lambda *a, **k: {"account_id":key})
+    plan = control.plan_zhipu_action(context(), key, "create_key")
+    result = control.execute_zhipu_action_now(context(), key, plan["plan_token"])
+    assert result["status"] == "unknown" and len(attempts) == 1
+    plan = control.plan_zhipu_action(context(), key, "create_key")
+    assert plan["resume_only"]
+    result = control.execute_zhipu_action_now(context(), key, plan["plan_token"])
+    assert result["status"] == "succeeded" and len(attempts) == 2
+    assert sum(url.endswith("/api_keys") and kw.get("method") == "POST" for url, kw in state["calls"]) == 1
+    assert sum(url.endswith("/api_keys") and kw.get("method", "GET") == "GET" for url, kw in state["calls"]) == 2

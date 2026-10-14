@@ -78,9 +78,9 @@ def test_required_identity_lookup_retry_does_not_exchange_code_twice(callback_en
 def test_oauth_import_without_projects_survives_subscription_outage(onboarding, monkeypatch, has_key):
     control, _, _, _ = onboarding
     monkeypatch.setattr(auth, "entitlement", network_failure)
-    result = create(control, credential("oauth", model_key="fixture.secret" if has_key else ""))
+    result = create(control, credential("oauth", model_key="fixture.secret" if has_key else "", **({"organization_id":"org", "project_id":"project"} if has_key else {})))
     saved = om.get_account(result.account_id)
-    assert bool(saved.get("model_key")) == has_key
+    assert common.has_model_key(saved) == has_key
     assert saved["access_token"] and saved["zcode_token"]
     assert bool(om.account_model_selection(saved)["effective_models"]) == has_key
 
@@ -101,6 +101,7 @@ def test_scope_is_saved_before_enrichment_and_reads_fail_independently(callback_
         called.append("key")
         return network_failure() if failure in {"key", "both"} else key(account, account_key=account_key, **kw)
     monkeypatch.setattr(auth, "entitlement", inspect_saved)
+    monkeypatch.setattr(runtime.project_tokens, "location_id", lambda a: "fixture")
     monkeypatch.setattr(auth, "resolve_model_key", read_key)
     control.submit_zhipu_callback(telegram_context(42), flow.flow_id, flow.flow_secret, callback(flow))
     result = control._flows.zhipu.completed_result(telegram_context(42).actor.subject_id, flow.flow_id, flow.flow_secret)
@@ -113,14 +114,14 @@ def test_scope_is_saved_before_enrichment_and_reads_fail_independently(callback_
     assert saved["access_token"] and saved["project_id"] == "project"
     assert len(om.list_accounts()) == 1
     assert "key" in called and "subscription" in called
-    assert bool(saved.get("model_key")) == (failure == "subscription")
+    assert common.has_model_key(saved) == (failure == "subscription")
     if failure != "subscription":
         assert saved["management_status"] == "model_key_lookup_failed"
 
 
 async def test_unknown_subscription_keeps_personal_routes_and_ui_consistent(onboarding, monkeypatch):
     control, _, _, _ = onboarding
-    result = create(control, credential("oauth"))
+    result = create(control, credential("oauth", organization_id="org", project_id="project"))
     saved = copy.deepcopy(om.get_account(result.account_id))
     monkeypatch.setattr(auth, "entitlement", lambda *a, **kw: "unknown")
     runtime.fetch_usage_sync(saved, result.account_id)
@@ -131,7 +132,7 @@ async def test_unknown_subscription_keeps_personal_routes_and_ui_consistent(onbo
     from src.channel.zhipu_oauth_channel import ZhipuOAuthChannel
     request = await ZhipuOAuthChannel(current).build_upstream_request(
         {"messages": [{"role": "user", "content": "fixture"}], "max_tokens": 16}, "GLM-5.3")
-    assert request.headers["x-api-key"] == current["model_key"]
+    assert request.headers["x-api-key"] == auth.resolve_model_key(current, account_key=result.account_id)
     team = dict(current, plan_scope="team", organization_id="org", project_id="project")
     assert not runtime.model_route_available(team)
     team["entitlement"] = "available"
@@ -145,6 +146,7 @@ def test_key_repair_survives_subscription_outage_without_lifting_other_pauses(ac
     entry = credential("oauth", organization_id="org", project_id="project", enabled=reason is None, disabled_reason=reason)
     om.add_account(entry); key = om.get_account_key(entry)
     monkeypatch.setattr(auth, "entitlement", network_failure)
+    monkeypatch.setattr(runtime.project_tokens, "location_id", lambda a: "fixture")
     monkeypatch.setattr(auth, "resolve_model_key", lambda *a, **kw: "repaired.fixture")
     assert runtime.refresh_locked(copy.deepcopy(om.get_account(key)), key, True) == "repaired.fixture"
     saved = om.get_account(key)
@@ -250,7 +252,7 @@ def test_binding_existing_target_preserves_target_settings_and_removes_empty_she
     bound.post_save["model_sync_future"].result(10)
     assert bound.account_id == target.account_id and len(om.list_accounts()) == 1
     saved = om.get_account(target.account_id)
-    assert saved["label"] == "已有项目" and saved["disabled_reason"] == "user" and saved["model_key"] == "fixture.secret"
+    assert saved["label"] == "已有项目" and saved["disabled_reason"] == "user" and saved["project_key_id"] == "existing-id"
 
 
 def test_saved_account_project_flow_http_round_trip_and_empty_projects(callback_env, tmp_path, monkeypatch):
@@ -277,11 +279,11 @@ def test_saved_account_project_flow_http_round_trip_and_empty_projects(callback_
             json={"flowSecret": flow["flowSecret"], "organizationId": "org", "projectId": "project"})
         assert bound.status_code == 200, bound.text
         key = bound.json()["data"]["accountId"]
-        assert om.get_account(key)["model_key"] == "existing-id.existing-secret"
+        assert om.get_account(key)["project_key_id"] == "existing-id"
         monkeypatch.setattr(control.backend, "zhipu_project_choices", lambda *a: [])
         start = client.post(base + "/accounts/" + key + "/zhipu/project-flows", headers=headers)
         assert start.status_code == 200
         flow = start.json()["data"]
         polled = client.post(base + "/login-flows/" + flow["flowId"] + "/poll", headers=headers, json={"flowSecret": flow["flowSecret"]})
         assert polled.json()["data"]["accountPreview"]["choices"] == []
-        assert om.get_account(key)["model_key"] == "existing-id.existing-secret"
+        assert om.get_account(key)["project_key_id"] == "existing-id"

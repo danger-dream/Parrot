@@ -100,7 +100,8 @@ def _remaining(deadline):
 
 
 def _fetch_model_rows(account, account_key, deadline):
-    key = c.text(account.get("model_key"), "model_key", required=True)
+    from .auth import resolve_model_key
+    key = resolve_model_key(account, account_key=account_key)
     headers = {"Authorization": "Bearer " + key, "x-api-key": key,
                "anthropic-version": "2023-06-01"}
     if account.get("plan_scope") == "team":

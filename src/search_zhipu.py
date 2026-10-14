@@ -137,10 +137,21 @@ async def adapter(backend, credential, args, operation, cfg):
             if not current:
                 raise SearchError("搜索账户身份已变更", code="search_account_retired", status_code=503, retryable=False)
             account = oauth_manager.get_account(account_key(credential))
-            if not account or not account.get("model_key"):
+            if not account or not (account.get("model_key") or account.get("project_key_id")):
                 raise SearchError("智谱账户缺少模型 Key", code="no_search_backend", retryable=False)
-            origin, key = MODEL_ORIGINS[site_of(account)], account["model_key"]
-            proxy_channel = f"oauth:{account_key(account)}"
+            selected_key = account_key(account)
+        key = await oauth_manager.ensure_valid_token(selected_key, expected_state_key=state_key)
+        with oauth_manager.account_generation_guard(state_key) as current:
+            account = oauth_manager.get_account(selected_key) if current else None
+            if not account:
+                raise SearchError("搜索账户身份已变更", code="search_account_retired", status_code=503, retryable=False)
+            from .oauth.zhipu import project_tokens
+            bound_token = (account.get("model_key") if account.get("credential_mode") == "api_key"
+                           else project_tokens.cached_token(account))
+            if bound_token != key:
+                raise SearchError("搜索账户凭据已变更", code="search_account_retired", status_code=503, retryable=False)
+            origin = MODEL_ORIGINS[site_of(account)]
+            proxy_channel = f"oauth:{selected_key}"
     else:
         origin, key = str(backend.get("endpoint") or MODEL_ORIGINS["bigmodel"]).rstrip("/"), credential
         if origin not in MODEL_ORIGINS.values():
@@ -166,6 +177,10 @@ async def adapter(backend, credential, args, operation, cfg):
     async with network.async_client(timeout=httpx.Timeout(float(cfg["timeoutSeconds"])),
                                     follow_redirects=False, proxy_purpose="oauth_zhipu",
                                     proxy_channel=proxy_channel) as client:
+        if isinstance(credential, dict):
+            with oauth_manager.account_generation_guard(state_key) as current:
+                if not current:
+                    raise SearchError("搜索账户身份已变更", code="search_account_retired", status_code=503, retryable=False)
         hello = await _rpc(client, url, headers, 1, "initialize", {
             "protocolVersion": "2025-03-26", "capabilities": {},
             "clientInfo": {"name": "parrot", "version": "1.0"},

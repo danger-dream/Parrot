@@ -143,7 +143,7 @@ class SearchControl(DomainControl):
             rows.append({"id": account_key(account),
                          "name": name,
                          "enabled": account.get("enabled", True) is not False and not bool(account.get("disabled_reason")),
-                         "credentialConfigured": bool(account.get("model_key" if provider == "zhipu" else "access_token"))})
+                         "credentialConfigured": bool((account.get("model_key") or account.get("project_key_id")) if provider == "zhipu" else account.get("access_token"))})
         return rows
 
     def _commit(self, context, action, mutate, expected_revision=None, *, read_back=True):

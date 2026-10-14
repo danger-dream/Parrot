@@ -10,6 +10,7 @@ import pytest
 from src import config, oauth_manager as om, state_db
 from src.oauth import normalize_provider
 from src.oauth.zhipu import auth, common, runtime
+from src.tests.zhipu_pat_fixtures import pat, envelope
 from src.oauth_ids import account_key
 from src.channel import registry
 from src.providers import registry as providers
@@ -35,13 +36,14 @@ def account_env(monkeypatch):
 
 @pytest.mark.parametrize("mode", ["api_key", "oauth"])
 @pytest.mark.parametrize("site", ["bigmodel", "zai"])
-async def test_real_account_registry_modes_scope_no_fake_email(account_env, mode, site):
-    entry = credential(mode, site)
+async def test_real_account_registry_modes_scope_no_fake_email(account_env, monkeypatch, mode, site):
+    entry = credential(mode, site, organization_id="org", project_id="project")
+    monkeypatch.setattr(common, "request", lambda url, **kw: envelope() if url.endswith("/access_tokens") else [{"apiKey":"fixture", "name":"zcode-api-key"}])
     om.add_account(entry)
     key = account_key(entry)
     saved = om.get_account(key)
     assert saved and not saved.get("refresh_token") and not saved.get("email")
-    assert await om.ensure_valid_token(key) == entry["model_key"]
+    assert await om.ensure_valid_token(key) == (pat() if mode == "oauth" else entry["model_key"])
     for org, project in (("a:b", "c"), ("a", "b:c")):
         team = credential(mode, site, plan_scope="team", organization_id=org, project_id=project)
         om.add_account(team)
@@ -73,10 +75,11 @@ def test_model_key_read_only_confirmed_create_wire(monkeypatch, site, prefix):
     calls = []
     def wire(url, **kw):
         calls.append((url, kw))
+        if url.endswith("/access_tokens"):
+            assert kw["headers"]["Authorization"] == "Bearer fixture-biz"
+            assert url.endswith("/id%2Fencoded/access_tokens")
+            return envelope("id/encoded")
         assert kw["headers"]["Authorization"] == prefix + "fixture-biz"
-        if "/copy/" in url:
-            assert url.endswith("/copy/id%2Fencoded")
-            return {"secretKey": "secret"}
         if kw.get("method") == "POST":
             return {"apiKey": "id/encoded", "name": "zcode-api-key"}
         return []
@@ -85,15 +88,14 @@ def test_model_key_read_only_confirmed_create_wire(monkeypatch, site, prefix):
     with pytest.raises(common.ZhipuError, match="creation_confirmation_required"):
         auth.resolve_model_key(a)
     assert all(kw.get("method", "GET") == "GET" for _, kw in calls)
-    assert auth.resolve_model_key(a, create=True) == "id/encoded.secret"
-    assert len([kw for _, kw in calls if kw.get("method") == "POST"]) == 1
+    assert auth.resolve_model_key(a, create=True) == pat("id/encoded")
+    assert len([kw for url, kw in calls if kw.get("method") == "POST" and url.endswith("/api_keys")]) == 1
 
 
-async def test_oauth_expiry_preserves_model_key(account_env, monkeypatch):
+async def test_oauth_expiry_migrates_legacy_key_without_using_jwt_exp(account_env, monkeypatch):
     a = credential("oauth", expired="2000-01-01T00:00:00Z")
     om.add_account(a)
     key = account_key(a)
-    assert await om.ensure_valid_token(key) == "fixture.secret"
     monkeypatch.delenv("PARROT_NO_REFRESH", raising=False)
     monkeypatch.setattr(auth, "resolve_model_key", lambda *a, **k: (_ for _ in ()).throw(common.ZhipuError("management", status=401)))
     monkeypatch.setattr(auth, "entitlement", lambda *a, **k: pytest.fail("failed Key authentication must not proceed to enrichment"))
@@ -102,7 +104,8 @@ async def test_oauth_expiry_preserves_model_key(account_env, monkeypatch):
     assert om.get_account(key)["model_key"] == "fixture.secret"
     assert om.get_account(key)["enabled"] is True
     assert om.get_account(key)["management_status"] == "relogin_required"
-    assert await om.ensure_valid_token(key) == "fixture.secret"
+    with pytest.raises(common.ZhipuError):
+        await om.ensure_valid_token(key)
 
 
 def quota(*rows):

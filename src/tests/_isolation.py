@@ -18,7 +18,7 @@ _TMP_DIR: str | None = None
 # 都要有一份：若该文件缺失，config._load_from_disk() 会改用 DEFAULT_CONFIG
 # （其中 oauth.mockMode 为 False）并把这份默认值写回磁盘，导致测试真的发起
 # OAuth 网络请求。
-MINIMAL_CONFIG_KEYS = ("oauth", "stateDbPath", "logDir", "images")
+MINIMAL_CONFIG_KEYS = ("oauth", "stateDbPath", "runtimeStatePath", "durableStatePath", "logDir", "images")
 
 
 def minimal_config() -> dict:
@@ -29,6 +29,8 @@ def minimal_config() -> dict:
         "oauthAccounts": [],
         "channels": [],
         "stateDbPath": os.environ["PARROT_TEST_STATE_PATH"],
+        "runtimeStatePath": str(Path(os.environ["ANTHROPIC_PROXY_DATA_DIR"]) / "runtime-cache.json"),
+        "durableStatePath": str(Path(os.environ["ANTHROPIC_PROXY_DATA_DIR"]) / "durable-state.json"),
         "logDir":      os.environ["PARROT_TEST_LOG_DIR"],
         "telegram": {"botToken": "", "adminIds": []},
         # 确保测试里 mock 模式开（OAuth 不触网）

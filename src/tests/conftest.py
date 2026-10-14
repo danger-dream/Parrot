@@ -5,6 +5,7 @@ import ipaddress
 import os
 from pathlib import Path
 import socket
+import sys
 
 
 def _worker_data_root() -> None:
@@ -73,8 +74,46 @@ def _validate_import_time_isolation() -> None:
     os.environ["PARROT_TEST_CONFTEST_PROBE"] = "absolute-paths-ok-before-collection"
 
 
+def _protect_repository_account_state():
+    """Fail before IO if a fixture escapes to the running service's root files.
+
+    Auditing is independent of config monkeypatches and also covers direct
+    snapshot/SQLite IO. The hook never opens these files, including in its tests.
+    """
+    repository = Path(__file__).resolve().parents[2]
+    names = ("config.json", "state.db", "durable-state.json", "runtime-cache.json",
+             "state-migration.json", "management-state.db", "image_logs.db")
+    def audit(event, args):
+        count = 2 if event in {"os.rename", "os.link", "os.symlink"} else 1
+        if event not in {"open", "sqlite3.connect", "os.rename", "os.link", "os.symlink",
+                         "os.remove", "os.chmod", "os.truncate"}:
+            return
+        for index, raw in enumerate(args[:count]):
+            if not isinstance(raw, (str, bytes, os.PathLike)):
+                continue
+            path = Path(os.fsdecode(raw))
+            fd_index = (2 + index if event in {"os.rename", "os.link"} else
+                        1 if event == "os.remove" else
+                        2 if event in {"os.chmod", "os.symlink"} else None)
+            if not path.is_absolute() and fd_index is not None and len(args) > fd_index:
+                directory_fd = args[fd_index]
+                if isinstance(directory_fd, int) and directory_fd >= 0:
+                    try:
+                        path = Path(os.readlink(f"/proc/self/fd/{directory_fd}")) / path
+                    except OSError:
+                        continue
+            path = path.resolve()
+            if path.parent == repository and any(
+                path.name == name or path.name.startswith((name + ".", name + "-", "." + name + "."))
+                for name in names
+            ):
+                raise RuntimeError("test IO blocked repository account state: " + path.name)
+    sys.addaudithook(audit)
+
+
 _worker_data_root()
 _validate_import_time_isolation()
+_protect_repository_account_state()
 
 import pytest
 
@@ -340,3 +379,22 @@ def pytest_unconfigure(config):
     if _ORIG_HTTPX_MOCK_HANDLE is not None:
         import httpx
         httpx.MockTransport.handle_async_request = _ORIG_HTTPX_MOCK_HANDLE
+
+
+@pytest.fixture(autouse=True)
+def _zhipu_process_cache_isolation(request):
+    if "zhipu" not in request.node.nodeid:
+        yield
+        return
+    from src.oauth.zhipu import project_tokens, signing
+    def clear():
+        with project_tokens._lock:
+            project_tokens._entries.clear()
+            project_tokens._locations.clear()
+            project_tokens._business_locks.clear()
+            project_tokens._business_tokens.clear()
+        with signing._cache_lock:
+            signing._cache.clear()
+    clear()
+    yield
+    clear()

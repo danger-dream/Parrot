@@ -5,6 +5,7 @@ import time
 import httpx
 import pytest
 from src.oauth.zhipu import auth, common
+from src.tests.zhipu_pat_fixtures import pat, envelope
 from src.tests.test_zhipu_provider import credential
 
 
@@ -74,13 +75,17 @@ def test_retry_after_respected_and_excessive_delay_stops(wire):
     assert len(calls) == 2 and sleeps == [2]
 
 
-def test_key_list_and_copy_retry_independently_without_creation(wire):
+def test_key_list_retries_but_pat_post_never_replays(wire):
     replies, calls, sleeps = wire
     replies.extend([httpx.Response(502), httpx.Response(200, json={"data": [{"apiKey": "id", "name": "zcode-api-key"}]}),
-                    httpx.ConnectError("temporary"), httpx.Response(200, json={"data": {"secretKey": "secret"}})])
-    assert auth.resolve_model_key(credential("oauth", organization_id="org", project_id="project")) == "id.secret"
-    assert len(calls) == 4 and sleeps == [0.5, 0.5]
-    assert all(request.method == "GET" for request in calls)
+                    httpx.ConnectError("temporary")])
+    account = credential("oauth", organization_id="org", project_id="project")
+    with pytest.raises(common.ZhipuError):
+        auth.resolve_model_key(account)
+    assert len(calls) == 3 and sleeps == [0.5]
+    replies.append(httpx.Response(200, json=envelope("id")))
+    assert auth.resolve_model_key(account) == pat("id")
+    assert [request.method for request in calls] == ["GET", "GET", "POST", "POST"]
 
 
 def test_read_timeouts_20_connect_60_read_preserve_explicit_and_write_limits(wire):

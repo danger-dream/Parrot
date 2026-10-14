@@ -635,7 +635,7 @@ class OAuthBackend:
         old_scope = tuple(entry.get(key) for key in ("organization_id", "project_id", "plan_scope"))
         new_scope = tuple(choice[key] for key in ("organization_id", "project_id", "plan_scope"))
         if old_scope != new_scope:
-            for key in ("model_key", "entitlement", "management_status"):
+            for key in ("model_key", "project_key_id", "entitlement", "management_status"):
                 entry.pop(key, None)  # Never carry a Key/seat from another project.
         entry.update({key: choice[key] for key in ("organization_id", "project_id", "plan_scope")})
         return auth.normalize_credential(entry)

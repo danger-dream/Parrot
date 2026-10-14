@@ -15,7 +15,7 @@ from ...proxy.connector import ProxyConnectError, UpstreamConnectError
 from ... import network
 from .diagnostics import RequestTrace, error_facts
 
-VERSION = "3.14.3"
+VERSION = "3.15.3"
 PLATFORM_ORIGIN = "https://zcode.z.ai"
 BIZ_ORIGINS = {"bigmodel": "https://bigmodel.cn", "zai": "https://api.z.ai"}
 MODEL_ORIGINS = {"bigmodel": "https://open.bigmodel.cn", "zai": "https://api.z.ai"}
@@ -66,8 +66,14 @@ def identity(account):
 
 def fingerprint(account):
     values = [identity(account), account.get("generationId"), account.get("model_key"),
-              account.get("access_token"), account.get("zcode_token")]
+              account.get("access_token"), account.get("zcode_token"), account.get("zhipu_oauth_token"),
+              account.get("plan_scope"), account.get("project_key_id")]
     return hashlib.sha256(json.dumps(values).encode()).hexdigest()
+
+
+def has_model_key(account):
+    # OAuth stores only a location; legacy model_key is a migration readiness hint.
+    return bool(account.get("model_key") or account.get("project_key_id"))
 
 
 def identity_headers():

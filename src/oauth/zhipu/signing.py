@@ -31,9 +31,35 @@ def derive(secret, info):
 
 def credential(key):
     parts = key.split(".")
-    if len(parts) != 2 or not all(p.strip() for p in parts):
-        raise c.ZhipuError("signing", "invalid-config")
-    return tuple(p.strip() for p in parts)
+    if len(parts) == 3 and parts[2]:
+        try:
+            def invalid_constant(_value):
+                raise ValueError("invalid JWT JSON")
+
+            def decode(part):
+                # FSr uses atob after URL-alphabet replacement. Ignore only
+                # atob's ASCII whitespace, not arbitrary non-alphabet bytes.
+                part = part.translate(str.maketrans("-_", "+/", " \t\n\r\f"))
+                padding = len(part) - len(part.rstrip("="))
+                if padding and (padding > 2 or len(part) % 4):
+                    raise ValueError("invalid JWT base64 padding")
+                raw = base64.b64decode(part + "=" * (-len(part) % 4), validate=True)
+                # Match TextDecoder (UTF-8, BOM removal/replacement), rather
+                # than json.loads(bytes)' UTF-16/32 autodetection. JSON.parse
+                # rejects the non-JSON NaN/Infinity constants Python accepts.
+                return json.loads(raw.decode("utf-8-sig", errors="replace"),
+                                  parse_constant=invalid_constant)
+            header, payload = decode(parts[0]), decode(parts[1])
+            if (isinstance(header, dict) and isinstance(payload, dict)
+                    and header.get("alg") == "HS256" and header.get("typ") == "JWT"
+                    and header.get("sign_type") == "SIGN" and payload.get("token_use") == "project_access"
+                    and isinstance(payload.get("api_key"), str) and payload["api_key"].strip()):
+                return payload["api_key"], key
+        except (ValueError, UnicodeError):
+            pass
+    elif len(parts) == 2 and all(p.strip() for p in parts):
+        return tuple(p.strip() for p in parts)
+    raise c.ZhipuError("signing", "invalid-config")
 
 
 def origin(url):
@@ -72,8 +98,6 @@ class Signer:
         self.epoch = 0
         self.disposed = False
         self.bypass = False
-        self.gate_value = False
-        self.gate_until = 0
         self.lock = threading.RLock()
         self.flights = {}
 
@@ -135,26 +159,6 @@ class Signer:
         except Exception:
             raise c.ZhipuError("handshake", "network", fail_open=True) from None
 
-    async def gate(self):
-        self.check()
-        if self.gate_until > time.monotonic():
-            return self.gate_value
-        async def load():
-            try:
-                data = await self.json_request(c.PLATFORM_ORIGIN + "/api/v1/agent/configs",
-                    headers={**c.identity_headers(), "x-api-key": self.key}, timeout=15)
-                if not isinstance(data, dict) or data.get("code") != 0 or not isinstance(data.get("data"), dict):
-                    return False
-                gate = data["data"].get("codingPlanSignature")
-                self.gate_value = isinstance(gate, dict) and gate.get("enable") is True
-                self.gate_until = time.monotonic() + 3600
-                return self.gate_value
-            except c.ZhipuError as exc:
-                if exc.kind == "disabled":
-                    raise
-                return False  # Unavailable is deliberately not cached.
-        return await self.singleflight("gate", load)
-
     async def ensure_private_key(self):
         self.check()
         key_id, secret = credential(self.key)
@@ -167,7 +171,7 @@ class Signer:
             sig = base64.b64encode(hmac.digest(derive(secret, "getSignKey_hmac"), f"get_sign_key\n{key_id}\n{ts}\n{nonce}".encode(), "sha256")).decode()
             data = await self.json_request(self.origin + "/api/paas/c1f3a7e2/v2/client",
                 headers={"Authorization": self.key, "Content-Type": "application/json"},
-                body={"apiKey": self.key, "nonce": nonce, "ts": ts, "sig": sig}, timeout=10)
+                body={"accessToken" if len(self.key.split(".")) == 3 else "apiKey": self.key, "nonce": nonce, "ts": ts, "sig": sig}, timeout=10)
             buffers = []
             try:
                 if not isinstance(data, dict) or data.get("code") != 200:
@@ -229,7 +233,7 @@ class SignedContext:
     async def __aenter__(self):
         signer, request = self.signer, self.request
         signer.check()
-        enabled = origin(request.url) == signer.origin and not signer.bypass and await signer.gate()
+        enabled = origin(request.url) == signer.origin and not signer.bypass
         for attempt in range(3):
             signed = enabled and attempt < 2 and not signer.bypass
             headers = {k: v for k, v in request.headers.items() if k.lower() not in SIGNATURE_HEADERS}
