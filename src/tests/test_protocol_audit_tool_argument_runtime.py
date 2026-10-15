@@ -10,6 +10,7 @@ from src.tests.test_protocol_fake_upstreams import (
     _import_modules, _setup, _install_channels, _install_keys, _default_key,
     _make_openai_channel, _make_openai_oauth_channel, _call_anthropic_core,
     _call_openai_handler, MockRouter, FakeOAuthResponseWs, ChunkedByteStream,
+    stored_log_bodies,
 )
 
 
@@ -106,7 +107,7 @@ def assert_settlement(m, response, effects, arguments, *, expected_stop="tool_us
 @pytest.mark.parametrize("protocol", ["openai-chat", "openai-responses"])
 @pytest.mark.parametrize("transport", ["json", "sse"])
 @pytest.mark.parametrize("arguments", [RECOVERABLE, INVALID])
-async def test_http_entry_tool_argument_translation_precedes_all_success_effects(m, monkeypatch, protocol, transport, arguments):
+async def test_http_entry_tool_argument_translation_precedes_all_success_effects(m, monkeypatch, protocol, transport, arguments, stored_log_bodies):
     _setup(m)
     channel = _make_openai_channel("audit-args", "https://audit.invalid", protocol=protocol,
                                   alias="sonnet", real="gpt-real")
@@ -144,7 +145,7 @@ async def test_http_entry_tool_argument_translation_precedes_all_success_effects
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["json", "sse"])
 @pytest.mark.parametrize("arguments", ['{"path":"a"}', INVALID])
-async def test_output_limit_with_tool_is_not_input_context_failure(m, monkeypatch, transport, arguments):
+async def test_output_limit_with_tool_is_not_input_context_failure(m, monkeypatch, transport, arguments, stored_log_bodies):
     _setup(m)
     channel = _make_openai_channel("audit-limit", "https://audit.invalid", protocol="openai-responses",
                                   alias="sonnet", real="gpt-real")
@@ -165,7 +166,7 @@ async def test_output_limit_with_tool_is_not_input_context_failure(m, monkeypatc
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("arguments", [RECOVERABLE, INVALID])
-async def test_ws_nonstream_real_consumer_translates_before_success_and_settles_errors(m, monkeypatch, arguments):
+async def test_ws_nonstream_real_consumer_translates_before_success_and_settles_errors(m, monkeypatch, arguments, stored_log_bodies):
     _setup(m)
     _install_keys(m, _default_key())
     m["config"].update(lambda cfg: cfg.update({

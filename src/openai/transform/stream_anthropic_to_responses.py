@@ -101,6 +101,7 @@ class _ReasoningState:
     text_parts: list[str] = field(default_factory=list)
     native_block: dict = field(default_factory=dict)
     native_complete: bool = False
+    item_started: bool = False
     summary_started: bool = False
     done: bool = False
 
@@ -458,6 +459,15 @@ class StreamTranslator:
             native["thinking"] = ""
         st = _ReasoningState(item_id=_gen_id("rs_"), output_index=self.state.alloc_output_index(), native_block=native)
         self.state.reasoning[block_index] = st
+        # Reserve the original position and collect signatures, but do not let
+        # an empty thinking start commit a still-waiting upstream attempt.
+        if block.get("type") == "redacted_thinking" or block.get("thinking"):
+            yield from self._ensure_reasoning_item_started(st)
+
+    def _ensure_reasoning_item_started(self, st: _ReasoningState) -> Iterator[bytes]:
+        if st.item_started:
+            return
+        st.item_started = True
         yield _emit("response.output_item.added", {
             "type": "response.output_item.added", "sequence_number": self.state.next_seq(),
             "output_index": st.output_index, "item": {"type": "reasoning", "id": st.item_id, "summary": []},
@@ -473,6 +483,7 @@ class StreamTranslator:
         st.native_block["thinking"] = st.native_block.get("thinking", "") + text
         if not self._reasoning_enabled:
             return
+        yield from self._ensure_reasoning_item_started(st)
         if not st.summary_started:
             st.summary_started = True
             yield _emit("response.reasoning_summary_part.added", {
@@ -507,6 +518,9 @@ class StreamTranslator:
     def _finish_reasoning(self, st: _ReasoningState) -> Iterator[bytes]:
         if st.done:
             return
+        # A completed signature-only block is a real native replay item, even
+        # though it has no readable summary. Emit its start before its done.
+        yield from self._ensure_reasoning_item_started(st)
         st.done = True
         if st.summary_started:
             yield from self._finish_reasoning_summary(st)

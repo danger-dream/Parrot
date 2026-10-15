@@ -39,6 +39,18 @@ import pytest
 
 
 @pytest.fixture
+def stored_log_bodies(m):
+    """Only raw request/response audit tests opt into body persistence."""
+    config = m["config"]
+    original = config.get().get("logStoreBodies", False)
+    config.update(lambda cfg: cfg.__setitem__("logStoreBodies", True))
+    try:
+        yield
+    finally:
+        config.update(lambda cfg: cfg.__setitem__("logStoreBodies", original))
+
+
+@pytest.fixture
 def channel_slots_enabled(tmp_path, monkeypatch):
     """Slot ownership assertions require accounting, not an inherited WS cache.
 
@@ -1023,7 +1035,7 @@ async def test_anthropic_reasoning_and_service_tier_to_openai_responses_fake_ups
     assert out["content"] == [{"type": "text", "text": "reasoning bridge pong"}]
 
 
-async def test_forced_fast_updates_http_log_without_mutating_raw_request(m):
+async def test_forced_fast_updates_http_log_without_mutating_raw_request(m, stored_log_bodies):
     _setup(m)
     _install_keys(m, _default_key())
     router = MockRouter()
@@ -3699,7 +3711,7 @@ async def test_native_responses_stream_response_is_saved_for_previous_response_i
     assert rec.output_items[0]["content"][0]["text"] == "native stream stored"
 
 
-async def test_native_responses_function_call_stream_finishes_request_log(m):
+async def test_native_responses_function_call_stream_finishes_request_log(m, stored_log_bodies):
     _setup(m)
     _install_keys(m, _default_key())
     router = MockRouter()

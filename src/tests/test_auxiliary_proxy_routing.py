@@ -7,9 +7,10 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from src import network, probe, search_service as search
+from src import network, oauth_manager, probe, search_service as search
 from src.management_control.channels.models import ChannelProtocol, DraftProbeCommand
 from src.management_control.channels.service import ChannelControl
+from src.oauth.zhipu import project_tokens
 from src.oauth_ids import account_key
 from src.proxy import manager as pm
 from src.proxy.connector import ProxyStats
@@ -18,6 +19,7 @@ from src.tests.test_proxy_upstream_types import routing_env  # noqa: F401
 from src.tests.test_search_service import setup, backend  # noqa: F401
 from src.tests.test_search_zhipu import wire
 from src.tests.test_zhipu_provider import credential
+from src.tests.zhipu_pat_fixtures import pat
 
 
 @pytest.fixture
@@ -93,7 +95,25 @@ async def test_draft_probe_keeps_channel_and_model_override_precedence(draft_pro
 @pytest.mark.parametrize("operation", ["search", "extract"])
 async def test_zhipu_mcp_uses_account_route_only_for_account_credentials(setup, monkeypatch, use_account, operation):
     cfg, requests, install = setup
-    account = credential("oauth", "zai", generationId="proxy-route-generation")
+    account = credential("oauth", "zai", generationId="proxy-route-generation",
+                         model_key="", organization_id="fixture-org", project_id="fixture-project",
+                         project_key_id="fixture-project-key")
+    # OAuth stores only the Key location; its MCP credential is a process-local PAT.
+    token = pat(account["project_key_id"])
+    token_calls = []
+
+    async def ensure(key, *, expected_state_key=None):
+        assert key == account_key(account)
+        assert expected_state_key == oauth_manager.account_state_key(account)
+        token_calls.append(key)
+        return token
+
+    def cached_token(current):
+        assert current == account
+        return token
+
+    monkeypatch.setattr(oauth_manager, "ensure_valid_token", ensure)
+    monkeypatch.setattr(project_tokens, "cached_token", cached_token)
     cfg["oauthAccounts"] = [account]
     cfg["channels"] = []
     cfg["search"]["backends"] = [backend("zhipu", apiKeys=[])] if use_account else [backend("zhipu")]
@@ -142,4 +162,7 @@ async def test_zhipu_mcp_uses_account_route_only_for_account_credentials(setup, 
         assert result["results"][0]["title"] == "Python"
     assert selected == ["account-route" if use_account else "provider-route"]
     assert len(requests) == 4
+    assert token_calls == ([account_key(account)] if use_account else [])
+    expected_token = token if use_account else "private-test-key"
+    assert all(request.headers["authorization"] == "Bearer " + expected_token for request in requests)
     assert cfg == before

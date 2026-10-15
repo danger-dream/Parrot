@@ -13,6 +13,12 @@ from src import config, log_db
 from src.mcp import catalog, server as ms
 
 
+@pytest.fixture
+def stored_log_bodies(reset):
+    """The video audit checks persisted results; reset restores the config."""
+    config.update(lambda cfg: cfg.__setitem__("logStoreBodies", True))
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tool", ["image_generate", "image_edit"])
 async def test_image_auto_uses_allowed_alternative_and_keeps_http_authorization(monkeypatch, tool):
@@ -142,7 +148,7 @@ async def test_image_alias_grants_match_real_http_handler(monkeypatch, grant):
     ("cancelled", "generation cancelled"),
     ("pending", None),
 ])
-async def test_video_status_preserves_failure_detail_and_query_semantics(monkeypatch, status, error):
+async def test_video_status_preserves_failure_detail_and_query_semantics(monkeypatch, status, error, stored_log_bodies):
     from src.xai import imagine
 
     async def response(request, request_id):

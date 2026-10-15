@@ -15,6 +15,18 @@ from src.tests import _isolation
 _isolation.isolate()
 
 
+@pytest.fixture
+def stored_log_bodies(m):
+    """Opt in only for persisted-body and historical-log assertions."""
+    config = m["config"]
+    original = config.get().get("logStoreBodies", False)
+    config.update(lambda cfg: cfg.__setitem__("logStoreBodies", True))
+    try:
+        yield
+    finally:
+        config.update(lambda cfg: cfg.__setitem__("logStoreBodies", original))
+
+
 def _import_modules():
     from src import config, failover, log_db, model_pricing
     from src.openai.channel.api_channel import OpenAIApiChannel
@@ -457,8 +469,10 @@ def test_http_pre_header_cancellation_terminalizes_root_and_retry(m, monkeypatch
     ).fetchone()[0] == 0
 
 
-def test_http_body_cancellation_preserves_complete_usage_chunk(m, monkeypatch):
+@pytest.mark.parametrize("store_bodies", [False, True])
+def test_http_body_cancellation_preserves_complete_usage_chunk(m, monkeypatch, store_bodies):
     _setup(m)
+    monkeypatch.setitem(m["config"].get(), "logStoreBodies", store_bodies)
     ch = m["OpenAIApiChannel"]({
         "name": "a", "type": "api", "baseUrl": "https://cancel.test",
         "apiKey": "secret", "protocol": "openai-responses",
@@ -545,7 +559,10 @@ def test_http_body_cancellation_preserves_complete_usage_chunk(m, monkeypatch):
     assert closed == [True]
     detail = m["log_db"].log_detail(rid)
     assert detail["log"]["status"] == "cancelled"
-    assert "response.completed" in detail["detail"]["response_body"]
+    if store_bodies:
+        assert "response.completed" in detail["detail"]["response_body"]
+    else:
+        assert detail["detail"]["response_body"] is None
     attempt = m["log_db"]._get_conn().execute(
         "SELECT * FROM upstream_attempt_usage WHERE root_request_id=?",
         (rid,),
@@ -965,7 +982,8 @@ def test_xai_error_actual_cost_and_strict_sse(m):
     assert row["pricing_version"].startswith("upstream-actual-v2:")
 
 
-def test_legacy_xai_error_response_without_actual_cost_is_explicitly_unpriced(m):
+def test_legacy_xai_error_response_without_actual_cost_is_explicitly_unpriced(m, stored_log_bodies):
+    # Pre-ledger rows derive their billing evidence from the stored response.
     _setup(m); ld = m["log_db"]
     channel = "oauth:xai:user@example.com"
     _pending(ld, "xai-legacy-no-cost", "grok-4.5")
@@ -981,6 +999,8 @@ def test_legacy_xai_error_response_without_actual_cost_is_explicitly_unpriced(m)
         response_body=body,
     )
 
+    # Future writes are disabled; the existing legacy body is still evidence.
+    m["config"].update(lambda cfg: cfg.__setitem__("logStoreBodies", False))
     account = ld.xai_cost_for_channel(channel, since_ts=0)
     summary = ld.stats_summary(0)["overall"]
     assert account["costed_success"] == 0
@@ -1483,8 +1503,10 @@ def test_partial_attempt_schema_migration_is_idempotent(m):
     } <= retry_cols
 
 
-def test_xai_cost_surfaces_share_actual_estimated_and_unpriced_state(m):
+@pytest.mark.parametrize("store_bodies", [False, True])
+def test_xai_cost_surfaces_share_actual_estimated_and_unpriced_state(m, monkeypatch, store_bodies):
     _setup(m); ld = m["log_db"]; ui = m["ui"]
+    monkeypatch.setitem(m["config"].get(), "logStoreBodies", store_bodies)
     channel = "oauth:xai:user@example.com"
     _pending(ld, "xai-consistent", "grok-4.5")
     aid = _attempt(ld, "xai-consistent", 1, channel, "oauth", "grok-4.5", 1.0)
@@ -1497,6 +1519,9 @@ def test_xai_cost_surfaces_share_actual_estimated_and_unpriced_state(m):
         "xai-consistent", "failed", final_channel_key=channel,
         final_channel_type="oauth", final_model="grok-4.5", response_body=body,
     )
+    # Current attempts retain billing independently of raw-body persistence.
+    detail = ld.log_detail("xai-consistent")
+    assert detail["detail"]["response_body"] == (body if store_bodies else None)
     request_row = dict(ld._get_conn().execute(
         "SELECT * FROM request_log WHERE request_id='xai-consistent'"
     ).fetchone())
@@ -1504,6 +1529,8 @@ def test_xai_cost_surfaces_share_actual_estimated_and_unpriced_state(m):
     per_account = ld.xai_cost_for_channel(channel, since_ts=0)
     global_cost = ld.stats_summary(0, summary_top_limit=5)["overall"]
     assert per_log["cost_ticks"] == per_account["cost_ticks"] == global_cost["cost_ticks"] == 321
+    period = ld.stats_period_snapshot(0)
+    assert period["by_channel"][channel]["actual_cost_ticks"] == 321
     assert ui.fmt_cost(per_log) == ui.fmt_cost(per_account) == ui.fmt_cost(global_cost)
     assert "计费: $0.000" in ui.fmt_log_entry_body(request_row)
     from src.telegram.menus import logs_menu

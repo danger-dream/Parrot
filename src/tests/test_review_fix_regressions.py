@@ -2,7 +2,7 @@
 import json
 import pytest
 from src import config
-from src.openai import store
+from src.openai import anthropic_reasoning_replay as native_replay, store
 from src.openai.transform import responses_to_anthropic
 from src.openai.transform.stream_responses_to_anthropic import StreamTranslator as R2A
 from src.openai.transform.stream_r2c import StreamTranslator as R2C
@@ -72,10 +72,28 @@ def test_nonstream_thinking_keeps_each_original_position_and_existing_drop_polic
         {'type': 'tool_use', 'id': 'c', 'name': 'Read', 'input': {}},
         {'type': 'thinking', 'thinking': 'R2', 'signature': 's2'}, {'type': 'text', 'text': 'B'},
     ]}
-    output = responses_to_anthropic.translate_response(source, model='x', api_key_name='offline', current_input_items=[])['output']
-    assert [i['type'] for i in output] == (['reasoning', 'message', 'function_call', 'reasoning', 'message']
-                                          if bridge == 'passthrough' else ['message', 'function_call', 'message'])
-    assert [i['summary'][0]['text'] for i in output if i['type'] == 'reasoning'] == (['R1', 'R2'] if bridge == 'passthrough' else [])
+    response = responses_to_anthropic.translate_response(source, model='x', api_key_name='offline', current_input_items=[])
+    output = response['output']
+    expected = [
+        {'type': 'reasoning', 'summary': [],
+         'encrypted_content': 'claude-redacted-thinking:not-openai-ciphertext'},
+        {'type': 'reasoning', 'summary': [{'type': 'summary_text', 'text': 'R1'}],
+         'encrypted_content': 'claude#s1'},
+        {'type': 'message', 'role': 'assistant', 'status': 'completed',
+         'content': [{'type': 'output_text', 'text': 'A', 'annotations': []}]},
+        {'type': 'function_call', 'call_id': 'c', 'name': 'Read', 'arguments': '{}', 'status': 'completed'},
+        {'type': 'reasoning', 'summary': [{'type': 'summary_text', 'text': 'R2'}],
+         'encrypted_content': 'claude#s2'},
+        {'type': 'message', 'role': 'assistant', 'status': 'completed',
+         'content': [{'type': 'output_text', 'text': 'B', 'annotations': []}]},
+    ]
+    if bridge == 'drop':
+        expected = [item for item in expected if item['type'] != 'reasoning']
+    # Only generated IDs vary: native carriers, summaries and tool/text order
+    # must match exactly, including the redacted block's empty summary.
+    assert [{k: v for k, v in item.items() if k != 'id'} for item in output] == expected
+    if bridge == 'passthrough':
+        assert [native_replay.decode(output[i]) for i in (0, 1, 4)] == [source['content'][i] for i in (0, 1, 4)]
+    assert response['output_text'] == 'AB'
     assert len({i['id'] for i in output}) == len(output)
-    assert all('encrypted_content' not in i for i in output)
     assert saved[0]['output_items'] == output

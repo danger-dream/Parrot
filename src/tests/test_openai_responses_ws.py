@@ -661,7 +661,8 @@ async def test_responses_ws_visible_then_lifecycle_close_terminates_once_and_rel
 
 @pytest.mark.asyncio
 async def test_responses_ws_forced_fast_updates_wire_and_log(monkeypatch, m):
-    _setup(m)
+    cfg = _setup(m)
+    cfg["logStoreBodies"] = True  # Compare the stored raw request with the wire.
     _make_channel(m, extra={"fastMode": "force", "fastModels": []})
     ws = FakeWebSocket({
         "type": "response.create",
@@ -1090,7 +1091,8 @@ async def test_responses_ws_forwards_terminal_only_completed_response(monkeypatc
 
 @pytest.mark.asyncio
 async def test_responses_ws_cancellation_preserves_partial_usage_and_body(monkeypatch, m):
-    _setup(m)
+    cfg = _setup(m)
+    cfg["logStoreBodies"] = True  # This case also checks the persisted partial body.
     _make_channel(m)
     ws = FakeWebSocket({
         "type": "response.create", "model": "test-model",
@@ -1137,7 +1139,8 @@ async def test_responses_ws_cancellation_preserves_partial_usage_and_body(monkey
 async def test_responses_ws_sse_error_body_cancellation_terminalizes_usage(
     monkeypatch, m,
 ):
-    _setup(m)
+    cfg = _setup(m)
+    cfg["logStoreBodies"] = True  # Persist the error body being inspected.
     _make_channel(m, extra={"responsesWsUpstreamTransport": "sse"})
     ws = FakeWebSocket({
         "type": "response.create", "model": "test-model",
@@ -2157,6 +2160,7 @@ def test_responses_upstream_ws_config_default_off(m):
 @pytest.mark.asyncio
 async def test_http_responses_oauth_ws_projects_snapshot_and_structurally_restores_response(monkeypatch, m):
     cfg = _setup(m)
+    cfg["logStoreBodies"] = True  # Inspect the persisted, structurally restored body.
     cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
     cfg.setdefault("oauth", {})["providers"] = {"openai": {"isolateSessionId": True, "forceCodexCLI": True}}
     ch = _make_oauth_channel_for_failover(m, name="identity@example.com")
@@ -2882,6 +2886,7 @@ async def test_responses_ws_pre_visible_incomplete_preserves_explicit_zero_usage
     monkeypatch, m,
 ):
     cfg = _setup(m)
+    cfg["logStoreBodies"] = True  # This case also inspects the terminal body.
     cfg["retry"] = {"transient": {"enabled": False}}
     _make_channel(m)
     ws = FakeWebSocket({
@@ -2964,10 +2969,12 @@ async def test_responses_ws_malformed_usage_is_not_logged_as_valid_tokens(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("store_bodies", [False, True])
 async def test_responses_ws_large_terminal_frame_keeps_billing_evidence(
-    monkeypatch, m,
+    monkeypatch, m, store_bodies,
 ):
     cfg = _setup(m)
+    cfg["logStoreBodies"] = store_bodies
     ch = _make_channel(m)
     cfg["pricing"] = {
         "enabled": True,
@@ -3021,9 +3028,12 @@ async def test_responses_ws_large_terminal_frame_keeps_billing_evidence(
     assert row["usage_observed"] == 1
     assert row["actual_service_tier"] == "priority"
     detail_body = m["log_db"].log_detail(row["request_id"])["detail"]["response_body"]
-    assert len(detail_body) == 200_000
-    assert not detail_body.startswith("{")
-    assert "_parrot_truncated_billing_evidence" in detail_body
+    if store_bodies:
+        assert len(detail_body) == 200_000
+        assert not detail_body.startswith("{")
+        assert "_parrot_truncated_billing_evidence" in detail_body
+    else:
+        assert detail_body is None
     attempts = _attempt_usage(m, row["request_id"])
     assert len(attempts) == 1
     assert attempts[0]["usage_observed"] == 1
@@ -3861,6 +3871,7 @@ async def test_http_responses_oauth_ws_non_stream_close_before_terminal_is_error
     monkeypatch, m, caplog,
 ):
     cfg = _setup(m)
+    cfg["logStoreBodies"] = True  # Preserve partial-body diagnostics explicitly.
     cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
     ch = _make_oauth_channel_for_failover(m, name="non-stream-close@example.com")
 
@@ -3987,6 +3998,7 @@ async def test_http_responses_oauth_ws_non_stream_failed_returns_http_error(
     monkeypatch, m,
 ):
     cfg = _setup(m)
+    cfg["logStoreBodies"] = True  # Assert the persisted upstream failure event.
     cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
     cfg["retry"] = {"transient": {"enabled": False}}
     ch = _make_oauth_channel_for_failover(m, name="non-stream-failed@example.com")
@@ -4096,10 +4108,12 @@ def test_oauth_ws_tracker_large_frame_keeps_actual_cost_evidence(m):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("store_bodies", [False, True])
 async def test_http_responses_oauth_ws_large_terminal_keeps_observed_zero_usage(
-    monkeypatch, m,
+    monkeypatch, m, store_bodies,
 ):
     cfg = _setup(m)
+    cfg["logStoreBodies"] = store_bodies
     cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
     ch = _make_oauth_channel_for_failover(m, name="large-zero@example.com")
 
@@ -4133,7 +4147,10 @@ async def test_http_responses_oauth_ws_large_terminal_keeps_observed_zero_usage(
     detail = m["log_db"].log_detail(rid)
     assert detail["log"]["status"] == "success"
     assert detail["log"]["usage_observed"] == 1
-    assert len(detail["detail"]["response_body"]) == 200_000
+    if store_bodies:
+        assert len(detail["detail"]["response_body"]) == 200_000
+    else:
+        assert detail["detail"]["response_body"] is None
     attempts = _attempt_usage(m, rid)
     assert len(attempts) == 1
     assert attempts[0]["usage_observed"] == 1
@@ -4145,6 +4162,7 @@ async def test_http_responses_oauth_ws_cancellation_preserves_partial_usage_and_
     monkeypatch, m,
 ):
     cfg = _setup(m)
+    cfg["logStoreBodies"] = True  # This regression also verifies the saved partial body.
     cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
     ch = _make_oauth_channel_for_failover(m, name="cancel-partial@example.com")
 
@@ -4194,6 +4212,7 @@ async def test_http_responses_oauth_ws_pre_visible_incomplete_keeps_zero_usage(
     monkeypatch, m,
 ):
     cfg = _setup(m)
+    cfg["logStoreBodies"] = True  # This case also checks the saved terminal event.
     cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
     cfg["retry"] = {"transient": {"enabled": False}}
     ch = _make_oauth_channel_for_failover(m, name="zero-context@example.com")

@@ -872,6 +872,9 @@ def _insert_success(ld, request_id: str, api_key: str, channel: str,
 
 def test_period_batch_matches_old_per_object_and_family_queries(m, monkeypatch):
     _reset_log_fixture(m)
+    # These historical request-only rows have no attempt ledger. Seed their
+    # stored billing evidence explicitly, without enabling it for other tests.
+    monkeypatch.setitem(m["config"].get(), "logStoreBodies", True)
     ld = m["log_db"]
     _insert_success(
         ld, "batch-openai", "key-a", "api:Priced", "gpt-5.6-sol",
@@ -888,6 +891,8 @@ def test_period_batch_matches_old_per_object_and_family_queries(m, monkeypatch):
     )
     since = time.time() - 3600
 
+    # Existing bodies remain usable after future body writes are disabled.
+    monkeypatch.setitem(m["config"].get(), "logStoreBodies", False)
     # 新批量入口不能回退到逐对象 _aggregate_by_filter。
     old_channel = ld.tokens_for_channel("api:Priced", since)
     old_xai = ld.tokens_for_channel("oauth:xai:acct", since)

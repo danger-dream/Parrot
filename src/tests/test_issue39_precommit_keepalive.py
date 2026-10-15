@@ -16,11 +16,62 @@ def event(name, **data):
     return (f"event: {name}\ndata: " + json.dumps({"type": name, **data}) + "\n\n").encode()
 
 
+def response_events(content):
+    return [json.loads(line[6:]) for line in content.splitlines() if line.startswith(b"data: ")]
+
+
+@pytest.mark.parametrize("bytewise", [False, True])
+@pytest.mark.parametrize("next_event", ["error", "thinking"])
+def test_issue39_empty_thinking_preserves_commit_boundary(monkeypatch, bytewise, next_event):
+    from src import config
+    from src.protocols.commit_gate import SseCommitGate
+    from src.protocols.runtime import make_stream_translator
+
+    monkeypatch.setitem(config.get().setdefault("openai", {}), "reasoningBridge", "passthrough")
+    translator = make_stream_translator({
+        "response_translator": "responses_to_anthropic", "model_for_response": "claude-opus-5-5",
+    })
+    gate = SseCommitGate(protocol="openai-responses", stream_translator=translator)
+    progress = b"".join([
+        event("message_start", message={"model": "claude-opus-5-5"}),
+        event("content_block_start", index=0, content_block={"type": "thinking", "thinking": ""}),
+        event("content_block_delta", index=0, delta={"type": "thinking_delta", "thinking": "", "estimated_tokens": 100}),
+        event("ping"),
+    ])
+    for chunk in ([bytes([b]) for b in progress] if bytewise else [progress]):
+        result = gate.feed(chunk)
+        assert result.downstream_chunks == []
+        assert result.error_event is None
+    assert gate.has_buffered_metadata
+
+    if next_event == "error":
+        # Even partial signatures must not turn a retryable error into a
+        # post-commit failure or leak the failed attempt's response/item IDs.
+        signature = event("content_block_delta", index=0, delta={"type": "signature_delta", "signature": "partial"})
+        assert gate.feed(signature).downstream_chunks == []
+        error = {"type": "invalid_request_error", "message": "Invalid thinking signature"}
+        result = gate.feed(event("error", error=error))
+        assert result.downstream_chunks == []
+        assert result.error_event["error"] == error
+    else:
+        result = gate.feed(event("content_block_delta", index=0, delta={"type": "thinking_delta", "thinking": "native thought"}))
+        assert result.error_event is None
+        frames = response_events(b"".join(result.downstream_chunks))
+        assert [frame["type"] for frame in frames] == [
+            "response.created", "response.in_progress", "response.output_item.added",
+            "response.reasoning_summary_part.added", "response.reasoning_summary_text.delta",
+        ]
+        assert frames[2]["output_index"] == frames[-1]["output_index"] == 0
+        assert frames[2]["item"]["id"] == frames[-1]["item_id"]
+        assert frames[-1]["delta"] == "native thought"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("early_visible,terminal_kind", [(False, "text"), (False, "tool"), (True, "text")])
 async def test_issue39_delayed_headers(m, monkeypatch, early_visible, terminal_kind):
     fake._setup(m)
     fake._install_keys(m, fake._default_key())
+    monkeypatch.setitem(m["config"].get().setdefault("openai", {}), "reasoningBridge", "passthrough")
     from src.channel.oauth_channel import OAuthChannel
     from src import oauth_manager
     from src.transports import precommit_sse
@@ -38,8 +89,15 @@ async def test_issue39_delayed_headers(m, monkeypatch, early_visible, terminal_k
 
     monkeypatch.setattr(oauth_manager, "ensure_channel_token", token)
     release = asyncio.Event()
+    release_signature = asyncio.Event()
+    release_thinking_stop = asyncio.Event()
     progress_done = asyncio.Event()
+    signature_progress_done = asyncio.Event()
     headers_sent = asyncio.Event()
+    repeated_keepalive_sent = asyncio.Event()
+    first_item_sent = asyncio.Event()
+    native_item_sent = asyncio.Event()
+    keepalive_count = 0
     started = time.monotonic()
     timeline = {}
     upstream_frames = []
@@ -58,21 +116,24 @@ async def test_issue39_delayed_headers(m, monkeypatch, early_visible, terminal_k
             if early_visible:
                 upstream_frames.append("text_start")
                 yield event("content_block_start", index=0, content_block={"type": "text", "text": ""})
+                progress_done.set()
             else:
                 yield event("content_block_start", index=0, content_block={"type": "thinking", "thinking": ""})
                 upstream_frames.append("empty_thinking_start")
                 for number in range(12):
-                    await asyncio.sleep(0.005)
                     upstream_frames.append("empty_thinking_delta")
                     yield event("content_block_delta", index=0, delta={
                         "type": "thinking_delta", "thinking": "", "estimated_tokens": 100 + number,
                     })
                     upstream_frames.append("ping")
                     yield event("ping")
+                progress_done.set()
+                await release_signature.wait()
                 upstream_frames.append("signature")
                 yield event("content_block_delta", index=0, delta={"type": "signature_delta", "signature": "fixture-signature"})
+                signature_progress_done.set()
+                await release_thinking_stop.wait()
                 yield event("content_block_stop", index=0)
-            progress_done.set()
             await release.wait()
             timeline["text_released_ms"] = (time.monotonic() - started) * 1000
             text_index = 0 if early_visible else 1
@@ -115,10 +176,21 @@ async def test_issue39_delayed_headers(m, monkeypatch, early_visible, terminal_k
         return {"type": "http.disconnect"}
 
     async def send(message):
+        nonlocal keepalive_count
         downstream.append(message)
         if message["type"] == "http.response.start":
             timeline["downstream_headers_ms"] = (time.monotonic() - started) * 1000
             headers_sent.set()
+        elif message["type"] == "http.response.body":
+            chunk = message.get("body", b"")
+            keepalive_count += chunk.count(b": parrot keepalive\n\n")
+            if keepalive_count >= 2:
+                repeated_keepalive_sent.set()
+            for frame in response_events(chunk):
+                if frame["type"] == "response.output_item.added":
+                    first_item_sent.set()
+                if frame["type"] == "response.output_item.done" and frame["item"]["type"] == "reasoning":
+                    native_item_sent.set()
 
     scope = {
         "type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"},
@@ -136,18 +208,40 @@ async def test_issue39_delayed_headers(m, monkeypatch, early_visible, terminal_k
     task = asyncio.create_task(application())
     try:
         await asyncio.wait_for(progress_done.wait(), 5)
-        try:
-            await asyncio.wait_for(headers_sent.wait(), 0.3)
-            timeline["header_wait_timeout"] = False
-        except asyncio.TimeoutError:
-            timeline["header_wait_timeout"] = True
-        assert headers_sent.is_set()
-        await asyncio.sleep(0.15)
+        await asyncio.wait_for(headers_sent.wait(), 5)
         if not early_visible:
+            # Empty thinking/progress/pings must not expose an attempt's IDs.
+            assert not first_item_sent.is_set()
+            # Keep the upstream blocked until actual ASGI sends prove periodic
+            # keepalive; a fixed sleep races CI scheduling and the commit point.
+            await asyncio.wait_for(repeated_keepalive_sent.wait(), 5)
             waiting_bytes = b"".join(row.get("body", b"") for row in downstream)
             assert waiting_bytes.count(b": parrot keepalive") >= 2
+            assert waiting_bytes == b": parrot keepalive\n\n" * keepalive_count
             assert b"response.created" not in waiting_bytes
             assert b"response.output_item" not in waiting_bytes
+
+            release_signature.set()
+            await asyncio.wait_for(signature_progress_done.wait(), 5)
+            assert not first_item_sent.is_set()  # Incomplete signatures are still buffered.
+            assert not response_events(b"".join(row.get("body", b"") for row in downstream))
+            release_thinking_stop.set()
+            await asyncio.wait_for(native_item_sent.wait(), 5)
+            signed_events = response_events(b"".join(row.get("body", b"") for row in downstream))
+            assert [frame["type"] for frame in signed_events] == [
+                "response.created", "response.in_progress", "response.output_item.added", "response.output_item.done",
+            ]
+            added, done = signed_events[-2:]
+            assert added["output_index"] == done["output_index"] == 0
+            native_item = done["item"]
+            assert native_item == {
+                "id": added["item"]["id"], "type": "reasoning", "status": "completed",
+                "summary": [], "encrypted_content": "claude#fixture-signature",
+            }
+        else:
+            await asyncio.wait_for(first_item_sent.wait(), 5)
+            visible_events = response_events(b"".join(row.get("body", b"") for row in downstream))
+            assert [frame["item"]["type"] for frame in visible_events if frame["type"] == "response.output_item.added"] == ["message"]
         timeline["observed_wait_ms"] = (time.monotonic() - started) * 1000
         release.set()
         await asyncio.wait_for(task, 5)
@@ -156,6 +250,15 @@ async def test_issue39_delayed_headers(m, monkeypatch, early_visible, terminal_k
         assert start_message["status"] == 200
         content = b"".join(row.get("body", b"") for row in downstream if row["type"] == "http.response.body")
         assert b"response.created" in content and b"response.completed" in content
+        frames = response_events(content)
+        completed = frames[-1]["response"]
+        assert frames[-1]["type"] == "response.completed"
+        assert completed["output_text"] == ("" if terminal_kind == "tool" else "pong")
+        expected_types = ([] if early_visible else ["reasoning"]) + ["function_call" if terminal_kind == "tool" else "message"]
+        assert [item["type"] for item in completed["output"]] == expected_types
+        assert [frame["item"] for frame in frames if frame["type"] == "response.output_item.done"] == completed["output"]
+        if not early_visible:
+            assert completed["output"][0] == native_item
         if terminal_kind == "tool":
             assert b"response.function_call_arguments.done" in content
             assert b"check_status" in content
@@ -171,6 +274,8 @@ async def test_issue39_delayed_headers(m, monkeypatch, early_visible, terminal_k
         }))
     finally:
         release.set()
+        release_signature.set()
+        release_thinking_stop.set()
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)

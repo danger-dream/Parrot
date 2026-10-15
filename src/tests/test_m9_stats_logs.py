@@ -23,6 +23,20 @@ import sqlite3
 import sys
 import time
 
+import pytest
+
+
+@pytest.fixture
+def stored_log_bodies(m):
+    """Body inspectors exercise explicitly enabled storage, not its default."""
+    config = m["config"]
+    original = config.get().get("logStoreBodies", False)
+    config.update(lambda cfg: cfg.__setitem__("logStoreBodies", True))
+    try:
+        yield
+    finally:
+        config.update(lambda cfg: cfg.__setitem__("logStoreBodies", original))
+
 
 def _import_modules():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -307,7 +321,8 @@ def test_stats_cost_estimate_and_unknown_coverage(m):
     assert "≈" not in text
 
 
-def test_stats_prefers_xai_actual_cost_ticks(m):
+def test_stats_prefers_xai_actual_cost_ticks(m, stored_log_bodies):
+    # Historical request-only rows have no attempt ledger; seed their body.
     _setup(m)
     actual_ticks = 123_456_789
     _insert_success(
@@ -326,6 +341,8 @@ def test_stats_prefers_xai_actual_cost_ticks(m):
         upstream_protocol="openai-responses",
     )
 
+    # Disabling future body writes must not hide historical billing evidence.
+    m["config"].update(lambda cfg: cfg.__setitem__("logStoreBodies", False))
     result = m["log_db"].stats_summary(0)
     overall = result["overall"]
     assert overall["cost_ticks"] == actual_ticks
@@ -343,7 +360,8 @@ def test_stats_prefers_xai_actual_cost_ticks(m):
     assert "≈" not in text
 
 
-def test_stats_ui_combines_actual_and_estimated_cost(m):
+def test_stats_ui_combines_actual_and_estimated_cost(m, stored_log_bodies):
+    # The xAI fixture models a historical response without an attempt ledger.
     _setup(m)
     _insert_success(
         m,
@@ -697,7 +715,7 @@ def test_cache_miss_write_sample_includes_request_cost(m):
     assert "≈" not in text
 
 
-def test_stats_without_cost_never_reads_response_body(m):
+def test_stats_without_cost_never_reads_response_body(m, stored_log_bodies):
     _setup(m)
     _insert_success(
         m,
@@ -722,7 +740,7 @@ def test_stats_without_cost_never_reads_response_body(m):
     assert not any("request_detail" in sql.lower() for sql in statements)
 
 
-def test_log_detail_reads_large_response_body_once(m):
+def test_log_detail_reads_large_response_body_once(m, stored_log_bodies):
     _setup(m)
     response_body = "x" * 200_000
     _insert_success(
@@ -1184,7 +1202,7 @@ def test_logs_detail_with_execution_chain(m):
 
 def test_log_detail_body_buttons_follow_storage_policy_and_row_data(m):
     _setup(m)
-    original = m["config"].get().get("logStoreBodies", True) is not False
+    original = m["config"].get().get("logStoreBodies", False) is not False
 
     def labels(edit):
         return [
@@ -1289,6 +1307,7 @@ def test_log_inspector_localizes_pretty_json_and_redacts_encrypted(m):
     print("  [PASS] log inspector localized labels + pretty json + encrypted redaction")
 
 
+@pytest.mark.usefixtures("stored_log_bodies")
 def test_logs_body_inspector_defaults_last_and_truncates(m):
     _setup(m)
     rid = "BODY-inspector"
@@ -1322,6 +1341,7 @@ def test_logs_body_inspector_defaults_last_and_truncates(m):
     print("  [PASS] logs body inspector default last + truncate")
 
 
+@pytest.mark.usefixtures("stored_log_bodies")
 def test_logs_response_inspector_parses_messages_and_search_state(m):
     _setup(m)
     rid = "RESP-inspector"
