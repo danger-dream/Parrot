@@ -168,8 +168,11 @@ def test_sync_picker_uses_fallback_icon_without_custom_provider_emoji(env, monke
     text, kb = sync._picker_render(7, 'mc:list')
     options = menu._source_options(7)
     picks = frozen_buttons(kb, 7, 'sync_pick_toggle')
+    assert {option.ref.type for option in options} == {ModelSourceType.API, ModelSourceType.OAUTH}
+    assert len(picks) == len(options)
     for (button, _action), option in zip(picks, options):
-        assert button['text'] == ui._truncate_btn_label(f'{ui.provider_icon(option.provider)} {option.label}')
+        icon = '👤' if option.ref.type is ModelSourceType.OAUTH else '🔌'
+        assert button['text'] == ui._truncate_btn_label(f'{icon} {option.label}')
         assert 'icon_custom_emoji_id' not in button
 
 

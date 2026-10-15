@@ -19,7 +19,7 @@ import threading
 from typing import Any, Callable
 
 from ...management_control import ManagementError
-from ...management_control.models import ModelSourceRef
+from ...management_control.models import ModelSourceRef, ModelSourceType
 from .. import menu_cache, ui
 from . import model_center_menu as menu
 
@@ -140,7 +140,8 @@ def _picker_render(chat_id: int, back_callback: str, page: int = 1) -> tuple[str
             elif ui.provider_custom_emoji_id(option.provider):
                 button = ui.provider_button(option.label, target, option.provider)
             else:
-                button = ui.btn(f"{ui.provider_icon(option.provider)} {option.label}", target)
+                icon = "👤" if option.ref.type is ModelSourceType.OAUTH else "🔌"
+                button = ui.btn(f"{icon} {option.label}", target)
             keyboard.append([button])
         if pages > 1:
             keyboard.append([

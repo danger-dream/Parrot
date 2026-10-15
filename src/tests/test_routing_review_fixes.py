@@ -338,8 +338,11 @@ def _observation_events(terminal):
 
 @pytest.mark.parametrize('mode', ['native', 'http-json', 'http-stream'])
 @pytest.mark.parametrize('terminal', ['completed', 'failed', 'cancelled'])
-async def test_ws_observation_survives_display_truncation_end_to_end(monkeypatch, mode, terminal):
+@pytest.mark.parametrize('store_bodies', [False, True])
+async def test_ws_observation_survives_display_truncation_end_to_end(monkeypatch, mode, terminal, store_bodies):
     m, cfg = setup(monkeypatch)
+    # Observation summaries must survive both disabled storage and truncation.
+    monkeypatch.setitem(cfg, 'logStoreBodies', store_bodies)
     cfg.setdefault('openai', {})['responsesUpstreamWsForOAuth'] = True
     cfg['retry'] = {'transient':{'enabled':False}}
     ch = w._make_oauth_channel_for_failover(m, name='signals@example.test')
@@ -375,7 +378,10 @@ async def test_ws_observation_survives_display_truncation_end_to_end(monkeypatch
     if terminal != 'cancelled':
         assert 'terminal-review' in review['reasons']
     detail = m['log_db'].log_detail(row['request_id'])
-    assert len(detail['detail']['response_body']) == 200000
+    if store_bodies:
+        assert len(detail['detail']['response_body']) == 200000
+    else:
+        assert detail['detail']['response_body'] is None
 
 
 @pytest.mark.parametrize('mode', ['json','stream','aggregate','ws-sse'])

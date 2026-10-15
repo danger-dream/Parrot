@@ -31,6 +31,18 @@ import httpx
 import pytest
 
 
+@pytest.fixture
+def stored_log_bodies(m):
+    """Only persisted-SSE assertions opt into body storage."""
+    config = m["config"]
+    original = config.get().get("logStoreBodies", False)
+    config.update(lambda cfg: cfg.__setitem__("logStoreBodies", True))
+    try:
+        yield
+    finally:
+        config.update(lambda cfg: cfg.__setitem__("logStoreBodies", original))
+
+
 class ChunkedByteStream(httpx.AsyncByteStream):
     def __init__(self, chunks):
         self.chunks = list(chunks)
@@ -1325,8 +1337,9 @@ async def test_responses_chunked_metadata_error_before_visible_chunk_switches(m,
     print("  [PASS] responses chunked overload retries twice → switch → chB ok")
 
 
+@pytest.mark.usefixtures("stored_log_bodies")
 async def test_responses_precommit_eof_persists_received_sse(m):
-    """An EOF before Chat-visible output must still retain received Responses SSE."""
+    """With storage enabled, pre-visible EOF still retains received Responses SSE."""
     _setup(m)
     router = MockRouter()
     router.register("https://cha", lambda r: responses_sse_chunked_metadata_then_close())

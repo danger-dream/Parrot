@@ -22,6 +22,19 @@ import os
 import sys
 
 import httpx
+import pytest
+
+
+@pytest.fixture
+def stored_log_bodies(m):
+    """Inspect sanitized stored requests only with body persistence enabled."""
+    config = m["config"]
+    original = config.get().get("logStoreBodies", False)
+    config.update(lambda cfg: cfg.__setitem__("logStoreBodies", True))
+    try:
+        yield
+    finally:
+        config.update(lambda cfg: cfg.__setitem__("logStoreBodies", original))
 
 
 def _import_modules():
@@ -268,6 +281,7 @@ def _install_channels(m, chs):
         m["registry"]._channels = {c.key: c for c in chs}
 
 
+@pytest.mark.usefixtures("stored_log_bodies")
 async def test_handler_sanitizes_internal_body_fields(m):
     _setup(m)
 
