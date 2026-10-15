@@ -165,6 +165,9 @@ def _maybe_record_codex_snapshot(
         # SQLite snapshot can be persisted. A BUSY/FULL/READONLY cache must
         # never leave an explicitly over-limit account enabled.
         _maybe_auto_disable_by_codex_snapshot(account_key, email, snap)
+        if resp is None or getattr(resp, "status_code", getattr(resp, "status", 200)) < 400:
+            from .openai import credit_notifications
+            credit_notifications.observe(account_key, snapshot=snap)
 
         # throttle bucket 用 account_key 作 key；OpenAI 同一邮箱可能有多个
         # workspace，不能按 email 合并。只在成功写入后推进 last；inflight

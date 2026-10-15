@@ -395,7 +395,8 @@ def _record(tool="web_search", status="success", params=None, **finish_kw):
     return handle, call_id
 
 
-def test_result_content_is_stored_alongside_the_summary():
+def test_result_content_is_stored_alongside_the_summary(monkeypatch):
+    monkeypatch.setitem(config.get(), "logStoreBodies", True)
     handle, call_id = _record()
     payload = {"query": "hello", "results": [{"title": "t", "url": "u"}]}
     log_db.save_mcp_call_detail(handle, payload)
@@ -407,15 +408,16 @@ def test_result_content_is_stored_alongside_the_summary():
 def test_result_content_survives_only_while_bodies_are_enabled():
     # 关闭正文保存后不得再写入新内容；已存在的内容不受影响（与实时日志同口径）。
     handle, call_id = _record()
+    previous = config.get().get("logStoreBodies", False)
     config.update(lambda cfg: cfg.__setitem__("logStoreBodies", False))
     try:
         log_db.save_mcp_call_detail(handle, {"query": "secret"})
         assert log_db.mcp_call_detail(call_id) is None
-    finally:
         config.update(lambda cfg: cfg.__setitem__("logStoreBodies", True))
-
-    log_db.save_mcp_call_detail(handle, {"query": "visible"})
-    assert log_db.mcp_call_detail(call_id) is not None
+        log_db.save_mcp_call_detail(handle, {"query": "visible"})
+        assert log_db.mcp_call_detail(call_id) is not None
+    finally:
+        config.update(lambda cfg: cfg.__setitem__("logStoreBodies", previous))
 
 
 def test_result_content_is_absent_for_denied_calls():
@@ -425,7 +427,8 @@ def test_result_content_is_absent_for_denied_calls():
     assert log_db.mcp_call_detail(call_id) is None
 
 
-def test_result_content_is_idempotent_per_call():
+def test_result_content_is_idempotent_per_call(monkeypatch):
+    monkeypatch.setitem(config.get(), "logStoreBodies", True)
     handle, call_id = _record()
     log_db.save_mcp_call_detail(handle, {"query": "first"})
     log_db.save_mcp_call_detail(handle, {"query": "second"})

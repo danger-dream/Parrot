@@ -4,6 +4,9 @@ import copy
 import json
 import os
 import sys
+from pathlib import Path
+
+import pytest
 
 # 测试隔离：必须在 import src.config 前重定向 config 路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -12,6 +15,21 @@ from src.tests import _isolation
 TMP = _isolation.isolate()
 
 from src import config  # noqa: E402
+
+
+@pytest.mark.parametrize('raw,expected', [
+    (None, False), ({}, False), ({"logStoreBodies": False}, False),
+    ({"logStoreBodies": True}, True),
+])
+def test_log_store_bodies_defaults_off_and_preserves_explicit_settings(tmp_path, monkeypatch, raw, expected):
+    path = tmp_path / "config.json"
+    monkeypatch.setattr(config, "CONFIG_PATH", str(path))
+    if raw is not None:
+        path.write_text(json.dumps(raw), encoding="utf-8")
+    assert config._load_from_disk()["logStoreBodies"] is expected
+    assert json.loads(path.read_text(encoding="utf-8"))["logStoreBodies"] is expected
+    example = Path(__file__).resolve().parents[2] / "config.example.json"
+    assert json.loads(example.read_text(encoding="utf-8"))["logStoreBodies"] is False
 
 
 def test_old_config_file_is_backfilled_with_new_defaults():

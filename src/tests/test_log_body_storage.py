@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from src import config, log_db
 
 
-def test_log_store_bodies_false_keeps_summary_and_attempt_accounting() -> None:
-    previous_store_bodies = config.get().get("logStoreBodies", True)
+@pytest.mark.parametrize('explicit', [False, True])
+def test_log_store_bodies_false_keeps_summary_and_attempt_accounting(explicit) -> None:
+    previous_store_bodies = config.get().get("logStoreBodies", False)
     try:
-        config.update(lambda cfg: cfg.__setitem__("logStoreBodies", False))
+        config.update(lambda cfg: cfg.__setitem__("logStoreBodies", False) if explicit
+                      else cfg.pop("logStoreBodies", None))
         log_db.init()
         handle = log_db.insert_pending(
-            "body-storage-disabled",
+            f"body-storage-disabled-{explicit}",
             "127.0.0.1",
             "test-key",
             "grok-4.5",

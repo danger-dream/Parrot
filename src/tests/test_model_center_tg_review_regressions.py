@@ -87,21 +87,107 @@ def frozen_buttons(kb, chat, name):
             and action.name == name]
 
 
+@pytest.mark.parametrize('source_type,source_id,origin', [
+    ('oauth', 'cursor:opaque-b', 'oa:detail:cursor-b'),
+    ('api', 'channel-public-a', 'ch:view:3'),
+])
+def test_sync_current_source_skips_picker_and_preserves_return_context(
+        env, monkeypatch, source_type, source_id, origin):
+    control, edits, _answers, _sends = env
+    captured = []
+    control.operations = SimpleNamespace(get=lambda *a: SimpleNamespace(status='succeeded'))
+
+    def start(ctx, source, *, sources, progress_sink):
+        assert source is None
+        captured.append(sources)
+        progress_sink('direct-op', {'phase': 'done', 'total': 1, 'index': 0,
+                                   'label': 'Current account', 'status': 'succeeded', 'models': ['model-01']})
+        progress_sink('direct-op', {'phase': 'finished', 'total': 1})
+        return SimpleNamespace(id='direct-op')
+
+    monkeypatch.setattr(control, 'start_upstream_sync', start, raising=False)
+    menu.open_source(7, 10, 'account', source_type=source_type, source_id=source_id, origin=origin)
+    callback = _button(edits[-1][3], '同步上游模型 · 当前来源')['callback_data']
+    state = menu._session(7)
+    state.source = None
+    state.origin = 'menu:main'
+    menu.handle_callback(7, 10, 'sync', callback)
+    source = ModelSourceRef(ModelSourceType(source_type), source_id)
+    assert captured == [(source,)]
+    assert '全部完成：1/1' in edits[-1][2]
+    assert not any('选择来源' in text for _, _, text, _ in edits)
+    menu.handle_callback(7, 10, 'back', _button(edits[-1][3], '◀ 返回模型中心')['callback_data'])
+    assert state.source == source and state.origin == origin
+    assert '模型中心 · 对话' in edits[-1][2]
+    assert _button(edits[-1][3], '返回')['callback_data'] == origin
+
+
+def test_sync_removed_current_account_does_not_fall_back_to_all_sources(env, monkeypatch):
+    control, edits, answers, _sends = env
+    captured = []
+    monkeypatch.setattr(sync, '_start', lambda *a: captured.append(a) or True)
+    menu.open_source(7, 10, 'account', source_type='oauth', source_id='cursor:opaque-b', origin='menu:oauth')
+    callback = _button(edits[-1][3], '同步上游模型 · 当前来源')['callback_data']
+    control.oauth.accounts[:] = [a for a in control.oauth.accounts if a.account_id != 'cursor:opaque-b']
+    menu.handle_callback(7, 10, 'sync', callback)
+    assert not captured
+    assert answers[-1][1:] == ('来源已变化，请从当前来源列表重新选择', True)
+    assert not any('选择来源' in text for _, _, text, _ in edits)
+
+
+def test_sync_global_picker_uses_account_rows_and_replaces_provider_icon_when_selected(env, monkeypatch):
+    _control, edits, _answers, _sends = env
+    monkeypatch.setattr(ui, '_telegram_ui_provider_table', lambda name: {})
+    _text, kb = menu.render(7)
+    menu.handle_callback(7, 10, 'sync', _button(kb, '同步上游模型')['callback_data'])
+    text, kb = edits[-1][2:]
+    options = menu._source_options(7)
+    picks = frozen_buttons(kb, 7, 'sync_pick_toggle')
+    assert len(picks) == len(options)
+    assert '选择来源' in text and '已选 <b>0</b>' in text
+    assert all(len(row) == 1 for row in kb['inline_keyboard'][:len(options)])
+    for (button, action), option in zip(picks, options):
+        assert option.label not in text
+        assert button['text'] == ui._truncate_btn_label(option.label)
+        assert button['icon_custom_emoji_id'] == ui.provider_custom_emoji_id(option.provider)
+        assert action.data['source'] == option.ref
+    first, _ = picks[0]
+    menu.handle_callback(7, 10, 'select', first['callback_data'])
+    selected = frozen_buttons(edits[-1][3], 7, 'sync_pick_toggle')[0][0]
+    assert selected['text'] == ui._truncate_btn_label('✅ ' + options[0].label)
+    assert 'icon_custom_emoji_id' not in selected
+    assert '已选 <b>1</b>' in edits[-1][2]
+    menu.handle_callback(7, 10, 'deselect', selected['callback_data'])
+    restored = frozen_buttons(edits[-1][3], 7, 'sync_pick_toggle')[0][0]
+    assert restored['text'] == first['text']
+    assert restored['icon_custom_emoji_id'] == first['icon_custom_emoji_id']
+
+
+def test_sync_picker_uses_fallback_icon_without_custom_provider_emoji(env, monkeypatch):
+    monkeypatch.setattr(ui, 'provider_custom_emoji_id', lambda provider: '')
+    text, kb = sync._picker_render(7, 'mc:list')
+    options = menu._source_options(7)
+    picks = frozen_buttons(kb, 7, 'sync_pick_toggle')
+    for (button, _action), option in zip(picks, options):
+        assert button['text'] == ui._truncate_btn_label(f'{ui.provider_icon(option.provider)} {option.label}')
+        assert 'icon_custom_emoji_id' not in button
+
+
 def test_sync_selection_and_start_keep_rendered_source_identity(env, monkeypatch):
     _control, edits, _answers, _sends = env
     a = ModelSourceRef(ModelSourceType.API, 'api:A')
     b = ModelSourceRef(ModelSourceType.API, 'api:B')
-    rows = [('A', a), ('B', b)]
+    rows = [menu._SourceOption(a, 'A', 'openai'), menu._SourceOption(b, 'B', 'anthropic')]
     monkeypatch.setattr(sync, '_available_sources', lambda chat: list(rows))
     captured = []
     monkeypatch.setattr(sync, '_start', lambda chat, mid, cb, refs, back: captured.append(refs) or True)
     sync.open_picker(7, 10, 'open', 'mc:list')
-    choose_a = _button(edits[-1][3], '1')['callback_data']
-    rows.reverse()  # The old number itself must not acquire B's identity.
+    choose_a = _button(edits[-1][3], 'A')['callback_data']
+    rows.reverse()  # Reordering must not change the rendered button's identity.
     menu.handle_callback(7, 10, 'pick-A', choose_a)
     assert sync._selection(7)['selected'] == [a]
     start = next(b['callback_data'] for b in _buttons(edits[-1][3]) if '同步所选' in b['text'])
-    menu.handle_callback(7, 10, 'also-B', _button(edits[-1][3], '1')['callback_data'])
+    menu.handle_callback(7, 10, 'also-B', _button(edits[-1][3], 'B')['callback_data'])
     assert set(sync._selection(7)['selected']) == {a, b}
     menu.handle_callback(7, 10, 'old-start', start)
     assert captured == [(a,)]  # Not the new selection and not the old list index.
@@ -112,16 +198,16 @@ def test_sync_expired_source_or_picker_cannot_retarget(env, monkeypatch, change)
     _control, edits, answers, _sends = env
     a = ModelSourceRef(ModelSourceType.API, 'api:A')
     b = ModelSourceRef(ModelSourceType.API, 'api:B')
-    rows = [('A', a), ('B', b)]
+    rows = [menu._SourceOption(a, 'A', 'openai'), menu._SourceOption(b, 'B', 'anthropic')]
     monkeypatch.setattr(sync, '_available_sources', lambda chat: list(rows))
     calls = []
     monkeypatch.setattr(sync, '_start', lambda *a: calls.append(a) or True)
     sync.open_picker(7, 10, 'open', 'mc:list')
-    old_toggle = _button(edits[-1][3], '1')['callback_data']
+    old_toggle = _button(edits[-1][3], 'A')['callback_data']
     menu.handle_callback(7, 10, 'pick', old_toggle)
     start = next(b['callback_data'] for b in _buttons(edits[-1][3]) if '同步所选' in b['text'])
     if change == 'removed':
-        rows[:] = [('B', b)]
+        rows[:] = [menu._SourceOption(b, 'B', 'anthropic')]
     else:
         sync.open_picker(7, 11, 'new', 'mc:list')
     menu.handle_callback(7, 10, 'old-start', start)
@@ -134,13 +220,13 @@ def test_sync_all_freezes_source_set_before_new_sources_arrive(env, monkeypatch)
     _control, edits, _answers, _sends = env
     a = ModelSourceRef(ModelSourceType.API, 'api:A')
     b = ModelSourceRef(ModelSourceType.API, 'api:B')
-    rows = [('A', a)]
+    rows = [menu._SourceOption(a, 'A', 'openai')]
     monkeypatch.setattr(sync, '_available_sources', lambda chat: list(rows))
     captured = []
     monkeypatch.setattr(sync, '_start', lambda chat, mid, cb, refs, back: captured.append(refs) or True)
     sync.open_picker(7, 10, 'open', 'mc:list')
     all_button = next(b['callback_data'] for b in _buttons(edits[-1][3]) if '同步全部' in b['text'])
-    rows.append(('B', b))
+    rows.append(menu._SourceOption(b, 'B', 'anthropic'))
     menu.handle_callback(7, 10, 'old-all', all_button)
     assert captured == [(a,)]
 
@@ -263,7 +349,8 @@ def assert_wire(text, kb):
 def test_sync_source_pagination_preserves_all_cross_page_actions(env, monkeypatch, label):
     _control, edits, _answers, _sends = env
     refs = [ModelSourceRef(ModelSourceType.API, f'api:{i}') for i in range(65)]
-    monkeypatch.setattr(sync, '_available_sources', lambda chat: [(label, ref) for ref in refs])
+    monkeypatch.setattr(sync, '_available_sources', lambda chat: [
+        menu._SourceOption(ref, label, 'openai') for ref in refs])
     sync.open_picker(7, 10, 'open', 'mc:list')
     seen = []
     while True:
@@ -273,7 +360,9 @@ def test_sync_source_pagination_preserves_all_cross_page_actions(env, monkeypatc
         seen.extend(action.data['source'] for _, action in picks)
         menu.handle_callback(7, 10, 'pick-first-on-page', picks[0][0]['callback_data'])
         text, kb = edits[-1][2:]
-        # Validate all HTML continuations as well as the bounded numbered keyboard.
+        assert label not in text
+        assert all(len(row) == 1 for row in kb['inline_keyboard'][:len(picks)])
+        # Keep both message and keyboard within Telegram limits.
         while any(b['text'] == '内容 ▶' and b['callback_data'] != 'mc:noop' for b in _buttons(kb)):
             menu.handle_callback(7, 10, 'content', _button(kb, '内容 ▶')['callback_data'])
             text, kb = edits[-1][2:]
@@ -433,8 +522,7 @@ def test_sync_reorder_uses_real_control_target_and_finishes_current_view(real, m
     }))
     registry.rebuild_from_config()
     sync.open_picker(42, 100, 'open', 'mc:list')
-    # OAuth comes first, then the selected API channel and another API channel.
-    choose_a = _button(messages[-1][1], '2')['callback_data']
+    choose_a = _button(messages[-1][1], 'Claude · audit')['callback_data']
     config.update(lambda cfg: cfg['channels'].reverse())
     menu.handle_callback(42, 100, 'pick-original-a', choose_a)
     start = next(b['callback_data'] for b in _buttons(messages[-1][1]) if '同步所选' in b['text'])

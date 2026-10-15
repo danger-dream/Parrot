@@ -122,7 +122,7 @@ class RetentionControl:
         data = {
             "mode": str(policy.get("mode") or "forever"),
             "days": policy.get("days"),
-            "logStoreBodies": cfg.get("logStoreBodies", True) is not False,
+            "logStoreBodies": cfg.get("logStoreBodies", False) is not False,
             "currentData": {"rows": rows},
             "busy": bool(self.log_db.retention_cleanup_busy()),
         }
@@ -259,7 +259,7 @@ class RetentionControl:
         return {
             "mode": policy["mode"],
             "days": policy.get("days"),
-            "logStoreBodies": cfg.get("logStoreBodies", True) is not False,
+            "logStoreBodies": cfg.get("logStoreBodies", False) is not False,
         }
 
     def sync_set_log_store_bodies(self, context: ManagementContext, value: bool) -> None:

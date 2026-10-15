@@ -177,6 +177,7 @@ class NotificationEventsData(StrictSchema):
     channelRecovered: bool
     quotaDisabled: bool
     quotaResumed: bool
+    openaiCreditsStarted: bool
     quotaCooldown: bool
     oauthRefreshed: bool
     oauthRefreshFailed: bool
@@ -193,6 +194,7 @@ class NotificationEventsPatch(StrictRequestSchema):
     channelRecovered: bool | None = None
     quotaDisabled: bool | None = None
     quotaResumed: bool | None = None
+    openaiCreditsStarted: bool | None = None
     quotaCooldown: bool | None = None
     oauthRefreshed: bool | None = None
     oauthRefreshFailed: bool | None = None

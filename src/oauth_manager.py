@@ -1330,6 +1330,8 @@ def forget_openai_probe(account_key_or_email: str) -> None:
     with _openai_probe_lock:
         _OPENAI_PROBE_LAST.pop(email, None)
         _OPENAI_PROBE_LAST.pop(key, None)
+    from .openai import credit_notifications
+    credit_notifications.forget(key)
 
 
 def _record_openai_usage_failure(account_key: str, expected_state_key: str,
@@ -3109,7 +3111,11 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict, *,
         if not current:
             return {"action": "noop_stale", "utils": extract_utils_percent(usage),
                     "any_over": False, "hit_windows": [], "disabled_until": None}
-        return _evaluate_and_toggle_by_usage_current(account_key, usage, threshold=threshold, fresh=fresh)
+        result = _evaluate_and_toggle_by_usage_current(account_key, usage, threshold=threshold, fresh=fresh)
+        if fresh and provider_of(account_key) == "openai":
+            from .openai import credit_notifications
+            credit_notifications.observe(account_key, usage=usage)
+        return result
 
 
 def _evaluate_and_toggle_by_usage_current(account_key: str, usage: dict,

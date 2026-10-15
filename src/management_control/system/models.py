@@ -105,6 +105,7 @@ class NotificationEvents:
     channelRecovered: bool
     quotaDisabled: bool
     quotaResumed: bool
+    openaiCreditsStarted: bool
     quotaCooldown: bool
     oauthRefreshed: bool
     oauthRefreshFailed: bool

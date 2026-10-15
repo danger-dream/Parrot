@@ -43,6 +43,7 @@ _NOTIFICATION_EVENTS = (
     ("channelRecovered", "channel_recovered"),
     ("quotaDisabled", "quota_disabled"),
     ("quotaResumed", "quota_resumed"),
+    ("openaiCreditsStarted", "openai_credits_started"),
     ("quotaCooldown", "quota_cooldown"),
     ("oauthRefreshed", "oauth_refreshed"),
     ("oauthRefreshFailed", "oauth_refresh_failed"),

@@ -348,7 +348,7 @@ class LogsControl:
 
     def log_store_bodies(self, context: ManagementContext) -> bool:
         require(context)
-        return self.config.get().get("logStoreBodies", True) is not False
+        return self.config.get().get("logStoreBodies", False) is not False
 
     def configured_api_keys(self, context: ManagementContext) -> list[str]:
         require(context)

@@ -208,6 +208,7 @@
       "channel_recovered": true,
       "quota_disabled": true,
       "quota_resumed": true,
+      "openai_credits_started": true,
       "quota_cooldown": true,
       "oauth_refreshed": true,
       "oauth_refresh_failed": true,
@@ -338,7 +339,7 @@
     }
   },
   "logDir": "logs",
-  "logStoreBodies": true,
+  "logStoreBodies": false,
   "logRetention": {
     "mode": "forever",
     "days": null

@@ -238,30 +238,32 @@ def test_all_p6_request_scalar_shapes_are_strict_and_side_effect_free(
         assert fixture.gateway.events == before_events
 
 
-def test_notifications_expose_and_patch_all_thirteen_authoritative_events(tmp_path):
+def test_notifications_expose_and_patch_all_authoritative_events(tmp_path):
     app, _runtime, fixture = build_p6_app(tmp_path)
     with TestClient(app) as client:
         headers = bearer(create_session(client))
         before = client.get(PREFIX + "/settings/notifications", headers=headers).json()["data"]
         assert list(before["events"]) == [
             "channelPermanent", "channelRecovered", "quotaDisabled", "quotaResumed",
-            "quotaCooldown", "oauthRefreshed", "oauthRefreshFailed", "noChannels",
+            "openaiCreditsStarted", "quotaCooldown", "oauthRefreshed", "oauthRefreshFailed", "noChannels",
             "openaiStoreSaveFailed", "modelDegraded", "statusAlert", "appUpdate",
             "networkMonitor",
         ]
         changed = client.patch(
             PREFIX + "/settings/notifications",
             headers={**headers, "If-Match": before["revision"]},
-            json={"events": {"statusAlert": False, "appUpdate": False}},
+            json={"events": {"statusAlert": False, "appUpdate": False, "openaiCreditsStarted": False}},
         )
         assert changed.status_code == 200, changed.text
         data = changed.json()["data"]
         assert data["events"]["statusAlert"] is False
         assert data["events"]["appUpdate"] is False
+        assert data["events"]["openaiCreditsStarted"] is False
         assert data["revision"] != before["revision"]
         stored = fixture.config.value["notifications"]["events"]
         assert stored["status_alert"] is False
         assert stored["app_update"] is False
+        assert stored["openai_credits_started"] is False
         assert client.get(PREFIX + "/settings/notifications", headers=headers).json()["data"] == data
 
 

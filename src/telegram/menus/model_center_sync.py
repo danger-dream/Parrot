@@ -28,8 +28,6 @@ _MODEL_PREVIEW_COUNT = 5
 _LABEL_CLIP = 60
 _ERROR_CLIP = 80
 
-# 每行放几个序号按钮，与负载均衡的多选页保持一致。
-_NUMBERS_PER_ROW = 5
 _SOURCE_PAGE_SIZE = 20
 
 _STATUS_TEXT = {
@@ -100,17 +98,17 @@ def _selection(chat_id: int) -> dict[str, Any]:
     return store
 
 
-def _available_sources(chat_id: int) -> list[tuple[str, ModelSourceRef]]:
-    """(展示标签, ref)；标签给人看，ref 才是身份。"""
+def _available_sources(chat_id: int) -> list[menu._SourceOption]:
+    """标签与 Provider 用于展示，ref 才是身份。"""
     from . import model_center_catalog as catalog
 
-    return [(str(option.label), option.ref) for option in catalog._source_options(chat_id)]
+    return catalog._source_options(chat_id)
 
 
 def _picker_render(chat_id: int, back_callback: str, page: int = 1) -> tuple[str, dict]:
     sources = _available_sources(chat_id)
     state = _selection(chat_id)
-    refs = tuple(ref for _label, ref in sources)
+    refs = tuple(option.ref for option in sources)
     selected = set(state["selected"]).intersection(refs)
     state["selected"] = [ref for ref in refs if ref in selected]
     total = len(sources)
@@ -132,21 +130,18 @@ def _picker_render(chat_id: int, back_callback: str, page: int = 1) -> tuple[str
     ]
     if not sources:
         lines.extend(["", "当前没有可同步的来源。"])
-    for index, (label, ref) in enumerate(visible, start + 1):
-        mark = "✅" if ref in selected else "▫️"
-        lines.append(f"{mark} {index}. {ui.escape_html(_clip(label, _LABEL_CLIP))}")
 
     keyboard: list[list[dict]] = []
     if sources:
-        row: list[dict] = []
-        for index, (_label, ref) in enumerate(visible, start + 1):
-            label = f"{index} ✅" if ref in selected else str(index)
-            row.append(ui.btn(label, callback("sync_pick_toggle", source=ref)))
-            if len(row) >= _NUMBERS_PER_ROW:
-                keyboard.append(row)
-                row = []
-        if row:
-            keyboard.append(row)
+        for option in visible:
+            target = callback("sync_pick_toggle", source=option.ref)
+            if option.ref in selected:
+                button = ui.btn("✅ " + option.label, target)
+            elif ui.provider_custom_emoji_id(option.provider):
+                button = ui.provider_button(option.label, target, option.provider)
+            else:
+                button = ui.btn(f"{ui.provider_icon(option.provider)} {option.label}", target)
+            keyboard.append([button])
         if pages > 1:
             keyboard.append([
                 ui.btn("◀ 上一页", callback("sync_pick_page", target_page=page - 1) if page > 1 else "mc:noop"),
@@ -348,7 +343,7 @@ def handle_action(chat_id: int, message_id: int, cb_id: str, action) -> bool:
             ui.answer_cb(cb_id, "来源选择页已过期，请重新打开", show_alert=True)
             return True
         page = int(data.get("page") or 1)
-        available = {ref for _label, ref in _available_sources(chat_id)}
+        available = {option.ref for option in _available_sources(chat_id)}
         refs = (data.get("source"),) if name == "sync_pick_toggle" else tuple(data.get("sources") or ())
         if any(not isinstance(ref, ModelSourceRef) or ref not in available for ref in refs):
             ui.answer_cb(cb_id, "来源已变化，请重新选择", show_alert=True)

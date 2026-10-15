@@ -555,9 +555,15 @@ def _handle_frozen(chat_id: int, message_id: int, cb_id: str, action: _FrozenAct
 
 
     if name == "sync_upstream":
-        # 打开来源多选页；单来源按钮（sync_source）仍直接同步那一个。
-        _sync_actions.open_picker(
-            chat_id, message_id, cb_id, str(data.get("back_callback") or "mc:list"))
+        back = str(data.get("back_callback") or "mc:list")
+        source = data.get("source")
+        if source is not None:
+            if not isinstance(source, ModelSourceRef) or _find_source_option(chat_id, source) is None:
+                ui.answer_cb(cb_id, "来源已变化，请从当前来源列表重新选择", show_alert=True)
+                return
+            _sync_actions._start(chat_id, message_id, cb_id, (source,), back)
+        else:
+            _sync_actions.open_picker(chat_id, message_id, cb_id, back)
         return
 
     if name == "sync_source":

@@ -144,7 +144,7 @@ def _resolve_log_dir() -> str:
 def _store_log_bodies() -> bool:
     """Return whether full request/response payloads may be persisted."""
 
-    return config.get().get("logStoreBodies", True) is not False
+    return config.get().get("logStoreBodies", False) is not False
 
 
 def _schema_sql() -> str:
@@ -1040,7 +1040,7 @@ def update_retention_settings(
     try:
         before = config.get()
         before_policy = retention_policy(before)
-        before_bodies = before.get("logStoreBodies", True) is not False
+        before_bodies = before.get("logStoreBodies", False) is not False
         if expected_policy is not None:
             normalized_expected = retention_policy({"logRetention": expected_policy})
             if normalized_expected != before_policy:
@@ -1091,7 +1091,7 @@ def update_retention_settings(
         def mutate(candidate: dict[str, Any]) -> None:
             nonlocal stale
             live_policy = retention_policy(candidate)
-            live_bodies = candidate.get("logStoreBodies", True) is not False
+            live_bodies = candidate.get("logStoreBodies", False) is not False
             if live_policy != before_policy or live_bodies != before_bodies:
                 stale = True
                 raise RetentionPlanError("日志留存设置在保存前已被修改")
@@ -1120,7 +1120,7 @@ def update_retention_settings(
             "ok": True,
             "changed": True,
             "policy": retention_policy(saved),
-            "log_store_bodies": saved.get("logStoreBodies", True) is not False,
+            "log_store_bodies": saved.get("logStoreBodies", False) is not False,
         }
     finally:
         _retention_lock.release()

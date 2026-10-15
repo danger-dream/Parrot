@@ -522,7 +522,7 @@ def _pop_retention_pending(code: str, chat_id: int, kind: str | None = None) -> 
 def _retention_menu_text_kb() -> tuple[str, dict]:
     cfg = _runtime_control.config_snapshot()
     policy = _runtime_control.retention_policy(cfg)
-    store_bodies = cfg.get("logStoreBodies", True) is not False
+    store_bodies = cfg.get("logStoreBodies", False) is not False
     if policy["mode"] == "days":
         policy_lines = [
             "当前留存模式：<code>按天留存</code>",
@@ -577,7 +577,7 @@ def _show_retention(chat_id: int, message_id: int, cb_id: str) -> None:
 
 
 def _toggle_log_store_bodies(chat_id: int, message_id: int, cb_id: str) -> None:
-    current = _runtime_control.config_snapshot().get("logStoreBodies", True) is not False
+    current = _runtime_control.config_snapshot().get("logStoreBodies", False) is not False
     new_value = not current
     _retention_control.set_log_store_bodies(_control_context(chat_id), new_value)
     ui.answer_cb(
@@ -1385,6 +1385,7 @@ _NOTIF_EVENTS = [
     ("channel_recovered",     "✅ 渠道恢复"),
     ("quota_disabled",        "⚠ 配额禁用"),
     ("quota_resumed",         "✅ 配额恢复"),
+    ("openai_credits_started", "💳 OpenAI 积分续用"),
     ("quota_cooldown",        "🟠 配额冷却"),
     ("oauth_refreshed",       "🔄 OAuth Token 刷新成功"),
     ("oauth_refresh_failed",  "❌ OAuth Token 刷新失败"),
@@ -1448,6 +1449,7 @@ def _on_notif_toggle_event(chat_id: int, message_id: int, cb_id: str, event_key:
     public_key = {
         "channel_permanent": "channelPermanent", "channel_recovered": "channelRecovered",
         "quota_disabled": "quotaDisabled", "quota_resumed": "quotaResumed",
+        "openai_credits_started": "openaiCreditsStarted",
         "quota_cooldown": "quotaCooldown", "oauth_refreshed": "oauthRefreshed",
         "oauth_refresh_failed": "oauthRefreshFailed", "no_channels": "noChannels",
         "openai_store_save_failed": "openaiStoreSaveFailed", "network_monitor": "networkMonitor",

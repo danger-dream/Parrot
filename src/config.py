@@ -302,6 +302,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "channel_recovered": True,    # 永久/长冷却被清除（手动 / probe 恢复）
             "quota_disabled": True,       # OAuth 配额到达阈值被自动禁用
             "quota_resumed": True,        # OAuth 配额恢复被自动启用
+            "openai_credits_started": True,  # OpenAI 套餐耗尽后使用积分续用
             "quota_cooldown": True,       # API 渠道单模型按上游重置时间临时冷却
             "oauth_refreshed": True,      # OAuth Token 自动刷新成功
             "oauth_refresh_failed": True, # OAuth Token 自动刷新失败（标 auth_error）
@@ -564,7 +565,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "logDir": "logs",
     # 是否把完整请求头、请求正文和响应正文写入 request_detail。
     # 关闭后仍保留请求摘要、token、成本、渠道、重试和代理链统计。
-    "logStoreBodies": True,
+    "logStoreBodies": False,
     # 请求业务日志留存：forever = 永久保留；days = 仅保留最近 N 天（N >= 1）。
     # 无效/缺失配置在运行时 fail-closed 为 forever，避免升级或手工编辑误删日志。
     "logRetention": {

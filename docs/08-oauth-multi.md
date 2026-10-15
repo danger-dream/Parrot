@@ -236,6 +236,10 @@ def set_disabled_by_quota(email: str, resets_at: str):
 
 ### 8.2.5 配额监控
 
+OpenAI 账户开启 `allowCredits` 且积分可用时，套餐窗口耗尽不会禁用账户。独立通知 `notifications.events.openai_credits_started`（默认开启，TG「通知设置 → 💳 OpenAI 积分续用」，Management API 为 `openaiCreditsStarted`）会提示“套餐额度已耗尽，将使用积分继续”，并说明可在账户详情关闭积分授权。它以套餐窗口达到 100% 或上游明确返回套餐限额为依据，不使用默认 95% 的禁用阈值；支出限制、积分不足、已禁用账户或失败响应不作为可继续使用积分的依据。
+
+实时 HTTP/WS 额度采样与新鲜主动用量评估共用按账户及工作区隔离的进程内去重状态。持续耗尽时成功入队一次，观察到额度恢复或已知窗口重置后可再次提醒；未知/无关窗口片段不视为恢复。总开关和事件开关仍生效，关闭或入队失败不占用提醒状态，后续新观测可重试；不是历史通知补发。进程重启后首次确认仍在使用积分时可能再提醒一次。该通知不改变积分授权、路由、禁用或恢复策略，入队也不代表 Telegram 已送达。
+
 响应头实时超限判定与 quota snapshot 持久化相互独立：先直接根据本次响应头
 执行 auto-disable，再 best-effort 写 cache。SQLite `BUSY/LOCKED/FULL/READONLY`
 不能阻止禁用；30 秒持久化节流只在写入成功后推进，写失败允许下一次响应立即

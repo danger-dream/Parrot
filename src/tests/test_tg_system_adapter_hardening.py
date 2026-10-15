@@ -52,6 +52,21 @@ def test_tg_blacklist_success_has_no_post_write_registry_dependency(monkeypatch)
     )
 
 
+def test_tg_retention_missing_body_setting_is_off_and_first_toggle_enables(monkeypatch):
+    env = SystemEnv(_case("TG-SYS-05.001-menu-toggle-busy"), monkeypatch)
+    env.cfg.pop("logStoreBodies")
+    text, kb = sm._retention_menu_text_kb()
+    assert "保存完整请求：<code>关闭</code>" in text
+    assert any(button["text"] == "☐ 保存完整请求" for row in kb["inline_keyboard"] for button in row)
+    control = sm._retention_control.control
+    context = sm._control_context(42)
+    assert control.sync_settings(context)["logStoreBodies"] is False
+    assert control.settings(context)["logStoreBodies"] is False
+    sm._toggle_log_store_bodies(42, 100, "cb-toggle")
+    assert env.cfg["logStoreBodies"] is True
+    assert "保存完整请求：<code>开启</code>" in sm._retention_menu_text_kb()[0]
+
+
 def test_tg_retention_pending_has_no_256_limit_and_exact_600_second_ttl(monkeypatch):
     env = SystemEnv(_case("TG-SYS-05.014-ttl"), monkeypatch)
     codes = [sm._register_retention_pending(42, "first", days=index + 1) for index in range(257)]
