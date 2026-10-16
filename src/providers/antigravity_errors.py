@@ -4,14 +4,16 @@ Google puts RetryDelay and the real reason in ``error.details``, not in the
 HTTP Retry-After header. Split:
 
 - ``RATE_LIMIT_EXCEEDED`` + delay < 3s → same-account short retry
-- delay 3s–5m → account+model cooldown
-- ``QUOTA_EXHAUSTED`` / ``INSUFFICIENT_G1_CREDITS_BALANCE`` / delay ≥ 5m
-  → whole-account quota disable
+- longer/unknown delays and ``QUOTA_EXHAUSTED`` → exact account+model pause
+- only structured ``INSUFFICIENT_G1_CREDITS_BALANCE`` proves account exhaustion.
+
+Neither model metadata, generic quota wording nor a long delay proves scope.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any
 
@@ -38,7 +40,7 @@ _UNIT_SECONDS = {
 
 
 def parse_antigravity_429(raw: Any) -> dict[str, Any]:
-    """Return ``{reason, retry_after, quota_exhausted}`` from a Google error body."""
+    """Separate exhaustion from proven account scope; do not retain metadata."""
     payload = _as_object(raw)
     error = payload.get("error") if isinstance(payload.get("error"), dict) else payload
     if not isinstance(error, dict):
@@ -46,17 +48,19 @@ def parse_antigravity_429(raw: Any) -> dict[str, Any]:
     details = error.get("details")
     reason = ""
     retry_after: float | None = None
+    account_quota = False
     if isinstance(details, list):
         for item in details:
             if not isinstance(item, dict):
                 continue
             typ = str(item.get("@type") or "")
             if typ == RETRY_INFO_TYPE and retry_after is None:
-                retry_after = parse_google_duration(item.get("retryDelay") or item.get("retry_delay"))
+                retry_after = parse_google_duration(item.get("retryDelay", item.get("retry_delay")))
             elif typ == ERROR_INFO_TYPE:
                 candidate = str(item.get("reason") or "").strip()
                 if candidate:
                     reason = candidate
+                    account_quota |= candidate.upper() == "INSUFFICIENT_G1_CREDITS_BALANCE"
                 if retry_after is None:
                     meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
                     retry_after = parse_google_duration(
@@ -73,21 +77,24 @@ def parse_antigravity_429(raw: Any) -> dict[str, Any]:
             "insufficient g1 credits",
         )
     )
-    if retry_after is not None and retry_after >= 300 and reason.upper() == "RATE_LIMIT_EXCEEDED":
-        quota = True
+    account_quota |= reason.upper() == "INSUFFICIENT_G1_CREDITS_BALANCE"
     return {
         "reason": reason,
         "retry_after": retry_after,
         "quota_exhausted": quota,
+        "account_quota_exhausted": account_quota,
     }
 
 
 def parse_google_duration(value: Any) -> float | None:
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        number = float(value)
-        return number if number >= 0 and number == number else None
+        try:
+            number = float(value)
+        except OverflowError:
+            return None
+        return number if number >= 0 and math.isfinite(number) else None
     text = str(value).strip()
     if not text:
         return None
@@ -101,7 +108,8 @@ def parse_google_duration(value: Any) -> float | None:
     scale = _UNIT_SECONDS.get(unit)
     if scale is None:
         return None
-    return number * scale
+    seconds = number * scale
+    return seconds if math.isfinite(seconds) else None
 
 
 def _as_object(raw: Any) -> dict[str, Any]:

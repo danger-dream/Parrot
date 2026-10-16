@@ -304,15 +304,23 @@ def test_antigravity_merges_prod_and_daily_with_daily_metadata_precedence(monkey
     assert not hasattr(oauth_model_discovery.antigravity_provider, "default_models")
 
     result = oauth_model_discovery.discover_antigravity(
-        {"access_token": "tok", "project_id": "p"}, timeout=0.2, proxy_channel="oauth:test",
+        {"access_token": "tok", "project_id": "p", "request_base_url": "https://daily.example/base"}, timeout=0.2, proxy_channel="oauth:test",
     )
 
     assert result.models == [
-        "shared", "prod-only", "gemini-3.8-flash-low",
+        "shared", "gemini-3.8-flash-low",
         "gemini-3.8-flash-medium", "gemini-3.8-flash-high",
     ]
     assert "gemini-3.8-flash" not in result.models
-    assert result.catalog["models"][0] == {
+    assert result.catalog["models"][1]["id"] == "prod-only"
+    assert result.catalog["models"][1]["antigravityAvailability"] == "discovery_only"
+    shared = dict(result.catalog["models"][0])
+    assert shared.pop("antigravityAvailability") == "generation"
+    sources = shared.pop("antigravitySources")
+    assert [s["endpoint"] for s in sources] == ["prod", "daily"]
+    assert [s["baseUrl"] for s in sources] == ["https://prod.example/base", "https://daily.example/base"]
+    assert all(type(s["observedAt"]) is int for s in sources)
+    assert shared == {
         "id": "shared", "name": "Daily Shared", "contextWindow": 200000,
         "reasoning": True, "supportsThinking": True,
     }
@@ -331,7 +339,7 @@ def test_antigravity_merges_prod_and_daily_with_daily_metadata_precedence(monkey
 
 @pytest.mark.parametrize("failed_index", [0, 1])
 @pytest.mark.parametrize("failure_kind", ["http_error", "no_text_models"])
-def test_antigravity_one_unavailable_endpoint_still_uses_the_other(
+def test_antigravity_only_active_endpoint_success_can_update_models(
     monkeypatch, failed_index, failure_kind,
 ):
     calls = []
@@ -357,10 +365,21 @@ def test_antigravity_one_unavailable_endpoint_still_uses_the_other(
     monkeypatch.setattr(oauth_model_discovery.antigravity_provider, "daily_api_base_url", lambda: "https://daily.example")
     monkeypatch.setattr(oauth_model_discovery.antigravity_provider, "image_models", lambda: ["gemini-image"])
 
-    result = oauth_model_discovery.discover_antigravity({"access_token": "tok", "project_id": "p"})
+    account = {"access_token": "tok", "project_id": "p", "request_base_url": "https://daily.example"}
+    if failed_index == 1:
+        with pytest.raises((RuntimeError, ValueError)):
+            oauth_model_discovery.discover_antigravity(account)
+        assert len(calls) == 2
+        return
+    result = oauth_model_discovery.discover_antigravity(account)
 
     assert result.models == ["gemini-text", "new-upstream-text"]
-    assert result.catalog["models"][1] == {"id": "new-upstream-text", "name": "New Upstream Text", "tagline": "preview", "contextWindow": 1000000, "maxOutputTokens": 64000, "reasoning": True, "supportsThinking": True, "supportsImages": True}
+    record = dict(result.catalog["models"][1])
+    assert record.pop("antigravityAvailability") == "generation"
+    sources = record.pop("antigravitySources")
+    assert len(sources) == 1
+    assert sources[0]["endpoint"] == ("daily" if failed_index == 0 else "prod")
+    assert record == {"id": "new-upstream-text", "name": "New Upstream Text", "tagline": "preview", "contextWindow": 1000000, "maxOutputTokens": 64000, "reasoning": True, "supportsThinking": True, "supportsImages": True}
     assert [url for url, _kwargs in calls] == [
         "https://prod.example/v1internal:fetchAvailableModels",
         "https://daily.example/v1internal:fetchAvailableModels",
@@ -388,7 +407,7 @@ def test_antigravity_rejects_when_both_endpoints_are_unavailable(monkeypatch, fa
 
     expected = "HTTP 503" if failure_kind == "http_error" else "no verified text models"
     with pytest.raises((RuntimeError, ValueError), match=expected):
-        oauth_model_discovery.discover_antigravity({"access_token": "tok", "project_id": "p"})
+        oauth_model_discovery.discover_antigravity({"access_token": "tok", "project_id": "p", "request_base_url": "https://daily.example"})
     assert len(calls) == 2
 
 

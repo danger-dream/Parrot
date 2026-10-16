@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "api": {
+    "google": {
+      "id": "google",
+      "name": "Google",
+      "models": {
+        "gemini-4-argon": {
+          "id": "gemini-4-argon",
+          "name": "Gemini 4 Argon",
+          "description": "Google's flagship reasoning model for complex software engineering, deep math and science, and long-horizon autonomous agents",
+          "family": "gemini",
+          "attachment": true,
+          "reasoning": true,
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high"]}],
+          "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "knowledge": "2026-03",
+          "release_date": "2026-10-13",
+          "last_updated": "2026-10-13",
+          "modalities": {"input": ["text", "image", "video", "audio", "pdf"], "output": ["text"]},
+          "open_weights": false,
+          "limit": {"context": 1048576, "output": 32768},
+          "cost": {"input": 2, "output": 10, "cache_read": 0.1, "input_audio": 2},
+          "canonical_model_id": "google/gemini-4-argon"
+        }
+      }
+    }
+  },
+  "models": {
+    "google/gemini-4-argon": {
+      "id": "google/gemini-4-argon",
+      "name": "Gemini 4 Argon",
+      "description": "Google's flagship reasoning model for complex software engineering, deep math and science, and long-horizon autonomous agents",
+      "family": "gemini",
+      "attachment": true,
+      "reasoning": true,
+      "tool_call": true,
+      "structured_output": true,
+      "temperature": false,
+      "knowledge": "2026-03",
+      "release_date": "2026-10-13",
+      "last_updated": "2026-10-13",
+      "modalities": {"input": ["text", "image", "video", "audio", "pdf"], "output": ["text"]},
+      "open_weights": false,
+      "limit": {"context": 1048576, "output": 65536}
+    }
+  }
+}

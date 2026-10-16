@@ -738,3 +738,41 @@ async def test_url_batch_storage_eviction_cannot_claim_complete(setup):
     assert result.status_code==507, result.text
     body=result.json();assert not body['parrot']['complete'] and body['parrot']['upstream_calls']==2
     assert all(image_artifacts.url_available(item['url']) for item in body['data'])
+
+
+@pytest.mark.parametrize('reason,account_exhausted', [
+    ('RATE_LIMIT_EXCEEDED', False), ('QUOTA_EXHAUSTED', False),
+    ('INSUFFICIENT_G1_CREDITS_BALANCE', True),
+])
+@pytest.mark.asyncio
+async def test_antigravity_image_429_uses_same_bounded_scope_policy(setup, monkeypatch, reason, account_exhausted):
+    from src.tests.test_antigravity_package_a import _google
+    cfg = setup[0]
+    cfg['oauthAccounts'].append({
+        'provider': 'antigravity', 'email': 'ag-second@example.test', 'project_id': 'p2',
+        'enabled': True, 'access_token': 'test-2', 'models': ['gemini-chat'],
+    })
+    # Exercise the real quota state mutator against this isolated fixture config.
+    monkeypatch.setattr(config, 'update', lambda mutate, **kwargs: mutate(cfg))
+    attempted, cooled = [], []
+    monkeypatch.setattr(runtime.cooldown, 'record_error', lambda *args, **kwargs: cooled.append((args, kwargs)))
+    async def send(source, parsed, *, action, n, cfg):
+        attempted.append(source)
+        if len(attempted) == 1:
+            return httpx.Response(429, content=_google('300s', reason), headers={'content-type': 'application/json'})
+        return httpx.Response(200, json={'data': [{'b64_json': b64()}]})
+    monkeypatch.setattr(runtime, '_send', send)
+    result = await post(setup, {'model': 'gemini-3.1-flash-image', 'prompt': 'draw a blue square'})
+    assert result.status_code == 200 and len(attempted) == 2
+    first = oauth_manager.get_account(attempted[0].key.removeprefix('oauth:'))
+    second = oauth_manager.get_account(attempted[1].key.removeprefix('oauth:'))
+    assert first['enabled'] is not account_exhausted
+    assert second['enabled'] is True
+    if account_exhausted:
+        assert first['quota_observation']['source'] == 'antigravity_account_quota'
+        assert not cooled
+    else:
+        assert len(cooled) == 1 and cooled[0][0][1] == 'gemini-3.1-flash-image'
+        until = cooled[0][1]['cooldown_until']
+        assert 290_000 < until - int(__import__('time').time() * 1000) <= 300_000
+        assert 'antigravity_model_429' in cooled[0][0][2]

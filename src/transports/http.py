@@ -34,6 +34,18 @@ class HttpStreamRequest:
         )
 
 
+def before_native_handoff(request: httpx.Request) -> None:
+    """Run a trusted synchronous guard immediately before native I/O ownership.
+
+    May run in a worker. Success only admits the request to the native backend;
+    it must not mark physical dispatch, complete connection timing or change
+    replay eligibility. Those remain driven by the backend's existing evidence.
+    """
+    callback = request.extensions.get("parrot_before_native_handoff")
+    if callback is not None:
+        callback()
+
+
 def open_stream(client, request: HttpStreamRequest):
     """Open an HTTP stream using the exact parameters Parrot used in failover."""
     return client.stream(

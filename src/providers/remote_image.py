@@ -22,7 +22,11 @@ ALLOWED_MIME = frozenset({"image/jpeg", "image/png", "image/webp", "image/gif"})
 
 
 class RemoteImageError(ValueError):
-    pass
+    """Invalid/unsafe image input or response content."""
+
+
+class RemoteImageDownloadError(RemoteImageError):
+    """External image service/DNS failure, not a model account failure."""
 
 
 def _safe_ip(value: str) -> bool:
@@ -37,17 +41,20 @@ def _safe_ip(value: str) -> bool:
 
 
 async def _validate_url(url: str, resolver: Callable[..., Any] | None = None) -> tuple[str, int, tuple[str, ...], str]:
-    parsed = urlsplit(url)
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port or 443
+    except ValueError as exc:
+        raise RemoteImageError("input_image remote URL has an invalid authority") from exc
     if parsed.scheme.lower() != "https":
         raise RemoteImageError("input_image remote URL must use HTTPS")
     if not parsed.hostname or parsed.username or parsed.password:
         raise RemoteImageError("input_image remote URL has an invalid authority")
-    port = parsed.port or 443
     resolve = resolver or socket.getaddrinfo
     try:
         rows = await asyncio.to_thread(resolve, parsed.hostname, port, 0, socket.SOCK_STREAM)
     except Exception as exc:
-        raise RemoteImageError("input_image hostname could not be resolved") from exc
+        raise RemoteImageDownloadError("input_image hostname could not be resolved") from exc
     addresses = {str(row[4][0]) for row in rows if row and len(row) >= 5 and row[4]}
     if not addresses or not all(_safe_ip(value) for value in addresses):
         raise RemoteImageError("input_image URL resolves to a non-public address")
@@ -111,7 +118,7 @@ async def download_https_image(
                     current = urljoin(current, location)
                     continue
                 if response.status_code != 200:
-                    raise RemoteImageError(f"input_image download returned HTTP {response.status_code}")
+                    raise RemoteImageDownloadError(f"input_image download returned HTTP {response.status_code}")
                 mime = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
                 if mime not in ALLOWED_MIME:
                     raise RemoteImageError(f"input_image Content-Type {mime or 'missing'} is not supported")
@@ -176,4 +183,58 @@ async def inline_remote_images(body: dict[str, Any]) -> dict[str, Any]:
                         holder["url"] = data_url
                     else:
                         part["image_url"] = data_url
+    return out
+
+
+async def prepare_antigravity_images(payload: dict, *, tool_outputs: bool = False) -> dict:
+    """AG boundary classification; the shared downloader keeps its safety policy.
+
+    Input failures are 400; external fetch failures are 502. Neither is evidence
+    about a model account's health, and retries on another model cannot fix them.
+    """
+    from ..openai.transform.guard import GuardError
+    try:
+        return await (inline_tool_output_images(payload) if tool_outputs else inline_remote_images(payload))
+    except (RemoteImageDownloadError, httpx.RequestError) as exc:
+        raise GuardError(502, "api_error", "Remote input image download failed", param="input", scope="request") from exc
+    except RemoteImageError as exc:
+        raise GuardError(400, "invalid_request_error", str(exc), param="input", scope="request") from exc
+
+
+def validate_inline_tool_image(inline: dict) -> None:
+    """Validate new tool-image support without altering ordinary user images."""
+    from ..openai.transform.guard import GuardError
+    mime, data = inline.get("mimeType"), inline.get("data")
+    if mime not in ALLOWED_MIME or not isinstance(data, str) or not data:
+        raise GuardError(400, "invalid_request_error", "Unsupported Antigravity tool image MIME or empty data", scope="candidate")
+    if len(data) > ((MAX_IMAGE_BYTES + 2) // 3) * 4:
+        raise GuardError(400, "invalid_request_error", "Antigravity tool image exceeds image size limit", scope="candidate")
+    try:
+        decoded = base64.b64decode(data, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise GuardError(400, "invalid_request_error", "Invalid base64 tool image", scope="candidate") from exc
+    if len(decoded) > MAX_IMAGE_BYTES:
+        raise GuardError(400, "invalid_request_error", "Antigravity tool image exceeds image size limit", scope="candidate")
+
+
+async def inline_tool_output_images(payload: dict[str, Any]) -> dict[str, Any]:
+    """AG-only: operate on normalized typed tool output lists, not arbitrary JSON."""
+    out = copy.deepcopy(payload)
+    items = out.get("input")
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict) or item.get("type") != "function_call_output":
+            continue
+        parts = item.get("output")
+        for part in parts if isinstance(parts, list) else []:
+            if not isinstance(part, dict) or part.get("type") not in {"input_image", "image_url"}:
+                continue
+            holder = part.get("image_url")
+            url = holder.get("url") if isinstance(holder, dict) else holder
+            if isinstance(url, str) and url.lower().startswith(("http://", "https://")):
+                raw, mime = await download_https_image(url)
+                data_url = f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+                if isinstance(holder, dict):
+                    holder["url"] = data_url
+                else:
+                    part["image_url"] = data_url
     return out

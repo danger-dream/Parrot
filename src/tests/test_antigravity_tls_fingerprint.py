@@ -241,3 +241,46 @@ async def test_route_owner_auth_safe_failure_and_close_order(monkeypatch):
     )
     await transport.aclose()
     assert owner.closed_after_curl == [True]
+
+
+@pytest.mark.parametrize("change_before_handoff", [False, True])
+@pytest.mark.asyncio
+async def test_actual_curl_uses_explicit_native_gate_not_completion_event(monkeypatch, change_before_handoff):
+    from src.antigravity import DispatchGuardError
+    from src.channel.antigravity_oauth_channel import _guarded_stream_context
+    from src.transports.http import HttpStreamRequest, open_stream
+    from src.transports.timing import HttpAttemptTiming
+    applicable = True
+    timing = HttpAttemptTiming(response_mode="non_stream")
+    original_init, original_request = FakeSession.__init__, FakeSession.request
+    def init(self, **kwargs):
+        nonlocal applicable
+        original_init(self, **kwargs)
+        if change_before_handoff: applicable = False
+    async def request(self, *args, **kwargs):
+        nonlocal applicable
+        response = await original_request(self, *args, **kwargs)
+        applicable = False
+        return response
+    monkeypatch.setattr(FakeSession, "__init__", init)
+    monkeypatch.setattr(FakeSession, "request", request)
+    def validate():
+        if not applicable:
+            raise DispatchGuardError(400, "invalid_request_error", "synthetic route change", scope="candidate")
+    wire = HttpStreamRequest("POST", "https://example.invalid", {}, b"payload", 10, 30, extensions={
+        "trace": timing.trace,
+        "parrot_transport_lifecycle": {"mark_connection_complete": timing.mark_connection_complete},
+    })
+    async with httpx.AsyncClient(transport=fingerprint.ImpersonatedTransport("chrome131")) as client:
+        context = _guarded_stream_context(wire, lambda req: open_stream(client, req), validate)
+        if change_before_handoff:
+            with pytest.raises(DispatchGuardError):
+                async with context: pytest.fail("stale request reached curl")
+            assert FakeSession.instances[0].calls == []
+            assert not timing.dispatch_started and not timing.connection_complete
+        else:
+            async with context as response:
+                assert await response.aread() == b"ok"
+                assert timing.dispatch_started and timing.connection_complete
+            assert len(FakeSession.instances[0].calls) == 1
+    assert FakeSession.instances[0].closed

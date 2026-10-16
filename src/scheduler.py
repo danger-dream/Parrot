@@ -20,6 +20,7 @@ from .protocols.matrix import (
 )
 from .protocols.runtime import retry_body_without_encrypted_content
 from .openai import compaction_owner
+from .openai.transform.guard import GuardError
 
 
 class ScheduleResult:
@@ -108,7 +109,14 @@ def _filter_candidates(requested_model: str,
         if not auth.channel_allowed(api_key_name, ch.key):
             excluded.append({"channel": ch.key, "reason": "api_key_channel_denied"})
             continue
-        resolved = ch.supports_model(requested_model)
+        try:
+            resolver = getattr(ch, "resolve_request_model", None)
+            resolved = (resolver(requested_model, request_body, ingress_protocol)
+                        if callable(resolver) else ch.supports_model(requested_model))
+        except GuardError as exc:
+            guard_errors.append(exc.message)
+            excluded.append({"channel": ch.key, "reason": "protocol_guard", "detail": exc.message})
+            continue
         if resolved is None:
             continue
         if not model_state.is_global_enabled(requested_model, source_key=ch.key):
@@ -116,6 +124,12 @@ def _filter_candidates(requested_model: str,
             continue
         if not model_state.is_source_enabled(ch.key, requested_model):
             excluded.append({"channel": ch.key, "reason": "source_model_disabled"})
+            continue
+        if callable(resolver) and resolved != requested_model and (
+            not model_state.is_global_enabled(resolved, source_key=ch.key)
+            or not model_state.is_source_enabled(ch.key, resolved)
+        ):
+            excluded.append({"channel": ch.key, "reason": "resolved_model_disabled"})
             continue
         if not ch.enabled:
             excluded.append({"channel": ch.key, "reason": "disabled"})
@@ -254,8 +268,10 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
         bound_model = str(exact_bound.get("model") or "")
         owner_channel = registry.get_channel(candidate_key) if candidate_key else None
         try:
+            resolver = getattr(owner_channel, "resolve_request_model", None)
             owner_resolved_model = (
-                owner_channel.supports_model(requested_model) if owner_channel else None
+                resolver(requested_model, body, ingress_protocol) if callable(resolver)
+                else owner_channel.supports_model(requested_model) if owner_channel else None
             )
         except Exception:
             owner_resolved_model = None

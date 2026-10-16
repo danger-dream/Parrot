@@ -1418,9 +1418,12 @@ async def fetch_usage(account_key: str) -> dict:
         return await cursor_provider.fetch_usage(access_token, account_key=account_key)
 
     if provider == "antigravity":
-        return await antigravity_provider.fetch_usage(
+        generation = _quota_observation_generation(get_account(account_key))
+        usage = await antigravity_provider.fetch_usage(
             access_token, account_key=account_key,
         )
+        usage.setdefault("antigravity", {})["quota_observation_generation"] = generation
+        return usage
 
     # OpenAI 路径：主动 quota 走 ChatGPT 私有 wham/usage。业务响应头里的
     # x-codex-* 仍由 failover/images/ws 实时采样，不在这里发最小 Codex 请求。
@@ -2176,7 +2179,9 @@ def evaluate_and_toggle_by_cached_quota(account_key: str,
         except Exception:
             threshold = 95.0
     usage = usage_from_quota_row(row)
-    if provider_of(account_key) == "cursor" and isinstance(usage.get("cursor"), dict):
+    if provider_of(account_key) == "antigravity" or (
+        provider_of(account_key) == "cursor" and isinstance(usage.get("cursor"), dict)
+    ):
         return evaluate_and_toggle_by_usage(
             account_key, usage, threshold=threshold, fresh=False,
         )
@@ -3019,88 +3024,104 @@ def _evaluate_antigravity_credits(
     fresh: bool,
     expected_quota_generation,
 ) -> dict:
-    """Combine reliable Credits and 5h/weekly signals into one quota gate."""
+    """Only Credits can gate the account; unknown group windows are display-only.
+
+    Retire recognizable legacy window-only gates on a fresh successful summary,
+    not on cached percentages or a partial response. Never rewrite observations
+    while recovering: the original generation CAS must survive a newer refusal.
+    """
     utils = extract_utils_percent(usage)
     block = usage.get("antigravity") if isinstance(usage, dict) else None
-    credits_known = isinstance(block, dict) and bool(block.get("known"))
-    credits_available = bool(block.get("available")) if credits_known else None
-    summary_failed = isinstance(block, dict) and isinstance(block.get("quota_error"), dict)
-    window_hits = [label for label, util in zip(("5h", "7d"), utils[:2])
-                   if util is not None and util >= threshold]
-    has_window_signal = any(util is not None for util in utils[:2])
-    hits = list(window_hits)
-    if credits_known and not credits_available:
-        hits.append("Credits")
-    any_over = bool(hits)
-    has_reliable_signal = credits_known or has_window_signal
-    reason = acc.get("disabled_reason")
-    base = {"utils": utils, "any_over": any_over, "hit_windows": hits,
+    block = block if isinstance(block, dict) else {}
+    credits_known = block.get("known") is True and type(block.get("available")) is bool
+    credits_over = credits_known and not block["available"]
+    hits = ["Credits"] if credits_over else []
+    base = {"utils": utils, "any_over": credits_over, "hit_windows": hits,
             "disabled_until": acc.get("disabled_until")}
-
-    previous = acc.get(_QUOTA_OBSERVATION_FIELD) or {}
-    if not isinstance(previous, dict):
-        previous = {}
-    blocked = set(previous.get("blocked") or []) if previous.get("source") == "antigravity_quota" else set()
-    blocked &= {"Credits", "5h", "7d"}
-    if fresh:
-        if credits_known and credits_available:
-            blocked.discard("Credits")
-        for label, util in zip(("5h", "7d"), utils[:2]):
-            if util is not None and util < threshold:
-                blocked.discard(label)
-    blocked.update(hits)
-    observation = {"source": "antigravity_quota", "blocked": sorted(blocked)}
-    # Persist independent gates even when already disabled. A later partial
-    # snapshot must not lose a known refusal just because an unrelated gate is low.
-    changed = previous != observation
-    if any_over or (reason == "quota" and previous.get("source") == "antigravity_quota" and changed):
-        latest_reset = None if "Credits" in hits else reset_iso_for_hit_windows(usage, threshold)
+    previous = acc.get(_QUOTA_OBSERVATION_FIELD)
+    previous = previous if isinstance(previous, dict) else {}
+    source = previous.get("source")
+    reason = acc.get("disabled_reason")
+    observed_generation = block.get("quota_observation_generation")
+    if "quota_observation_generation" in block and (
+        type(observed_generation) is not int or observed_generation != expected_quota_generation
+    ):
+        return {**base, "action": "quota_observation_conflict"}
+    if credits_over:
+        # A poll must not replace a true request refusal (or an unknown older
+        # gate) with a weaker observation that legacy recovery could erase.
+        observation = {"source": "antigravity_quota", "blocked": ["Credits"]}
+        if reason == "quota":
+            old_blocked = previous.get("blocked")
+            if source == "antigravity_quota" and isinstance(old_blocked, list) and all(
+                isinstance(label, str) and label in {"Credits", "5h", "7d"} for label in old_blocked
+            ):
+                observation["blocked"] = sorted(set(old_blocked) | {"Credits"})
+            else:
+                observation = None
         try:
-            disable_result = set_disabled_by_quota(account_key, latest_reset, observation=observation)
+            result = set_disabled_by_quota(account_key, None, observation=observation)
         except Exception as exc:
-            print(f"[oauth] evaluate antigravity disable failed for {account_key}: {exc}")
-            return {**base, "action": "disable_failed", "disabled_until": latest_reset}
-        disable_state = (disable_result or {}).get("state")
-        if disable_state not in {"disabled", "already_quota_disabled"}:
-            return {**base, "action": disable_state or "disable_failed",
-                    "disabled_until": (disable_result or {}).get("disabled_until"),
-                    "disabled_reason": (disable_result or {}).get("disabled_reason"),
-                    "error_code": "account_state_conflict"}
-        expected_quota_generation = disable_result["quota_observation_generation"]
-        if any_over:
-            return {**base,
-                    "action": "disabled" if disable_state == "disabled" else "still_over_quota",
-                    "disabled_until": disable_result.get("disabled_until")}
-
+            print(f"[oauth] Antigravity quota disable failed: {type(exc).__name__}")
+            return {**base, "action": "disable_failed"}
+        state = result.get("state")
+        return {**base, "action": "still_over_quota" if state == "already_quota_disabled" else state,
+                "disabled_until": result.get("disabled_until")}
+    if not fresh:
+        return {**base, "action": "quota_stale_keep_disabled" if reason == "quota" else "kept_enabled"}
     if reason != "quota":
         return {**base, "action": "kept_enabled"}
-    # Credits and 5h/weekly are independent gates.  A successful Credits read
-    # cannot prove that a previously exhausted window recovered when the quota
-    # summary endpoint failed in this refresh.  Keep the account disabled until
-    # a fresh window snapshot is available again.
-    if summary_failed and not has_window_signal:
-        return {**base, "action": "quota_partial_keep_disabled"}
-    if not has_reliable_signal:
+
+    if source == "antigravity_account_quota":
+        # Only a subsequent Credits fetch started after the refusal can recover
+        # it. Catalog listings and old caches never prove account recovery.
+        recoverable = (previous.get("reason") == "INSUFFICIENT_G1_CREDITS_BALANCE"
+                       and credits_known and block["available"]
+                       and observed_generation == expected_quota_generation
+                       and observed_generation is not None)
+    elif source == "antigravity_quota":
+        blocked = previous.get("blocked")
+        if not isinstance(blocked, list) or not blocked or any(
+            not isinstance(label, str) or label not in {"Credits", "5h", "7d"} for label in blocked
+        ):
+            return {**base, "action": "quota_unknown_keep_disabled"}
+        recoverable = "Credits" not in blocked or (credits_known and block["available"])
+        legacy_windows = set(blocked) & {"5h", "7d"}
+        if legacy_windows:
+            groups = block.get("quota_groups")
+            present = set()
+            if isinstance(groups, list) and not block.get("quota_error") and not block.get("quota_groups_stale"):
+                for group in groups:
+                    buckets = group.get("buckets") if isinstance(group, dict) else None
+                    for bucket in buckets if isinstance(buckets, list) else []:
+                        if not isinstance(bucket, dict):
+                            continue
+                        fraction = bucket.get("remaining_fraction")
+                        if type(fraction) in (int, float) and 0 <= fraction <= 1 and math.isfinite(fraction):
+                            window = bucket.get("window")
+                            if isinstance(window, str):
+                                present.add({"5h": "5h", "weekly": "7d"}.get(window))
+            # Even an exhausted *independent* window is not an account gate.
+            recoverable = recoverable and legacy_windows <= present
+    else:
+        # Old real refusals had no typed scope. Do not guess them healthy.
+        recoverable = False
+    if not recoverable:
         return {**base, "action": "quota_unknown_keep_disabled"}
-    if not fresh:
-        return {**base, "action": "quota_stale_keep_disabled"}
-    if blocked:
-        return {**base, "action": "quota_unknown_keep_disabled", "missing_gates": sorted(blocked)}
     if expected_quota_generation is None:
         return {**base, "action": "resume_failed",
                 "error_code": "quota_observation_generation_invalid"}
     try:
-        enable_result = set_enabled(
+        result = set_enabled(
             account_key, True, expected_disabled_reason="quota",
             expected_quota_observation_generation=expected_quota_generation,
         )
     except Exception as exc:
-        print(f"[oauth] evaluate antigravity resume failed for {account_key}: {exc}")
+        print(f"[oauth] Antigravity quota resume failed: {type(exc).__name__}")
         return {**base, "action": "resume_failed"}
-    enable_state = (enable_result or {}).get("state")
-    if enable_state != "enabled":
-        return {**base, "action": enable_state or "resume_failed",
-                "error_code": "account_state_conflict"}
+    state = (result or {}).get("state")
+    if state != "enabled":
+        return {**base, "action": state or "resume_failed", "error_code": "account_state_conflict"}
     return {**base, "action": "resumed", "disabled_until": None}
 
 
@@ -4123,6 +4144,9 @@ def _add_account_serialized(
             "token_endpoint": entry.get("token_endpoint") or antigravity_provider.token_url(),
             "redirect_uri": entry.get("redirect_uri") or antigravity_provider.redirect_uri(),
         })
+        # Omission on re-login preserves an existing explicit generation route.
+        if "request_base_url" in entry or "requestBaseUrl" in entry:
+            normalized["request_base_url"] = str(entry.get("request_base_url") or entry.get("requestBaseUrl") or "")
     # Cursor 专属字段。模型目录来自该账号自己的 AvailableModels，不能
     # 与 models.dev 元数据合并，否则上下文和变体限制会失真。
     elif provider == "cursor":
@@ -5570,6 +5594,8 @@ def _discovery_generation(account: dict) -> str:
         client_identity = "\0".join((
             profile.profile_id, profile.client_version, codex_backend_base_url(),
         ))
+    elif provider == "antigravity":
+        client_identity = antigravity_provider.effective_request_base_url(account)
     else:
         client_identity = ""
     raw = "\0".join((
@@ -5643,6 +5669,7 @@ async def _discover_account_models_once(account_key: str, *, timeout_s: float) -
     if mock_mode_enabled():
         return {"action": "network_disabled", "account_key": canonical}
     generation = _discovery_generation(account)
+    ag_state_key = account_state_key(account) if provider == "antigravity" else None
     remaining_s = deadline - time.monotonic()
     if remaining_s <= 0:
         _persist_model_discovery_failure(canonical, generation, "timeout")
@@ -5749,7 +5776,15 @@ async def _discover_account_models_once(account_key: str, *, timeout_s: float) -
             saved["value"] = True
             return
 
-    config.update(mutate, skip_if_unchanged=True)
+    if provider == "antigravity":
+        with account_generation_guard(ag_state_key) as current:
+            if current:
+                config.update(mutate, skip_if_unchanged=True)
+                if saved["value"]:
+                    from .antigravity.quota import apply_fresh_catalog
+                    apply_fresh_catalog(account, result.catalog, expected_state_key=ag_state_key)
+    else:
+        config.update(mutate, skip_if_unchanged=True)
     return {
         "action": "updated" if saved["value"] else "stale",
         "account_key": canonical, "models": len(models), "source": result.source,
@@ -5788,10 +5823,17 @@ def _normalize_model_refresh_result(canonical: str, before: dict | None, result:
         field = "cursor_model_catalog" if provider_of(snapshot) == "cursor" else "account_model_catalog"
         catalog = snapshot.get(field) or {}
         # Compare native model content, not fetch timestamps or list ordering.
-        return {
-            str(row["id"]): row for row in catalog.get("models", [])
+        rows = {
+            str(row["id"]): copy.deepcopy(row) for row in catalog.get("models", [])
             if isinstance(row, dict) and row.get("id")
         }
+        if provider_of(snapshot) == "antigravity":
+            for row in rows.values():
+                sources = row.get("antigravitySources")
+                for source in sources if isinstance(sources, list) else []:
+                    if isinstance(source, dict):
+                        source.pop("observedAt", None)
+        return rows
 
     normalized["catalog_changed"] = normalized.get("action") == "updated" and (
         normalized["changed"] or records(before) != records(after)
@@ -6147,6 +6189,11 @@ def _model_catalog_complete(account: dict, model_ids: Iterable[str]) -> bool:
     """Whether the provider-native catalog has a metadata record for every ID."""
     catalog_key = "cursor_model_catalog" if provider_of(account) == "cursor" else "account_model_catalog"
     catalog = account.get(catalog_key)
+    if provider_of(account) == "antigravity" and (
+        not isinstance(catalog, dict)
+        or catalog.get("antigravityGenerationBaseUrl") != antigravity_provider.effective_request_base_url(account)
+    ):
+        return False
     # Older OpenAI catalogs dropped hidden IDs, instructions and explicit nulls.
     # Refresh them once rather than accepting an old ETag/304 forever.
     if provider_of(account) == "openai" and (

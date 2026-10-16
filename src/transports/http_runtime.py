@@ -19,6 +19,7 @@ import httpx
 
 from .. import blacklist, log_db, network, upstream
 from ..async_owned import await_owned
+from ..antigravity import DispatchGuardError
 from ..providers import registry as provider_registry
 from ..protocols import errors as protocol_errors
 from ..protocols.output_repetition import OUTPUT_REPETITION_CODE, output_repetition_error_event
@@ -1863,6 +1864,17 @@ async def open_response_with_proxy_chain(
                 persist_dispatch=persist_dispatch,
             ))
             raise
+        except DispatchGuardError as exc:
+            # AG-owned pre-dispatch validation is not a transport/proxy
+            # fault. Keep its status and exclude it from account health effects.
+            result = await _finish_pre_header_round(
+                owner=owner, timing=timing,
+                outcome="candidate_guard" if exc.scope == "candidate" else "guard_error",
+                detail=exc.message, proxy_name=proxy_name_used, proxy_bytes=proxy_bytes,
+                persist_dispatch=persist_dispatch,
+            )
+            result.http_status = exc.status
+            return OpenedHttpResponse(error=result)
         except BusinessTimeoutError as exc:
             detail = f"{exc.outcome} while opening upstream response"
             last_pre_header = await _finish_pre_header_round(

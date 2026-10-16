@@ -881,13 +881,27 @@ def catalog_models() -> list[dict[str, str]]:
         return result
 
 
+def _canonical_official_from(index: Mapping[str, str], name: str) -> str | None:
+    from .antigravity.argon import BASE, VARIANTS
+    if name in VARIANTS:
+        # Confirmed full AG tier IDs share Google's base tariff. This is an
+        # auto-binding input only, never a pricing-consumer fallback. Never
+        # borrow a reseller's similarly named model when Google is absent.
+        exact = index.get(f"google/{name}")
+        if exact == f"google/{name}":
+            return exact
+        base = index.get(f"google/{BASE}")
+        return base if base == f"google/{BASE}" else None
+    return index.get(name)
+
+
 def canonical_official_model(model: str) -> str | None:
-    """Resolve an exact canonical model ID to its official provider/model."""
+    """Resolve exact official identities, including the three confirmed Argon tiers."""
     name = str(model or "").strip().lower()
     if not name or not _ensure_catalog():
         return None
     with _lock:
-        return _canonical_official_models.get(name)
+        return _canonical_official_from(_canonical_official_models, name)
 
 
 def catalog_tariff(provider_model: str) -> PricingEntry | None:
@@ -2311,7 +2325,7 @@ def fetch_catalog_candidate_sync() -> CatalogCandidate:
 def candidate_canonical_official_model(
     candidate: CatalogCandidate, model: str,
 ) -> str | None:
-    return candidate.official_models.get(str(model or "").strip().lower())
+    return _canonical_official_from(candidate.official_models, str(model or "").strip().lower())
 
 
 def candidate_binding_snapshot(

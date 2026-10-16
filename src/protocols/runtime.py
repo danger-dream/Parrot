@@ -687,7 +687,7 @@ def _upstream_error_identity(result: AttemptResult) -> tuple[str, str, bool]:
     return error_type, error_code, structured
 
 
-def bounded_account_quota_error(result: AttemptResult) -> dict[str, str] | None:
+def bounded_account_quota_error(result: AttemptResult, channel: Any = None) -> dict[str, str] | None:
     """Recognize only explicit account/billing exhaustion signals.
 
     HTTP 402 is authoritative balance exhaustion. Generic 403/429 responses
@@ -700,6 +700,12 @@ def bounded_account_quota_error(result: AttemptResult) -> dict[str, str] | None:
         return None
     if status not in (402, 403, 429):
         return None
+    if status == 429 and str(getattr(channel, "provider", "")) == "antigravity":
+        signal = parse_antigravity_429(result.full_response_text or result.error_detail)
+        if not signal["account_quota_exhausted"]:
+            return None
+        return {"classification": "quota_exhausted", "code": "INSUFFICIENT_G1_CREDITS_BALANCE",
+                "message": str(result.error_detail or "")}
     advice = getattr(result, "error_advice", None)
     if advice is not None and advice.kind in {"usage_limit", "quota"}:
         return {"classification": "quota_exhausted", "code": advice.code,

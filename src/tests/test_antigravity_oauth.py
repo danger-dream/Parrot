@@ -1111,53 +1111,26 @@ def _add_ag_account(om, email="state@gmail.com", project="proj-state", **extra):
     return f"antigravity:{email}:{project}"
 
 
-def test_antigravity_windows_and_credits_share_quota_state_machine(m):
+def test_antigravity_windows_are_display_only_and_credits_gate_account(m):
     _setup(m)
     om = m["oauth_manager"]
     ak = _add_ag_account(om)
     exhausted_window = {
         "antigravity": {"known": False, "quota_supported": True},
-        "five_hour": {"utilization": 96, "resets_at": "2099-01-01T00:00:00Z"},
+        "five_hour": {"utilization": 100, "resets_at": "2099-01-01T00:00:00Z"},
         "seven_day": {"utilization": 20, "resets_at": "2099-01-07T00:00:00Z"},
     }
-    first = om.evaluate_and_toggle_by_usage(ak, exhausted_window, threshold=95, fresh=True)
-    assert first["action"] == "disabled"
-    assert first["hit_windows"] == ["5h"]
-    assert first["disabled_until"] == "2099-01-01T00:00:00Z"
-    assert om.get_account(ak)["disabled_reason"] == "quota"
-    assert om.evaluate_and_toggle_by_usage(ak, exhausted_window, threshold=95)["action"] == "still_over_quota"
-
-    # Credits success is not proof that an independently exhausted 5h/weekly
-    # window recovered when retrieveUserQuotaSummary failed in this refresh.
-    partial = {
-        "antigravity": {
-            "known": True,
-            "available": True,
-            "quota_error": {"kind": "server_error", "http_status": 503},
-        },
-    }
-    assert om.evaluate_and_toggle_by_usage(
-        ak, partial, threshold=95, fresh=True,
-    )["action"] == "quota_partial_keep_disabled"
-    assert om.get_account(ak)["enabled"] is False
-
-    recovered = {
-        "antigravity": {"known": False, "quota_supported": True},
-        "five_hour": {"utilization": 5}, "seven_day": {"utilization": 10},
-    }
-    assert om.evaluate_and_toggle_by_usage(ak, recovered, threshold=95, fresh=False)["action"] == "quota_stale_keep_disabled"
-    assert om.evaluate_and_toggle_by_usage(ak, recovered, threshold=95, fresh=True)["action"] == "resumed"
+    result = om.evaluate_and_toggle_by_usage(ak, exhausted_window, threshold=95)
+    assert result["action"] == "kept_enabled"
+    assert result["hit_windows"] == [] and result["utils"][0] == 100
     assert om.get_account(ak)["enabled"] is True
-
-    # Either reliable source can gate routing; an available Credits pool cannot
-    # override an exhausted window, and low windows cannot override exhausted Credits.
-    over_with_credits = {**exhausted_window, "antigravity": {"known": True, "available": True}}
-    assert om.evaluate_and_toggle_by_usage(ak, over_with_credits, threshold=95)["action"] == "disabled"
-    low_exhausted_credits = {**recovered, "antigravity": {"known": True, "available": False}}
-    result = om.evaluate_and_toggle_by_usage(ak, low_exhausted_credits, threshold=95)
-    assert result["action"] == "still_over_quota"
-    assert result["hit_windows"] == ["Credits"]
-    assert result["disabled_until"] == "2099-01-01T00:00:00Z"  # existing target is not moved
+    exhausted_credits = {**exhausted_window, "antigravity": {"known": True, "available": False}}
+    assert om.evaluate_and_toggle_by_usage(ak, exhausted_credits)["action"] == "disabled"
+    assert om.evaluate_and_toggle_by_usage(ak, exhausted_window)["action"] == "quota_unknown_keep_disabled"
+    recovered = {**exhausted_window, "antigravity": {"known": True, "available": True}}
+    assert om.evaluate_and_toggle_by_usage(ak, recovered, fresh=False)["action"] == "quota_stale_keep_disabled"
+    assert om.evaluate_and_toggle_by_usage(ak, recovered)["action"] == "resumed"
+    assert om.get_account(ak)["enabled"] is True
 
 
 def test_antigravity_manual_disable_is_never_overwritten(m):

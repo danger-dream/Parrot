@@ -9,9 +9,13 @@ Responses by ``AntigravityOAuthAdapter`` before the Responses toolkit.
 from __future__ import annotations
 
 import json
+import threading
+from contextlib import asynccontextmanager
+from dataclasses import replace
 from typing import Optional
 
 from .. import cache_hints, config, media_config, oauth_manager
+from ..antigravity import DispatchGuardError
 from ..oauth import antigravity as ag_provider
 from ..oauth_ids import account_key as _account_key
 from ..openai.transform import anthropic_to_responses, chat_to_responses, guard, responses_to_chat
@@ -34,6 +38,45 @@ def _provider_cfg() -> dict:
         else:
             merged[key] = value
     return merged
+
+
+@asynccontextmanager
+async def _guarded_stream_context(request, factory, validate):
+    """Use the existing raw HTTP context hook, not a request-supplied callback."""
+    validate()
+    extensions = dict(request.extensions or {})
+    trace = extensions.get("trace")
+    # This admission flag is NOT dispatch/billing evidence. Native transports
+    # invoke the synchronous callback at their real handoff (possibly a worker).
+    # Their later trace/connection events are observations, not rejection gates.
+    handed_off = threading.Event()
+
+    def native_handoff():
+        validate()
+        handed_off.set()
+
+    extensions["parrot_before_native_handoff"] = native_handoff
+
+    async def guarded_trace(name, info):
+        first_headers = not handed_off.is_set() and name in {
+            "http11.send_request_headers.started", "http2.send_request_headers.started",
+        }
+        if first_headers:
+            validate()
+        if trace is not None:
+            await trace(name, info)
+        if first_headers:
+            # The timing callback can await dispatch-log persistence itself.
+            validate()
+            handed_off.set()
+
+    extensions["trace"] = guarded_trace
+    ctx = factory(replace(request, extensions=extensions))
+    try:
+        response = await ctx.__aenter__()
+        yield response
+    finally:
+        await ctx.__aexit__(None, None, None)
 
 
 def _wants_stream(body: dict) -> bool:
@@ -95,22 +138,7 @@ class AntigravityOAuthChannel(Channel):
             self.tls_fingerprint = profile or None
         else:
             self.tls_fingerprint = None
-        stored_base = str(
-            account.get("request_base_url")
-            or account.get("requestBaseUrl")
-            or ""
-        ).rstrip("/")
-        # Login identity may persist prod cloudcode-pa as base_url for
-        # loadCodeAssist. Generate/stream use daily first.
-        prod = str(cfg.get("apiBaseUrl") or ag_provider.api_base_url()).rstrip("/")
-        account_base = str(account.get("base_url") or account.get("baseUrl") or "").rstrip("/")
-        if not stored_base and account_base and account_base != prod:
-            stored_base = account_base
-        self.base_url = str(
-            stored_base
-            or cfg.get("dailyApiBaseUrl")
-            or ag_provider.request_api_base_url()
-        ).rstrip("/")
+        self.base_url = ag_provider.effective_request_base_url(account)
 
         selected_models = list(account.get("models") or [])
         disabled_models = {
@@ -118,7 +146,9 @@ class AntigravityOAuthChannel(Channel):
             if str(model).strip()
         }
         from ..image_catalog import is_image_name
-        self.models = [model for model in selected_models if model not in disabled_models and not is_image_name(model)]
+        self.models = [model for model in selected_models
+                       if model not in disabled_models and not is_image_name(model)
+                       and ag_provider.model_at_generation_endpoint(account, model)]
         self.state_key = oauth_manager.account_state_key(account)
         self.image_models = media_config.account_models(account, 'image')
 
@@ -126,6 +156,39 @@ class AntigravityOAuthChannel(Channel):
         if requested_model in self.models:
             return requested_model
         return None
+
+    def _selected_request_models(self) -> list[str]:
+        live = oauth_manager.get_account(self.account_key)
+        if not live:
+            return list(self.models)
+        if ag_provider.effective_request_base_url(live) != self.base_url:
+            return []
+        return [model for model in self.models
+                if model in live.get("models", [])
+                and model not in (live.get("disabledModels") or [])
+                and ag_provider.model_at_generation_endpoint(live, model)]
+
+    def validate_dispatch(self, resolved_model: str, requested_models: tuple[str, ...]) -> None:
+        """Recheck this prepared route after awaits; never retarget the request."""
+        from .. import channel_state, model_state
+        if channel_state.is_deleted(self.state_key):
+            raise DispatchGuardError(400, "invalid_request_error", "Antigravity account generation was removed", scope="candidate")
+        live = oauth_manager.get_account(self.account_key)
+        if live:
+            if oauth_manager.account_state_key(live) != self.state_key:
+                raise DispatchGuardError(400, "invalid_request_error", "Antigravity account generation changed", scope="candidate")
+            if ag_provider.effective_request_base_url(live) != self.base_url or not ag_provider.model_at_generation_endpoint(live, resolved_model):
+                raise DispatchGuardError(400, "invalid_request_error", "Antigravity generation endpoint changed; refresh its model catalog", param="model", scope="candidate")
+            if resolved_model not in live.get("models", []) or resolved_model in (live.get("disabledModels") or []):
+                raise DispatchGuardError(400, "invalid_request_error", "Antigravity model is no longer selected or enabled", param="model", scope="candidate")
+        for model in {*requested_models, resolved_model}:
+            if model and (not model_state.is_global_enabled(model, source_key=self.key)
+                          or not model_state.is_source_enabled(self.key, model)):
+                raise DispatchGuardError(400, "invalid_request_error", "Model is disabled for this source", param="model", scope="candidate")
+
+    def resolve_request_model(self, requested_model: str, body: dict, ingress: str) -> Optional[str]:
+        from ..antigravity import argon
+        return argon.resolve(requested_model, self._selected_request_models(), body, ingress)
 
     def list_client_models(self) -> list[str]:
         return list(self.models)
@@ -164,11 +227,26 @@ class AntigravityOAuthChannel(Channel):
                 f"openai-responses ingress; got {ingress_protocol!r}."
             )
 
+        from ..antigravity import argon
+        # body.model remains the trusted post-ingress-mapping request identity;
+        # only the response/pricing identity is rewritten for a bare Argon tier.
+        requested_models = tuple(str(requested_body.get(key) or "").strip()
+                                 for key in ("model", "_client_visible_model"))
+        def validate():
+            self.validate_dispatch(resolved_model, requested_models)
+        validate()
+        argon_config = None
+        if argon.is_argon(resolved_model):
+            selected = self._selected_request_models()
+            expected = argon.resolve(str(requested_body.get("model") or resolved_model), selected, requested_body, ingress_protocol)
+            if expected != resolved_model:
+                raise guard.GuardError(400, "invalid_request_error", "Argon must resolve to an enabled exact model before dispatch", param="model", scope="candidate")
+            argon_config = argon.thinking_config(resolved_model, requested_body, ingress_protocol)
         stream = _wants_stream(requested_body)
         # Gemini inlineData cannot consume ordinary remote URLs.  Resolve them at
         # this provider boundary so other bridges retain their existing policy.
         if ingress_protocol in ("chat", "responses"):
-            requested_body = await remote_image.inline_remote_images(requested_body)
+            requested_body = await remote_image.prepare_antigravity_images(requested_body)
         translator_ctx: Optional[dict]
         namespace_tool_map = None
         local_store_context = None
@@ -178,7 +256,7 @@ class AntigravityOAuthChannel(Channel):
             )
             # Locally expanded history may contain images from another route;
             # apply the same provider image conversion as to current input.
-            prepared = await remote_image.inline_remote_images(prepared)
+            prepared = await remote_image.prepare_antigravity_images(prepared)
             local_store_context = {
                 "api_key_name": _request_api_key_name(requested_body),
                 "channel_key": self.key,
@@ -231,6 +309,12 @@ class AntigravityOAuthChannel(Channel):
             }
 
         payload["model"] = resolved_model
+        if argon_config is not None:
+            # Override bridge-derived defaults, never the selected wire model.
+            payload["reasoning"] = {"summary": "auto" if argon_config["includeThoughts"] else "none"}
+            if argon_config.get("thinkingLevel"):
+                payload["reasoning"]["effort"] = argon_config["thinkingLevel"]
+        payload = await remote_image.prepare_antigravity_images(payload, tool_outputs=True)
         payload = provider_registry.filter_request_payload(
             self, payload, protocol="openai-responses",
         )
@@ -250,7 +334,9 @@ class AntigravityOAuthChannel(Channel):
         )
         translator_ctx["antigravity_stream_requested"] = stream
 
+        validate()
         access_token = await oauth_manager.ensure_channel_token(self)
+        validate()
         headers = self._build_headers(access_token, stream=stream)
         url = (
             f"{self.base_url}/{ag_provider.API_VERSION}:streamGenerateContent?alt=sse"
@@ -266,6 +352,7 @@ class AntigravityOAuthChannel(Channel):
             dispatch_metadata=build_dispatch_metadata(
                 envelope, "openai-responses", headers,
             ),
+            stream_context_hook=lambda request, factory: _guarded_stream_context(request, factory, validate),
         )
 
     async def restore_response(self, chunk: bytes,

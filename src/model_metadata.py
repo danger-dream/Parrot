@@ -612,6 +612,10 @@ def _oauth_account_record(
         records = ((account.get("account_model_catalog") or {}).get("models") or [])
         record = next((item for item in records if isinstance(item, Mapping)
                        and model_names.canonical_id(provider, normalize_model_name(item.get("id"))) == candidate), None)
+        if provider == "antigravity":
+            from .oauth.antigravity import model_at_generation_endpoint
+            if not model_at_generation_endpoint(account, candidate):
+                return None
     return (record, provider) if isinstance(record, Mapping) else None
 
 
@@ -634,6 +638,8 @@ def _upstream_metadata(record: Mapping[str, Any], provider: str) -> dict[str, An
         return metadata_from_record(record)
     result = dict(record)
     result.update(normalize_metadata(dict(record)))
+    if provider == "antigravity" and isinstance(record.get("supportsThinking"), bool):
+        result["reasoning"] = record["supportsThinking"]
     if isinstance(record.get("serviceTiers"), list):
         result["serviceTiers"] = service_tier_ids(record["serviceTiers"])
     modalities = [str(item) for item in record.get("inputModalities") or [] if str(item)]
@@ -740,8 +746,19 @@ def _effective_binding(
         "outputModalities", "serviceTiers", "supportsFast", "supportsThinking",
         "variants", "compactTriggerTokens",
     } if native and native[1] == "cursor" else set()
+    # AG's verified active directory owns explicitly reported capabilities over
+    # automatic catalog bindings. Pricing identity/snapshot remain untouched;
+    # operator bindings and the existing override/hard-limit layers stay intact.
+    ag_fields = {
+        "contextWindow", "maxInputTokens", "maxOutputTokens", "compactTriggerTokens",
+        "reasoning", "supportsThinking", "vision", "supportsImages", "toolCall",
+        "structuredOutput", "temperature", "reasoningEfforts", "defaultReasoningEffort",
+        "inputModalities", "outputModalities",
+    } if (native and native[1] == "antigravity"
+          and native[0].get("antigravitySources")
+          and binding.source in {"auto", "legacy"}) else set()
     for name, value in upstream.items():
-        if name not in metadata or name in cursor_fields:
+        if name not in metadata or name in cursor_fields or name in ag_fields:
             metadata[name] = copy.deepcopy(value)
             provenance[name] = "account-native"
     if cursor_fields and "maxInputTokens" not in upstream:
@@ -764,6 +781,13 @@ def _effective_binding(
         provenance["contextWindowMaxMode"] = "derived"
         constrained["contextWindowMaxMode"] = ("contextWindow",)
     _derive_consistent_limits(metadata, provenance, constrained)
+    if (native and native[1] == "antigravity"
+            and ("reasoning" in upstream or "supportsThinking" in upstream)
+            and isinstance(metadata.get("reasoning"), bool)):
+        # Like vision/supportsImages, the alias follows the winning canonical
+        # value, including an explicitly selected manual metadata binding.
+        metadata["supportsThinking"] = metadata["reasoning"]
+        provenance["supportsThinking"] = provenance.get("reasoning", "derived")
     return MetadataBinding(**{
         **binding.__dict__,
         "client_visible_model": model,

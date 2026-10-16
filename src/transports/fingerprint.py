@@ -29,6 +29,8 @@ from typing import Any, Callable
 
 import httpx
 
+from .http import before_native_handoff
+
 logger = logging.getLogger(__name__)
 
 _IMPORT_ERROR: BaseException | None = None
@@ -357,6 +359,7 @@ class ImpersonatedTransport(httpx.AsyncBaseTransport):
         # The high-level curl API has no upload-complete callback. Move the
         # business state to first-byte now, while retaining an exact libcurl
         # connect timeout from the converted tuple.
+        before_native_handoff(request)
         _mark_connection_handoff(request)
         try:
             response = await session.request(

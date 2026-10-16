@@ -19,6 +19,7 @@ import httpx
 
 from .. import network
 from ..async_owned import await_owned
+from .http import before_native_handoff
 
 PROFILE = "antigravity-ls-2.22.0"
 
@@ -259,6 +260,9 @@ class GoTLSTransport(httpx.AsyncBaseTransport):
                                        proxy_auth=proxy_auth, insecure=self.insecure, ca_pem=self.ca_pem)
             try:
                 check_start_allowed()
+                # Last synchronous gate after DNS, worker queueing and client
+                # construction. Native poll/close events are retrospective.
+                before_native_handoff(request)
                 native = client.start(
                     request.method, str(request.url), headers=request.headers.raw, body=content,
                     connect_timeout=None if connect is None else max(1e-9, connect - (time.monotonic() - started)),

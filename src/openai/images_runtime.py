@@ -336,12 +336,12 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
                     if 200 <= response.status_code < 300:
                         cooldown.clear_on_success(effect_key, source.upstream)
                     elif response.status_code == 429:
-                        # Image quota is not exposed as an account-wide quota
-                        # bucket. Cool only this model/source; never disable AG
-                        # chat based on an image-only rejection.
-                        cooldown.record_error(
-                            effect_key, source.upstream,
-                            f'Antigravity image HTTP {response.status_code}',
+                        from ..antigravity.quota import apply_request_429
+                        apply_request_429(
+                            effect_key, source.upstream, response.text,
+                            account_key=source.key.removeprefix('oauth:'),
+                            expected_state_key=getattr(source, 'state_key', None),
+                            retry_after=response.headers.get('retry-after'),
                         )
                 if response.status_code in SAFE_REJECTIONS:
                     sources.remove(source)

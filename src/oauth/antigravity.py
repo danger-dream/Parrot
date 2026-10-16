@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import math
 import os
 import re
 import secrets
@@ -201,6 +202,34 @@ def image_models() -> list[str]:
 def request_api_base_url() -> str:
     """generateContent default: daily first, prod reserved for loadCodeAssist."""
     return daily_api_base_url()
+
+
+def effective_request_base_url(account: dict) -> str:
+    """One selector for generation, discovery and endpoint-scoped quota evidence."""
+    from .. import config
+    cfg = {**(config.DEFAULT_CONFIG.get("antigravityOAuth") or {}), **_ag_cfg()}
+    stored = str(account.get("request_base_url") or account.get("requestBaseUrl") or "").rstrip("/")
+    prod = str(cfg.get("apiBaseUrl") or api_base_url()).rstrip("/")
+    legacy = str(account.get("base_url") or account.get("baseUrl") or "").rstrip("/")
+    if not stored and legacy and legacy != prod:
+        stored = legacy
+    return str(stored or cfg.get("dailyApiBaseUrl") or request_api_base_url()).rstrip("/")
+
+
+def model_at_generation_endpoint(account: dict, model: str) -> bool:
+    """Source-aware discoveries are route-specific; source-less manual IDs stay valid."""
+    catalog = account.get("account_model_catalog") or {}
+    records = catalog.get("models") if isinstance(catalog, dict) else None
+    record = next((r for r in records if isinstance(r, dict) and r.get("id") == model), None) if isinstance(records, list) else None
+    if not record or "antigravitySources" not in record:
+        return True
+    base = effective_request_base_url(account)
+    if catalog.get("antigravityGenerationBaseUrl") != base:
+        return False
+    sources = record.get("antigravitySources")
+    return isinstance(sources, list) and any(
+        isinstance(source, dict) and source.get("baseUrl") == base for source in sources
+    )
 
 
 def generate_content_url() -> str:
@@ -801,11 +830,17 @@ def parse_quota_summary(summary_resp: Any) -> list[dict[str, Any]]:
     if not isinstance(summary_resp, dict):
         return []
     groups_out: list[dict[str, Any]] = []
-    for raw_group in summary_resp.get("groups") or []:
+    raw_groups = summary_resp.get("groups")
+    if not isinstance(raw_groups, list):
+        raw_groups = []
+    if isinstance(summary_resp.get("buckets"), list):
+        raw_groups = [*raw_groups, {"buckets": summary_resp["buckets"]}]
+    for raw_group in raw_groups:
         if not isinstance(raw_group, dict):
             continue
         buckets_out = []
-        for raw in raw_group.get("buckets") or []:
+        raw_buckets = raw_group.get("buckets")
+        for raw in raw_buckets if isinstance(raw_buckets, list) else []:
             if not isinstance(raw, dict):
                 continue
             bucket = {
@@ -816,8 +851,15 @@ def parse_quota_summary(summary_resp: Any) -> list[dict[str, Any]]:
                 "remaining_fraction": _num(raw.get("remainingFraction")),
                 "description": str(raw.get("description") or "").strip(),
             }
-            if bucket["remaining_fraction"] is None:
-                continue
+            frac = bucket["remaining_fraction"]
+            if isinstance(raw.get("remainingFraction"), bool) or frac is None or not math.isfinite(frac) or not 0 <= frac <= 1:
+                bucket.pop("remaining_fraction")
+            amount = _num(raw.get("remainingAmount"))
+            if not isinstance(raw.get("remainingAmount"), bool) and amount is not None and math.isfinite(amount) and amount >= 0:
+                bucket["remaining_amount"] = amount
+            if isinstance(raw.get("disabled"), bool):
+                bucket["disabled"] = raw["disabled"]
+            # Unmapped/partial buckets are still useful for display, never gates.
             buckets_out.append(bucket)
         if not buckets_out:
             continue
@@ -980,8 +1022,8 @@ def fetch_usage_sync(access_token: str, *, account_key: str = "") -> dict:
         usage["antigravity"]["quota_error"] = _safe_quota_error(exc)
     if groups:
         usage["antigravity"]["quota_groups"] = groups
-        # Fill standard 5h/7d windows (min remaining across groups) so
-        # generic UI / disable-evaluation paths keep working.
+        # Display-only worst-window summary. QuotaSummaryGroup has no model
+        # membership: this aggregate must never become an account routing gate.
         fh_frac, fh_reset = _worst_window(groups, "5h")
         wk_frac, wk_reset = _worst_window(groups, "weekly")
         if fh_frac is not None:

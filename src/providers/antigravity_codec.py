@@ -248,7 +248,47 @@ def _file_part_from_content_item(item: dict, typ: str) -> dict[str, Any] | None:
     return None
 
 
+def _tool_output_parts(output: Any) -> tuple[dict, list[dict]]:
+    """Extract only protocol content parts, never image-shaped tool JSON data."""
+    from ..openai.transform.guard import GuardError
+    from . import remote_image
+
+    images = []
+    if isinstance(output, list) and any(
+        isinstance(part, dict) and part.get("type") in {"input_image", "image_url", "input_file", "file"}
+        for part in output
+    ):
+        texts = []
+        for part in output:
+            if isinstance(part, str):
+                texts.append(part)
+            elif isinstance(part, dict) and part.get("type") in {"input_text", "output_text", "text"}:
+                texts.append(str(part.get("text") or ""))
+            elif isinstance(part, dict) and part.get("type") in {"input_image", "image_url"}:
+                image = _part_from_content_item(part)
+                inline = (image or {}).get("inlineData")
+                if not inline:
+                    raise GuardError(400, "invalid_request_error", "Antigravity tool images require image data or a supported HTTPS URL", scope="candidate")
+                remote_image.validate_inline_tool_image(inline)
+                images.append(image)
+            else:
+                raise GuardError(400, "invalid_request_error", "Antigravity tool results support text and images, not opaque files or unknown content parts", scope="candidate")
+        return {"result": "\n".join(texts)}, images
+    if isinstance(output, str):
+        try:
+            response = json.loads(output)
+        except json.JSONDecodeError:
+            response = {"result": output}
+    else:
+        response = output
+    return response if isinstance(response, dict) else {"result": response}, images
+
+
 def _thinking_config(payload: dict) -> dict[str, Any] | None:
+    from ..antigravity import argon
+    model = str(payload.get("model") or "")
+    if argon.is_argon(model):
+        return argon.thinking_config(model, payload)
     reasoning = payload.get("reasoning")
     if not isinstance(reasoning, dict):
         return None
@@ -509,16 +549,7 @@ def responses_to_gemini(payload: dict) -> dict[str, Any]:
         if typ == "function_call_output":
             call_id = str(item.get("call_id") or "")
             name = call_names.get(call_id) or str(item.get("name") or "tool")
-            output = item.get("output")
-            if isinstance(output, str):
-                try:
-                    response = json.loads(output)
-                except json.JSONDecodeError:
-                    response = {"result": output}
-            elif isinstance(output, dict):
-                response = output
-            else:
-                response = {"result": output}
+            response, image_parts = _tool_output_parts(item.get("output"))
             function_response: dict[str, Any] = {
                 "name": name,
                 "response": response if isinstance(response, dict) else {"result": response},
@@ -527,7 +558,7 @@ def responses_to_gemini(payload: dict) -> dict[str, Any]:
                 function_response["id"] = call_id
             contents.append({
                 "role": "user",
-                "parts": [{"functionResponse": function_response}],
+                "parts": [{"functionResponse": function_response}, *image_parts],
             })
             continue
 

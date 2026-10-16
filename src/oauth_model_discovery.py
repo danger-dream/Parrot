@@ -460,7 +460,15 @@ def discover_antigravity(account: dict, *, timeout: float = _TIMEOUT, proxy_chan
     image_model_ids = set(antigravity_provider.image_models())
     merged: dict[str, dict[str, Any]] = {}
     last_error: Exception | None = None
-    for base in (antigravity_provider.api_base_url(), antigravity_provider.daily_api_base_url()):
+    from .antigravity.quota import normalize_quota_info
+    active_base = antigravity_provider.effective_request_base_url(account)
+    endpoints = [("prod", antigravity_provider.api_base_url().rstrip("/")),
+                 ("daily", antigravity_provider.daily_api_base_url().rstrip("/"))]
+    if active_base not in {base for _, base in endpoints}:
+        endpoints = [("custom", active_base)]
+    active_models: set[str] | None = None
+    active_error: Exception | None = None
+    for endpoint, base in endpoints:
         try:
             payload = _json_object(antigravity_provider.request_sync(
                 "POST", base.rstrip("/") + "/v1internal:fetchAvailableModels",
@@ -472,8 +480,10 @@ def discover_antigravity(account: dict, *, timeout: float = _TIMEOUT, proxy_chan
                 raise ValueError("Antigravity model catalog has invalid models schema")
             records = []
             for model_id, value in raw.items():
-                record = dict(value) if isinstance(value, dict) else {}
-                record.setdefault("id", model_id)
+                if not isinstance(model_id, str) or not model_id.strip() or not isinstance(value, dict):
+                    raise ValueError("Antigravity model catalog has incomplete model records")
+                record = dict(value)
+                record["id"] = model_id.strip()
                 records.append(record)
             models = _unique([
                 item["id"] for item in records
@@ -486,18 +496,39 @@ def discover_antigravity(account: dict, *, timeout: float = _TIMEOUT, proxy_chan
                 model_id = item["id"]
                 if model_id not in wanted:
                     continue
-                # Daily is queried second and refreshes duplicate metadata while
+                # Keep every source observation, but only the active endpoint
+                # supplies effective metadata for shared models. Replacing the
+                # whole record avoids borrowing fields absent from that endpoint;
                 # dict assignment preserves the model's first-seen position.
-                merged[model_id] = _record(model_id, item, {
-                    "name": ("displayName", "name"), "description": ("description",), "tagline": ("tag", "tagline"),
-                    "contextWindow": ("maxTokens", "contextWindow"), "maxOutputTokens": ("maxOutputTokens",),
-                    "reasoning": ("supportsThinking",), "supportsThinking": ("supportsThinking",), "supportsImages": ("supportsImages",),
-                    "inputModalities": ("inputModalities",), "outputModalities": ("outputModalities",),
-                })
+                sources = list(merged.get(model_id, {}).get("antigravitySources", []))
+                source = {"endpoint": endpoint, "baseUrl": base.rstrip("/"),
+                          "observedAt": int(time.time() * 1000)}
+                quota = normalize_quota_info(item.get("quotaInfo"))
+                if quota:
+                    source["quotaInfo"] = quota
+                sources.append(source)
+                if model_id not in merged or base == active_base:
+                    merged[model_id] = _record(model_id, item, {
+                        "name": ("displayName", "name"), "description": ("description",), "tagline": ("tag", "tagline"),
+                        "contextWindow": ("maxTokens", "contextWindow"), "maxOutputTokens": ("maxOutputTokens",),
+                        "reasoning": ("supportsThinking",), "supportsThinking": ("supportsThinking",), "supportsImages": ("supportsImages",),
+                        "inputModalities": ("inputModalities",), "outputModalities": ("outputModalities",),
+                    })
+                merged[model_id]["antigravitySources"] = sources
+            if base == active_base:
+                active_models = wanted
         except Exception as exc:
             last_error = exc
-    if merged:
-        return DiscoveryResult(list(merged), _catalog(list(merged.values())), "upstream:antigravity")
+            if base == active_base:
+                active_error = exc
+    if merged and active_models is not None:
+        for model_id, record in merged.items():
+            record["antigravityAvailability"] = "generation" if model_id in active_models else "discovery_only"
+        catalog = _catalog(list(merged.values()))
+        catalog["antigravityGenerationBaseUrl"] = active_base
+        return DiscoveryResult([model for model in merged if model in active_models], catalog, "upstream:antigravity")
+    if active_error is not None:
+        raise active_error
     raise last_error or ValueError("Antigravity model discovery failed")
 
 

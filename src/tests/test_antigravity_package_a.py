@@ -278,11 +278,13 @@ async def test_run_failover_antigravity_medium_cooldown_and_quota_disable(m, mon
     failover = m["failover"]; _patch_failover_runtime(monkeypatch, failover)
     first, second = FailoverChannel("ag:first", account_key="acct"), FailoverChannel("ag:second")
     route = m["scheduler"].ScheduleResult([(first, "m"), (second, "m")], None, False)
-    effects, disabled, calls = [], [], []
+    effects, disabled, calls, cooled = [], [], [], []
     monkeypatch.setattr(failover.finalize_policy, "apply_error_health_effects",
                         lambda *a, **kw: effects.append(kw))
     monkeypatch.setattr(failover.oauth_manager, "set_disabled_by_quota",
-                        lambda account, reset: disabled.append((account, reset)))
+                        lambda account, reset, **kwargs: disabled.append((account, reset)))
+    monkeypatch.setattr(failover.cooldown, "record_error",
+                        lambda *args, **kw: cooled.append((args, kw)))
     sequence = [
         AttemptResult(outcome="http_error", http_status=429, error_detail=_google("30s"),
                       full_response_text=_google("30s"), cooldown_until=123456),
@@ -293,10 +295,12 @@ async def test_run_failover_antigravity_medium_cooldown_and_quota_disable(m, mon
     response = await failover.run_failover(route, {"model": "m"}, "r2", "k", "ip", False,
                                            __import__("time").time(), ingress_protocol="responses")
     assert response.status_code == 200 and calls == ["ag:first", "ag:second"]
-    assert effects[0]["cooldown_until"] == 123456 and disabled == []
+    assert not effects and disabled == []
+    assert cooled[0][0][:2] == ("ag:first", "m")
+    assert cooled[0][1]["cooldown_until"] > int(__import__("time").time() * 1000)
 
     quota_route = m["scheduler"].ScheduleResult([(first, "m"), (second, "m")], None, False)
-    quota = _google("300s", "QUOTA_EXHAUSTED")
+    quota = _google("300s", "INSUFFICIENT_G1_CREDITS_BALANCE")
     sequence[:] = [AttemptResult(outcome="http_error", http_status=429, error_detail=quota, full_response_text=quota),
                    AttemptResult(outcome="success", success=True, http_status=200, response=JSONResponse({"ok": True}))]
     response = await failover.run_failover(quota_route, {"model": "m"}, "r3", "k", "ip", False,

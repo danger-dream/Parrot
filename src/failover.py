@@ -1156,7 +1156,7 @@ def _structured_attempt_error(
     ordinal: int,
     channel: Optional[Channel] = None,
 ) -> dict:
-    quota = bounded_account_quota_error(result)
+    quota = bounded_account_quota_error(result, channel)
     status = int(result.http_status) if isinstance(result.http_status, int) else None
     detail = str(result.error_detail or "")
     code = str(result.error_code or "").strip() or None
@@ -1510,9 +1510,9 @@ def _attach_retry_after_from_response(
         delay = google.get("retry_after")
         if result.retry_after_seconds is None and isinstance(delay, (int, float)):
             result.retry_after_seconds = parse_retry_after_seconds(delay)
-            # Short delays are consumed by same-owner retry and must not park the
-            # model. Medium delays become an exact non-blocking model cooldown.
-            if 3 <= float(delay) < 300:
+            # Short delays retain bounded same-owner retry; long waits still
+            # describe this request's model, not the whole account.
+            if 3 <= float(delay) <= 45 * 24 * 3600:
                 result.cooldown_until = int((time.time() + float(delay)) * 1000)
     return result
 
@@ -2294,6 +2294,13 @@ async def run_failover(
             slot_reserved = True
 
         ch, resolved_model = pending[idx]
+        from .antigravity import argon
+        argon_tier_selection = (
+            getattr(ch, "provider", "") == "antigravity"
+            and body.get("model") == argon.BASE and resolved_model in argon.VARIANTS
+            and client_visible_model == argon.BASE
+        )
+        attempt_visible_model = resolved_model if argon_tier_selection else client_visible_model
         attempt_order += 1
         last_ch_key, last_ch_type, last_model = ch.key, ch.type, resolved_model
         last_ch_protocol = getattr(ch, "protocol", "anthropic")
@@ -2336,7 +2343,7 @@ async def run_failover(
                     request_id, attempt_order, ch.key, ch.type, resolved_model,
                     time.time(), proxy_name=_attempt_proxy,
                     upstream_protocol=getattr(ch, "protocol", "anthropic"),
-                    client_visible_model=client_visible_model,
+                    client_visible_model=attempt_visible_model,
                 )
 
             # The assignment runs in the owned task so cancellation cannot lose the
@@ -2351,6 +2358,10 @@ async def run_failover(
             attempt_body = _attempt_body_for_channel(
                 body, ch.key, bound_channel_key, portable_body,
             )
+            if argon_tier_selection:
+                # Keep the trusted scheduling model for AG's late permission
+                # checks. Wire/response/billing still use the resolved tier.
+                attempt_body = {**attempt_body, "_client_visible_model": resolved_model}
             attempt_body["_codex_turn_serialization_required"] = True
             attempt_handed_off = True
             if use_responses_ws:
@@ -2378,7 +2389,7 @@ async def run_failover(
             result = _request_invalid_result_if_needed(result, ch)
             pending_stream_result = result
             last_result = result
-            quota_exhaustion = bounded_account_quota_error(result)
+            quota_exhaustion = bounded_account_quota_error(result, ch)
             if not result.success and not result.stream_started:
                 structured_attempts.append(
                     _structured_attempt_error(result, attempt_order, ch),
@@ -2512,30 +2523,6 @@ async def run_failover(
             if recovery_code:
                 # An unresolved state anchor cannot be retried on another account.
                 result.outcome = "request_invalid"
-
-        # Antigravity's explicit quota reasons (or RetryInfo >=5 minutes) are
-        # account-wide, not a model-local throttle. Advance the existing quota
-        # observation generation before moving to another candidate so recovery
-        # cannot race a newer exhaustion observation.
-        if (
-            str(getattr(ch, "provider", "")) == "antigravity"
-            and result.http_status == 429
-        ):
-            google_quota = parse_antigravity_429(
-                result.full_response_text or result.error_detail
-            )
-            if google_quota.get("quota_exhausted"):
-                account_key = getattr(ch, "account_key", None)
-                if account_key:
-                    try:
-                        with oauth_manager.account_generation_guard(getattr(ch, "state_key", None)) as current:
-                            if current:
-                                oauth_manager.set_disabled_by_quota(account_key, None)
-                    except Exception as exc:
-                        print(f"[failover] Antigravity quota disable failed for {account_key}: {exc}")
-                retry_count += 1
-                idx += 1
-                continue
 
         from .openai import anthropic_reasoning_replay
         if (
@@ -2765,6 +2752,21 @@ async def run_failover(
                     f"{transient_retry_limit}) after {delay:.2f}s"
                 )
                 continue
+
+        # AG terminal 429s share one exact-model policy with images. This runs
+        # after the existing short retry budget and only before stream commit.
+        if str(getattr(ch, "provider", "")) == "antigravity" and result.http_status == 429:
+            from .antigravity.quota import apply_request_429
+            apply_request_429(
+                channel_state.effect_key(ch), resolved_model,
+                result.full_response_text or result.error_detail,
+                account_key=ch.account_key,
+                expected_state_key=getattr(ch, "state_key", None),
+                retry_after=result.retry_after_seconds,
+            )
+            retry_count += 1
+            idx += 1
+            continue
 
         # Explicit quota/entitlement/rate errors use bounded existing gates,
         # not the generic failure ladder or an account health penalty.
