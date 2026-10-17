@@ -17,6 +17,8 @@ class OAuthAccountOrchestrationControlMixin:
     def account_authentication_failed(account: dict) -> bool:
         """Only explicit authentication failures, not expiry/quota/network errors."""
         return account.get("disabled_reason") == "auth_error" or (
+            account.get("provider") == "workbuddy" and account.get("workbuddy_relogin_required") is True
+        ) or (
             account.get("provider") == "zhipu" and account.get("credential_mode") == "oauth"
             and account.get("management_status") == "relogin_required"
         )

@@ -339,7 +339,11 @@ class _Handler(BaseHTTPRequestHandler):
             )
         except CursorError as exc:
             self.runtime.finish_session(account_key, session_id, cancel=True, owner=owner)
-            self._json(exc.status, exc.to_openai_error())
+            observation = getattr(exc, "oauth_refresh_observation", None)
+            # Private loopback metadata: the rejected H2 session may predate
+            # this HTTP turn or the client's latest token update.
+            headers = {"X-Parrot-OAuth-Observation": json.dumps(observation)} if observation else None
+            self._json(exc.status, exc.to_openai_error(), headers=headers)
             return
         except (ValueError, KeyError, TypeError) as exc:
             self.runtime.finish_session(account_key, session_id, cancel=True, owner=owner)

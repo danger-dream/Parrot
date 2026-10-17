@@ -38,7 +38,8 @@ def refresh_due(account: dict, account_key: str, threshold: int = 300) -> bool:
     state = _refresh_states.get(account_key)
     if state and state.fingerprint == credential_fingerprint(account):
         if state.candidate_expired:
-            return False
+            # Retry only the local terminal-state write if storage was unavailable.
+            return account.get("enabled", True) and account.get("disabled_reason") not in {"user", "auth_error"}
         if state.pending is not None:
             return True
         if max(state.retry_at, state.unknown_valid_until) > time.monotonic():
@@ -50,7 +51,24 @@ def refresh_due(account: dict, account_key: str, threshold: int = 300) -> bool:
         return True
 
 
-def refresh_locked(account: dict, account_key: str, force: bool) -> str:
+def _candidate_lost(account, account_key, state):
+    from ... import oauth_manager, oauth_refresh_failure
+    from ...notifications import reporting
+    state.pending = None
+    state.candidate_expired = True
+    error = common.WorkBuddyError("refresh", kind="save_candidate_expired_relogin")
+    error.oauth_refresh_observation = oauth_manager.refresh_observation(account)
+    observation = reporting.observation(account_key)
+    display, effect = oauth_refresh_failure.apply(account_key, error, provider="workbuddy")
+    if effect is not None and not account.get("workbuddy_relogin_required"):
+        try:
+            reporting.refresh_failed(account_key, display, effect, source="credential_save", observation=observation)
+        except Exception:
+            pass  # Notification failure cannot turn terminal credential loss into success.
+    raise error
+
+
+def refresh_locked(account: dict, account_key: str, force: bool, *, reuse_current: bool = False) -> str:
     from ... import config, oauth_manager
     common.require_refresh()
     fingerprint = credential_fingerprint(account)
@@ -60,10 +78,10 @@ def refresh_locked(account: dict, account_key: str, force: bool) -> str:
         state = _RefreshState(fingerprint)
         _refresh_states[account_key] = state
     now = time.monotonic()
-    if state.candidate_expired or (state.pending is not None and state.pending_until <= now):
-        state.pending = None
-        state.candidate_expired = True
-        raise common.WorkBuddyError("refresh", kind="save_candidate_expired_relogin")
+    if account.get("workbuddy_relogin_required") or state.candidate_expired or (state.pending is not None and state.pending_until <= now):
+        _candidate_lost(account, account_key, state)
+    if state.pending is None and reuse_current:
+        return account["access_token"]
     if state.pending is None and not force:
         if state.unknown_valid_until > now:
             return account["access_token"]
@@ -88,7 +106,7 @@ def refresh_locked(account: dict, account_key: str, force: bool) -> str:
         state.pending, state.pending_until = fields, now + 600
     if state.pending_until <= time.monotonic():
         # Do not reuse the pre-rotation RT after losing the recoverable candidate.
-        raise common.WorkBuddyError("refresh", kind="save_candidate_expired_relogin")
+        _candidate_lost(account, account_key, state)
     fields = state.pending
     try:
         with config.serialized_updates():

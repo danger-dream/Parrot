@@ -357,8 +357,15 @@ class CursorClient:
             # protocol's explicit Max Mode bit for the same request.
             max_mode=bool(self.max_mode or long_ctx),
         )
+        access_token = self.access_token
+        observation = None
+        if self.account_key:
+            from .. import oauth_manager
+            account = oauth_manager.get_account(self.account_key)
+            if account:
+                observation = oauth_manager.refresh_observation(account, access_token=access_token)
         session = self._session_factory(
-            access_token=self.access_token,
+            access_token=access_token,
             request_bytes=request_bytes,
             blob_store=state.blob_store,
             mcp_tools=mcp_tools,
@@ -371,6 +378,7 @@ class CursorClient:
             channel_key=self.channel_key,
             model=model_id,
         )
+        session.oauth_refresh_observation = observation
         with self._conversation_lock:
             cancelled = state.cancelled
             if not cancelled:
@@ -400,6 +408,8 @@ class CursorClient:
         if not event.error:
             return False, attempt, auth_retried
         error = classify_cursor_failure(event.error, http_status=event.http_status)
+        if error.status in (401, 403):
+            error.oauth_refresh_observation = getattr(state.live, "oauth_refresh_observation", None)
         if isinstance(error, CursorAuthError) and self._refresh_token and not auth_retried and not emitted:
             self._refresh_if_needed(force=True)
             if not resumed:

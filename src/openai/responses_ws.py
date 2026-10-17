@@ -1429,10 +1429,9 @@ async def _run_ws_failover(
             notification_observation = reporting.observation(ak)
             try:
                 expected = getattr(ch, "state_key", None)
-                if expected is None:
-                    await oauth_manager.force_refresh(ak)
-                else:
-                    await oauth_manager.force_refresh(ak, expected_state_key=expected)
+                observed = (result.translator_ctx or {}).get("oauth_refresh")
+                await oauth_manager.force_refresh(ak, **({"expected_state_key": expected} if expected else {}),
+                                                  **({"observation": observed} if observed else {}))
                 with oauth_manager.account_generation_guard(expected) as current:
                     if not current:
                         raise ValueError("OAuth account generation was deleted")
@@ -1443,7 +1442,8 @@ async def _run_ws_failover(
                 print(f"[responses_ws] OAuth refresh failed for {ch.key}: {exc}")
                 from .. import oauth_refresh_failure
                 refresh_error, effect = oauth_refresh_failure.apply(
-                    ak, exc, expected_state_key=getattr(ch, "state_key", None), provider=getattr(ch, "provider", ""))
+                    ak, exc, expected_state_key=getattr(ch, "state_key", None), provider=getattr(ch, "provider", ""),
+                    observation=(result.translator_ctx or {}).get("oauth_refresh"))
                 if effect is not None:
                     reporting.refresh_failed(ak, refresh_error, effect, source="responses_ws", observation=notification_observation)
 
@@ -2428,6 +2428,8 @@ async def _try_ws_channel(
                 upstream_protocol=ch_proto,
             )
         finally:
+            if last_error is not None:
+                last_error.translator_ctx = {**(upstream_req.translator_ctx or {}), **(last_error.translator_ctx or {})}
             active_turn_body = relay_state.get("turn_body")
             if active_turn_body is not None:
                 release_request_turn_serialization(active_turn_body)
@@ -2740,6 +2742,7 @@ async def _try_sse_channel(
         http_body["stream"] = True
         http_body = failover_runtime._candidate_budget_body(ch, resolved_model, http_body)
         upstream_req = await ch.build_upstream_request(http_body, resolved_model, ingress_protocol="responses")
+        oauth_manager.observe_request_credentials(ch, upstream_req)
         failover_runtime._validate_wire_payload_budget(
             ch,
             resolved_model,
@@ -2844,6 +2847,7 @@ async def _try_sse_channel(
             error_code=error.error_code,
             http_status=error.http_status,
             openai_oauth_html_403=error.openai_oauth_html_403,
+            translator_ctx=upstream_req.translator_ctx,
             retry_after_seconds=error.retry_after_seconds,
             round_id=error.round_id,
             connect_ms=error.connect_ms,
@@ -2985,6 +2989,7 @@ async def _try_sse_channel(
             outcome=outcome,
             error_detail=f"HTTP {status}: {detail}"[:2000],
             http_status=status,
+            translator_ctx=upstream_req.translator_ctx,
             openai_oauth_html_403=(
                 isinstance(ch, OpenAIOAuthChannel)
                 and status == 403
@@ -4391,6 +4396,7 @@ async def _build_ws_upstream_request(
             direct_installation_header=False,
             create_client_metadata=False,
         )
+        oauth_manager.observe_request_credentials(ch, req, headers=headers)
         return UpstreamRequest(
             url=ws_url,
             headers=headers,
@@ -4402,9 +4408,11 @@ async def _build_ws_upstream_request(
     # Third-party OpenAI Responses API channel. Only same-protocol channels are
     # valid here; chat upstream cannot speak Responses WS.
     req = await ch.build_upstream_request(body, resolved_model, ingress_protocol="responses")
+    headers = _merge_ws_headers(req.headers, websocket)
+    oauth_manager.observe_request_credentials(ch, req, headers=headers)
     return UpstreamRequest(
         url=_http_url_to_ws(req.url),
-        headers=_merge_ws_headers(req.headers, websocket),
+        headers=headers,
         body=b"",
         dynamic_tool_map=req.dynamic_tool_map,
         translator_ctx=req.translator_ctx,

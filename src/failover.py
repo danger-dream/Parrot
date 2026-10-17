@@ -2597,10 +2597,9 @@ async def run_failover(
             notification_observation = reporting.observation(ak)
             try:
                 expected = getattr(ch, "state_key", None)
-                if expected is None:
-                    await oauth_manager.force_refresh(ak)
-                else:
-                    await oauth_manager.force_refresh(ak, expected_state_key=expected)
+                observed = (result.translator_ctx or {}).get("oauth_refresh")
+                await oauth_manager.force_refresh(ak, **({"expected_state_key": expected} if expected else {}),
+                                                  **({"observation": observed} if observed else {}))
                 with oauth_manager.account_generation_guard(expected) as current:
                     if not current:
                         raise ValueError("OAuth account generation was deleted")
@@ -2616,7 +2615,8 @@ async def run_failover(
                         continue
                 from . import oauth_refresh_failure
                 refresh_error, effect = oauth_refresh_failure.apply(
-                    ak, exc, expected_state_key=getattr(ch, "state_key", None), provider=getattr(ch, "provider", ""))
+                    ak, exc, expected_state_key=getattr(ch, "state_key", None), provider=getattr(ch, "provider", ""),
+                    observation=(result.translator_ctx or {}).get("oauth_refresh"))
                 if effect is not None:
                     reporting.refresh_failed(ak, refresh_error, effect, source="request", observation=notification_observation)
                 # fallthrough 到普通失败处理
@@ -3257,6 +3257,7 @@ async def _build_oauth_responses_ws_upstream_request(
     _validate_wire_payload_budget(
         ch, resolved_model, body, frame, req.dispatch_metadata,
     )
+    oauth_manager.observe_request_credentials(ch, req, headers=headers)
     return (
         ws_url, headers, frame, req.translator_ctx, identity_state,
         req.dispatch_metadata,
@@ -3575,6 +3576,8 @@ async def _try_openai_oauth_responses_ws_channel(
                 proxy_name=proxy_name,
             )
         finally:
+            if last_error is not None:
+                last_error.translator_ctx = {**(translator_ctx or {}), **(last_error.translator_ctx or {})}
             if last_error is not None and not timing.terminal:
                 await _finalize_ws_attempt_result(
                     last_error,
@@ -4469,6 +4472,7 @@ async def _try_channel(
         upstream_req = await ch.build_upstream_request(
             body, resolved_model, ingress_protocol=ingress_protocol,
         )
+        oauth_manager.observe_request_credentials(ch, upstream_req)
         _validate_wire_payload_budget(
             ch,
             resolved_model,
@@ -4521,8 +4525,10 @@ async def _try_channel(
         # Body readers/parsers may return a new error without translator_ctx.
         # Preserve the raw Zhipu response boundary on every transport/result
         # exit, including empty/malformed bodies and unexpected exceptions.
+        source_ctx = upstream_req.translator_ctx or {}
+        if source_ctx.get("oauth_refresh"):
+            result.translator_ctx = {**(result.translator_ctx or {}), "oauth_refresh": source_ctx["oauth_refresh"]}
         if getattr(ch, "provider", "") == "zhipu":
-            source_ctx = upstream_req.translator_ctx or {}
             result.translator_ctx = {
                 **source_ctx, **(result.translator_ctx or {}),
                 "zhipu_auth": source_ctx.get("zhipu_auth") or {},
@@ -4663,6 +4669,15 @@ async def _try_channel(
     _proxy_name_used = opened.proxy_name
     _proxy_bytes = opened.proxy_bytes
     _proxy_client = opened.proxy_client
+    if getattr(ch, "provider", "") == "cursor" and upstream_resp.status_code in (401, 403):
+        # Only our authenticated loopback bridge owns this metadata. Its Bearer
+        # header is NOT the Cursor H2 credential that actually failed.
+        try:
+            observation = json.loads(upstream_resp.headers.get("X-Parrot-OAuth-Observation", "null"))
+            if isinstance(observation, dict) and observation.get("state_key") and observation.get("access_fingerprint"):
+                upstream_req.translator_ctx = {**(upstream_req.translator_ctx or {}), "oauth_refresh": observation}
+        except (ValueError, TypeError):
+            pass
 
     try:
         # 1.5 响应头 snapshot 采样：成功/失败分支前都先记一次

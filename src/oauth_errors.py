@@ -152,6 +152,13 @@ def describe_oauth_error(
     technical = _technical_from_exception(exc)
 
     if isinstance(exc, OAuthRefreshStateError):
+        if exc.kind == "account_unavailable":
+            return OAuthDisplayError(
+                code="oauth_refresh_account_unavailable", title="账户已暂停",
+                reason="等待认证恢复期间账户已被停用；未发出新的刷新请求。",
+                action="请检查账户状态；认证失效需重新登录，手动停用不会被自动恢复。",
+                retryable=False, auth_error=False, provider=prov, operation=op, technical=technical,
+            )
         pending = exc.kind == "save_failed_retry_save"
         return OAuthDisplayError(
             code=f"oauth_refresh_{exc.kind}",
@@ -171,6 +178,9 @@ def describe_oauth_error(
             persistence = exc.kind in {"save_failed_retry_save", "save_candidate_expired_relogin"}
             title = "保护模式暂停执行" if protected else ("Token 保存未完成" if persistence else "WorkBuddy 请求失败")
             reason = "当前不会刷新 Token 或执行签到、领取。" if protected else "上游请求或凭据保存未完成；未将未知结果当作成功。"
+            if exc.kind == "save_candidate_expired_relogin":
+                title = "轮换凭据已无法恢复"
+                reason = "上游已返回轮换结果，但本地未能保存且可恢复候选已过期；不能再使用旧刷新凭据。并非上游返回 401 或确认吊销。"
             action = ("使用独立账户并解除保护后再执行。" if protected else
                       "请重新授权此账号。" if exc.kind == "save_candidate_expired_relogin" or exc.auth_error else
                       "稍后重试；已取得的轮换 Token 会优先重试保存，不重复刷新。" if persistence else

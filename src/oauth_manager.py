@@ -457,6 +457,40 @@ def _refresh_credential_fingerprint(account: dict) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def refresh_observation(account: dict, *, access_token: str | None = None) -> dict:
+    """Process-local witness of the credentials actually used; never raw secrets."""
+    token = account.get("access_token") if access_token is None else access_token
+    return {
+        "state_key": account_state_key(account),
+        "access_fingerprint": hashlib.sha256(str(token or "").encode()).hexdigest(),
+        "credential_fingerprint": (_refresh_credential_fingerprint(account)
+                                   if token == account.get("access_token") else None),
+    }
+
+
+def refresh_observation_matches(account: dict, observation: dict) -> bool:
+    if observation.get("credential_fingerprint"):
+        return _refresh_credential_fingerprint(account) == observation["credential_fingerprint"]
+    return hashlib.sha256(str(account.get("access_token") or "").encode()).hexdigest() == observation.get("access_fingerprint")
+
+
+def observe_request_credentials(channel, request, *, headers=None) -> None:
+    """Capture final wire authentication, not a channel's possibly stale snapshot."""
+    if getattr(channel, "type", None) != "oauth" or getattr(channel, "provider", "") in {"zhipu", "cursor"}:
+        return  # Zhipu PAT and Cursor's local bridge have their own credential boundary.
+    authorization = next((v for k, v in (request.headers if headers is None else headers).items() if k.lower() == "authorization"), "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        return
+    with account_generation_guard(getattr(channel, "state_key", None)) as current:
+        if not current:
+            raise ValueError("OAuth account generation was deleted")
+        account = get_account(channel.account_key)
+        if account:
+            request.translator_ctx = {**(request.translator_ctx or {}),
+                                      "oauth_refresh": refresh_observation(account, access_token=token)}
+
+
 def _has_pending_refresh(state_key: str) -> bool:
     with _refresh_lock_for_dict:
         return state_key in _pending_refreshes
@@ -940,12 +974,17 @@ def _do_refresh_mock(refresh_token: str) -> dict:
     }
 
 
-def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: str | None = None) -> str:
+def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: str | None = None, observation: dict | None = None) -> str:
     """同步刷新（持 threading.Lock，跨线程跨 loop 串行）。
 
     force=False 时进入锁后做一次"双重检查"：若另一并发刷新已完成且 token 仍有效则跳过实际请求。
-    force=True 时无视剩余时间，强制刷新。
+    force=True 默认保留显式强刷语义；携带 observation 的请求/后台恢复
+    只刷新仍匹配的旧凭据，已更新则复用（不使用时间窗口）。
     """
+    if observation is not None:
+        if expected_state_key is not None and expected_state_key != observation["state_key"]:
+            raise ValueError("OAuth refresh observation generation mismatch")
+        expected_state_key = observation["state_key"]
     # ⛔ 双实例重构期硬禁用刷新：副本与线上共享同一批 OAuth 账号，
     # 任一方刷新会轮换 access_token/refresh_token，击穿线上 token 导致小夕 401。
     # 三条刷新入口（proactive_refresh_loop / ensure_valid_token / force_refresh）
@@ -986,12 +1025,20 @@ def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: s
                 raise ValueError(f"unknown OAuth account: {account_key}")
             expected_state_key = account_state_key(acc)
 
+        if observation is not None and (not acc.get("enabled", True) or acc.get("disabled_reason") in {"user", "auth_error"}):
+            raise oauth_errors.OAuthRefreshStateError("account_unavailable")
+        superseded = observation is not None and not refresh_observation_matches(acc, observation)
+
         # WorkBuddy owns unknown-expiry backoff and an unsaved rotated candidate.
         # It must see pending persistence before returning an apparently healthy old AT.
         if provider_of(acc) == "zhipu":
             return zhipu_runtime.refresh_locked(copy.deepcopy(acc), account_key, force)
         if provider_of(acc) == "workbuddy":
-            return workbuddy_runtime.refresh_locked(copy.deepcopy(acc), account_key, force)
+            try:
+                return workbuddy_runtime.refresh_locked(copy.deepcopy(acc), account_key, force, reuse_current=superseded)
+            except Exception as exc:
+                exc.oauth_refresh_observation = refresh_observation(acc)
+                raise
 
         with _refresh_lock_for_dict:
             pending = _pending_refreshes.get(expected_state_key)
@@ -1011,7 +1058,10 @@ def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: s
                 with _refresh_lock_for_dict:
                     _pending_refreshes.pop(expected_state_key, None)
 
-        # 双重检查：force 路径不做（强制刷）
+        if superseded and acc.get("access_token"):
+            return acc["access_token"]
+
+        # Explicit force (without an observation) still rotates every time.
         if not force:
             if _token_is_fresh(acc):
                 return acc["access_token"]
@@ -1050,7 +1100,8 @@ def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: s
                 data = _do_refresh_http(
                     acc["refresh_token"], acc.get("scopes", ""), account_key=account_key,
                 )
-        except Exception:
+        except Exception as exc:
+            exc.oauth_refresh_observation = refresh_observation(acc)
             # A late failure of old credentials must not disable a fresh login.
             # Otherwise retain the original exception and provider classification.
             from . import channel_state
@@ -1227,8 +1278,11 @@ async def ensure_valid_token(account_key: str, *, expected_state_key: str | None
     return await asyncio.to_thread(_refresh_sync_locked, account_key, False, expected_state_key=expected_state_key)
 
 
-async def force_refresh(account_key: str, *, expected_state_key: str | None = None) -> str:
-    """无视剩余时间，强制刷一次（用于 401/403 重试前 / 管理员手动触发）。"""
+async def force_refresh(account_key: str, *, expected_state_key: str | None = None, observation: dict | None = None) -> str:
+    """Explicit force by default; an observed 401/background snapshot coalesces."""
+    if observation is not None:
+        return await asyncio.to_thread(_refresh_sync_locked, account_key, True,
+                                       expected_state_key=expected_state_key, observation=observation)
     if expected_state_key is None:
         return await asyncio.to_thread(_refresh_sync_locked, account_key, True)
     return await asyncio.to_thread(_refresh_sync_locked, account_key, True, expected_state_key=expected_state_key)
@@ -3900,10 +3954,14 @@ def _replace_exact_identity_in_config(
                     "last_model_sync", "last_model_sync_source", "last_model_sync_error", "last_model_sync_attempt"):
             if key in current:
                 replacement[key] = copy.deepcopy(current[key])
+    if provider == "workbuddy" and (authenticated_login or
+            _refresh_credential_fingerprint(current) != _refresh_credential_fingerprint(incoming)):
+        replacement.pop("workbuddy_relogin_required", None)
     zhipu_reauthenticated = authenticated_login and provider == "zhipu" and incoming.get("credential_mode") == "oauth"
     if zhipu_reauthenticated and replacement.get("management_status") in {"relogin_required", "model_key_rejected"}:
         replacement["management_status"] = "ready"
     if (current.get("disabled_reason") == "auth_error"
+            and not replacement.get("workbuddy_relogin_required")
             and (provider != "zhipu" or incoming.get("model_key") or zhipu_reauthenticated)):
         replacement["enabled"] = True
         replacement["disabled_reason"] = None
@@ -6856,9 +6914,11 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
         notification_observation = reporting.observation(ak)
         try:
             if provider == "workbuddy" and expired is None:
-                await ensure_valid_token(ak)
+                await asyncio.to_thread(_refresh_sync_locked, ak, False,
+                                        expected_state_key=expected_state_key, observation=refresh_observation(acc))
             else:
-                await force_refresh(ak)
+                await force_refresh(ak, expected_state_key=expected_state_key,
+                                    observation=refresh_observation(acc))
             out[email] = "refreshed"
             usage_flat: dict | None = None
             usage: dict | None = None

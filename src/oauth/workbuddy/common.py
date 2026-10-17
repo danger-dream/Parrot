@@ -25,7 +25,9 @@ class WorkBuddyError(RuntimeError):
         self.status_code = status
         self.code = code if isinstance(code, int) and not isinstance(code, bool) else None
         self.kind = kind
-        self.auth_error = status == 401 or self.code == 12153
+        # Locally losing a rotated credential also requires reauthorization;
+        # keep status/code unchanged so it is never presented as upstream 401.
+        self.auth_error = status == 401 or self.code == 12153 or kind == "save_candidate_expired_relogin"
         self.retryable = kind == "network" or status >= 500 or status == 429
         # Never interpolate msg, URLs, headers or transport exception text here.
         super().__init__(f"WorkBuddy {stage}: {kind} (HTTP {status}, code {self.code})")
