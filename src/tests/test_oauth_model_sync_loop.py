@@ -127,7 +127,7 @@ async def test_metadata_only_backfill_does_not_notify_or_repeat_when_fresh(monke
     sent = []
     monkeypatch.setattr(oauth_manager, "ensure_valid_token", token)
     monkeypatch.setattr(oauth_manager.oauth_model_discovery, "discover", discover)
-    monkeypatch.setattr(oauth_manager.notifier, "notify", sent.append)
+    capture(monkeypatch, lambda kind, text, record: sent.append(text))
 
     first = await oauth_manager.oauth_model_sync_once(trigger="background")
     assert len(first) == 1
@@ -185,9 +185,9 @@ async def test_background_notification_matrix_and_failure_isolated(monkeypatch, 
                 "had_success_baseline": True, "changed": True,
                 "added": ["c<script>"], "removed": ["b"]}
     monkeypatch.setattr(oauth_manager, "refresh_account_models", changed)
-    monkeypatch.setattr(oauth_manager.notifier, "notify", sent.append)
+    capture(monkeypatch, lambda kind, text, record: sent.append(text))
     await oauth_manager.oauth_model_sync_once(force=True, trigger="background")
-    assert len(sent) == 1 and "新增 1" in sent[0] and "删除 1" in sent[0]
+    assert len(sent) == 1 and "新增模型（1）" in sent[0] and "移除模型（1）" in sent[0]
     assert "A &lt; B" in sent[0] and "c&lt;script&gt;" in sent[0]
 
     sent.clear()
@@ -202,7 +202,7 @@ async def test_background_notification_matrix_and_failure_isolated(monkeypatch, 
     assert sent == []
 
     monkeypatch.setattr(oauth_manager, "refresh_account_models", changed)
-    monkeypatch.setattr(oauth_manager.notifier, "notify", lambda text: (_ for _ in ()).throw(RuntimeError("tg down")))
+    capture(monkeypatch, lambda *a: (_ for _ in ()).throw(RuntimeError("tg down")))
     out = await oauth_manager.oauth_model_sync_once(force=True, trigger="background")
     assert out[0]["action"] == "updated"
 
@@ -413,7 +413,7 @@ def test_foreground_timeout_does_not_cancel_and_uses_accurate_source(monkeypatch
     monkeypatch.setattr(oauth_menu.ui, "send", lambda *a, **k: {"result": {"message_id": 9}})
     def edit(*args, **kwargs):
         calls.append(args[2])
-        if "任务将在后台继续" in args[2]: finished.set()
+        if "模型目录：仍在后台进行" in args[2]: finished.set()
     monkeypatch.setattr(oauth_menu.ui, "edit", edit)
     result = oauth_menu._foreground_account_model_sync(
         1, "openai:openai1@x:ws1", provider="openai", label="user",
@@ -421,7 +421,7 @@ def test_foreground_timeout_does_not_cancel_and_uses_accurate_source(monkeypatch
     assert result["action"] == "started"
     assert finished.wait(1)
     assert not future.cancelled() and not future.done()
-    assert "任务将在后台继续" in calls[-1] and "继续使用上次账户模型" in calls[-1]
+    assert "模型目录：仍在后台进行" in calls[-1] and oauth_manager.get_account("openai:openai1@x:ws1")["models"] == ["lkg"]
 
 
 def test_foreground_success_and_failure_copy(monkeypatch, sync_config):
@@ -432,13 +432,13 @@ def test_foreground_success_and_failure_copy(monkeypatch, sync_config):
     monkeypatch.setattr(oauth_menu.ui, "send", lambda *a, **k: {"result": {"message_id": 8}})
     def edit(*args, **kwargs):
         edits.append(args[2])
-        if "已同步模型" in args[2] or "后台将静默重试" in args[2]: finished.set()
+        if "模型目录：已完成" in args[2] or "模型目录：未完成" in args[2]: finished.set()
     monkeypatch.setattr(oauth_menu.ui, "edit", edit)
     success = concurrent.futures.Future(); success.set_result({"action": "updated", "models": 2})
     monkeypatch.setattr(oauth_manager, "start_account_model_refresh", lambda key: success)
     oauth_menu._foreground_account_model_sync(1, "openai:openai1@x:ws1", provider="openai", label="u")
     assert finished.wait(1)
-    assert "已同步模型" in edits[-1]
+    assert "模型目录：已完成" in edits[-1]
     finished.clear()
     failure = concurrent.futures.Future(); failure.set_result({"action": "error", "error": "safe failure"})
     monkeypatch.setattr(oauth_manager, "start_account_model_refresh", lambda key: failure)
@@ -446,4 +446,18 @@ def test_foreground_success_and_failure_copy(monkeypatch, sync_config):
     assert finished.wait(1)
     # 默认模型回退已退役：账户没有已持久化的目录时，失败后必须如实说明
     # 「无可路由模型」，而不是宣称仍在用一个已不存在的内置默认模型。
-    assert "后台将静默重试，尚无账户目录，当前无可路由模型" in edits[-1]
+    assert "模型目录：未完成" in edits[-1]
+    assert oauth_manager.account_model_selection("openai:openai1@x:ws1")["effective_models"] == []
+
+from src.tests.notification_helpers import capture
+
+
+@pytest.fixture(autouse=True)
+def structured_operation_wire(monkeypatch):
+    from src.tests.notification_helpers import ui_operation_transport
+    ui_operation_transport(monkeypatch)
+    yield
+    import threading
+    for worker in threading.enumerate():
+        if worker.name == "oauth-model-sync-ui":
+            worker.join(25)

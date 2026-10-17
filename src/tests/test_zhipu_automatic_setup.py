@@ -49,7 +49,7 @@ def test_auto_setup_retries_unsent_but_only_reconciles_uncertain_create(callback
 def test_automatic_claim_notifies_once_and_cooldown_prevents_post(reset_env, monkeypatch):
     _, key, state, _ = reset_env
     notifications = []
-    monkeypatch.setattr(notifier, "notify", lambda text, **kw: notifications.append(text))
+    capture(monkeypatch, lambda kind, text, record: notifications.append(text))
     snapshot = actions.status(om.get_account(key), key)
     result = actions.auto_claim(key, copy.deepcopy(om.get_account(key)), snapshot)
     assert result["status"] == "succeeded"
@@ -114,3 +114,5 @@ def test_both_cards_or_paused_accounts_do_not_auto_claim(reset_env):
     account.update(credential_mode="api_key", enabled=True, disabled_reason=None)
     assert actions.auto_claim(key, account, {}) is None
     assert not state["calls"]
+
+from src.tests.notification_helpers import capture

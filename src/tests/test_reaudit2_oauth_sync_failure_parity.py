@@ -37,7 +37,7 @@ class UiTrace:
         parse_mode: str = "HTML",
     ) -> dict:
         self.events.append(("send", chat_id, text, reply_markup, parse_mode))
-        if "模型同步失败" in text:
+        if "模型目录：未完成" in text:
             self.async_finished.set()
         return {"ok": True, "result": {"message_id": 900}}
 
@@ -52,7 +52,7 @@ class UiTrace:
         self.events.append(
             ("edit", chat_id, message_id, text, reply_markup, parse_mode)
         )
-        if "模型同步失败" in text:
+        if "模型目录：未完成" in text:
             self.async_finished.set()
         return {"ok": True, "result": {"message_id": message_id}}
 
@@ -421,6 +421,17 @@ def test_returned_future_failure_still_uses_async_warning(
     assert trace.async_finished.wait(1)
     assert [event[0] for event in trace.events] == ["send", "edit"]
     assert "正在同步模型，请稍候" in trace.events[0][2]
-    assert "⚠️ 模型同步失败" in trace.events[1][3]
-    assert "injected asynchronous refresh failure" in trace.events[1][3]
-    assert "后台将静默重试" in trace.events[1][3]
+    assert "模型目录：未完成" in trace.events[1][3]
+    assert "injected asynchronous refresh failure" not in trace.events[1][3]  # raw errors may contain credentials
+    assert "账户已保存" in trace.events[1][3]
+
+
+@pytest.fixture(autouse=True)
+def structured_operation_wire(monkeypatch):
+    from src.tests.notification_helpers import ui_operation_transport
+    ui_operation_transport(monkeypatch)
+    yield
+    import threading
+    for worker in threading.enumerate():
+        if worker.name == "oauth-model-sync-ui":
+            worker.join(25)

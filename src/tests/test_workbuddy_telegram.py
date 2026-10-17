@@ -101,7 +101,7 @@ def test_list_and_detail_keep_baseline_order_stats_and_fixed_buttons(tg, monkeyp
     assert "按模型:" in detail and "glm-fixture" in detail and "缓存" in detail and "峰值" in detail and "累计金额" in detail
     assert "📦 资源包: 1 个" in detail and "🎁 签到: 今日未签到" in detail
     assert [[b["text"] for b in row] for row in kb["inline_keyboard"]][:6] == [
-        ["🔄 刷新 Token", "📊 刷新额度"], ["管理模型", "🚦 并发上限"],
+        ["📊 刷新额度"], ["管理模型", "🚦 并发上限"],
         ["🧹 清模型故障", "🔗 清亲和绑定"], ["⏸ 停用账户", "🗑 删除账户"],
         ["🎁 签到/领额度"], ["🏠 主菜单", "◀ 返回列表"]]
     manage = kb["inline_keyboard"][1][0]

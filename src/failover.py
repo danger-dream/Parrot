@@ -9,6 +9,10 @@
 
 from __future__ import annotations
 
+from src import notifications
+from src.notifications import reporting
+from src.notifications.events import Effect
+
 import asyncio
 import json
 import os
@@ -390,26 +394,8 @@ def _maybe_auto_disable_by_headers(account_key: str, email: str,
         print(f"[failover] auto-disable failed for {account_key}: {exc}")
         return
 
-    # 发通知
-    try:
-        ek = notifier.escape_html
-        windows = []
-        if hit_5h: windows.append("5h")
-        if hit_7d: windows.append("7d")
-        _acc = oauth_manager.get_account(account_key)
-        _plan = oauth_manager.claude_plan_label(_acc) if _acc else ""
-        _plan_tag = f" · {ek(_plan)}" if _plan else ""
-        notifier.notify_event(
-            "quota_disabled",
-            "⚠ <b>OAuth 配额已用尽（响应头实时触发）</b>\n"
-            f"账号: <code>{ek(email)}</code>\n"
-            f"{notifier.provider_tag('claude')}{_plan_tag}\n"
-            f"超限窗口: <code>{' / '.join(windows)}</code>\n"
-            f"恢复时间: <code>{ek(oauth_manager._to_bjt(latest) if latest else 'unknown')}</code>\n"
-            "达到该时间后由 quota_monitor 自动恢复。"
-        )
-    except Exception:
-        pass
+    reporting.quota(account_key, windows=[w for w, hit in (("5h", hit_5h), ("7d", hit_7d)) if hit],
+                    threshold=100, reset_at=latest, source="claude_response_headers")
 
 
 def _maybe_auto_disable_by_codex_snapshot(account_key: str, email: str,
@@ -498,21 +484,19 @@ def _maybe_auto_disable_by_codex_snapshot(account_key: str, email: str,
     if (disable_result or {}).get("state") != "disabled":
         return
 
-    try:
-        ek = notifier.escape_html
-        _acc = oauth_manager.get_account(account_key)
-        _label = oauth_manager.openai_plan_workspace_label(_acc) if _acc else "OpenAI"
-        notifier.notify_event(
-            "quota_disabled",
-            "⚠ <b>OAuth 配额已用尽（响应头实时触发）</b>\n"
-            f"账号: <code>{ek(email)}</code>\n"
-            f"{notifier.provider_custom_emoji_html('openai')} {ek(_label)}\n"
-            f"超限窗口: <code>{' / '.join(over_windows)}</code> "
-            f"(阈值 {threshold:.0f}%)\n"
-            f"恢复时间: <code>{ek(oauth_manager._to_bjt(latest_iso) if latest_iso else 'unknown')}</code>"
-        )
-    except Exception:
-        pass
+    def window_label(name):
+        minutes = snap.get(name + "_window_min")
+        prefix = "主窗口" if name == "primary" else "次窗口"
+        if type(minutes) not in (int, float) or minutes <= 0:
+            return prefix + "（时长未取得）"
+        if minutes == 43800:
+            return prefix + "（月额度 · 730小时）"
+        duration = f"{minutes / 1440:g}天" if minutes % 1440 == 0 else f"{minutes / 60:g}小时" if minutes % 60 == 0 else f"{minutes:g}分钟"
+        return prefix + "（" + duration + "额度）"
+    metrics = [{"metric_id": name, "display_name": window_label(name), "kind": "percent", "used": value, "unit": "%"}
+               for name, value in (("primary", primary_pct), ("secondary", secondary_pct)) if value is not None]
+    reporting.quota(account_key, windows=over_windows, metrics=metrics,
+                    threshold=threshold, reset_at=latest_iso, source="codex_response_snapshot")
 
 
 def forget_codex_snapshot(account_key_or_email: str) -> None:
@@ -646,16 +630,7 @@ def _maybe_save_native_responses_store(
         should_log = True
         try:
             ek = notifier.escape_html
-            should_log = notifier.throttled_notify_event_sync(
-                "openai_store_save_failed",
-                f"openai_store_save_failed:{api_key_name}",
-                f"❌ {notifier.provider_custom_emoji_html('openai')} <b>OpenAI Store 写入失败</b>（native Responses）\n"
-                f"API Key: <code>{ek(str(api_key_name or ''))}</code>\n"
-                f"模型: <code>{ek(model)}</code> · 渠道: <code>{ek(str(channel_key or '?'))}</code>\n"
-                f"resp_id: <code>{ek(response_id)}</code>\n"
-                f"原因: <code>{ek(str(exc))[:300]}</code>\n"
-                "⚠ 后续 fallback 使用该 previous_response_id 时可能无法展开历史。",
-            )
+            should_log = notifications.store_failed(model=model, api_key_name=api_key_name, response_id=response_id, error=exc, source="native_responses")
         except Exception:
             pass
         if should_log:
@@ -1391,7 +1366,7 @@ def _apply_zhipu_quota_cooldown(ch: Channel, resolved_model: str, result) -> boo
     # 时间。若按通用 429 走阶梯冷却，恢复循环会每 30 秒试探一次（实测半小时
     # 73 次），既无意义又刷日志。改用有限退避窗口停下无效重试；套餐放开后
     # 窗口到期即自动恢复调度，不做永久冻结。
-    plan_excluded = quota_reset_ms is None and \
+    plan_excluded = quota_reset_ms is None and quota_errors.is_zhipu_channel(ch) and \
         quota_errors.is_zhipu_plan_excluded_message(result.error_detail)
     if plan_excluded:
         quota_reset_ms = quota_errors.zhipu_plan_excluded_retry_ms()
@@ -1427,58 +1402,18 @@ def _apply_zhipu_quota_cooldown(ch: Channel, resolved_model: str, result) -> boo
 def _notify_zhipu_quota_cooldown(
     ch: Channel, model: str, reset_ms: int, *, plan_excluded: bool = False,
 ) -> None:
-    """Best-effort TG notice with a direct link to an API channel's detail page."""
-    channel_name = str(getattr(ch, "display_name", None) or getattr(ch, "key", "?"))
-    reset_text = quota_errors.format_bjt_ms(reset_ms)
-    ek = notifier.escape_html
-    reply_markup = None
-    if getattr(ch, "type", "") == "api":
-        try:
-            from .telegram import ui as telegram_ui
-            short = telegram_ui.register_code(channel_name)
-            reply_markup = telegram_ui.inline_kb([
-                [telegram_ui.btn("📡 查看渠道详情", f"ch:view:{short}:1")],
-            ])
-        except Exception:
-            reply_markup = None
+    """Stable channel/model incident; dynamic retry timestamps are facts, not keys."""
+    facts = {"model": model, "error_code": "1311" if plan_excluded else "1310"}
     if plan_excluded:
-        # 1311：套餐不含，不是额度问题，措辞与恢复预期都要说清楚。
-        reason_line = "原因: <b>当前订阅套餐尚未包含该模型</b>（上游 <code>1311</code>）"
-        recovery_line = f"下次尝试: <code>{ek(reset_text)}</code>（北京时间）"
-        impact_line = (
-            f"恢复前仅跳过 <code>{ek(channel_name)} / {ek(model)}</code>；"
-            "同模型的其他渠道仍可继续承接请求。"
-        )
-        tail = (
-            "<i>这不是渠道故障，也不是永久冻结。套餐开放后无需手工操作，"
-            "下次尝试成功即自动恢复调度。</i>"
-        )
-        event = "plan_excluded"
-        title = "🟡 <b>渠道模型不在当前套餐内</b>"
+        facts["retry_at"] = quota_errors.format_bjt_ms(reset_ms)
     else:
-        reason_line = "原因: <b>周/月使用额度已达上限</b>（上游 <code>1310</code>）"
-        recovery_line = f"自动恢复: <code>{ek(reset_text)}</code>（北京时间）"
-        impact_line = (
-            f"恢复前仅跳过 <code>{ek(channel_name)} / {ek(model)}</code>；"
-            "同模型的其他渠道仍可继续承接请求。"
-        )
-        tail = "<i>这不是手动禁用，也不是永久冻结。到达上游给出的重置时间后自动恢复调度。</i>"
-        event = "quota_cooldown"
-        title = "🟠 <b>渠道模型进入配额冷却</b>"
-    notifier.throttled_notify_event_sync(
-        event,
-        f"{event}:{getattr(ch, 'key', channel_name)}:{model}:{reset_ms}",
-        f"{title}\n"
-        f"渠道: <code>{ek(channel_name)}</code>\n"
-        f"模型: <code>{ek(model)}</code>\n"
-        f"{reason_line}\n"
-        f"{recovery_line}\n\n"
-        "<b>调度影响</b>\n"
-        f"{impact_line}\n\n"
-        f"{tail}",
-        cooldown_seconds=86_400,
-        reply_markup=reply_markup,
-    )
+        facts.pop("model")
+        facts.update(models=[model], windows=["周/月额度"], reset_at=quota_errors.format_bjt_ms(reset_ms))
+    confirmed = cooldown.is_blocked(channel_state.effect_key(ch), model)
+    notifications.channel_event(
+        "model.entitlement.blocked" if plan_excluded else "model.quota.blocked",
+        channel_state.effect_key(ch), facts, Effect("confirmed" if confirmed else "unknown", "model_paused"),
+        scope_ref=model, source="upstream_quota_error")
 
 
 def _err_type_from_outcome(outcome: str, http_status: Optional[int]) -> str:
@@ -2659,6 +2594,7 @@ async def run_failover(
         ):
             refreshed_once.add(ch.key)
             ak = getattr(ch, "account_key", None) or getattr(ch, "email", "")
+            notification_observation = reporting.observation(ak)
             try:
                 expected = getattr(ch, "state_key", None)
                 if expected is None:
@@ -2678,34 +2614,11 @@ async def run_failover(
                         retry_count += 1
                         idx += 1
                         continue
-                email = getattr(ch, "email", "?")
-                refresh_error = oauth_errors.describe_oauth_error(
-                    exc, provider=getattr(ch, "provider", ""), operation="refresh_token",
-                )
-                # A failed refresh is not proof of invalid credentials. Network,
-                # rate-limit, upstream and local persistence failures must not
-                # turn into a permanent auth_error disabled account.
-                disable_auth = refresh_error.auth_error
-                try:
-                    with oauth_manager.account_generation_guard(getattr(ch, "state_key", None)) as current:
-                        if disable_auth and current:
-                            oauth_manager.set_enabled(ak, False, reason="auth_error")
-                except Exception:
-                    pass
-                try:
-                    ek = notifier.escape_html
-                    prov = getattr(ch, "provider", "") or oauth_manager.provider_of(ak)
-                    relogin_hint = "重新登录" if prov == "workbuddy" else "重新登录或粘贴新 JSON"
-                    notifier.notify_event(
-                        "oauth_refresh_failed",
-                        "⚠ <b>OAuth Token 刷新失败</b>（请求路径触发）\n"
-                        f"账号: <code>{ek(email)}</code> · {notifier.provider_tag(prov)}\n"
-                        f"原因: <code>{ek(str(exc))}</code>\n"
-                        + (f"账号已被自动禁用 (auth_error)。请通过 TG Bot {relogin_hint}。"
-                           if disable_auth else "账号未自动禁用；请稍后重试。")
-                    )
-                except Exception:
-                    pass
+                from . import oauth_refresh_failure
+                refresh_error, effect = oauth_refresh_failure.apply(
+                    ak, exc, expected_state_key=getattr(ch, "state_key", None), provider=getattr(ch, "provider", ""))
+                if effect is not None:
+                    reporting.refresh_failed(ak, refresh_error, effect, source="request", observation=notification_observation)
                 # fallthrough 到普通失败处理
 
         # 自动透传的 1M entitlement 不足不是渠道故障：同渠道去掉 context-1m

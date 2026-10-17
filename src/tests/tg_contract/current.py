@@ -34,6 +34,12 @@ def load_current_jsonl(segment: str | Path) -> list[dict]:
     archived = load_jsonl(segment)
     overlay = segment.parents[2] / 'model-center-2026-09-13' / 'overrides' / segment.name
     overrides = load_jsonl(overlay) if overlay.exists() else []
+    notification_overlay = segment.parents[2] / 'notification-2026-10-17' / 'overrides' / segment.name
+    if notification_overlay.exists():
+        additions = load_jsonl(notification_overlay)
+        if [c['caseId'] for c in additions] != ['TG-SYS-04.001-notifications']:
+            raise AssertionError('unexpected notification overlay scope')
+        overrides = [c for c in overrides if c['caseId'] != 'TG-SYS-04.001-notifications'] + additions
     by_id = {case['caseId']: case for case in overrides}
     archived_ids = {case['caseId'] for case in archived}
     if len(by_id) != len(overrides):

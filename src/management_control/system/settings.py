@@ -38,22 +38,8 @@ _RETRY_ERRORS = (
 _RETRY_RECOVERY = (
     "oauthRefresh", "invalidEncryptedContent", "claudeContext1mFallback",
 )
-_NOTIFICATION_EVENTS = (
-    ("channelPermanent", "channel_permanent"),
-    ("channelRecovered", "channel_recovered"),
-    ("quotaDisabled", "quota_disabled"),
-    ("quotaResumed", "quota_resumed"),
-    ("openaiCreditsStarted", "openai_credits_started"),
-    ("quotaCooldown", "quota_cooldown"),
-    ("oauthRefreshed", "oauth_refreshed"),
-    ("oauthRefreshFailed", "oauth_refresh_failed"),
-    ("noChannels", "no_channels"),
-    ("openaiStoreSaveFailed", "openai_store_save_failed"),
-    ("modelDegraded", "model_degraded"),
-    ("statusAlert", "status_alert"),
-    ("appUpdate", "app_update"),
-    ("networkMonitor", "network_monitor"),
-)
+from src.notifications.catalog import settings_entries, CATALOG as _NOTIFICATION_CATALOG, enabled as _notification_enabled
+_NOTIFICATION_EVENTS = settings_entries()
 
 
 def _int(value: Any, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
@@ -243,7 +229,7 @@ class SettingsControl(DomainControl):
         events = self._mapping(raw.get("events"))
         values = {
             "enabled": bool(raw.get("enabled", True)),
-            "events": NotificationEvents(**{public: bool(events.get(stored, True)) for public, stored in _NOTIFICATION_EVENTS}),
+            "events": NotificationEvents(**{public: (_notification_enabled(stored, {"events": events}) if stored in _NOTIFICATION_CATALOG else bool(events.get(stored, True))) for public, stored in _NOTIFICATION_EVENTS}),
         }
         return _with_revision(NotificationSettings, **values)
 

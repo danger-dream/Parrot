@@ -13,6 +13,14 @@ from src.management_control.errors import ErrorField, ManagementError, Managemen
 class OAuthAccountOrchestrationControlMixin:
     """Transport-neutral account validation and post-save business effects."""
 
+    @staticmethod
+    def account_authentication_failed(account: dict) -> bool:
+        """Only explicit authentication failures, not expiry/quota/network errors."""
+        return account.get("disabled_reason") == "auth_error" or (
+            account.get("provider") == "zhipu" and account.get("credential_mode") == "oauth"
+            and account.get("management_status") == "relogin_required"
+        )
+
     def _ensure_legacy_identity_safe(self, entry: dict) -> None:
         """Preserve frozen XAI/Cursor email-fallback identity protection."""
         provider = self.backend.provider_of(entry)
@@ -88,6 +96,17 @@ class OAuthAccountOrchestrationControlMixin:
         email: str | None = None,
         tolerate_evaluation_error: bool = False,
     ) -> tuple[dict, dict | None]:
+        from src import oauth_manager
+        bound = oauth_manager._exact_operation_target.get()
+        if bound is not None:
+            with oauth_manager.account_generation_guard(bound[1]) as current:
+                if not current:
+                    raise ValueError("OAuth account generation was deleted")
+                oauth_manager.validate_usage_commit(account_id)
+                return self._commit_usage(account_id, usage, email=email, tolerate_evaluation_error=tolerate_evaluation_error)
+        return self._commit_usage(account_id, usage, email=email, tolerate_evaluation_error=tolerate_evaluation_error)
+
+    def _commit_usage(self, account_id, usage, *, email=None, tolerate_evaluation_error=False):
         preserved = self.backend.preserve_antigravity_summary(account_id, usage)
         self.backend.quota_save(
             account_id,

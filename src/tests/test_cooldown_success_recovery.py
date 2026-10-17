@@ -33,11 +33,7 @@ def isolated_cooldown(monkeypatch):
         "error_delete",
         lambda channel_key, model: deletes.append((channel_key, model)),
     )
-    monkeypatch.setattr(
-        cooldown.notifier,
-        "notify_event",
-        lambda event_key, text, **_kwargs: events.append((event_key, text)),
-    )
+    capture(monkeypatch, lambda kind, text, record: events.append((kind, text)))
     return entries, deletes, events
 
 
@@ -130,5 +126,7 @@ def test_explicit_recovery_can_clear_active_cooldown_and_notifies_once(
     assert entries == {}
     assert deletes == [key, key]
     assert len(events) == 1
-    assert events[0][0] == "channel_recovered"
-    assert "渠道恢复" in events[0][1]
+    assert events[0][0] == "channel.model.recovered"
+    assert "渠道模型限制已解除" in events[0][1]
+
+from src.tests.notification_helpers import capture

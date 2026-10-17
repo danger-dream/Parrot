@@ -479,20 +479,20 @@ def notify_reroute(obs: RerouteObservation) -> bool:
         return False
     if muted_until(obs.channel_key) is not None:
         return False
-    from . import notifier
-
-    alert_key = f"model_reroute:{obs.channel_key}:{obs.outbound_model}->{obs.actual_model}".lower()
+    from . import notifications
+    from .notifications.events import Effect
+    facts = {"requested_model": obs.requested_model or obs.outbound_model, "outbound_model": obs.outbound_model,
+             "api_key_name": obs.api_key_name, "request_id": obs.request_id}
     if obs.model_conflict:
-        values = sorted({model.casefold() for group in obs.model_conflict.values() for model in group})
-        signature = hashlib.sha256(json.dumps(values).encode()).hexdigest()[:16]
-        alert_key = f"model_conflict:{obs.channel_key}:{obs.outbound_model}:{signature}".lower()
-    return notifier.throttled_notify_event_sync(
-        NOTIFY_EVENT_KEY,
-        alert_key,
-        format_notification(obs),
-        cooldown_seconds=NOTIFY_COOLDOWN_SECONDS,
-        reply_markup=build_mute_buttons(obs.channel_key),
-    )
+        labels = {"http_header": "HTTP模型头", "event_headers": "事件模型头", "body_models": "正文模型"}
+        facts["signals"] = [{"source": labels.get(key, key), "models": list(values)} for key, values in obs.model_conflict.items()]
+        dimension = hashlib.sha256(json.dumps(sorted({model.casefold() for group in obs.model_conflict.values() for model in group})).encode()).hexdigest()[:16]
+    else:
+        facts["actual_model"] = obs.actual_model
+        dimension = obs.actual_model.casefold()
+    return notifications.channel_event("request.model.conflict" if obs.model_conflict else "request.model.changed", obs.channel_key,
+        facts, Effect("confirmed", "model_conflict" if obs.model_conflict else "model_changed"),
+        scope_ref=obs.outbound_model.casefold(), dimension=dimension, source="request_log")
 
 
 def on_log_observation(payload: Mapping[str, Any]) -> None:

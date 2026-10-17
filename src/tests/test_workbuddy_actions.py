@@ -24,7 +24,7 @@ def action_env(account, monkeypatch, tmp_path):
     state["store"].start()
     state["notifications"] = []
     # The notifier now returns whether enqueue succeeded; this fake accepts it.
-    monkeypatch.setattr(actions.notifier, "notify_event", lambda event, text, **k: state["notifications"].append((event, text)) or True)
+    capture(monkeypatch, lambda kind, text, record: state["notifications"].append((kind, text)) or True)
     monkeypatch.setattr(actions, "_cleanup_after", 0.0)
     actions._auto_attempts.clear()
     monkeypatch.setattr(state_db, "get_store", lambda: state["store"])
@@ -281,13 +281,13 @@ def test_auto_retry_bound_failure_notice_and_silent_success(action_env, monkeypa
         actions._next_auto_at.clear()
         actions.auto_checkin_once()
     assert len(queries) == 3 and state["calls"] == 0
-    assert len(state["notifications"]) == 1 and state["notifications"][0][0] == "workbuddy_action_failed"
+    assert len(state["notifications"]) == 3 and all(n[0] == "account.action.attention" for n in state["notifications"])
     assert "fixture-at" not in repr(state["notifications"]) and "fixture-rt" not in repr(state["notifications"])
     fixed += timedelta(days=1)
     monkeypatch.setattr(billing, "fetch_checkin_sync", lambda *a, **k: {"active": True, "today_checked_in": False})
     actions._next_auto_at.clear()
     assert actions.auto_checkin_once()[key]["status"] == "succeeded"
-    assert state["calls"] == 1 and len(state["notifications"]) == 1  # no daily success spam
+    assert state["calls"] == 1 and len(state["notifications"]) == 3  # no daily success spam
 
 
 def test_auto_quota_recovery_notice_and_scheduled_retention(action_env, monkeypatch):
@@ -308,7 +308,9 @@ def test_auto_quota_recovery_notice_and_scheduled_retention(action_env, monkeypa
     config.update(lambda c: c["oauthAccounts"][0].update(workbuddy_auto_checkin=True))
     om.set_disabled_by_quota(key, None)
     assert actions.auto_checkin_once()[key]["quota_action"] == "resumed"
-    assert state["notifications"][0][0] == "quota_resumed"
+    assert state["notifications"][0][0] == "account.quota.recovered"
     records = actions.history(key)
     assert {r["business_date"] for r in records} == {"old-unknown", "lifetime", "2026-09-07"}
     assert state["calls"] == 1
+
+from src.tests.notification_helpers import capture

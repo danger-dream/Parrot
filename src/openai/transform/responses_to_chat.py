@@ -14,6 +14,10 @@ MS-3 约束：
 
 from __future__ import annotations
 
+from src import notifications
+from src.notifications import reporting
+from src.notifications.events import Effect
+
 import copy
 import json
 import sqlite3
@@ -806,17 +810,7 @@ def translate_response(chat: dict, *, model: str,
             ek = _notifier.escape_html
             should_log = True
             try:
-                should_log = _notifier.throttled_notify_event_sync(
-                    "openai_store_save_failed",
-                    f"openai_store_save_failed:{api_key_name}",
-                    f"❌ {_notifier.provider_custom_emoji_html('openai')} <b>OpenAI Store 写入失败</b>（非流式）\n"
-                    f"API Key: <code>{ek(api_key_name)}</code>\n"
-                    f"模型: <code>{ek(model)}</code> · 渠道: <code>{ek(channel_key or '?')}</code>\n"
-                    f"resp_id: <code>{ek(resp_id)}</code>\n"
-                    f"原因: <code>{ek(str(exc))[:300]}</code>\n"
-                    "⚠ 下一次带该 previous_response_id 的请求会 404；"
-                    "请检查 openai.store.dbPath 配置、对应文件权限与磁盘空间。",
-                )
+                should_log = notifications.store_failed(model=model, api_key_name=api_key_name, response_id=resp_id, error=exc, source="responses_nonstream")
             except Exception:
                 pass
             if should_log:

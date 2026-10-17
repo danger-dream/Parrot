@@ -905,3 +905,15 @@ def test_xai_tg_login_and_refresh_token_entries(m):
     menu.on_set_rt_xai_input(1, "refresh_token: rt_xai_abcdefghijklmnopqrstuvwxyz")
     assert any(om.provider_of(acc) == "xai" for acc in om.list_accounts())
     assert "Grok OAuth 账户已" in (rec.last("sendMessage") or {}).get("text", "")
+
+
+# Login now has a structured async result; no UI worker may outlive its fake wire.
+import pytest as _notification_pytest
+
+@_notification_pytest.fixture(autouse=True)
+def _finish_notification_ui_workers():
+    yield
+    import threading
+    for worker in threading.enumerate():
+        if worker.name == "oauth-model-sync-ui":
+            worker.join(25)

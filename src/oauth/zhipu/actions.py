@@ -253,8 +253,7 @@ def execute(account_key, account, observation, *, actor, cancellation=None, on_s
         # Only a newly completed grant reaches here. Cached/cooldown results
         # return above and must not resend success notifications.
         from .runtime import fetch_reset_status
-        from ... import notifier
-        from ...telegram.menus.zhipu_oauth_menu import reset_grant_notification
+        from ...notifications import reporting
         after = None
         try:
             current = copy.deepcopy(oauth_manager.get_account(account_key))
@@ -262,8 +261,7 @@ def execute(account_key, account, observation, *, actor, cancellation=None, on_s
                 after = fetch_reset_status(current, account_key)
         except Exception:
             pass  # A granted card remains granted if the follow-up read fails.
-        text, keyboard = reset_grant_notification(account_key, account, observation.get("snapshot"), after)
-        notifier.notify(text, reply_markup=keyboard)
+        reporting.benefit_granted(account_key, account, observation.get("snapshot"), after, str(key) + ":" + str(result["updated_at"]))
     return public(result)
 
 

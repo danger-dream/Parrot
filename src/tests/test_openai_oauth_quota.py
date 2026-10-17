@@ -1259,7 +1259,7 @@ def test_openai_quota_resume_uses_fresh_usage_over_future_disabled_until(m):
     print("  [PASS] OpenAI quota resume trusts fresh low usage over old disabled_until")
 
 
-def test_quota_monitor_notifies_when_openai_quota_really_resumes(m):
+def test_quota_monitor_notifies_when_openai_quota_really_resumes(m, monkeypatch):
     """Once disabled_until has expired and fresh WHAM usage is low, resume and notify."""
     _setup(m)
     email = "notify-resume@openai.test"
@@ -1278,7 +1278,8 @@ def test_quota_monitor_notifies_when_openai_quota_really_resumes(m):
 
     calls = []
     orig_fetch = m["oauth_manager"].fetch_usage
-    orig_notify = m["oauth_manager"].notifier.throttled_notify_event_sync
+    from src.tests.notification_helpers import capture
+    capture(monkeypatch, lambda kind, text, record: calls.append((kind, record, text)))
 
     async def _fake_fetch_usage(account_key):
         assert account_key == key
@@ -1290,21 +1291,19 @@ def test_quota_monitor_notifies_when_openai_quota_really_resumes(m):
     import asyncio
     try:
         m["oauth_manager"].fetch_usage = _fake_fetch_usage
-        m["oauth_manager"].notifier.throttled_notify_event_sync = _fake_notify
         out = asyncio.run(m["oauth_manager"].quota_monitor_once())
     finally:
         m["oauth_manager"].fetch_usage = orig_fetch
-        m["oauth_manager"].notifier.throttled_notify_event_sync = orig_notify
 
     acc = m["oauth_manager"].get_account(key)
     assert out[email] == "resumed", out
     assert acc.get("enabled") is True, acc
     assert acc.get("disabled_reason") is None, acc
     assert len(calls) == 1, calls
-    assert calls[0][0] == "quota_resumed", calls
-    assert calls[0][1] == f"quota_resumed:{key}", calls
-    assert "OAuth 配额已恢复" in calls[0][2]
-    assert "OpenAI · Plus" in calls[0][2]
+    assert calls[0][0] == "account.quota.recovered", calls
+    assert calls[0][1]["subject"]["exact_id"] == key, calls
+    assert "OpenAI · 配额已恢复" in calls[0][2]
+    assert "套餐：Plus" in calls[0][2]
     print("  [PASS] quota_monitor resumes and sends notification after cooldown expires")
 
 
@@ -1711,13 +1710,12 @@ def test_fresh_openai_recovery_notifies_once_only_after_durable_enable(m, monkey
     with monkeypatch.context() as fault:
         fault.setattr(m["oauth_manager"], "fetch_usage", fetch_usage)
         fault.setattr(cooldown.notifier, "notify_event", capture_notice)
-        fault.setattr(
-            m["oauth_manager"].notifier, "throttled_notify_event_sync", capture_notice,
-        )
+        from src.tests.notification_helpers import capture
+        capture(fault, lambda kind, text, record: capture_notice(kind, text))
         outcomes = asyncio.run(m["oauth_manager"].quota_monitor_once())
 
     assert outcomes[email] == "resumed", outcomes
-    assert notices == [("quota_resumed", True, True)], notices
+    assert notices == [("account.quota.recovered", True, True)], notices
     assert not cooldown.is_blocked(channel_key, "gpt-test")
     m["config"].reload()
     assert m["oauth_manager"].get_account(key)["enabled"] is True

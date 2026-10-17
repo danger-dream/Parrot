@@ -4326,3 +4326,46 @@ async def test_responses_ws_html403_skips_refresh_health_and_exhausts_with_safe_
     for ch in channels:
         assert m["cooldown"].get_state(ch.key, "real-model") is None
         assert m["scorer"].get_stats(ch.key, "real-model") is None
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['network', 'auth_save_failed', 'auth_no_commit', 'auth_committed'])
+async def test_ws_refresh_failure_uses_shared_classification_and_actual_effect(monkeypatch, m, failure):
+    import httpx
+    from src.tests.notification_helpers import capture
+    cfg = _setup(m)
+    monkeypatch.setenv('PARROT_NO_REFRESH', '0')
+    cfg['retry'] = {'transient': {'enabled': False}, 'recovery': {'oauthRefresh': True}}
+    ch = _make_oauth_channel_for_failover(m, name='notification-ws@example.test')
+    ws = FakeWebSocket({'type':'response.create','model':'test-model','input':'hello','stream':True})
+    await ws.accept()
+    body = {'model':'test-model','input':'hello','stream':True}
+    request_id = 'nt-ws-' + failure
+    m['log_db'].insert_pending(request_id,'1.2.3.4','ws-key','test-model',True,1,0,{},body,ingress_protocol='responses_ws')
+    records=[]
+    capture(monkeypatch, lambda kind,text,record:records.append(record))
+    async def attempt(*a, **kw):
+        return m['responses_ws']._WsAttemptResult(outcome='http_auth_error',http_status=401,error_detail='HTTP 401')
+    async def refresh(*a, **kw):
+        if failure=='network': raise httpx.ReadTimeout('SECRET_UPSTREAM')
+        request=httpx.Request('POST','https://fixture.test/auth')
+        raise httpx.HTTPStatusError('SECRET_UPSTREAM',request=request,response=httpx.Response(401,request=request))
+    writes=[]
+    def set_enabled(key,value,**kw):
+        writes.append(key)
+        if failure=='auth_save_failed': raise OSError('SECRET_PATH')
+        if failure=='auth_committed':
+            cfg['oauthAccounts'][0].update(enabled=False,disabled_reason='auth_error')
+    monkeypatch.setattr(m['responses_ws'],'_try_ws_channel',attempt)
+    monkeypatch.setattr(m['responses_ws'].oauth_manager,'force_refresh',refresh)
+    monkeypatch.setattr(m['responses_ws'].oauth_manager,'set_enabled',set_enabled)
+    from src.scheduler import ScheduleResult
+    route=ScheduleResult(candidates=[(ch,'test-model')],saturated=[],affinity_hit=False,fp_query=None,client_key='fixture')
+    await m['responses_ws']._run_ws_failover(ws,first_obj={'type':'response.create',**body},schedule_result=route,body=body,
+        request_id=request_id,api_key_name='ws-key',client_ip='1.2.3.4',start_time=time.time(),start_monotonic=time.monotonic(),fp_query=None)
+    auth=[r for r in records if r['event_type']=='account.auth.refresh_failed']
+    assert len(auth)==1 and auth[0]['source']=='responses_ws'
+    expected={'network':('unchanged','not_disabled'),'auth_save_failed':('failed','disable_failed'),
+              'auth_no_commit':('unknown','disable_failed'),'auth_committed':('confirmed','account_paused')}[failure]
+    assert auth[0]['effect']==dict(zip(('status','code'),expected))
+    assert len(writes)==(0 if failure=='network' else 1)
+    assert 'SECRET' not in json.dumps(auth)

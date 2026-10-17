@@ -181,7 +181,7 @@ def test_tg_key_paste_initializes_and_reports_without_any_refresh_click(onboardi
         return {"result": {"message_id": 901}}
     def edit(chat, message_id, text, **kwargs):
         messages.append(text)
-        if "账户初始化结果" in text:
+        if "操作已完成" in text and "模型目录：已完成" in text:
             initialized.set()
     monkeypatch.setattr(ui, "send", send)
     monkeypatch.setattr(ui, "edit", edit)
@@ -190,8 +190,8 @@ def test_tg_key_paste_initializes_and_reports_without_any_refresh_click(onboardi
     state = states.get_state(42)
     assert state["action"] == "oa_zh_name"
     assert initialized.wait(10)
-    summary = next(text for text in messages if "账户初始化结果" in text)
-    assert "已自动获取额度用量" in summary and "已同步目录" in summary and "当前可用" in summary and "元数据已同步" in summary
+    summary = next(text for text in messages if "操作已完成" in text and "模型目录：已完成" in text)
+    assert "额度快照：已完成" in summary and "模型目录：已完成" in summary and "元数据：已完成" in summary
     assert "正在同步" not in summary
     assert state_db.quota_load(state["data"]["key"])
     assert len([url for url in calls if "/quota/limit" in url]) == 1
@@ -241,7 +241,7 @@ def test_tg_pending_message_updates_on_same_future_completion(onboarding, monkey
     menu._foreground_account_model_sync(42, key, provider="zhipu", label="test", post_save={
         "model_sync_future": future, "usage": {"zhipu": {"windows": {"five_hour": {"utilization": 0}}}}})
     assert waiting.wait(3)
-    assert "初始化仍在后台进行" in messages[-1] and "请同步上游模型" not in messages[-1]
+    assert "模型目录：仍在后台进行" in messages[-1] and "请同步上游模型" not in messages[-1]
     if worker_timeout:
         future.set_exception(TimeoutError())
     else:
@@ -254,5 +254,16 @@ def test_tg_pending_message_updates_on_same_future_completion(onboarding, monkey
     for thread in threading.enumerate():
         if thread.name == "oauth-model-sync-ui":
             thread.join(3)
-    assert len(messages) == 2 and "账户初始化结果" in messages[-1]
-    assert ("模型同步失败" if worker_timeout else "元数据已同步") in messages[-1]
+    assert len(messages) == 2 and ("操作需要关注" if worker_timeout else "操作已完成") in messages[-1]
+    assert ("模型目录：未完成" if worker_timeout else "元数据：已完成") in messages[-1]
+
+
+@pytest.fixture(autouse=True)
+def structured_operation_wire(monkeypatch):
+    from src.tests.notification_helpers import ui_operation_transport
+    ui_operation_transport(monkeypatch)
+    yield
+    import threading
+    for worker in threading.enumerate():
+        if worker.name == "oauth-model-sync-ui":
+            worker.join(25)

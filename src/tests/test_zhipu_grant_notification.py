@@ -57,13 +57,13 @@ def test_real_grant_path_sends_enriched_notification_once(reset_env,monkeypatch,
         return wire(url,**kw)
     monkeypatch.setattr(common,"request",request)
     sent=[]
-    monkeypatch.setattr(notifier,"notify",lambda text,**kw:sent.append((text,kw)))
+    capture(monkeypatch, lambda kind,text,record:sent.append((text,record)))
     result=actions.auto_claim(key,copy.deepcopy(om.get_account(key)),before)
     assert result["status"]=="succeeded"
     actions.auto_claim(key,copy.deepcopy(om.get_account(key)),before)
-    assert len(sent)==1 and "reply_markup" in sent[0][1]
-    assert ("5小时额度重置卡：<b>1 张</b>" in sent[0][0]) is (not read_failure)
-    assert ("张数尚未核实" in sent[0][0]) is read_failure
+    assert len(sent)==1 and sent[0][1]["event_type"]=="account.benefit.granted"
+    assert bool(sent[0][1]["facts"]["benefits"]) is (not read_failure)
+    assert ("新增数量未核实" in sent[0][0]) is read_failure
     assert sum(kw.get("method")=="POST" for _,kw in state["calls"])==1
 
 
@@ -95,3 +95,5 @@ def test_close_notification_only_deletes_target_and_preserves_pending_input(monk
     assert deleted==([(42,500)] if authorized else [])
     assert states.get_state(42)==before
     states.pop_state(42)
+
+from src.tests.notification_helpers import capture

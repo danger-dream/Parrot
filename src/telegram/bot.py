@@ -547,6 +547,11 @@ def _handle_callback(cb: dict) -> None:
     # Management login approvals are deliberately isolated from all legacy menu
     # dispatch and authorization.  The service validates callback_query.from.id
     # against the current non-empty configured admin allow-list.
+    if data.startswith("nt:"):
+        from .menus import notification_menu
+        notification_menu.handle_callback(cb)
+        return
+
     if data.startswith("mauth:"):
         parts = data.split(":", 2)
         actor_id = (cb.get("from") or {}).get("id")

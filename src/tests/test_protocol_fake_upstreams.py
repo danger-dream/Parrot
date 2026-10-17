@@ -2613,11 +2613,8 @@ def test_zhipu_plan_excluded_does_not_join_the_long_lived_quota_set():
 def test_zhipu_plan_excluded_notification_says_plan_not_quota(m, monkeypatch):
     """1311 的通知必须说"套餐不含"，不能复用 1310 的"额度已达上限"文案。"""
     calls = []
-    monkeypatch.setattr(
-        m["failover"].notifier,
-        "throttled_notify_event_sync",
-        lambda event, alert, text, **kwargs: calls.append((event, alert, text, kwargs)),
-    )
+    from src.tests.notification_helpers import capture
+    capture(monkeypatch, lambda kind, text, record: calls.append((kind, record["scope_ref"], text, record)))
     channel = SimpleNamespace(key="api:智谱 Max", type="api", display_name="智谱 Max")
     reset_ms = int(datetime(2026, 9, 18, 16, 36, 12, tzinfo=timezone(timedelta(hours=8))).timestamp() * 1000)
     m["failover"]._notify_zhipu_quota_cooldown(
@@ -2626,14 +2623,14 @@ def test_zhipu_plan_excluded_notification_says_plan_not_quota(m, monkeypatch):
 
     assert len(calls) == 1
     event, alert, text, kwargs = calls[0]
-    assert event == "plan_excluded"
-    assert "订阅套餐尚未包含该模型" in text
+    assert event == "model.entitlement.blocked"
+    assert "当前套餐未包含模型" in text
     assert "1311" in text
     assert "周/月使用额度已达上限" not in text      # 不能沿用 1310 的措辞
     assert "2026-09-18 16:36:12" in text
-    assert "永久冻结" in text and "自动恢复" in text
-    button = kwargs["reply_markup"]["inline_keyboard"][0][0]
-    assert button["text"] == "📡 查看渠道详情"
+    assert "当前影响尚未确认" in text and "预计下次尝试" in text
+    assert kwargs["subject"]["kind"] == "channel"
+    assert kwargs["subject"]["exact_id"] == "api:智谱 Max"
 
 
 def test_zhipu_channel_recognized_on_both_domains():
@@ -2705,11 +2702,8 @@ def test_recovery_probe_skips_zhipu_plan_excluded_entries(m, monkeypatch):
 
 def test_zhipu_quota_cooldown_notification_is_explicit_and_links_channel(m, monkeypatch):
     calls = []
-    monkeypatch.setattr(
-        m["failover"].notifier,
-        "throttled_notify_event_sync",
-        lambda event, alert, text, **kwargs: calls.append((event, alert, text, kwargs)),
-    )
+    from src.tests.notification_helpers import capture
+    capture(monkeypatch, lambda kind, text, record: calls.append((kind, record["scope_ref"], text, record)))
     channel = SimpleNamespace(
         key="api:智谱 Max",
         type="api",
@@ -2720,14 +2714,14 @@ def test_zhipu_quota_cooldown_notification_is_explicit_and_links_channel(m, monk
 
     assert len(calls) == 1
     event, alert, text, kwargs = calls[0]
-    assert event == "quota_cooldown"
-    assert "api:智谱 Max:glm-5.2" in alert
-    assert "周/月使用额度已达上限" in text
+    assert event == "model.quota.blocked"
+    assert alert == "glm-5.2"
+    assert "周/月额度" in text
     assert "2026-07-26 10:01:10" in text
-    assert "仅跳过" in text and "不是手动禁用" in text
-    button = kwargs["reply_markup"]["inline_keyboard"][0][0]
-    assert button["text"] == "📡 查看渠道详情"
-    assert button["callback_data"].startswith("ch:view:")
+    assert "指定模型" in text and "当前影响尚未确认" in text
+    assert kwargs["subject"]["kind"] == "channel"
+    assert kwargs["subject"]["exact_id"] == "api:智谱 Max"
+    assert kwargs["effect"] == {"status": "unknown", "code": "model_paused"}  # direct reporting cannot fabricate an uncommitted pause
 
 
 async def test_zhipu_1310_cools_only_channel_model_until_reset_and_fails_over(m, monkeypatch):

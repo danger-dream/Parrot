@@ -586,6 +586,14 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
 }
 ```
 
+### 统一通知与快捷处理
+
+账号、额度、模型、请求路由和 Responses 历史存储通知使用 `src/notifications/catalog.py` 的同一事件目录。Telegram 可精确查看账户/渠道及本地详情、关闭当前消息、按收件人静音；明确刷新仅针对绑定账户，权益消费/积分策略/清冷却遵守已有权限和确认。查看不隐式刷新，unknown 不等于成功，关闭不等于恢复或停用账户。
+
+`notifications.events` 中显式新事件名优先，否则兼容旧 key。历史逐次授权续期通知及 180 秒自动删除保持；不会在升级时静默关闭。模型目录/权益推送现在受统一开关控制，用户主动操作回执不受运维静音影响。官网状态、应用更新、网络通知及管理登录审批保留原通路。
+
+通知最小记录复用现有 JSON durable state，不保存凭据或确认计划秘密；每个管理员独立记录 Telegram 接受/拒绝/结果未知。无持久世代的旧账户在重启后旧写按钮失效，旧批准不会自动重做。未实现新的 Web 通知中心，也不承诺 Telegram 已读或恰好一次投递。
+
 > `quotaMonitor.enabled` **默认关闭** —— 启用后每 N 秒拉一次每个 OAuth 账号的 usage（Claude 走 `/api/oauth/usage`，OpenAI 走 `wham/usage`）。`openaiOAuth.quotaProbe` 是另一个会实际调用模型的诊断入口，默认禁用，只有配置开启且调用方明确请求时才发网。
 
 > `apiKeys.*.allowImages` **默认关闭** —— 新建或历史 API Key 不会自动获得图片生成 / 编辑能力，必须在 TG「🔑 管理 API Key」里显式开启。

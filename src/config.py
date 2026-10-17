@@ -4,6 +4,8 @@
 写入使用 tmp + os.replace 原子方式。
 """
 
+from .notifications.catalog import default_events as _notification_default_events
+
 import copy
 import json
 import os
@@ -297,22 +299,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # notifier.notify_event(key, text) 会同时检查 enabled 和 events[key]。
     "notifications": {
         "enabled": True,
-        "events": {
-            "channel_permanent": True,    # 渠道/模型连续失败进入永久冷却
-            "channel_recovered": True,    # 永久/长冷却被清除（手动 / probe 恢复）
-            "quota_disabled": True,       # OAuth 配额到达阈值被自动禁用
-            "quota_resumed": True,        # OAuth 配额恢复被自动启用
-            "openai_credits_started": True,  # OpenAI 套餐耗尽后使用积分续用
-            "quota_cooldown": True,       # API 渠道单模型按上游重置时间临时冷却
-            "oauth_refreshed": True,      # OAuth Token 自动刷新成功
-            "oauth_refresh_failed": True, # OAuth Token 自动刷新失败（标 auth_error）
-            "no_channels": True,          # 无可用渠道（503）
-            "openai_store_save_failed": True,  # OpenAI previous_response_id Store 写入失败
-            "model_degraded": True,       # OpenAI 上游模型降级（请求模型与实际模型不一致）
-            "status_alert": True,         # 上游 status page（Claude/OpenAI/Cloudflare）事件
-            "app_update": True,           # Parrot 本身的新版本上线提醒
-            "network_monitor": True,      # Parrot 自身网络健康检测失败/恢复
-        },
+        "events": _notification_default_events(),
     },
     # ─── 上游 status page 监控 ─────────────────────────────────
     # 监控 Claude / OpenAI / Cloudflare 的 statuspage incidents，

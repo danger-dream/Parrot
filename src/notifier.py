@@ -121,6 +121,34 @@ def _worker_loop() -> None:
             item = _queue.get()
         except Exception:
             continue
+        if isinstance(item, dict) and "notification_delivery" in item:
+            try:
+                from .notifications.delivery import deliver
+                deliver(item["notification_delivery"])
+            except Exception as exc:
+                print(f"[notification] delivery interrupted error={type(exc).__name__}")
+                try:
+                    from .notifications.delivery import interrupted
+                    interrupted(item["notification_delivery"])
+                except Exception:
+                    # Durable storage may still be unavailable. Reconcile this
+                    # known queue orphan after the transient outage, not by send.
+                    import threading
+                    def reconcile(key=item["notification_delivery"]):
+                        try:
+                            interrupted(key)
+                        except Exception:
+                            # No transport retry here: only reconcile the already
+                            # consumed item once durable writes become available.
+                            timer = threading.Timer(5, reconcile)
+                            timer.daemon = True
+                            timer.start()
+                    timer = threading.Timer(5, reconcile)
+                    timer.daemon = True
+                    timer.start()
+            finally:
+                _queue.task_done()
+            continue
         # 兼容多种入队格式：str / (text, auto_delete) / (text, auto_delete, reply_markup, meta)
         text = None
         auto_delete = None
@@ -189,6 +217,16 @@ def set_handler(fn: Optional[Callable[[str], None]]) -> None:
     with _lock:
         _handler = fn
     _ensure_worker()
+
+
+def enqueue_delivery(delivery_id: str) -> bool:
+    """Queue a durable structured delivery reference, never a business operation."""
+    _ensure_worker()
+    try:
+        _queue.put_nowait({"notification_delivery": delivery_id})
+        return True
+    except queue.Full:
+        return False
 
 
 def notify(text: str, auto_delete_seconds: Optional[int] = None,

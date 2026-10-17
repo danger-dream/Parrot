@@ -165,7 +165,7 @@ def test_retry_settings_menu_and_controls(m):
         assert m["states"].get_state(42) is None
 
         sm._show_notif(42, 100, "cb")
-        assert "配额冷却" in rec.last("editMessageText")["text"]
+        assert "模型额度已暂停" in rec.last("editMessageText")["text"]
     finally:
         m["config"].update(lambda c: c.__setitem__("retry", original))
         m["states"].clear_all()

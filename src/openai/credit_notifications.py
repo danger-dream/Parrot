@@ -6,7 +6,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from .. import notifier
+from .. import notifications
+from ..notifications.events import Effect
 
 
 @dataclass
@@ -104,21 +105,17 @@ def _observe(account_key: str, *, usage: dict | None, snapshot: dict | None) -> 
         hits = [name for name, window in state.windows.items() if exhausted(window)]
         if not hits and not state.gate[1]:
             state.sent = False
+            notifications.resolve_silently("account.credits.started", notifications.subjects.account(account_key))
             return
         if state.sent or not account.get("enabled", True) or account.get("disabled_reason"):
             return
         if not manager.openai_credits_usable(account_key, usage, snapshot=snapshot):
             return
-        notifications = manager.config.get().get("notifications") or {}
-        if not notifications.get("enabled", True) or not (notifications.get("events") or {}).get("openai_credits_started", True):
-            return
-        label = manager.openai_plan_workspace_label(account)
-        lines = [
-            "💳 <b>OpenAI 套餐额度已耗尽，将使用积分继续</b>",
-            f"账号: <code>{notifier.escape_html(manager.account_key_to_email(account_key))}</code>",
-            f"{notifier.provider_custom_emoji_html('openai')} {notifier.escape_html(label)}",
-            "已开启「允许使用积分」，后续请求可能消耗积分余额；账号保持可用。",
-            "如不希望消耗积分，请在该账户详情关闭「允许使用积分」。",
-        ]
-        if notifier.notify_event("openai_credits_started", "\n".join(lines)):
+        credits = ((snapshot or {}).get("credits") if snapshot is not None else block.get("credits")) or {}
+        metrics = []
+        balance = credits.get("balance")
+        if isinstance(balance, (int, float)) and not isinstance(balance, bool):
+            metrics.append({"metric_id": "credits", "display_name": "积分余额", "kind": "credits", "remaining": balance, "unit": "积分"})
+        if notifications.account_event("account.credits.started", account_key, {"metrics": metrics},
+                Effect("confirmed", "credits_allowed"), source="codex_usage"):
             state.sent = True

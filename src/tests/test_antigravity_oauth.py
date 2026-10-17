@@ -1289,3 +1289,15 @@ def test_quota_error_ui_distinguishes_validation_and_http_classes(m):
     assert "5xx" in menu._ag_quota_error_html({"kind": "server_error"})
     assert "超时" in menu._ag_quota_error_html({"kind": "timeout"})
     assert "网络" in menu._ag_quota_error_html({"kind": "network"})
+
+
+# Login now has a structured async result; no UI worker may outlive its fake wire.
+import pytest as _notification_pytest
+
+@_notification_pytest.fixture(autouse=True)
+def _finish_notification_ui_workers():
+    yield
+    import threading
+    for worker in threading.enumerate():
+        if worker.name == "oauth-model-sync-ui":
+            worker.join(25)

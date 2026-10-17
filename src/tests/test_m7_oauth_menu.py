@@ -421,7 +421,7 @@ def test_view_detail_with_quota_cache(m):
     # 详情按钮
     kb = last["reply_markup"]["inline_keyboard"]
     flat = [b["callback_data"] for row in kb for b in row if "callback_data" in b]
-    assert any(x.startswith("oa:refresh_token:") for x in flat)
+    assert not any(x.startswith(("oa:refresh_token:", "oa:relogin:")) for x in flat)
     assert any(x.startswith("oa:refresh_usage:") for x in flat)
     assert any(x.startswith("oa:toggle:") for x in flat)
     assert any(x.startswith("oa:delete_ask:") for x in flat)
@@ -2121,3 +2121,15 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# Login now has a structured async result; no UI worker may outlive its fake wire.
+import pytest as _notification_pytest
+
+@_notification_pytest.fixture(autouse=True)
+def _finish_notification_ui_workers():
+    yield
+    import threading
+    for worker in threading.enumerate():
+        if worker.name == "oauth-model-sync-ui":
+            worker.join(25)

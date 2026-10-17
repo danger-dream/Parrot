@@ -47,10 +47,11 @@ class ZhipuFlows:
         return OAuthLoginFlow(flow_id, secret, OAuthProvider.ZHIPU, payload.get("auth_url", ""),
                               "授权后自动保存账户并配置个人项目、专用模型 Key（不存在则创建）、额度及模型。", plan.expires_at)
 
-    def start(self, actor, *, site, callback_mode=False):
+    def start(self, actor, *, site, callback_mode=False, relogin=None):
         generation = self._reserve(actor)
         payload = (self.backend.zhipu_start_callback_login(site=site) if callback_mode
                    else self.backend.zhipu_start_login(site=site))
+        payload["relogin"] = copy.deepcopy(relogin)
         return self._register(actor, generation, payload)
 
     def projects(self, actor, account_id, account):

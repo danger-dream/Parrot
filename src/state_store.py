@@ -33,6 +33,8 @@ DURABLE_DOMAINS = (
     "codex_logical_sessions", "app_self_update", "app_update_state",
     "status_seen_updates", "status_muted_incidents", "workbuddy_actions",
     "model_reroute_mutes", "claude_reset_operations", "zhipu_actions",
+    "notification_events", "notification_incidents", "notification_deliveries",
+    "notification_refs", "notification_policy",
 )
 
 

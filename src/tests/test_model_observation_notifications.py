@@ -18,11 +18,18 @@ from src.tests.test_model_reroute import _finish, _row, _sse
 
 
 @pytest.fixture
-def notifications(monkeypatch):
-    settings = {"notifications": {"enabled": True, "events": {"model_degraded": True}}}
+def notifications(env, monkeypatch):
+    settings = {"telegram": {"adminIds": [11]}, "notifications": {"enabled": True, "events": {"model_degraded": True}}}
     pending = queue.Queue(maxsize=1)
     monkeypatch.setattr(notifier, "_ensure_worker", lambda: None)
     monkeypatch.setattr(notifier, "_queue", pending)
+    def enqueue(key):
+        try:
+            pending.put_nowait(key)
+            return True
+        except queue.Full:
+            return False
+    monkeypatch.setattr(notifier, "enqueue_delivery", enqueue)
     monkeypatch.setattr(notifier, "_throttle_last_sent", {})
     monkeypatch.setattr(config, "get", lambda: settings)
     monkeypatch.setattr(model_reroute, "_account_label", lambda key: "fixture")
@@ -53,9 +60,10 @@ def test_disabled_or_muted_does_not_consume_throttle(notifications, monkeypatch,
     settings["notifications"]["events"]["model_degraded"] = True
     monkeypatch.setattr(model_reroute, "muted_until", lambda key: None)
     assert model_reroute.notify_reroute(observation()) is True
-    text = pending.get_nowait()[0]
-    assert "上游模型变更" in text and "模型降级" not in text
-    assert all(label in text for label in ("请求模型:", "出站模型:", "上游报告模型:"))
+    row = store.get("deliveries", pending.get_nowait())
+    text = content.render(store.get("events", row["event_id"]))
+    assert "上游报告模型发生变化" in text and "模型降级" not in text
+    assert all(label in text for label in ("请求模型：", "出站模型：", "上游报告模型："))
     assert model_reroute.notify_reroute(observation()) is False
     assert pending.empty()
 
@@ -133,7 +141,7 @@ def test_conflict_is_persisted_notified_and_displayed_without_false_actual(monke
     handle = log_db.insert_pending(rid, "127.0.0.1", "client", "alias", True, 1, 0, {}, {})
     queued = []
     monkeypatch.setattr(model_reroute, "muted_until", lambda key: None)
-    monkeypatch.setattr(notifier, "throttled_notify_event_sync", lambda event, key, text, **kw: queued.append((key, text)) or True)
+    capture(monkeypatch, lambda kind, text, record: queued.append((kind, text)) or True)
     kwargs = dict(final_channel_key="oauth:openai:fixture", final_channel_type="oauth", final_model="model-a",
                   upstream_protocol="openai-responses", http_header_model="model-a",
                   response_body=json.dumps({"model": "model-b", "safety_buffering": {"reasons": ["policy"]}}))
@@ -187,3 +195,7 @@ def test_old_schema_adds_nullable_conflict_column_without_rewriting_history(tmp_
     assert old.execute("SELECT model_signal_conflict FROM request_log WHERE request_id='schema-before-conflict'").fetchone() == (None,)
     assert old.execute("SELECT upstream_actual_model FROM request_log WHERE request_id='schema-before-conflict'").fetchone() == ("model-b",)
     old.close()
+
+from src.tests.test_notifications import env
+from src.notifications import store, content
+from src.tests.notification_helpers import capture

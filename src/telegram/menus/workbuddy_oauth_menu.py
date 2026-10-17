@@ -460,19 +460,20 @@ def _plan_action(chat_id, message_id, key, nav, *, allow_unknown=False, trial_co
     _confirm(chat_id, message_id, text=text, data={"kind": "action", "key": key, "nav": nav, "plan_token": plan["plan_token"]})
 
 
-def _login_start(chat_id, message_id, *, realm="cn"):
+def _login_start(chat_id, message_id, *, realm="cn", relogin=None):
     discard_state(chat_id)
     try:
         flow = oauth_control.start_login_flow(telegram_context(chat_id), OAuthProvider.WORKBUDDY,
-            realm=realm, client_profile="ide" if realm == "global" else "cli")
+            realm=realm, client_profile="ide" if realm == "global" else "cli",
+            **({"relogin_account_id": relogin["target_key"]} if relogin else {}))
     except Exception as exc:
-        ui.edit(chat_id, message_id, _error(exc), reply_markup=ui.inline_kb([[ui.btn("◀ 返回新增", "oa:add")]]))
+        ui.edit(chat_id, message_id, _error(exc), reply_markup=ui.inline_kb([[ui.btn(_parent()._login_nav(relogin)["back_label"], _parent()._login_cancel(relogin))]]))
         return
     data = _set_state(chat_id, "oa_wb_login", {"flow_id": flow.flow_id, "flow_secret": flow.flow_secret,
-        "realm": realm, "auth_url": flow.auth_url, "expires_at": flow.expires_at})
+        "realm": realm, "auth_url": flow.auth_url, "expires_at": flow.expires_at, "relogin": relogin})
     region = "国际区" if realm == "global" else "中国区"
     login_hint = "使用 Google / GitHub 在官方页面登录并授权。\n" if realm == "global" else ""
-    ui.edit(chat_id, message_id, f"🌐 <b>WorkBuddy {region}登录</b>\n{login_hint}在浏览器登录并授权后，后台每 5 秒自动检查，成功即保存并显示身份。同一身份重新登录只更新授权，保留原有设置。\n有效期 5 分钟。",
+    ui.edit(chat_id, message_id, f"🌐 <b>WorkBuddy {region}登录</b>\n{login_hint}在浏览器登录并授权后，后台每 5 秒自动检查，成功即保存并显示身份。同一身份重新登录只更新授权，保留原有设置。\n有效期 5 分钟。" + _parent()._login_hint(relogin),
         reply_markup=ui.inline_kb([[{"text": "🌐 打开授权页面", "url": flow.auth_url}],
             [ui.btn("🔎 检查登录", _PREFIX + "poll:" + data["nonce"])],
             [ui.btn("❌ 取消", _PREFIX + "cancel:" + data["nonce"])]]))
@@ -497,7 +498,7 @@ def _login_feedback(data, poll=None, error=None):
         return text, ui.inline_kb([[ui.btn("查看账户", "oa:view:" + ui.register_code(poll.account_id) + ":1")],
                                   [ui.btn("◀ 返回列表", "menu:oauth")]])
     if status in {"cancelled", "expired"}:
-        return "ℹ️ 登录流程已取消或过期，请重新开始。", ui.inline_kb([[ui.btn("◀ 返回新增", "oa:add")]])
+        return "ℹ️ 登录流程已取消或过期，请重新开始。", ui.inline_kb([[ui.btn(_parent()._login_nav(data.get("relogin"))["back_label"], _parent()._login_cancel(data.get("relogin")))]])
     text = "⌛ 等待浏览器授权，后台自动检查中；成功后直接保存。"
     if status == "identity_pending":
         text = "⌛ 已取得授权，正在自动确认账户身份；仅继续获取身份，不重复获取 Token。"
@@ -520,11 +521,17 @@ def _run_login_job(chat_id, job):
                 poll = owner.poll_login_flow(telegram_context(chat_id), data["flow_id"], data["flow_secret"])
             except Exception as exc:
                 error = exc
-            terminal = poll is not None and poll.status in {"completed", "cancelled", "expired"}
+            rejected_target = bool(data.get("relogin")) and getattr(getattr(error, "code", None), "value", "") in {
+                "IDENTITY_CONFLICT", "RESOURCE_CONFLICT", "REVISION_CONFLICT", "RESOURCE_NOT_FOUND",
+            }
+            terminal = rejected_target or (poll is not None and poll.status in {"completed", "cancelled", "expired"})
             expired = not terminal and time.monotonic() >= job["deadline"]
             text, kb = _login_feedback(data, poll, error)
+            if rejected_target:
+                text = "❌ 登录身份不匹配或原账户已变化；未修改或新增账户。请返回原账户重新登录。"
+                kb = ui.inline_kb([[ui.btn("◀ 返回账户", _parent()._login_cancel(data["relogin"]))]])
             if expired:
-                text, kb = "ℹ️ 登录等待已到期，请重新开始。", ui.inline_kb([[ui.btn("◀ 返回新增", "oa:add")]])
+                text, kb = "ℹ️ 登录等待已到期，请重新开始。", ui.inline_kb([[ui.btn(_parent()._login_nav(data.get("relogin"))["back_label"], _parent()._login_cancel(data.get("relogin")))]])
             with _login_jobs_lock:
                 message_id, token = job["message_id"], job["view_token"]
             render_key = (message_id, token, text)
@@ -541,7 +548,7 @@ def _run_login_job(chat_id, job):
                     pass  # A Telegram delivery failure must not abort authorization.
             if terminal or expired:
                 states.pop_state_if_current(chat_id, data)
-                if expired:
+                if expired or rejected_target:
                     try:
                         owner.cancel_login_flow(telegram_context(chat_id), data["flow_id"], data["flow_secret"])
                     except ManagementError:
@@ -614,7 +621,9 @@ def handle_callback(chat_id, message_id, cb_id, callback):
         if kind == "cancel":
             nav = data.get("nav")
             discard_state(chat_id)
-            if nav and _resolve(nav):
+            if data.get("relogin"):
+                _parent()._return_from_relogin(chat_id, message_id, "", data["relogin"]["payload"])
+            elif nav and _resolve(nav):
                 _show_activity(chat_id, message_id, _resolve(nav), nav)
             else:
                 _parent().on_add_menu(chat_id, message_id, "")

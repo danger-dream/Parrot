@@ -855,7 +855,7 @@ def test_cursor_login_button_completes_and_saves_account_in_mock_mode(monkeypatc
     monkeypatch.setattr(ui, "answer_cb", lambda *args, **kwargs: None)
     def edit(*args, **kwargs):
         edits.append((args[2], kwargs.get("reply_markup")))
-        if "后台将静默重试" in args[2]:
+        if "模型目录：未完成" in args[2]:
             finished.set()
     monkeypatch.setattr(ui, "edit", edit)
 
@@ -880,7 +880,7 @@ def test_cursor_login_button_completes_and_saves_account_in_mock_mode(monkeypatc
     assert states.get_state(321) is None
     assert any("正在同步模型，请稍候" in text for text, _ in edits)
     assert finished.wait(1)
-    assert "后台将静默重试" in edits[-1][0]
+    assert "模型目录：未完成" in edits[-1][0]
 
 
 def test_cursor_quota_updated_at_is_detail_only(monkeypatch):
@@ -1836,3 +1836,14 @@ def test_cursor_bulk_editor_freezes_order_and_visible_snapshot(monkeypatch):
     oauth_menu.on_cursor_disable_save(chat_id, 1, "cb")
     saved = oauth_manager.cursor_disabled_models(account_key)
     assert saved == {"hidden-old", "new-after-open", original[1]}
+
+
+@pytest.fixture(autouse=True)
+def structured_operation_wire(monkeypatch):
+    from src.tests.notification_helpers import ui_operation_transport
+    ui_operation_transport(monkeypatch)
+    yield
+    import threading
+    for worker in threading.enumerate():
+        if worker.name == "oauth-model-sync-ui":
+            worker.join(25)

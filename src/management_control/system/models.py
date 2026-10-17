@@ -99,22 +99,9 @@ class QuotaMonitorSettings:
     revision: str
 
 
-@dataclass(frozen=True, slots=True)
-class NotificationEvents:
-    channelPermanent: bool
-    channelRecovered: bool
-    quotaDisabled: bool
-    quotaResumed: bool
-    openaiCreditsStarted: bool
-    quotaCooldown: bool
-    oauthRefreshed: bool
-    oauthRefreshFailed: bool
-    noChannels: bool
-    openaiStoreSaveFailed: bool
-    modelDegraded: bool
-    statusAlert: bool
-    appUpdate: bool
-    networkMonitor: bool
+from dataclasses import make_dataclass
+from src.notifications.catalog import settings_entries
+NotificationEvents = make_dataclass("NotificationEvents", [(public, bool) for public, _ in settings_entries()], frozen=True, slots=True)
 
 
 @dataclass(frozen=True, slots=True)

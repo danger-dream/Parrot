@@ -194,10 +194,14 @@ class OAuthControl(
         *,
         usage: dict | None = None,
         defer_post_save: bool = False,
+        expected_account: dict | None = None,
+        authenticated_login: bool = False,
     ) -> dict:
         self._require(context, Capability.SECRETS_WRITE)
         self._ensure_legacy_identity_safe(entry)
-        result = self.backend.replace_exact_identity(account_id, copy.deepcopy(entry))
+        result = (self.backend.replace_exact_identity_conditional(account_id, copy.deepcopy(entry), expected_account,
+                      **({"authenticated_login": True} if authenticated_login else {}))
+                  if expected_account is not None else self.backend.replace_exact_identity(account_id, copy.deepcopy(entry)))
         if result.get("status") == "replaced":
             if not defer_post_save:
                 result["_post_save"] = self._post_save_account_effects(
@@ -392,12 +396,26 @@ class OAuthControl(
         self._audit(context, "oauth.account.reorder", "oauthAccounts")
 
     @audit_failures("oauth.login.start", target_arg="provider")
-    def start_login_flow(self, context: ManagementContext, provider: OAuthProvider, *, realm=None, client_profile=None, site=None) -> OAuthLoginFlow:
+    def start_login_flow(self, context: ManagementContext, provider: OAuthProvider, *, realm=None, client_profile=None, site=None, relogin_account_id=None) -> OAuthLoginFlow:
         self._require(context, Capability.SECRETS_WRITE)
+        relogin = None
+        if relogin_account_id is not None:
+            account = copy.deepcopy(self._account(relogin_account_id))
+            if (self.backend.provider_of(account) != provider.value
+                    or not self.account_authentication_failed(account)
+                    or provider not in {OAuthProvider.WORKBUDDY, OAuthProvider.ZHIPU}
+                    or (provider is OAuthProvider.ZHIPU and account.get("credential_mode") != "oauth")):
+                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+            relogin = {"target_key": relogin_account_id, "account": account}
+            if provider is OAuthProvider.WORKBUDDY:
+                realm = account.get("realm") or "cn"
+                client_profile = "ide" if realm == "global" else "cli"
+            else:
+                site = account["site"]
         if provider is OAuthProvider.ZHIPU:
             if site not in {"bigmodel", "zai"} or realm is not None or client_profile is not None:
                 raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
-            return self._flows.zhipu.start(context.actor.subject_id, site=site)
+            return self._flows.zhipu.start(context.actor.subject_id, site=site, **({"relogin": relogin} if relogin else {}))
         if site is not None:
             raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
         if provider is OAuthProvider.WORKBUDDY:
@@ -410,7 +428,8 @@ class OAuthControl(
         elif realm is not None or client_profile is not None:
             raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
         try:
-            flow = (self._flows.start(context.actor.subject_id, provider, realm=realm, client_profile=client_profile)
+            flow = (self._flows.workbuddy.start(context.actor.subject_id, realm=realm, client_profile=client_profile, relogin=relogin)
+                    if relogin else self._flows.start(context.actor.subject_id, provider, realm=realm, client_profile=client_profile)
                     if provider is OAuthProvider.WORKBUDDY else self._flows.start(context.actor.subject_id, provider))
         except ManagementError:
             raise

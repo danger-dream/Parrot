@@ -249,7 +249,7 @@ async def test_auth_refresh_boundary_and_no_false_auth_disable(env, monkeypatch,
         monkeypatch.delenv("PARROT_NO_REFRESH", raising=False)
     config.update(lambda c: c.update(retry={"recovery": {"oauthRefresh": True}}))
     notices = []
-    monkeypatch.setattr(notifier, "notify_event", lambda event, text, **kw: notices.append(text))
+    capture(monkeypatch, lambda kind, text, record: notices.append(text))
     calls = []
     async def ensure(*a, **k):
         return "fixture-access"
@@ -275,7 +275,7 @@ async def test_auth_refresh_boundary_and_no_false_auth_disable(env, monkeypatch,
     assert (om.get_account(ch.account_key).get("disabled_reason") == "auth_error") is (refresh_result == "auth")
     assert (response.status_code == 200) is (refresh_result == "ok")
     if refresh_result == "auth":
-        assert any("重新登录" in text for text in notices)
+        assert any("重新授权" in text for text in notices)
         assert all("JSON" not in text for text in notices)
 
 
@@ -302,3 +302,5 @@ async def test_workbuddy_stream_close_records_cancelled_and_closes_upstream(env)
     assert latest["status"] == "cancelled" and latest["error_message"] == "client disconnected"
     assert m["cooldown"].get_state(ch.key, "glm-fixture") is None
 
+
+from src.tests.notification_helpers import capture

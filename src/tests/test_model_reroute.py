@@ -369,11 +369,11 @@ def test_the_alert_carries_three_mute_buttons() -> None:
     assert any("永久" in label for label in labels)
 
 
-def test_throttle_sends_only_once_inside_the_two_hour_window(monkeypatch) -> None:
+def test_throttle_sends_only_once_inside_the_two_hour_window(env, monkeypatch) -> None:
     from src import notifier
 
     sent: list[str] = []
-    monkeypatch.setattr(notifier, "notify_event", lambda *a, **k: sent.append(a[0]) or True)
+    monkeypatch.setattr(notifier, "enqueue_delivery", lambda key: sent.append(key) or True)
     clock = {"now": 1_000_000.0}
     monkeypatch.setattr(notifier._t, "time", lambda: clock["now"])
     notifier._throttle_last_sent.clear()
@@ -424,3 +424,5 @@ def test_a_disabled_event_switch_suppresses_the_alert(monkeypatch) -> None:
 def test_the_event_key_and_cooldown_match_the_agreed_values() -> None:
     assert model_reroute.NOTIFY_EVENT_KEY == "model_degraded"
     assert model_reroute.NOTIFY_COOLDOWN_SECONDS == 2 * 3600
+
+from src.tests.test_notifications import env

@@ -202,17 +202,24 @@ def execute(account_key: str, action: str, *, actor: str, source: str = "manual"
         return out
 
 
-def _notify_auto_result(key: str, result: dict) -> None:
-    account = oauth_manager.get_account(key) or {}
-    label = notifier.escape_html(account.get("label") or account.get("nickname") or "WorkBuddy")
+def _notify_auto_result(key: str, result: dict, *, observation=None) -> None:
+    from ... import notifications
+    from ...notifications import reporting
+    from ...notifications.events import Effect
+    subject = observation[0] if observation else notifications.subjects.account(key)
+    if notifications.subjects.current(subject) is None:
+        return  # No delayed result may target a replacement account.
+    if result.get("status") in {"succeeded", "already_done"}:
+        notifications.resolve_silently("account.action.attention", subject,
+            scope="operation", scope_ref="checkin", dimension=business_date(), version=observation[1] if observation else 0)
     if result.get("quota_action") == "resumed":
-        notifier.throttled_notify_event_sync("quota_resumed", f"quota_resumed:{key}",
-            f"✅ <b>WorkBuddy 积分已恢复</b>\n账户: <code>{label}</code>\n已解除本地配额禁用。", cooldown_seconds=300)
+        reporting.quota(key, recovered=True, operation="签到后积分重新可用", source="workbuddy_checkin", observation=observation)
     elif result.get("status") not in {"succeeded", "already_done", "paused"}:
         unknown = result.get("status") in {"pending", "unknown"}
-        note = "结果未知，可能已提交；请查询记录核对，不会自动重复提交。" if unknown else "未完成签到；请检查活动状态或重新授权后再试。"
-        notifier.throttled_notify_event_sync("workbuddy_action_failed", f"workbuddy-action:{key}:{business_date()}",
-            f"⚠️ <b>WorkBuddy 自动签到未完成</b>\n账户: <code>{label}</code>\n{note}", cooldown_seconds=86400)
+        notifications.account_event("account.action.attention", key,
+            {"operation": "自动签到", "result": str(result.get("status") or "unknown"), "business_date": business_date(), "error_code": "result_unknown" if unknown else "action_not_completed"},
+            Effect("unknown" if unknown else "failed", "action_unknown" if unknown else "action_failed"),
+            source="workbuddy_checkin", scope="operation", scope_ref="checkin", dimension=business_date(), observation=observation)
 
 
 def auto_checkin_once() -> dict:
@@ -240,14 +247,21 @@ def auto_checkin_once() -> dict:
             continue
         _auto_attempts[key] = (window, count + 1)
         _next_auto_at[key] = time.monotonic() + 15 * 60
+        from ...notifications import subjects, store
+        subject = subjects.account(account)
         try:
-            results[key] = execute(key, "checkin", actor="scheduler:workbuddy", source="auto")
+            observation = (subject, store.next_version(subject))
+        except Exception:
+            observation = (subject, 0)
+        try:
+            with oauth_manager.exact_operation_target(key, oauth_manager.account_state_key(account)):
+                results[key] = execute(key, "checkin", actor="scheduler:workbuddy", source="auto")
         except common.WorkBuddyError as exc:
             results[key] = {"status": "paused" if exc.kind == "account_paused" else "not_submitted", "code": exc.kind}
         except Exception:
             results[key] = {"status": "unknown", "code": "persistence_or_runtime_failure"}
         try:
-            _notify_auto_result(key, results[key])
+            _notify_auto_result(key, results[key], observation=observation)
         except Exception:
             pass  # A notification failure never changes a recorded action.
     if time.monotonic() >= _cleanup_after:

@@ -298,7 +298,7 @@ async def test_proactive_refresh_triggers_near_expiry(m):
 
     # 通知应至少 1 条（refresh 成功）
     m["notifier"].wait_drain(2.0)
-    assert any(("refreshed" in msg.lower() or "已刷新" in msg)
+    assert any(("refreshed" in msg.lower() or "授权已续期" in msg)
                for msg in collector.messages), collector.messages
     print("  [PASS] proactive_refresh: near refreshed, ok skipped, off skipped")
 
@@ -335,7 +335,7 @@ async def test_proactive_refresh_network_failure_does_not_mark_auth_error(m):
     assert bad["enabled"] is True
     assert bad["disabled_reason"] is None
     m["notifier"].wait_drain(2.0)
-    assert any(("刷新失败" in msg and "账号未自动禁用" in msg)
+    assert any(("授权续期未完成" in msg and "未因此自动禁用" in msg)
                for msg in collector.messages), collector.messages
     print("  [PASS] transient refresh failure → not marked auth_error + notified")
 
@@ -468,7 +468,7 @@ async def test_claude_refresh_400_invalid_request_does_not_disable(m):
     assert acc["enabled"] is True
     assert acc["disabled_reason"] is None
     m["notifier"].wait_drain(2.0)
-    assert any("账号未自动禁用" in msg for msg in collector.messages), collector.messages
+    assert any("未因此自动禁用" in msg for msg in collector.messages), collector.messages
     print("  [PASS] Claude refresh compat: 400 invalid_request does not mark auth_error")
 
 
@@ -522,7 +522,7 @@ async def test_quota_monitor_disables_high_util(m):
     assert acc["disabled_reason"] == "quota"
     assert acc["disabled_until"]
     m["notifier"].wait_drain(2.0)
-    assert any(("quota disabled" in msg.lower() or "配额已用尽" in msg)
+    assert any(("quota disabled" in msg.lower() or "额度达到暂停条件" in msg)
                for msg in collector.messages), collector.messages
     print("  [PASS] quota_monitor disables account with util=97%")
 
@@ -648,3 +648,11 @@ async def amain():
 
 if __name__ == "__main__":
     sys.exit(asyncio.run(amain()))
+
+
+import pytest
+@pytest.fixture(autouse=True)
+def structured_business_notices(monkeypatch):
+    from src import notifier
+    from src.tests.notification_helpers import capture
+    capture(monkeypatch, lambda kind, text, record: notifier._handler(text) if notifier._handler else None)

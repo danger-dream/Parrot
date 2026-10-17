@@ -1148,3 +1148,15 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# Login now has a structured async result; no UI worker may outlive its fake wire.
+import pytest as _notification_pytest
+
+@_notification_pytest.fixture(autouse=True)
+def _finish_notification_ui_workers():
+    yield
+    import threading
+    for worker in threading.enumerate():
+        if worker.name == "oauth-model-sync-ui":
+            worker.join(25)

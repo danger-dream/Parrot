@@ -20,6 +20,10 @@
 
 from __future__ import annotations
 
+from src import notifications
+from src.notifications import reporting
+from src.notifications.events import Effect
+
 import asyncio
 import hashlib
 import json
@@ -695,15 +699,7 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         )
         # 节流告警
         ek = notifier.escape_html
-        await notifier.throttled_notify_event(
-            "no_channels",
-            f"no_channels:{ingress_protocol}:{model}",
-            f"🚨 <b>无可用渠道</b>（{notifier.provider_tag('openai')} 入口）\n"
-            f"客户端: <code>{ek(client_ip)}</code> / Key <code>{ek(str(key_name))}</code>\n"
-            f"入口: <code>{ingress_protocol}</code> / 模型: <code>{ek(model)}</code>\n"
-            f"筛选详情: <code>{ek(exclusion_summary)}</code>\n"
-            "请按筛选详情检查渠道状态。",
-        )
+        notifications.routing_unavailable(ingress=ingress_protocol, model=model, exclusions=result.exclusions, api_key_name=key_name, request_id=request_id)
         return errors.json_error_openai(status, err_type, msg)
 
     ts = time.strftime("%H:%M:%S", time.localtime(start_time))

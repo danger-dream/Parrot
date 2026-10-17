@@ -76,7 +76,7 @@ def test_actual_list_detail_share_quota_helpers_and_baseline_layout(display):
     assert listed.index("🏷️ 套餐") < listed.index("📊 5h") < listed.index("📊 7d") < listed.index("🛠 工具/月")
     assert {"5h", "7d"} <= set(window_calls)
     assert [[button["text"] for button in row] for row in kb["inline_keyboard"]] == [
-        ["🔄 刷新连接", "📊 刷新额度"], ["管理模型", "🚦 并发上限"],
+        ["📊 刷新额度"], ["管理模型", "🚦 并发上限"],
         ["🧹 清模型故障", "🔗 清亲和绑定"], ["⏸ 停用账户", "🗑 删除账户"],
         ["✏️ 账户名称"], ["🏠 主菜单", "◀ 返回列表"]]
     assert all(len(button.get("callback_data", "").encode()) <= 64 for row in kb["inline_keyboard"] for button in row)
@@ -134,7 +134,8 @@ def test_oauth_team_detail_has_known_identity_without_api_key_expiry(display):
     assert "模型目录: 1 个 · 已启用 1 · 禁用 0" in detail and "可用模型" not in detail
     assert "组织:" not in listed and "Token:" not in detail
     buttons = [button["text"] for row in kb["inline_keyboard"] for button in row]
-    assert "🔄 更新凭据" in buttons and "♻️ 官方重置卡" in buttons
+    assert "🔐 重新登录" in buttons and "♻️ 官方重置卡" in buttons
+    assert "🔄 更新凭据" not in buttons
     assert "创建模型 Key（需确认）" not in buttons
 
 
@@ -244,3 +245,9 @@ def test_quota_pause_without_known_reset_has_no_fake_estimate(display):
     om.set_enabled(key, False, reason="quota")
     text = menu._format_account_block(om.get_account(key))
     assert "[配额禁用]" in text and "预计 ?" not in text
+
+
+@pytest.fixture(autouse=True)
+def structured_operation_wire(monkeypatch):
+    from src.tests.notification_helpers import ui_operation_transport
+    ui_operation_transport(monkeypatch)

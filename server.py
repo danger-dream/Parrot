@@ -80,29 +80,6 @@ from src.transform.cc_mimicry import (
 )
 
 
-# ─── 全局告警节流（避免刷屏）────────────────────────────────────
-
-_alert_last_sent: dict[str, float] = {}
-_alert_lock = asyncio.Lock()    # async 互斥：FastAPI handler 都跑在主 event loop
-_ALERT_COOLDOWN_SEC = 300  # 同一类告警 5 分钟内不重复
-
-
-async def _throttled_notify(alert_key: str, text: str) -> None:
-    """节流告警：同 alert_key 5 分钟内只发一次。
-
-    用 asyncio.Lock 保证 check-and-set 原子（FastAPI 单 loop 多请求并发场景）。
-    notifier.notify 本身是非阻塞队列入队，不会卡 event loop。
-    """
-    import time as _t
-    async with _alert_lock:
-        now = _t.time()
-        last = _alert_last_sent.get(alert_key, 0)
-        if now - last < _ALERT_COOLDOWN_SEC:
-            return
-        _alert_last_sent[alert_key] = now
-    notifier.notify_event("no_channels", text)
-
-
 # ─── 后台循环 ─────────────────────────────────────────────────────
 
 _background_tasks: list[asyncio.Task] = []
@@ -110,10 +87,13 @@ _telegram_control_defaults: tuple[tuple[object, str, object], ...] | None = None
 
 
 def _telegram_control_bindings(controls: ManagementControls):
+    from src.notifications import actions as notification_actions
     observability = controls.observability
     auxiliary = controls.auxiliary
     system = controls.system
     return (
+        (notification_actions, "_control", controls.oauth),
+        (notification_actions, "_operations", controls.operations),
         (tgbot.main_menu, "_CONTROL", observability.status),
         (tgbot.status_menu, "_CONTROL", observability.status),
         (tgbot.stats_menu, "_CONTROL", observability.stats),
@@ -1469,16 +1449,9 @@ async def proxy_messages(request: Request):
             http_status=status, affinity_hit=(1 if result.affinity_hit else 0),
             total_ms=int((time.monotonic() - start_monotonic) * 1000),
         )
-        # 主动告警（节流 5min）：帮助运维第一时间发现
-        ek = notifier.escape_html
-        await _throttled_notify(
-            f"no_channels:{model}",
-            "🚨 <b>无可用渠道</b>\n"
-            f"客户端: <code>{ek(client_ip)}</code> / Key <code>{ek(str(key_name))}</code>\n"
-            f"请求模型: <code>{ek(model)}</code>\n"
-            f"筛选详情: <code>{ek(exclusion_summary)}</code>\n"
-            "请按筛选详情检查渠道状态。"
-        )
+        from src import notifications
+        notifications.routing_unavailable(ingress="anthropic", model=model, exclusions=result.exclusions,
+                                           api_key_name=key_name, request_id=request_id)
         return errors.json_error_response(status, err_type, msg)
 
     # Local token estimates are advisory, not a request-wide hard input cap.

@@ -67,7 +67,7 @@ def test_saved_login_refresh_initializes_default_personal_project_without_relogi
     else:
         assert saved["project_key_id"] == "new-id"
         assert created == [True]
-        assert any("账户已就绪" in text for text in display)
+        assert any("操作已完成" in text for text in display)
         assert not any("创建并继续" in text for text in display)
     assert sum(url.endswith("/oauth/token") for url, _ in calls) == 1
     assert all(kw.get("method", "GET") == "GET" for url, kw in calls if url.endswith("/api_keys") or "/reset/" in url)
@@ -157,3 +157,14 @@ def test_auto_setup_never_selects_team_and_keeps_login(callback_env, display, mo
     assert om.get_account(key)["plan_scope"] == "personal"
     assert not om.get_account(key).get("project_id")
     assert any("选择对应团队项目" in text for text in display)
+
+
+@pytest.fixture(autouse=True)
+def structured_operation_wire(monkeypatch):
+    from src.tests.notification_helpers import ui_operation_transport
+    ui_operation_transport(monkeypatch)
+    yield
+    import threading
+    for worker in threading.enumerate():
+        if worker.name == "oauth-model-sync-ui":
+            worker.join(25)

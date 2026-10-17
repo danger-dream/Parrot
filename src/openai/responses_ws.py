@@ -17,6 +17,10 @@ as much as possible while keeping the actual transport as a transparent WS relay
 
 from __future__ import annotations
 
+from src import notifications
+from src.notifications import reporting
+from src.notifications.events import Effect
+
 import asyncio
 import copy
 import json
@@ -1046,15 +1050,7 @@ async def _handle_responses_ws_lane(websocket: WebSocket) -> None:
             request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
         )
         ek = notifier.escape_html
-        await notifier.throttled_notify_event(
-            "no_channels",
-            f"no_channels:responses_ws:{model}",
-            f"🚨 <b>无可用渠道</b>（{notifier.provider_tag('openai')} Responses WS 入口）\n"
-            f"客户端: <code>{ek(client_ip)}</code> / Key <code>{ek(str(key_name))}</code>\n"
-            f"模型: <code>{ek(model)}</code>\n"
-            f"筛选详情: <code>{ek(exclusion_summary)}</code>\n"
-            "请按筛选详情检查渠道状态。",
-        )
+        notifications.routing_unavailable(ingress="responses_ws", model=model, exclusions=result.exclusions, api_key_name=key_name, request_id=request_id)
         code = 4404 if _model_never_supported(model) else 4503
         await websocket.close(code=code, reason=_trim_reason(msg))
         return
@@ -1419,6 +1415,8 @@ async def _run_ws_failover(
             recovery_retry_allowed("oauthRefresh", cfg)
             and os.environ.get("PARROT_NO_REFRESH") != "1"
             and ch.type == "oauth"
+            and getattr(ch, "provider", "") != "zhipu"
+            and (getattr(ch, "provider", "") != "workbuddy" or result.http_status == 401)
             and result.http_status in (401, 403)
             and not result.openai_oauth_html_403
             and getattr(getattr(result, "error_advice", None), "kind", "") not in {
@@ -1428,31 +1426,26 @@ async def _run_ws_failover(
         ):
             refreshed_once.add(ch.key)
             ak = getattr(ch, "account_key", None) or getattr(ch, "email", "")
+            notification_observation = reporting.observation(ak)
             try:
-                await oauth_manager.force_refresh(ak)
+                expected = getattr(ch, "state_key", None)
+                if expected is None:
+                    await oauth_manager.force_refresh(ak)
+                else:
+                    await oauth_manager.force_refresh(ak, expected_state_key=expected)
+                with oauth_manager.account_generation_guard(expected) as current:
+                    if not current:
+                        raise ValueError("OAuth account generation was deleted")
                 print(f"[responses_ws] OAuth 401/403 on {ch.key}, refreshed; retrying same channel")
                 retry_count += 1
                 continue
             except Exception as exc:
                 print(f"[responses_ws] OAuth refresh failed for {ch.key}: {exc}")
-                email = getattr(ch, "email", "?")
-                try:
-                    oauth_manager.set_enabled(ak, False, reason="auth_error")
-                except Exception:
-                    pass
-                try:
-                    ek = notifier.escape_html
-                    prov = getattr(ch, "provider", "") or oauth_manager.provider_of(ak)
-                    relogin_hint = "重新登录" if prov == "workbuddy" else "重新登录或粘贴新 JSON"
-                    notifier.notify_event(
-                        "oauth_refresh_failed",
-                        "⚠ <b>OAuth Token 刷新失败</b>（Responses WS 请求路径触发）\n"
-                        f"账号: <code>{ek(email)}</code> · {notifier.provider_tag(prov)}\n"
-                        f"原因: <code>{ek(str(exc))}</code>\n"
-                        f"账号已被自动禁用 (auth_error)。请通过 TG Bot {relogin_hint}。"
-                    )
-                except Exception:
-                    pass
+                from .. import oauth_refresh_failure
+                refresh_error, effect = oauth_refresh_failure.apply(
+                    ak, exc, expected_state_key=getattr(ch, "state_key", None), provider=getattr(ch, "provider", ""))
+                if effect is not None:
+                    reporting.refresh_failed(ak, refresh_error, effect, source="responses_ws", observation=notification_observation)
 
         transient_kind = retryable_transient_error_kind(ch, result)
         if (

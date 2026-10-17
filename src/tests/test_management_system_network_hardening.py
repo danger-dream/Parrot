@@ -243,12 +243,9 @@ def test_notifications_expose_and_patch_all_authoritative_events(tmp_path):
     with TestClient(app) as client:
         headers = bearer(create_session(client))
         before = client.get(PREFIX + "/settings/notifications", headers=headers).json()["data"]
-        assert list(before["events"]) == [
-            "channelPermanent", "channelRecovered", "quotaDisabled", "quotaResumed",
-            "openaiCreditsStarted", "quotaCooldown", "oauthRefreshed", "oauthRefreshFailed", "noChannels",
-            "openaiStoreSaveFailed", "modelDegraded", "statusAlert", "appUpdate",
-            "networkMonitor",
-        ]
+        from src.notifications.catalog import settings_entries
+        assert list(before["events"]) == [public for public, _ in settings_entries()]
+
         changed = client.patch(
             PREFIX + "/settings/notifications",
             headers={**headers, "If-Match": before["revision"]},

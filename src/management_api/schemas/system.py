@@ -172,38 +172,12 @@ class QuotaMonitorSettingsPatch(StrictRequestSchema):
     thresholdPercent: float | None = Field(default=None, ge=1, le=100, allow_inf_nan=False)
 
 
-class NotificationEventsData(StrictSchema):
-    channelPermanent: bool
-    channelRecovered: bool
-    quotaDisabled: bool
-    quotaResumed: bool
-    openaiCreditsStarted: bool
-    quotaCooldown: bool
-    oauthRefreshed: bool
-    oauthRefreshFailed: bool
-    noChannels: bool
-    openaiStoreSaveFailed: bool
-    modelDegraded: bool
-    statusAlert: bool
-    appUpdate: bool
-    networkMonitor: bool
-
-
-class NotificationEventsPatch(StrictRequestSchema):
-    channelPermanent: bool | None = None
-    channelRecovered: bool | None = None
-    quotaDisabled: bool | None = None
-    quotaResumed: bool | None = None
-    openaiCreditsStarted: bool | None = None
-    quotaCooldown: bool | None = None
-    oauthRefreshed: bool | None = None
-    oauthRefreshFailed: bool | None = None
-    noChannels: bool | None = None
-    openaiStoreSaveFailed: bool | None = None
-    modelDegraded: bool | None = None
-    statusAlert: bool | None = None
-    appUpdate: bool | None = None
-    networkMonitor: bool | None = None
+from pydantic import create_model
+from src.management_control.system.models import settings_entries
+NotificationEventsData = create_model("NotificationEventsData", __base__=StrictSchema,
+    **{public: (bool, ...) for public, _ in settings_entries()})
+NotificationEventsPatch = create_model("NotificationEventsPatch", __base__=StrictRequestSchema,
+    **{public: (bool | None, None) for public, _ in settings_entries()})
 
 
 class NotificationSettingsData(StrictSchema):

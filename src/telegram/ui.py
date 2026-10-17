@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import math
 import queue
 import re
@@ -445,6 +446,71 @@ def api(method: str, data: Optional[dict] = None) -> Optional[dict]:
 
 
 # ─── 消息发送辅助 ─────────────────────────────────────────────────
+
+def _notification_diagnostic(method, data, started, *, response=None, result=None, error=None):
+    """Only protocol metadata; no body, button refs, URLs or raw exception strings.
+
+    Telegram can echo untrusted input in descriptions. Keep exact known static
+    errors, classify parse errors without their echoed fragments, hash the rest.
+    """
+    description = str((result or {}).get("description") or "")
+    known = {"Bad Request: message to edit not found", "Bad Request: message can't be edited",
+             "Bad Request: message is not modified", "Bad Request: BUTTON_DATA_INVALID",
+             "Bad Request: chat not found", "Bad Request: message text is empty",
+             "Bad Request: message is too long", "Forbidden: bot was blocked by the user",
+             "Bad Request: query is too old and response timeout expired or query ID is invalid"}
+    safe = description if description in known else ""
+    if not safe and "message is not modified" in description.lower():
+        safe = "Bad Request: message is not modified"
+    if not safe and "can't parse entities" in description.lower():
+        safe = "Bad Request: can't parse entities (echo omitted)"
+    if not safe and description:
+        safe = "unrecognized description (omitted)"
+    markup = data.get("reply_markup") or {}
+    buttons = [button for row in markup.get("inline_keyboard", []) for button in row] if isinstance(markup, dict) else []
+    record = {"method": method, "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+              "outcome": "accepted" if (result or {}).get("ok") is True else "rejected" if (result or {}).get("ok") is False else "unknown",
+              "http_status": response.status_code if response is not None else None,
+              "error_code": (result or {}).get("error_code") if type((result or {}).get("error_code")) is int else None, "description": safe,
+              "text_chars": len(data.get("text") or ""), "buttons": len(buttons),
+              "callback_max_bytes": max((len(str(b.get("callback_data", "")).encode()) for b in buttons), default=0)}
+    for field in ("chat_id", "message_id"):
+        if type(data.get(field)) is int:
+            record[field] = data[field]
+    returned = (result or {}).get("result")
+    if isinstance(returned, dict) and type(returned.get("message_id")) is int:
+        record["result_message_id"] = returned["message_id"]
+    if description:
+        record["description_sha256"] = hashlib.sha256(description.encode()).hexdigest()[:16]
+    if error is not None:
+        record["exception_type"] = type(error).__name__
+    retry_after = ((result or {}).get("parameters") or {}).get("retry_after")
+    if type(retry_after) in (int, float):
+        record["retry_after"] = retry_after
+    print("[tg-notification] " + json.dumps(record, ensure_ascii=False))
+
+
+def notification_api(method: str, data: dict) -> Optional[dict]:
+    """One structured-message attempt; never replay unknown I/O or log secrets."""
+    started = time.monotonic()
+    response = result = error = None
+    try:
+        if not _bot_token:
+            result = {"ok": False, "error_code": 503}
+        else:
+            with _session_lease() as session:
+                response = session.post(f"https://api.telegram.org/bot{_bot_token}/{method}", json=data)
+                value = response.json()
+                result = value if isinstance(value, dict) else None
+    except Exception as exc:
+        error = exc
+    # Diagnostics must never turn an accepted side effect into a retryable failure.
+    try:
+        _notification_diagnostic(method, data, started, response=response, result=result, error=error)
+    except Exception:
+        pass
+    return result
+
 
 def send(chat_id: int, text: str,
          reply_markup: Optional[dict] = None,
@@ -1272,6 +1338,8 @@ def install_notify_handler() -> None:
                     pass
 
     notifier.set_handler(_handler)
+    from ..notifications import delivery
+    delivery.install(notification_api)
 
 
 # ─── 日志条目共用渲染 ──────────────────────────────────────────────

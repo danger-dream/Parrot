@@ -67,7 +67,7 @@ def test_missing_key_auto_creation_continues_to_ready_on_same_card(callback_env,
     assert created == [True]
     assert saved["project_key_id"] == "new-id"
     assert saved["models"] and state_db.quota_load(key)
-    assert "账户已就绪" in cards[-1][0]
+    assert "操作已完成" in cards[-1][0]
     assert states.get_state(42) is None
 
 
@@ -165,3 +165,14 @@ def test_cancel_confirmation_does_not_execute(reset_env, cards, monkeypatch):
     click("oa:zh:cancel_action:" + nonce)
     assert states.get_state(42) is None
     assert not state["calls"]
+
+
+@pytest.fixture(autouse=True)
+def structured_operation_wire(monkeypatch):
+    from src.tests.notification_helpers import ui_operation_transport
+    ui_operation_transport(monkeypatch)
+    yield
+    import threading
+    for worker in threading.enumerate():
+        if worker.name == "oauth-model-sync-ui":
+            worker.join(25)

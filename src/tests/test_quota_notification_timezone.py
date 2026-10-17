@@ -16,15 +16,18 @@ def test_realtime_quota_notice_bjt_preserves_utc_reset(m, monkeypatch, provider,
     failover = m["failover"]
     from src import notifier
     messages, disabled = [], []
-    monkeypatch.setattr(manager, "get_account", lambda key: {})
+    account = {"provider": provider, "email": "user@example.test", "enabled": True, "generationId": "timezone-" + provider}
+    m["config"].update(lambda cfg: cfg.update(oauthAccounts=[account]))
+    key = manager.get_account_key(account)
     monkeypatch.setattr(manager, "openai_credits_usable", lambda *a, **k: False)
     monkeypatch.setattr(manager, "openai_plan_workspace_label", lambda acc: "OpenAI")
     monkeypatch.setattr(manager, "claude_plan_label", lambda acc: "")
     monkeypatch.setattr(failover, "_get_quota_disable_threshold_pct", lambda: 100)
-    monkeypatch.setattr(notifier, "notify_event", lambda event, text: messages.append(text))
+    capture(monkeypatch, lambda kind, text, record: messages.append(text))
 
     def disable(key, until, **kwargs):
         disabled.append(until)
+        account.update(enabled=False, disabled_reason="quota")
         return {"state": "disabled"}
 
     monkeypatch.setattr(manager, "set_disabled_by_quota", disable)
@@ -42,12 +45,12 @@ def test_realtime_quota_notice_bjt_preserves_utc_reset(m, monkeypatch, provider,
         if reset:
             target = datetime.fromisoformat(reset.replace("Z", "+00:00"))
             snap["primary_reset_sec"] = int((target - instant).total_seconds())
-        failover._maybe_auto_disable_by_codex_snapshot("test-account", "user@example.test", snap)
+        failover._maybe_auto_disable_by_codex_snapshot(key, "user@example.test", snap)
     else:
         headers = {"anthropic-ratelimit-unified-5h-utilization": "1.0"}
         if reset:
             headers["anthropic-ratelimit-unified-5h-reset"] = str(int(datetime.fromisoformat(reset.replace("Z", "+00:00")).timestamp()))
-        failover._maybe_auto_disable_by_headers("test-account", "user@example.test", headers, provider="claude")
+        failover._maybe_auto_disable_by_headers(key, "user@example.test", headers, provider="claude")
 
     assert disabled == [reset]  # Storage and recovery still receive UTC ISO.
     assert len(messages) == 1
@@ -55,6 +58,11 @@ def test_realtime_quota_notice_bjt_preserves_utc_reset(m, monkeypatch, provider,
         datetime.fromisoformat(reset.replace("Z", "+00:00"))
         .astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
     )
-    assert f"恢复时间: <code>{expected}</code>" in messages[0]
+    if reset:
+        assert expected in messages[0] and "北京时间" in messages[0]
+    else:
+        assert "上游给出的重置时间" not in messages[0]
     if reset:
         assert reset not in messages[0]
+
+from src.tests.notification_helpers import capture

@@ -7,6 +7,10 @@ policy. Native signatures/redacted payloads use tagged opaque replay carriers.
 
 from __future__ import annotations
 
+from src import notifications
+from src.notifications import reporting
+from src.notifications.events import Effect
+
 import copy
 import json
 import time
@@ -699,15 +703,7 @@ class StreamTranslator:
             _tb.print_exc()
             from ... import notifier as _notifier
             ek = _notifier.escape_html
-            _notifier.throttled_notify_event_sync(
-                "openai_store_save_failed",
-                f"openai_store_save_failed:{self._store_api_key_name}",
-                f"❌ {_notifier.provider_custom_emoji_html('openai')} <b>OpenAI Store 写入失败</b>（流式 Anthropic→Responses）\n"
-                f"API Key: <code>{ek(self._store_api_key_name)}</code>\n"
-                f"模型: <code>{ek(self.state.model)}</code> · 渠道: <code>{ek(self._store_channel_key or '?')}</code>\n"
-                f"resp_id: <code>{ek(self.state.resp_id)}</code>\n"
-                f"原因: <code>{ek(str(exc))[:300]}</code>",
-            )
+            notifications.store_failed(model=self.state.model, api_key_name=self._store_api_key_name, response_id=self.state.resp_id, error=exc, source="anthropic_responses_stream")
 
     def get_downstream_responses_output(self) -> list[dict]:
         return self._collect_output_items()

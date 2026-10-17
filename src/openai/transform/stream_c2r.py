@@ -22,6 +22,10 @@ sequence_number 全局自增，保留官方字段占位；客户端通常不严�
 
 from __future__ import annotations
 
+from src import notifications
+from src.notifications import reporting
+from src.notifications.events import Effect
+
 import json
 import time
 import uuid
@@ -843,18 +847,7 @@ class StreamTranslator:
             ek = _notifier.escape_html
             should_log = True
             try:
-                should_log = _notifier.throttled_notify_event_sync(
-                    "openai_store_save_failed",
-                    f"openai_store_save_failed:{self._store_api_key_name}",
-                    f"❌ {_notifier.provider_custom_emoji_html('openai')} <b>OpenAI Store 写入失败</b>（流式）\n"
-                    f"API Key: <code>{ek(self._store_api_key_name)}</code>\n"
-                    f"模型: <code>{ek(self.state.model)}</code> · "
-                    f"渠道: <code>{ek(self._store_channel_key or '?')}</code>\n"
-                    f"resp_id: <code>{ek(self.state.resp_id)}</code>\n"
-                    f"原因: <code>{ek(str(exc))[:300]}</code>\n"
-                    "⚠ 下一次带该 previous_response_id 的请求会 404；"
-                    "请检查 openai.store.dbPath 配置、对应文件权限与磁盘空间。",
-                )
+                should_log = notifications.store_failed(model=self.state.model, api_key_name=self._store_api_key_name, response_id=self.state.resp_id, error=exc, source="chat_responses_stream")
             except Exception:
                 pass
             if should_log:

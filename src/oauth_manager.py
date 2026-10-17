@@ -14,6 +14,10 @@
 
 from __future__ import annotations
 
+from . import notifications
+from .notifications import reporting
+from .notifications.events import Effect
+
 import asyncio
 import base64
 import copy
@@ -309,7 +313,81 @@ def _resolve_existing_account_key_or_raise(value: str) -> str:
     return key
 
 
+from contextvars import ContextVar
+from contextlib import contextmanager
+_exact_operation_target = ContextVar("oauth_exact_operation_target", default=None)
+_usage_commit_observation = ContextVar("oauth_usage_commit_observation", default=None)
+
+
+@contextmanager
+def usage_commit_observation(account):
+    """Request-local witness, never serialized; default binds even custom backends.
+
+    Real usage request adapters bind the credentials they actually dispatch AFTER
+    their own necessary renewal. A later login cannot relabel an in-flight result.
+    """
+    from .management_control.oauth.contracts import credential_fingerprint
+    witness = {"state": account_state_key(account), "credential": credential_fingerprint(account)}
+    token = _usage_commit_observation.set(witness)
+    try:
+        yield witness
+    finally:
+        _usage_commit_observation.reset(token)
+
+
+def _bind_usage_request(account_key, access_token=None, *, account=None):
+    witness = _usage_commit_observation.get()
+    if witness is None:
+        return
+    from .management_control.oauth.contracts import credential_fingerprint
+    with account_generation_guard(witness["state"]) as current:
+        if not current:
+            raise ValueError("Usage request generation changed")
+        snapshot = copy.deepcopy(account if account is not None else get_account(account_key))
+        if access_token is not None and snapshot.get("access_token") != access_token:
+            raise ValueError("Usage request credentials changed before dispatch")
+        witness["credential"] = credential_fingerprint(snapshot)
+
+
+def validate_usage_commit(account_key):
+    """Caller owns the generation/config lock through cache save and evaluation."""
+    witness = _usage_commit_observation.get()
+    if witness is not None:
+        from .management_control.oauth.contracts import credential_fingerprint
+        account = get_account(account_key)
+        if not account or account_state_key(account) != witness["state"] or credential_fingerprint(account) != witness["credential"]:
+            raise ValueError("Usage request credential revision changed")
+
+
+
+@contextmanager
+def exact_operation_target(account_id, expected_state_key):
+    """Bind management work to an incarnation without holding locks across I/O."""
+    token = _exact_operation_target.set((account_id, expected_state_key))
+    try:
+        with account_generation_guard(expected_state_key) as current:
+            if not current:
+                raise ValueError("OAuth account generation was deleted")
+        yield
+    finally:
+        _exact_operation_target.reset(token)
+
+
 def get_account(account_key: str) -> dict | None:
+    bound = _exact_operation_target.get()
+    if bound is None:
+        return _get_account_unbound(account_key)
+    from . import channel_state
+    with account_generation_guard(bound[1]) as current:
+        if not current:
+            raise ValueError("OAuth account generation was deleted")
+        target = channel_state.resolve(bound[1]).removeprefix("oauth:")
+        if account_key not in {bound[0], target}:
+            raise ValueError("Exact management operation target mismatch")
+        return _get_account_unbound(target)
+
+
+def _get_account_unbound(account_key: str) -> dict | None:
     """按 canonical account_key 精确匹配账户。
 
     历史上本函数按 email 查找；同邮箱下 Claude + OpenAI 共存后必须联合键。
@@ -734,6 +812,10 @@ def _save_token_fields_serialized(account_key: str, new: dict) -> bool:
         if refreshed is None:
             raise RuntimeError("refreshed OpenAI account disappeared before identity registration")
         register_account_identity(refreshed)
+    try:
+        reporting.refreshed(new_key, source="credential_commit", recovery_only=True)
+    except Exception:
+        print("[notification] auth recovery record unavailable")
     return True
 
 
@@ -868,6 +950,8 @@ def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: s
     # 任一方刷新会轮换 access_token/refresh_token，击穿线上 token 导致小夕 401。
     # 三条刷新入口（proactive_refresh_loop / ensure_valid_token / force_refresh）
     # 最终都汇到这里，单点拦截即全堵。返回现有 token，绝不发刷新请求。
+    if expected_state_key is None and _exact_operation_target.get() is not None:
+        expected_state_key = _exact_operation_target.get()[1]
     with account_generation_guard(expected_state_key) as current:
         if not current:
             raise ValueError("OAuth account generation was deleted")
@@ -1217,6 +1301,7 @@ async def _fetch_claude_usage(account_key: str) -> dict:
         raise ValueError(f"unknown OAuth account: {account_key}")
     expected = account_state_key(account)
     access_token = await ensure_valid_token(account_key, expected_state_key=expected)
+    _bind_usage_request(account_key, access_token)
     try:
         usage = await asyncio.to_thread(_usage_sync, access_token, account_key=account_key)
     except httpx.HTTPStatusError as exc:
@@ -1239,6 +1324,7 @@ async def _fetch_claude_usage(account_key: str) -> dict:
         with account_generation_guard(expected) as current:
             if not current:
                 raise
+        _bind_usage_request(account_key, access_token)
         usage = await asyncio.to_thread(_usage_sync, access_token, account_key=account_key)
     from .oauth import claude_reset
     return await claude_reset.enrich_usage(access_token, account_key, usage, expected=expected)
@@ -1356,6 +1442,7 @@ async def _fetch_openai_usage(account_key: str, *, access_token: str | None = No
             openai_provider.fetch_wham_usage,
             account_id=_openai_workspace_id(acc) or None, account_key=account_key,
         )
+        _bind_usage_request(account_key, access_token, account=acc)
         usage = await openai_provider.fetch_wham_usage(access_token, **kwargs)
         codex = usage.get("openai") if isinstance(usage, dict) else None
         if isinstance(codex, dict):
@@ -1400,8 +1487,10 @@ async def fetch_usage(account_key: str) -> dict:
         return await _fetch_openai_usage(account_key)
     access_token = await ensure_valid_token(account_key)
 
+    account = copy.deepcopy(get_account(account_key) or {})
+    _bind_usage_request(account_key, access_token if provider != "zhipu" else None, account=account)
     if provider == "zhipu":
-        return await asyncio.to_thread(zhipu_runtime.fetch_usage_sync, copy.deepcopy(get_account(account_key) or {}), account_key)
+        return await asyncio.to_thread(zhipu_runtime.fetch_usage_sync, account, account_key)
     if provider == "workbuddy":
         account = copy.deepcopy(get_account(account_key) or {})
         usage = await asyncio.to_thread(workbuddy_provider.fetch_usage_sync, access_token,
@@ -2807,6 +2896,7 @@ def _evaluate_cursor_model_pools(
     records = catalog_records(account)
     cooled = 0
     recovered = 0
+    pool_changes = {"cooled": {}, "recovered": {}}
     over_pools: list[str] = []
     unknown_pool = False
     channel_key = f"oauth:{account_key}"
@@ -2850,35 +2940,21 @@ def _evaluate_cursor_model_pools(
                 channel_key, model, message, cooldown_until=reset_ms,
             )
             cooled += 1
+            pool_changes["cooled"].setdefault(pool, []).append(model)
         elif fresh and owned:
             cooldown.clear(
                 channel_key, model=model, notify_recovered=False,
             )
             recovered += 1
+            pool_changes["recovered"].setdefault(pool, []).append(model)
 
+    for status, pools in pool_changes.items():
+        for pool, changed_models in pools.items():
+            reporting.model_quota(account_key, pool=pool, models=changed_models, recovered=status == "recovered",
+                used=auto_pct if pool == "cursor_models" else api_pct, threshold=threshold, reset_at=reset_iso)
     if cooled:
-        try:
-            notifier.notify_event(
-                "quota_cooldown",
-                "⏸ <b>Cursor 模型池已进入配额暂停</b>\n"
-                f"账号: <code>{notifier.escape_html(account_key_to_email(account_key))}</code> · {notifier.provider_tag('cursor')}\n"
-                f"额度池: <code>{notifier.escape_html(' / '.join(over_pools))}</code>\n"
-                f"暂停覆盖: <code>{cooled}</code> 个模型（含已禁用模型）\n"
-                f"恢复时间: <code>{notifier.escape_html(_to_bjt(reset_iso))}</code>"
-            )
-        except Exception:
-            pass
         action = "cursor_pool_cooldown"
     elif recovered:
-        try:
-            notifier.notify_event(
-                "quota_resumed",
-                "♻️ <b>Cursor 模型池额度已恢复</b>\n"
-                f"账号: <code>{notifier.escape_html(account_key_to_email(account_key))}</code> · {notifier.provider_tag('cursor')}\n"
-                f"恢复模型: <code>{recovered}</code>"
-            )
-        except Exception:
-            pass
         action = "cursor_pool_recovered"
     elif over_pools:
         action = "cursor_pool_still_cooling"
@@ -2940,6 +3016,7 @@ def _evaluate_claude_fable_pool(
     channel_key = f"oauth:{account_key}"
     cooled = 0
     recovered = 0
+    cooled_list, recovered_list = [], []
 
     for model in models:
         state = cooldown.get_state(channel_key, model) or {}
@@ -2968,34 +3045,22 @@ def _evaluate_claude_fable_pool(
                 channel_key, model, message, cooldown_until=reset_ms,
             )
             cooled += 1
+            cooled_list.append(model)
         elif utilization is not None and fresh and owned:
             cooldown.clear(
                 channel_key, model=model, notify_recovered=False,
             )
             recovered += 1
+            recovered_list.append(model)
 
+    if cooled_list:
+        reporting.model_quota(account_key, pool="fable", models=cooled_list, used=utilization,
+                              threshold=threshold, reset_at=reset_iso)
+    if recovered_list:
+        reporting.model_quota(account_key, pool="fable", models=recovered_list, recovered=True)
     if cooled:
-        try:
-            notifier.notify_event(
-                "quota_cooldown",
-                "🟠 <b>Claude Fable 模型已进入额度冷却</b>\n"
-                f"账号: <code>{notifier.escape_html(account_key_to_email(account_key))}</code> · {notifier.provider_tag('claude')}\n"
-                f"冷却模型: <code>{cooled}</code>\n"
-                f"恢复时间: <code>{notifier.escape_html(_to_bjt(reset_iso))}</code>"
-            )
-        except Exception:
-            pass
         action = "claude_fable_model_cooldown"
     elif recovered:
-        try:
-            notifier.notify_event(
-                "quota_resumed",
-                "♻️ <b>Claude Fable 模型额度已恢复</b>\n"
-                f"账号: <code>{notifier.escape_html(account_key_to_email(account_key))}</code> · {notifier.provider_tag('claude')}\n"
-                f"恢复模型: <code>{recovered}</code>"
-            )
-        except Exception:
-            pass
         action = "claude_fable_model_recovered"
     elif over and models and reset_ms is not None:
         action = "claude_fable_model_still_cooling"
@@ -3772,6 +3837,7 @@ def _replace_exact_identity_in_config(
     entry: dict,
     *,
     expected_account: dict | None = None,
+    authenticated_login: bool = False,
 ) -> dict:
     """Apply the established exact-identity replacement to one config candidate."""
     provider = _normalize_provider(entry.get("provider"))
@@ -3834,8 +3900,11 @@ def _replace_exact_identity_in_config(
                     "last_model_sync", "last_model_sync_source", "last_model_sync_error", "last_model_sync_attempt"):
             if key in current:
                 replacement[key] = copy.deepcopy(current[key])
+    zhipu_reauthenticated = authenticated_login and provider == "zhipu" and incoming.get("credential_mode") == "oauth"
+    if zhipu_reauthenticated and replacement.get("management_status") in {"relogin_required", "model_key_rejected"}:
+        replacement["management_status"] = "ready"
     if (current.get("disabled_reason") == "auth_error"
-            and (provider != "zhipu" or incoming.get("model_key"))):
+            and (provider != "zhipu" or incoming.get("model_key") or zhipu_reauthenticated)):
         replacement["enabled"] = True
         replacement["disabled_reason"] = None
         replacement["disabled_until"] = None
@@ -3886,11 +3955,14 @@ def replace_exact_identity(
     entry: dict,
     *,
     expected_account: dict | None = None,
+    authenticated_login: bool = False,
 ) -> dict:
     """Atomically replace credentials/profile for one unchanged OAuth identity.
 
     ``expected_account`` is an optional exact-snapshot CAS for Management API
     callers. Legacy/TG callers omit it and retain their historical behavior.
+    ``authenticated_login`` is reserved for a verified, identity-bound browser
+    login; imports and background refresh retain their existing recovery rules.
     """
     provider = _normalize_provider(entry.get("provider"))
     incoming = copy.deepcopy(entry)
@@ -3918,6 +3990,7 @@ def replace_exact_identity(
     def mutate(cfg):
         result.update(_replace_exact_identity_in_config(
             cfg, expected_account_key, incoming, expected_account=expected_account,
+            authenticated_login=authenticated_login,
         ))
 
     with config.serialized_updates():
@@ -6307,7 +6380,10 @@ async def oauth_model_sync_once(
             and result.get("had_success_baseline") and result.get("changed")
         ):
             try:
-                notifier.notify(_format_model_change_notification(snapshot, result))
+                notifications.account_event("account.catalog.changed", key,
+                    {"added": list(result.get("added") or [])[:300], "removed": list(result.get("removed") or [])[:300]},
+                    Effect("confirmed", "catalog_updated"), source="model_sync",
+                    observation=(notifications.subjects.account(snapshot), 0))
             except Exception as exc:
                 print(f"[oauth] model change notification failed: {type(exc).__name__}")
         return result
@@ -6777,6 +6853,7 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
             continue
 
         expected_state_key = account_state_key(acc)
+        notification_observation = reporting.observation(ak)
         try:
             if provider == "workbuddy" and expired is None:
                 await ensure_valid_token(ak)
@@ -6800,48 +6877,15 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
             except Exception as exc:
                 print(f"[oauth] usage fetch after refresh failed for {ak}: {exc}")
 
-            notifier.notify_event(
-                "oauth_refreshed",
-                _build_refresh_notice(ak, usage_flat, usage=usage),
-                auto_delete_seconds=180,
-            )
+            reporting.refreshed(ak, observation=notification_observation)
         except Exception as exc:
-            err = oauth_errors.describe_oauth_error(
-                exc, provider=provider_of(ak), operation="refresh_token",
-            )
+            from . import oauth_refresh_failure
+            err, effect = oauth_refresh_failure.apply(ak, exc, expected_state_key=expected_state_key, provider=provider)
+            if effect is None:
+                out[email] = "skipped:deleted_generation"
+                continue
             out[email] = f"failed:{err.code}"
-            disabled_line = ""
-            if err.auth_error:
-                try:
-                    with account_generation_guard(expected_state_key) as current:
-                        if not current:
-                            out[email] = "skipped:deleted_generation"
-                            continue
-                        set_enabled(ak, False, reason="auth_error")
-                        relogin_hint = "重新登录" if provider == "workbuddy" else "重新登录或粘贴新 JSON"
-                        disabled_line = f"\n账号已被自动禁用 (auth_error)。请到「🔐 管理 OAuth」{relogin_hint}。"
-                except Exception:
-                    disabled_line = "\n⚠ 自动禁用写入失败，请查看 systemd 日志。"
-            else:
-                disabled_line = "\n账号未自动禁用；可稍后重试。"
-            print(f"[oauth] proactive refresh failed for {ak}: {oauth_errors.technical_detail(exc)}")
-            _rf_plan_tag = ""
-            if provider_of(ak) == "claude":
-                _rf_pl = claude_plan_label(acc)
-                _rf_plan_tag = f"\n{notifier.provider_tag('claude')} · {notifier.escape_html(_rf_pl)}" if _rf_pl else ""
-            elif provider_of(ak) == "openai":
-                _rf_pl = openai_plan_label(acc.get("plan_type"))
-                _rf_plan_tag = f"\n{notifier.provider_tag('openai')} · {notifier.escape_html(_rf_pl)}" if _rf_pl else ""
-            elif provider_of(ak) == "cursor":
-                _rf_pl = acc.get("plan_type") or ""
-                _rf_plan_tag = f"\n{notifier.provider_tag('cursor')} · {notifier.escape_html(_rf_pl)}" if _rf_pl else ""
-            notifier.notify_event(
-                "oauth_refresh_failed",
-                "⚠ <b>OAuth Token 刷新失败</b>\n"
-                f"账号: <code>{notifier.escape_html(disp)}</code>{_rf_plan_tag}\n"
-                + oauth_errors.format_oauth_error_html(err)
-                + disabled_line
-            )
+            reporting.refresh_failed(ak, err, effect, source="background", observation=notification_observation)
     return out
 
 
@@ -6872,6 +6916,7 @@ async def quota_monitor_once() -> dict:
 
         reason_before = acc.get("disabled_reason")
         expected_state_key = account_state_key(acc)
+        notification_observation = reporting.observation(ak)
         if provider == "zhipu" and acc.get("credential_mode") == "oauth":
             # Cards and automatic grants share the existing monitor. Neither
             # failure may block quota recovery; consumption is never automatic.
@@ -6910,44 +6955,17 @@ async def quota_monitor_once() -> dict:
         utils = result["utils"]
         action = result["action"]
 
-        # 通知使用套餐显示标签，账号仍保留上游原始套餐代码。
-        _plan_tag = ""
-        if provider == "claude":
-            _pl = claude_plan_label(acc)
-            _plan_tag = f"\n{notifier.provider_tag('claude')} · {notifier.escape_html(_pl)}" if _pl else ""
-        elif provider == "openai":
-            _label = openai_plan_workspace_label(acc)
-            _plan_tag = f"\n{notifier.provider_custom_emoji_html('openai')} {notifier.escape_html(_label)}" if _label else ""
-        elif provider == "xai":
-            _plan_tag = f"\n{notifier.provider_custom_emoji_html('xai')} Grok"
-        elif provider == "cursor":
-            _plan_tag = f"\n{notifier.provider_tag('cursor')} · {notifier.escape_html(str(acc.get('plan_type') or 'Cursor'))}"
-        elif provider == "antigravity":
-            _plan_tag = f"\n{notifier.provider_custom_emoji_html('antigravity')} Antigravity"
-
         if action in ("disabled", "wham_limit_disabled"):
             latest_reset = result["disabled_until"]
             hit = " / ".join(result["hit_windows"]) or "?"
             out[email] = f"disabled_quota:{latest_reset}"
-            notifier.notify_event(
-                "quota_disabled",
-                "⚠ <b>OAuth 配额已用尽，账号被自动禁用</b>\n"
-                f"账号: <code>{notifier.escape_html(email)}</code>{_plan_tag}\n"
-                f"撞到窗口: <code>{hit}</code>\n"
-                f"重置时间: <code>{_to_bjt(latest_reset) if latest_reset else 'unknown'}</code>\n"
-                "所有撞到窗口恢复后即可自动解禁。"
-            )
+            reporting.quota(ak, windows=result["hit_windows"], usage=usage, threshold=threshold,
+                            reset_at=latest_reset, observation=notification_observation)
         elif action in ("still_over_quota", "wham_limit_keep_disabled"):
             out[email] = action
         elif action == "resumed":
             out[email] = "resumed"
-            notifier.throttled_notify_event_sync(
-                "quota_resumed",
-                f"quota_resumed:{ak}",
-                "✅ <b>OAuth 配额已恢复，账号重新启用</b>\n"
-                f"账号: <code>{notifier.escape_html(email)}</code>{_plan_tag}",
-                cooldown_seconds=300,
-            )
+            reporting.quota(ak, recovered=True, usage=usage, observation=notification_observation)
         elif action == "kept_enabled":
             parts = [f"{u:.0f}%" if u is not None else "-" for u in utils]
             out[email] = f"ok:{','.join(parts)}"

@@ -81,10 +81,10 @@ class OAuthBackend:
         return oauth_manager.replace_exact_identity(account_id, entry)
 
     def replace_exact_identity_conditional(
-        self, account_id: str, entry: dict, expected_account: dict,
+        self, account_id: str, entry: dict, expected_account: dict, *, authenticated_login: bool = False,
     ) -> dict:
         return oauth_manager.replace_exact_identity(
-            account_id, entry, expected_account=expected_account,
+            account_id, entry, expected_account=expected_account, authenticated_login=authenticated_login,
         )
 
     def delete_account(self, account_id: str) -> None:

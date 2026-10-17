@@ -23,13 +23,13 @@ class WorkBuddyFlows:
         self._known = OrderedDict()
         self._known_lock = RLock()
 
-    def start(self, actor: str, *, realm="cn", client_profile=None) -> OAuthLoginFlow:
+    def start(self, actor: str, *, realm="cn", client_profile=None, relogin=None) -> OAuthLoginFlow:
         try:
             payload = (self.backend.workbuddy_start_login() if realm == "cn" and client_profile in (None, "cli")
                        else self.backend.workbuddy_start_login(realm=realm, client_profile=client_profile))
         except Exception:
             raise ManagementError(ManagementErrorCode.UPSTREAM_ERROR, retryable=True) from None
-        payload = dict(payload, lock=Lock(), last_poll=None)
+        payload = dict(payload, lock=Lock(), last_poll=None, relogin=copy.deepcopy(relogin))
         flow_id, secret, plan = self.store.create_split(actor_subject_id=actor, kind="workbuddy-login", revision="", payload=payload)
         with self._known_lock:
             for key, value in list(self._known.items()):

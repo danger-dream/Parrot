@@ -289,23 +289,31 @@ def _cancel_flow(chat_id, flow):
         pass
 
 
-def _login(chat_id, message_id, site):
+def _login_back(data):
+    nav = parent()._login_nav(data.get("relogin"))
+    return ui.btn(nav["back_label"], nav["back_callback"])
+
+
+def _login(chat_id, message_id, site, *, relogin=None):
     discard_state(chat_id)
-    data = _state(chat_id, "oa_zh_login")
-    ui.edit(chat_id, message_id, "🔄 正在准备授权链接…", reply_markup=ui.inline_kb([[_back()]]))
+    data = _state(chat_id, "oa_zh_login", relogin=relogin)
+    ui.edit(chat_id, message_id, "🔄 正在准备授权链接…", reply_markup=ui.inline_kb([[_login_back(data)]]))
     def ready(flow):
         data.update(flow_id=flow.flow_id, flow_secret=flow.flow_secret, auth_url=flow.auth_url,
                     message_id=message_id, flow=flow)
         ui.edit(chat_id, message_id,
             "🌐 <b>智谱 / Z.ai OAuth 登录</b>\n\n请打开官方授权页面并完成授权。\n"
             "⏳ 正在等待网页授权，成功后自动保存账户，<b>无需粘贴回调地址</b>。\n\n"
-            "链接 5 分钟内有效。授权后自动配置个人账户和专用模型 Key（不存在则创建），并获取额度与模型。",
+            + ("链接 5 分钟内有效。授权后保留原账户团队/项目及设置，并同步额度与模型。" if relogin else
+             "链接 5 分钟内有效。授权后自动配置个人账户和专用模型 Key（不存在则创建），并获取额度与模型。") + parent()._login_hint(relogin),
             reply_markup=ui.inline_kb([[{"text": "打开授权页面", "url": flow.auth_url}],
                 [ui.btn("取消登录", PREFIX + "cancel:" + data["nonce"])]]))
         _start_login_wait(chat_id, message_id, data)
     _run_remote(chat_id, data,
-        lambda: control.start_login_flow(telegram_context(chat_id), OAuthProvider.ZHIPU, site=site), ready,
-        lambda exc: _result(chat_id, message_id, None, error_reporting.report(exc, operation="智谱OAuth登录初始化")),
+        lambda: control.start_login_flow(telegram_context(chat_id), OAuthProvider.ZHIPU, site=site,
+            **({"relogin_account_id": relogin["target_key"]} if relogin else {})), ready,
+        lambda exc: ui.edit(chat_id, message_id, error_reporting.report(exc, operation="智谱OAuth登录初始化"),
+            reply_markup=ui.inline_kb([[_login_back(data)]])),
         abandoned=lambda flow: _cancel_flow(chat_id, flow))
 
 
@@ -328,7 +336,7 @@ def _wait_for_login(chat_id, message_id, data, flow):
     def authorized():
         if current():
             ui.edit(chat_id, message_id, "✅ 网页授权已完成，正在保存登录并获取项目、Key、额度及账户信息…",
-                    reply_markup=ui.inline_kb([[_back()]]))
+                    reply_markup=ui.inline_kb([[_login_back(data)]]))
 
     read_retries = 0
     while current() and time.time() < flow.expires_at.timestamp():
@@ -347,7 +355,7 @@ def _wait_for_login(chat_id, message_id, data, flow):
             if poll.status != "pending":
                 discard_state(chat_id)
                 ui.edit(chat_id, message_id, "❌ 官方授权未完成或已过期，请重新发起登录。",
-                        reply_markup=ui.inline_kb([[_back()]]))
+                        reply_markup=ui.inline_kb([[_login_back(data)]]))
                 return
         except Exception as exc:
             if not current():
@@ -366,14 +374,14 @@ def _wait_for_login(chat_id, message_id, data, flow):
                 return
             discard_state(chat_id)
             ui.edit(chat_id, message_id, error_reporting.report(exc, operation="智谱OAuth授权结果查询"),
-                    reply_markup=ui.inline_kb([[_back()]]))
+                    reply_markup=ui.inline_kb([[_login_back(data)]]))
             return
         # The control layer honors the interval supplied by the official server.
         time.sleep(1)
     if current():
         discard_state(chat_id)
         ui.edit(chat_id, message_id, "⌛ 登录链接已过期，请重新发起登录。",
-                reply_markup=ui.inline_kb([[_back()]]))
+                reply_markup=ui.inline_kb([[_login_back(data)]]))
 
 
 def _login_saved(chat_id, message_id, data, poll):
@@ -431,6 +439,9 @@ def refresh_usage(chat_id, message_id, key, page=1, filter_key="all"):
 
 def _initialize_account(chat_id, message_id, key, *, result=None):
     """One progress/result card; personal defaults are automatic, not a wizard."""
+    from ...notifications import subjects
+    from ...notifications.operations import present
+    notification_subject = subjects.account(key)
     discard_state(chat_id)
     data = _state(chat_id, "oa_zh_initializing", key=key)
     progress = "🔄 登录已保存，正在自动配置账户…"
@@ -448,46 +459,36 @@ def _initialize_account(chat_id, message_id, key, *, result=None):
             outcome = control.initialize_zhipu_account(telegram_context(chat_id), key)
         future = (outcome.post_save or {}).get("model_sync_future")
         model_error = None
+        model_result = {}
         if future is not None:
             try:
                 model_result = future.result()  # Discovery owns its bounded network deadline.
-                if (model_result.get("metadata_sync") or {}).get("status") == "failed":
-                    model_error = RuntimeError("metadata_sync_failed")
+                if model_result.get("action") not in {"updated", "not_modified"}:
+                    model_error = RuntimeError("model_discovery_incomplete")
             except Exception as exc:
                 model_error = exc
-        return outcome, model_error
+        return outcome, model_result, model_error
 
     def render(outcome):
-        saved, model_error = outcome
+        saved, model_result, model_error = outcome
         effects = saved.post_save or {}
-        current = control.account_snapshot(saved.account_id) or {}
-        selection = control.account_model_selection_snapshot(current)
-        count = len(selection.get("effective_models") or [])
-        configured = bool(count and (current.get("model_key") or current.get("project_key_id")) and model_route_available(current))
-        text = ("✅ 账户已就绪" if current.get("enabled", True) else "⏸ 账户配置已完成，当前已暂停") if configured else "✅ 登录已保存"
-        key_action = effects.get("key_action")
-        if key_action and key_action.get("status") != "succeeded":
-            text += "\n⚠️ " + _action_state(key_action["status"]) + "。" + _action_error(key_action)
-            text += ("\n继续初始化只核对或读取已有 Key，不会重复创建。" if key_action["status"] in {"unknown", "key_pending", "pending"}
-                     else "\n已保存的登录保留，可继续初始化。")
-        elif effects.get("enrichment_error"):
-            text += "\n" + parent()._oauth_error_html(effects["enrichment_error"], provider="zhipu", operation="initialize")
-        elif not (current.get("model_key") or current.get("project_key_id")):
-            text += "\n模型 Key 暂未取得，可重试初始化。"
-        elif model_error or effects.get("model_sync_error"):
-            text += "\n⚠️ 模型目录同步未完成。"
-        if effects.get("usage_error"):
-            text += "\n" + parent()._oauth_error_html(effects["usage_error"], provider="zhipu", operation="fetch_usage")
-        if effects.get("reset_error"):
-            text += "\n" + parent()._oauth_error_html(effects["reset_error"], provider="zhipu", operation="reset_status")
-        parent()._edit_cached_detail(chat_id, message_id, saved.account_id, 1, "all",
-                                    prefix=text + "\n\n", refresh_quota=False)
+        current = subjects.current(notification_subject)
+        account = current["account"] if current else {}
+        stages = [{"name": "登录保存", "status": "succeeded"},
+                  {"name": "模型Key配置", "status": "succeeded" if account.get("model_key") or account.get("project_key_id") else (effects.get("key_action") or {}).get("status", "unknown")},
+                  {"name": "模型目录", "status": "failed" if model_error or effects.get("model_sync_error") else "succeeded" if model_result.get("action") in {"updated", "not_modified"} else "unknown"},
+                  {"name": "额度快照", "status": "failed" if effects.get("usage_error") else "succeeded" if effects.get("usage") is not None else "unknown"},
+                  {"name": "权益查询", "status": "failed" if effects.get("reset_error") else "succeeded" if effects.get("reset") is not None else "unknown"}]
+        if type(model_result.get("models")) is int:
+            stages[2]["count"] = model_result["models"]
+        metadata = model_result.get("metadata_sync")
+        if isinstance(metadata, dict):
+            stages.append({"name": "元数据", "status": metadata.get("status") if metadata.get("status") in {"succeeded", "failed", "partial_failed", "unknown", "skipped"} else "unknown"})
+        present(chat_id, message_id, notification_subject, operation="智谱账户初始化", stages=stages, error=effects.get("enrichment_error") or effects.get("usage_error") or model_error)
         states.pop_state_if_current(chat_id, data)
 
     def failed(exc):
-        parent()._edit_cached_detail(chat_id, message_id, key, 1, "all",
-            prefix="✅ 登录已保存\n" + parent()._oauth_error_html(exc, provider="zhipu", operation="initialize") + "\n\n",
-            refresh_quota=False)
+        present(chat_id, message_id, notification_subject, operation="智谱账户初始化", stages=[{"name": "登录保存", "status": "succeeded"}, {"name": "后续初始化", "status": "unknown"}])
         states.pop_state_if_current(chat_id, data)
 
     _run_remote(chat_id, data, work, render, failed)
@@ -532,16 +533,19 @@ def _result(chat_id, message_id, key, text):
     ui.edit(chat_id, message_id, text, reply_markup=ui.inline_kb([[_back(key)]]))
 
 
-def _show_initial_sync(chat_id, result):
+def _show_initial_sync(chat_id, result, message_id=None):
     """Observe the save's existing work; never start a second initialization."""
     effects = result.post_save or {}
     if effects.get("model_sync_future") is None:
-        ui.send(chat_id, "⚠️ 账户已保存，但模型同步未能启动；请在详情查看额度并重试模型同步。",
-                reply_markup=ui.inline_kb([[_back(result.account_id)]]))
+        from ...notifications import subjects
+        from ...notifications.operations import present
+        present(chat_id, message_id, subjects.account(result.account_id), operation="智谱导入后初始化",
+            stages=[{"name": "账户保存", "status": "succeeded"}, {"name": "模型目录", "status": "failed"}],
+            result_text="账户已保存；模型同步未启动，可在精确详情只重试未完成阶段。")
         return
     account = control.account_snapshot(result.account_id) or {}
     parent()._foreground_account_model_sync(chat_id, result.account_id,
-        provider="zhipu", label=account_display(account), post_save=dict(effects))
+        provider="zhipu", label=account_display(account), post_save=dict(effects), message_id=message_id)
 
 
 def _reset_page(chat_id, message_id, key):
@@ -661,7 +665,10 @@ def handle_callback(chat_id, message_id, cb_id, callback):
             return True
         if kind == "cancel":
             discard_state(chat_id)
-            parent().on_add_menu(chat_id, message_id, "")
+            if data.get("relogin"):
+                parent()._return_from_relogin(chat_id, message_id, "", data["relogin"]["payload"])
+            else:
+                parent().on_add_menu(chat_id, message_id, "")
             return True
         if kind == "cancel_action":
             cancellation = data.get("action_cancellation")
@@ -771,6 +778,12 @@ def handle_callback(chat_id, message_id, cb_id, callback):
     elif kind == "projects":
         _projects(chat_id, message_id, key)
     elif kind == "refresh":
+        if account.get("credential_mode") == "oauth":
+            parent().on_relogin(chat_id, message_id, "", parts[1])
+            return True
+        if account.get("disabled_reason") != "auth_error":
+            _result(chat_id, message_id, key, "账户无需更新凭据。")
+            return True
         discard_state(chat_id)
         data = _state(chat_id, "oa_zh_work", key=key)
         ui.edit(chat_id, message_id, "🔄 正在刷新连接/解析已有 Key…", reply_markup=ui.inline_kb([[_back(key)]]))
@@ -844,20 +857,32 @@ def handle_text(chat_id, action, text):
         if saved.get("credential_mode") == "oauth":
             _initialize_account(chat_id, progress_id, result.account_id, result=result)
             return
-        _show_initial_sync(chat_id, result)
+        _show_initial_sync(chat_id, result, message_id=progress_id)
         if saved.get("credential_mode") == "api_key" and saved.get("label") in (None, "", saved.get("subject")):
             named = _state(chat_id, "oa_zh_name", key=result.account_id, generation=saved.get("generationId"))
-            ui.send(chat_id, "✅ API Key 已导入。\n\n请发送账户名称，例如“智谱老号”或“智谱新号”；也可以跳过，稍后在详情修改。",
-                reply_markup=ui.inline_kb([[ui.btn("跳过命名", PREFIX + "name_skip:" + named["nonce"])]]))
-        else:
-            ui.send(chat_id, "✅ 已保存账户。", reply_markup=ui.inline_kb([[_back(result.account_id)]]))
+            from ...notifications import subjects
+            from ...notifications.operations import present
+            present(chat_id, None, subjects.account(result.account_id), operation="智谱 API Key 导入",
+                stages=[{"name": "账户保存", "status": "succeeded"}],
+                result_text="请发送账户名称，例如“智谱老号”；也可以跳过，稍后在详情修改。",
+                continuation=[[ui.btn("跳过命名", PREFIX + "name_skip:" + named["nonce"])]])
     def failed(exc):
         from ...management_control.oauth.account_mutations import OAuthReplaceRequired
+        from ...notifications import subjects
+        from ...notifications.events import Subject
+        from ...notifications.operations import present
         if isinstance(exc, OAuthReplaceRequired):
             replacement = _state(chat_id, "oa_zh_replace", payload=payload, plan_token=exc.plan_token)
-            ui.send(chat_id, "账户已存在，是否确认替换凭据？", reply_markup=ui.inline_kb([[ui.btn("确认替换", PREFIX + "replace:" + replacement["nonce"])], [_back()]]))
+            present(chat_id, progress_id, subjects.account(exc.account_id), operation="智谱导入替换确认", saved=False,
+                stages=[{"name": "凭据替换", "status": "unknown"}], result_text="账户已存在；尚未替换，是否继续原有一次性确认流程？",
+                continuation=[[ui.btn("确认替换", PREFIX + "replace:" + replacement["nonce"])], [ui.btn("取消，返回新增", "oa:add")]])
         else:
-            ui.send(chat_id, "❌ 无法保存，请检查凭据模式和必填字段；未创建任何远端 Key。", reply_markup=ui.inline_kb([[_back()]]))
+            site = data.get("site")
+            subject = Subject("operation", "zhipu_import", "v1", "zhipu", "智谱 · BigModel 中国站" if site == "bigmodel" else "Z.ai 国际站" if site == "zai" else "智谱 / Z.ai", "import", "待保存账户")
+            present(chat_id, progress_id, subject, operation="智谱账户导入", saved=False,
+                stages=[{"name": "账户保存", "status": "failed"}], error=exc,
+                result_text="未确认保存；请检查凭据模式和必填字段。此导入没有创建远端 Key。",
+                continuation=[[ui.btn("返回新增", "oa:add")]])
     _run_remote(chat_id, data, lambda: control.create_account(telegram_context(chat_id),
         CreateOAuthAccountCommand(JsonCredential(OAuthProvider.ZHIPU, payload))), saved, failed)
     return True

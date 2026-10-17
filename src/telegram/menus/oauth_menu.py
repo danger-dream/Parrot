@@ -180,6 +180,9 @@ def _foreground_account_model_sync(
     usage: dict | None = None, message_id: int | None = None,
 ) -> dict:
     """Show progress and wait at most 20s without cancelling the 45s worker."""
+    from ...notifications import subjects
+    from ...notifications.operations import present
+    notification_subject = subjects.account(account_key)
     progress = (
         ("🔄 <b>正在同步模型及元数据，请稍候…</b>\n\n" if provider == "zhipu" else "🔄 <b>正在同步模型，请稍候…</b>\n\n")
         + f"类型: <code>{ui.escape_html(notifier.provider_label(provider))}</code>\n"
@@ -220,61 +223,18 @@ def _foreground_account_model_sync(
         except Exception as exc:
             result = {"action": "error", "account_key": account_key, "error": str(exc)}
 
-        try:
-            selection = oauth_control.account_model_selection_snapshot(account_key)
-        except ValueError:
-            # The user may remove the account while discovery is in flight.
-            return
+        if subjects.current(notification_subject) is None:
+            return  # deleted/replaced while waiting: never update a new incarnation's UI
         action = str(result.get("action") or "error")
-        if (action == "updated" or (provider == "zhipu" and action == "not_modified")) and int(result.get("models") or len(selection.get("models") or [])) > 0:
-            count = int(result.get("models") or len(selection.get("models") or []))
-            status = f"✅ 已同步模型 <code>{count}</code> 个，当前使用账户模型。"
-            if provider == "zhipu":
-                available = len(selection.get("effective_models") or [])
-                status = f"✅ 已同步目录 <code>{count}</code> 个模型，当前可用 <code>{available}</code> 个。"
-        elif action == "foreground_timeout":
-            source = "继续使用上次账户模型" if selection_before.get("models") else "尚无账户目录，当前无可路由模型，请同步上游模型"
-            if provider == "zhipu":
-                source = "已取得模型目录" if selection.get("models") else "正在获取模型目录"
-                status = f"⏳ {source}，初始化仍在后台进行，完成后自动更新此消息。"
-            else:
-                status = f"⏱ 模型同步超时，任务将在后台继续；{source}。"
-        else:
-            source = "继续使用上次账户模型" if selection.get("models") else "尚无账户目录，当前无可路由模型，请同步上游模型"
-            error = str(result.get("error") or action)[:180]
-            status = (
-                f"⚠️ 模型同步失败：<code>{ui.escape_html(error)}</code>\n"
-                f"后台将静默重试，{source}。"
-            )
+        stages = [{"name": "账户保存", "status": "succeeded"},
+                  {"name": "模型目录", "status": "succeeded" if action in {"updated", "not_modified"} else "running" if action == "foreground_timeout" else "failed"}]
+        if result.get("models") is not None:
+            stages[-1]["count"] = int(result["models"])
         if provider == "zhipu":
-            usage = post_save.get("usage")
-            if post_save.get("usage_error") is not None:
-                quota_status = "⚠️ 额度获取失败，账户已保存，可在详情重试。"
-            elif isinstance(usage, dict) and ((usage.get("zhipu") or {}).get("windows") or (usage.get("zhipu") or {}).get("limits")):
-                quota_status = "✅ 已自动获取额度用量。"
-            else:
-                quota_status = "⚠️ 额度接口未返回可用数据。"
-            metadata = result.get("metadata_sync") or {}
-            metadata_status = {
-                "succeeded": "✅ 元数据已同步。",
-                "partial_failed": "⚠️ 元数据已按本地目录更新，远端目录刷新失败。",
-                "skipped": "ℹ️ 元数据自动更新已关闭，保留当前设置。",
-                "failed": "⚠️ 元数据同步失败，已保留模型目录。",
-            }.get(metadata.get("status"), "⏳ 模型及元数据同步仍在后台继续。" if action == "foreground_timeout" else "⚠️ 元数据尚未完成同步。")
-            status = quota_status + "\n" + status + "\n" + metadata_status
-        heading = progress
-        if provider == "zhipu" and action != "foreground_timeout":
-            heading = progress.replace("🔄 <b>正在同步模型及元数据，请稍候…</b>", "<b>账户初始化结果</b>")
-        final = heading + "\n\n" + status
-        nav_markup = ui.inline_kb([[ui.btn("◀ 返回 OAuth 列表", "menu:oauth")]])
-        try:
-            if progress_id is not None:
-                ui.edit(chat_id, progress_id, final, reply_markup=nav_markup)
-            else:
-                ui.send(chat_id, final, reply_markup=nav_markup)
-        except Exception as exc:
-            print(f"[oauth] model sync UI update failed: {type(exc).__name__}")
-        if provider == "zhipu" and action == "foreground_timeout":
+            stages.append({"name": "额度快照", "status": "failed" if post_save.get("usage_error") else "succeeded" if post_save.get("usage") is not None else "unknown"})
+            stages.append({"name": "元数据", "status": (result.get("metadata_sync") or {}).get("status") or "unknown"})
+        present(chat_id, progress_id, notification_subject, operation="登录/导入后模型初始化", stages=stages)
+        if action == "foreground_timeout":
             # Reuse the original worker; completion updates this progress
             # message without starting another fetch or requiring a click.
             future.add_done_callback(lambda _done: finish(timeout_s=0))
@@ -318,13 +278,16 @@ def _overwrite_summary(entry: dict) -> str:
 
 def _persist_new_or_stage_overwrite(
     chat_id: int, entry: dict, *, source: str, usage: dict | None = None,
-    message_id: int | None = None,
+    message_id: int | None = None, relogin: dict | None = None,
 ) -> str:
-    """Add a new identity immediately, or stage an exact-identity overwrite."""
+    """Add a new identity, or stage an exact-identity (optionally bound) overwrite."""
     provider = oauth_control.provider_of_snapshot(entry)
     if provider == "openai" and not _openai_workspace_id(entry):
         raise ValueError("OpenAI token 缺少 workspace identity，无法安全判断账户")
     duplicate = oauth_control.prepare_account_save(_management_context(chat_id), entry)
+    if relogin and (duplicate is None or duplicate[0] != relogin["target_key"]
+                    or duplicate[1] != relogin["account"]):
+        raise ValueError("登录身份与原账户不匹配，或原账户已变化；未修改或新增任何账户")
     if duplicate is None:
         added = oauth_control.add_account_entry(
             _management_context(chat_id), entry, usage=usage, defer_post_save=True,
@@ -347,6 +310,7 @@ def _persist_new_or_stage_overwrite(
         "entry": entry,
         "source": source,
         "usage": usage,
+        **({"relogin": relogin} if relogin else {}),
     })
     markup = ui.inline_kb([[
         ui.btn("✅ 覆盖", f"oa:overwrite:confirm:{nonce}"),
@@ -357,7 +321,7 @@ def _persist_new_or_stage_overwrite(
         ui.send_result(chat_id, text, extra_rows=[[
             ui.btn("✅ 覆盖", f"oa:overwrite:confirm:{nonce}"),
             ui.btn("❌ 取消", f"oa:overwrite:cancel:{nonce}"),
-        ]], back_label="◀ 返回新增账户", back_callback="oa:add")
+        ]], **_login_nav(relogin))
     else:
         ui.edit(chat_id, message_id, text, reply_markup=markup)
     return "staged"
@@ -381,6 +345,8 @@ def on_oauth_overwrite_cancel(chat_id: int, message_id: int, cb_id: str, nonce: 
     if data is None:
         ui.answer_cb(cb_id, "确认会话已失效，请重新登录", show_alert=True)
         return
+    if data.get("relogin"):
+        return _return_from_relogin(chat_id, message_id, cb_id, data["relogin"]["payload"])
     ui.answer_cb(cb_id, "已取消")
     ui.edit(chat_id, message_id, "✅ 已取消覆盖，现有账户未作任何修改。",
             reply_markup=ui.inline_kb([[ui.btn("◀ 返回新增账户", "oa:add")]]))
@@ -398,11 +364,12 @@ def on_oauth_overwrite_confirm(chat_id: int, message_id: int, cb_id: str, nonce:
     result = oauth_control.replace_account_entry(
         _management_context(chat_id), target_key, entry, usage=usage,
         defer_post_save=True,
+        **({"expected_account": data["relogin"]["account"]} if data.get("relogin") else {}),
     )
     if result.get("status") != "replaced":
         ui.answer_cb(cb_id, "账户已变化，请重新登录", show_alert=True)
         ui.edit(chat_id, message_id, "❌ 目标账户已消失或身份发生变化；未写入本次登录结果。",
-                reply_markup=ui.inline_kb([[ui.btn("◀ 重新登录", "oa:add")]]))
+                reply_markup=ui.inline_kb([[ui.btn("◀ 返回账户", _login_cancel(data["relogin"])) if data.get("relogin") else ui.btn("◀ 重新登录", "oa:add")]]))
         return
 
     provider = str(data.get("provider") or oauth_control.provider_of_snapshot(entry))
@@ -424,7 +391,7 @@ def on_oauth_overwrite_confirm(chat_id: int, message_id: int, cb_id: str, nonce:
         f"✅ {_provider_tag(provider)} <b>OAuth 账户已覆盖</b>\n\n"
         f"账户: <code>{ui.escape_html(str(entry.get('label') or entry.get('email') or '?'))}</code>\n"
         "账户主键、历史统计、优先级和用户设置均保持不变。" + quota_note,
-        reply_markup=ui.inline_kb([[ui.btn("◀ 返回 OAuth 列表", "menu:oauth")]]),
+        reply_markup=ui.inline_kb([[ui.btn("◀ 返回账户", "oa:view:" + data["relogin"]["payload"])]] if data.get("relogin") else [[ui.btn("◀ 返回 OAuth 列表", "menu:oauth")]]),
     )
 
 
@@ -3539,10 +3506,13 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
             text += f" (累计失败 {e['error_count']} 次)\n"
 
     payload = _callback_payload(short, page, filter_key)
-    rows = [
-        [ui.btn(("🔄 更新凭据" if acc.get("credential_mode") == "oauth" else "🔄 刷新连接") if prov == "zhipu" else "🔄 刷新 Token", f"oa:zh:refresh:{short}" if prov == "zhipu" else f"oa:refresh_token:{payload}"),
-         ui.btn("📊 刷新额度", f"oa:refresh_usage:{payload}")],
-    ]
+    credential_buttons = []
+    if oauth_control.account_authentication_failed(acc):
+        if prov == "zhipu" and acc.get("credential_mode") != "oauth":
+            credential_buttons.append(ui.btn("🔄 刷新连接", f"oa:zh:refresh:{short}"))
+        else:
+            credential_buttons.append(ui.btn("🔐 重新登录", f"oa:relogin:{payload}"))
+    rows = [credential_buttons + [ui.btn("📊 刷新额度", f"oa:refresh_usage:{payload}")]]
     # All OAuth providers enter the same source-filtered model center.  The
     # source identity crossing this boundary is the public accountId, never the
     # legacy private account key carried by old ``oam:`` callbacks.
@@ -5428,15 +5398,70 @@ def on_add_openai(chat_id: int, message_id: int, cb_id: str) -> None:
     )
 
 
+def _login_nav(relogin=None):
+    if relogin:
+        return {"back_label": "◀ 返回账户", "back_callback": "oa:relogin_cancel:" + relogin["payload"]}
+    return {"back_label": "◀ 返回新增账户", "back_callback": "oa:add"}
+
+
+def _login_cancel(relogin=None):
+    return _login_nav(relogin)["back_callback"]
+
+
+def _login_hint(relogin=None):
+    if not relogin:
+        return ""
+    account = relogin["account"]
+    label = account.get("label") or account.get("email") or relogin["target_key"]
+    return f"\n\n本次仅更新原账户 <code>{ui.escape_html(str(label))}</code>。请选择原身份；其他身份不会被替换或新增。"
+
+
+def _return_from_relogin(chat_id, message_id, cb_id, payload):
+    workbuddy_menu.discard_state(chat_id)
+    zhipu_menu.discard_state(chat_id)
+    states.pop_state(chat_id)
+    short, page, filter_key = _split_short_page_filter(payload)
+    on_view(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
+
+
+def on_relogin(chat_id, message_id, cb_id, short, page=1, filter_key=_FILTER_ALL):
+    key = _account_key_from_short(short)
+    account = oauth_control.account_snapshot(key) if key else None
+    if not account or not oauth_control.account_authentication_failed(account):
+        ui.answer_cb(cb_id, "账户不存在或无需重新登录", show_alert=True)
+        return
+    provider = oauth_control.provider_of_snapshot(account)
+    if provider == "zhipu" and account.get("credential_mode") != "oauth":
+        ui.answer_cb(cb_id, "API Key 接入不支持网页登录，请使用刷新连接", show_alert=True)
+        return
+    relogin = {"target_key": key, "account": account,
+               "payload": _callback_payload(short, page, filter_key)}
+    workbuddy_menu.discard_state(chat_id)
+    zhipu_menu.discard_state(chat_id)
+    states.pop_state(chat_id)
+    if provider == "workbuddy":
+        ui.answer_cb(cb_id)
+        return workbuddy_menu._login_start(chat_id, message_id, realm=account.get("realm") or "cn", relogin=relogin)
+    if provider == "zhipu":
+        ui.answer_cb(cb_id)
+        return zhipu_menu._login(chat_id, message_id, account["site"], relogin=relogin)
+    start = {"claude": on_login_start, "openai": on_login_openai_start,
+             "xai": on_login_xai_start, "cursor": on_login_cursor_start,
+             "antigravity": on_login_antigravity_start}.get(provider)
+    if start:
+        start(chat_id, message_id, cb_id, relogin=relogin)
+
+
 # ─── PKCE 登录流程 ────────────────────────────────────────────────
 
-def on_login_start(chat_id: int, message_id: int, cb_id: str) -> None:
+def on_login_start(chat_id: int, message_id: int, cb_id: str, *, relogin=None) -> None:
     ui.answer_cb(cb_id)
     code_verifier, code_challenge = oauth_control.claude_pkce_generate()
     state = secrets.token_urlsafe(32)
     url = oauth_control.claude_build_login_url(code_challenge, state)
 
     states.set_state(chat_id, "oa_login_code", {
+        **({"relogin": relogin} if relogin else {}),
         "code_verifier": code_verifier, "state": state,
     })
 
@@ -5446,14 +5471,15 @@ def on_login_start(chat_id: int, message_id: int, cb_id: str) -> None:
         f"<a href=\"{ui.escape_html(url)}\">点此打开登录页</a>\n\n"
         "登录后页面会显示一个 <b>authorization code</b>（通常形如 <code>abc#state</code>），"
         "请复制并发送给我。\n\n"
-        "<i>（登录会话 10 分钟内有效）</i>",
-        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "oa:add")]]),
+        "<i>（登录会话 10 分钟内有效）</i>" + _login_hint(relogin),
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", _login_cancel(relogin))]]),
     )
 
 
 def on_login_code_input(chat_id: int, text: str) -> None:
     state = states.pop_state(chat_id)
-    nav = {"back_label": "◀ 返回新增账户", "back_callback": "oa:add"}
+    relogin = ((state or {}).get("data") or {}).get("relogin")
+    nav = _login_nav(relogin)
     if not state or state.get("action") != "oa_login_code":
         ui.send_result(chat_id, "❌ 登录会话已失效，请重新发起登录流程。", **nav)
         return
@@ -5514,7 +5540,7 @@ def on_login_code_input(chat_id: int, text: str) -> None:
     }
     try:
         save_action = _persist_new_or_stage_overwrite(
-            chat_id, entry, source="Claude OAuth 登录",
+            chat_id, entry, source="Claude OAuth 登录", relogin=relogin,
         )
     except Exception as exc:
         ui.send_result(chat_id,
@@ -5619,7 +5645,7 @@ def on_set_json_input(chat_id: int, text: str) -> None:
 _OA_NAV_CURSOR = {"back_label": "◀ 返回新增账户", "back_callback": "oa:add"}
 
 
-def on_login_cursor_start(chat_id: int, message_id: int, cb_id: str) -> None:
+def on_login_cursor_start(chat_id: int, message_id: int, cb_id: str, *, relogin=None) -> None:
     ui.answer_cb(cb_id)
     try:
         params = oauth_control.cursor_generate_login()
@@ -5627,10 +5653,11 @@ def on_login_cursor_start(chat_id: int, message_id: int, cb_id: str) -> None:
         ui.send_result(
             chat_id,
             _oauth_error_html(exc, provider="cursor", operation="exchange_code"),
-            **_OA_NAV_CURSOR,
+            **_login_nav(relogin),
         )
         return
     states.set_state(chat_id, "oa_cursor_login", {
+        **({"relogin": relogin} if relogin else {}),
         "uuid": params.uuid,
         "verifier": params.verifier,
         "created_at": time.time(),
@@ -5644,14 +5671,14 @@ def on_login_cursor_start(chat_id: int, message_id: int, cb_id: str) -> None:
         "👇 长按也可复制登录地址：\n"
         f"<code>{ui.escape_html(params.login_url)}</code>\n\n"
         "<i>如果仍提示未登录，请等待几秒后再次点击；登录会话 15 分钟内有效。</i>"
-    )
+    ) + _login_hint(relogin)
     ui.edit(
         chat_id,
         message_id,
         text,
         reply_markup=ui.inline_kb([
             [ui.provider_url_button("打开 Cursor 登录页", params.login_url, "cursor")],
-            [ui.btn("✅ 已登录", "oa:login:cursor:done"), ui.btn("❌ 取消", "oa:add")],
+            [ui.btn("✅ 已登录", "oa:login:cursor:done"), ui.btn("❌ 取消", _login_cancel(relogin))],
         ]),
     )
 
@@ -5662,13 +5689,14 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
         ui.answer_cb(cb_id, "登录会话已失效，请重新发起", show_alert=True)
         return
     data = state.get("data") or {}
+    relogin = data.get("relogin")
     if time.time() - float(data.get("created_at") or 0) > 15 * 60:
         states.pop_state(chat_id)
         ui.answer_cb(cb_id, "登录会话已过期，请重新生成", show_alert=True)
         ui.edit(
             chat_id, message_id,
             "❌ Cursor 登录会话已过期，请重新发起登录。",
-            reply_markup=ui.inline_kb([[ui.btn("◀ 返回新增账户", "oa:add")]]),
+            reply_markup=ui.inline_kb([[ui.btn(_login_nav(relogin)["back_label"], _login_cancel(relogin))]]),
         )
         return
 
@@ -5686,7 +5714,7 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
             chat_id,
             message_id,
             _oauth_error_html(exc, provider="cursor", operation="exchange_code"),
-            reply_markup=ui.inline_kb([[ui.btn("◀ 重新登录", "oa:login:cursor"), ui.btn("❌ 取消", "oa:add")]]),
+            reply_markup=ui.inline_kb([[ui.btn("◀ 重新登录", "oa:relogin:" + relogin["payload"] if relogin else "oa:login:cursor"), ui.btn("❌ 取消", _login_cancel(relogin))]]),
         )
         return
 
@@ -5699,7 +5727,7 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
         ui.edit(
             chat_id, message_id,
             _oauth_error_html(exc, provider="cursor", operation="exchange_code"),
-            reply_markup=ui.inline_kb([[ui.btn("◀ 重新登录", "oa:login:cursor"), ui.btn("❌ 取消", "oa:add")]]),
+            reply_markup=ui.inline_kb([[ui.btn("◀ 重新登录", "oa:relogin:" + relogin["payload"] if relogin else "oa:login:cursor"), ui.btn("❌ 取消", _login_cancel(relogin))]]),
         )
         return
     # AvailableModels is deliberately fetched only after the account has been
@@ -5767,7 +5795,7 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
     existed = False  # duplicate returns above and is rendered by the confirmation callback
     try:
         save_action = _persist_new_or_stage_overwrite(
-            chat_id, entry, source="Cursor 浏览器登录", usage=usage,
+            chat_id, entry, source="Cursor 浏览器登录", usage=usage, relogin=relogin,
             message_id=message_id,
         )
         if save_action == "staged":
@@ -5784,7 +5812,7 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
             chat_id,
             message_id,
             f"❌ 保存 Cursor 账户失败：<code>{ui.escape_html(str(exc))[:500]}</code>",
-            reply_markup=ui.inline_kb([[ui.btn("◀ 返回新增账户", "oa:add")]]),
+            reply_markup=ui.inline_kb([[ui.btn(_login_nav(relogin)["back_label"], _login_cancel(relogin))]]),
         )
         return
 
@@ -5807,7 +5835,7 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
 _OA_NAV_OPENAI = {"back_label": "◀ 返回新增账户", "back_callback": "oa:add"}
 
 
-def _build_openai_login_text_and_kb(url: str) -> tuple[str, dict]:
+def _build_openai_login_text_and_kb(url: str, *, relogin=None) -> tuple[str, dict]:
     """构建 OpenAI 登录页的文本和键盘（复用于首次生成和重新生成）。"""
     text = (
         f"请在浏览器打开以下链接登录 {_provider_tag('openai')}（ChatGPT）账号：\n\n"
@@ -5821,28 +5849,33 @@ def _build_openai_login_text_and_kb(url: str) -> tuple[str, dict]:
     )
     kb = ui.inline_kb([
         [ui.btn("🔄 重新生成登录地址", "oa:login:openai:regen")],
-        [ui.btn("❌ 取消", "oa:add")],
+        [ui.btn("❌ 取消", _login_cancel(relogin))],
     ])
-    return text, kb
+    return text + _login_hint(relogin), kb
 
 
-def on_login_openai_start(chat_id: int, message_id: int, cb_id: str) -> None:
+def on_login_openai_start(chat_id: int, message_id: int, cb_id: str, *, relogin=None) -> None:
     ui.answer_cb(cb_id)
     verifier, challenge = oauth_control.openai_pkce_generate()
     state = secrets.token_urlsafe(32)
     url = oauth_control.openai_build_login_url(challenge, state)
 
     states.set_state(chat_id, "oa_openai_code", {
+        **({"relogin": relogin} if relogin else {}),
         "code_verifier": verifier, "state": state,
     })
 
-    text, kb = _build_openai_login_text_and_kb(url)
+    text, kb = _build_openai_login_text_and_kb(url, relogin=relogin)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 def on_login_openai_regen(chat_id: int, message_id: int, cb_id: str) -> None:
     """重新生成 PKCE + 登录 URL，覆盖旧状态。"""
-    on_login_openai_start(chat_id, message_id, cb_id)
+    state = states.get_state(chat_id)
+    if not state or state.get("action") != "oa_openai_code":
+        ui.answer_cb(cb_id, "登录会话已失效，请返回账户重试", show_alert=True)
+        return
+    on_login_openai_start(chat_id, message_id, cb_id, relogin=state["data"].get("relogin"))
 
 
 def _extract_openai_code_and_state(text: str) -> tuple[str, str]:
@@ -5882,9 +5915,10 @@ def _extract_openai_code_and_state(text: str) -> tuple[str, str]:
 
 def on_login_openai_code_input(chat_id: int, text: str) -> None:
     state = states.pop_state(chat_id)
+    relogin = ((state or {}).get("data") or {}).get("relogin")
     if not state or state.get("action") != "oa_openai_code":
         ui.send_result(chat_id, "❌ 登录会话已失效，请重新发起登录流程。",
-                       **_OA_NAV_OPENAI)
+                       **_login_nav(relogin))
         return
     data = state.get("data") or {}
 
@@ -5900,13 +5934,13 @@ def on_login_openai_code_input(chat_id: int, text: str) -> None:
             chat_id,
             "❌ 回调地址不是本次 OpenAI 登录使用的 "
             "<code>http://localhost:1455/auth/callback</code>，请重新发起登录流程。",
-            **_OA_NAV_OPENAI,
+            **_login_nav(relogin),
         )
         return
     code, recv_state = _extract_openai_code_and_state(raw_callback)
     if not code:
         ui.send_result(chat_id, "❌ 没有抽到 code，请重新发起登录流程。",
-                       **_OA_NAV_OPENAI)
+                       **_login_nav(relogin))
         return
     # PKCE protects the code. Preserve the existing manual bare-code flow, but
     # whenever a callback/query supplies state, bind it to this TG login session.
@@ -5916,7 +5950,7 @@ def on_login_openai_code_input(chat_id: int, text: str) -> None:
             chat_id,
             "❌ 完整回调地址中缺少 state，请重新发起登录流程；"
             "如需手工输入，请只发送授权 code。",
-            **_OA_NAV_OPENAI,
+            **_login_nav(relogin),
         )
         return
     if recv_state and orig_state and not secrets.compare_digest(recv_state, orig_state):
@@ -5925,7 +5959,7 @@ def on_login_openai_code_input(chat_id: int, text: str) -> None:
             f"❌ state 不匹配：收到 <code>{ui.escape_html(recv_state[:16])}...</code>，"
             f"期望 <code>{ui.escape_html(orig_state[:16])}...</code>。"
             "可能是会话错乱，请重新发起登录流程。",
-            **_OA_NAV_OPENAI,
+            **_login_nav(relogin),
         )
         return
 
@@ -5936,11 +5970,11 @@ def on_login_openai_code_input(chat_id: int, text: str) -> None:
         ui.send_result(
             chat_id,
             _oauth_error_html(exc, provider="openai", operation="exchange_code"),
-            **_OA_NAV_OPENAI,
+            **_login_nav(relogin),
         )
         return
 
-    _finish_openai_add(chat_id, tok, source="login")
+    _finish_openai_add(chat_id, tok, source="login", **({"relogin": relogin} if relogin else {}))
 
 
 def on_set_rt_openai_start(chat_id: int, message_id: int, cb_id: str) -> None:
@@ -6130,12 +6164,12 @@ def _save_openai_entry_with_duplicate_policy(
     return "added", "新增"
 
 
-def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
+def _finish_openai_add(chat_id: int, tok: dict, *, source: str, relogin=None) -> None:
     """共用保存路径：从 token 解 email/workspace → 按重复策略保存 → 回报。"""
     try:
         entry, meta = _openai_token_to_entry(tok)
         action = _persist_new_or_stage_overwrite(
-            chat_id, entry, source=source,
+            chat_id, entry, source=source, relogin=relogin,
         )
         if action == "staged":
             return
@@ -6144,7 +6178,7 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
         ui.send_result(
             chat_id,
             f"❌ 保存失败: <code>{ui.escape_html(str(exc))[:500]}</code>",
-            **_OA_NAV_OPENAI,
+            **_login_nav(relogin),
         )
         return
 
@@ -6190,7 +6224,7 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
         f"过期: <code>{_fmt_time_full(meta.get('expired'))}</code>{quota_note}\n"
         f"处理: <code>{ui.escape_html(action_msg)}</code>\n"
         f"来源: <code>{source}</code>{lb_hint}",
-        **_OA_NAV_OPENAI,
+        **_login_nav(relogin),
     )
 
 
@@ -6199,7 +6233,7 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
 _OA_NAV_XAI = {"back_label": "◀ 返回新增账户", "back_callback": "oa:add"}
 
 
-def _build_xai_login_text_and_kb(url: str) -> tuple[str, dict]:
+def _build_xai_login_text_and_kb(url: str, *, relogin=None) -> tuple[str, dict]:
     redirect = oauth_control.xai_redirect_uri()
     text = (
         f"请在浏览器打开以下链接登录 {_provider_tag('xai', full=True)} 账号：\n\n"
@@ -6213,12 +6247,12 @@ def _build_xai_login_text_and_kb(url: str) -> tuple[str, dict]:
     )
     kb = ui.inline_kb([
         [ui.btn("🔄 重新生成登录地址", "oa:login:xai:regen")],
-        [ui.btn("❌ 取消", "oa:add")],
+        [ui.btn("❌ 取消", _login_cancel(relogin))],
     ])
-    return text, kb
+    return text + _login_hint(relogin), kb
 
 
-def on_login_xai_start(chat_id: int, message_id: int, cb_id: str) -> None:
+def on_login_xai_start(chat_id: int, message_id: int, cb_id: str, *, relogin=None) -> None:
     ui.answer_cb(cb_id)
     verifier, challenge = oauth_control.xai_pkce_generate()
     state = secrets.token_urlsafe(32)
@@ -6235,34 +6269,40 @@ def on_login_xai_start(chat_id: int, message_id: int, cb_id: str) -> None:
         ui.send_result(
             chat_id,
             _oauth_error_html(exc, provider="xai", operation="discovery"),
-            **_OA_NAV_XAI,
+            **_login_nav(relogin),
         )
         return
 
     states.set_state(chat_id, "oa_xai_code", {
+        **({"relogin": relogin} if relogin else {}),
         "code_verifier": verifier,
         "state": state,
         "token_endpoint": token_endpoint,
         "redirect_uri": oauth_control.xai_redirect_uri(),
     })
 
-    text, kb = _build_xai_login_text_and_kb(url)
+    text, kb = _build_xai_login_text_and_kb(url, relogin=relogin)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 def on_login_xai_regen(chat_id: int, message_id: int, cb_id: str) -> None:
-    on_login_xai_start(chat_id, message_id, cb_id)
+    state = states.get_state(chat_id)
+    if not state or state.get("action") != "oa_xai_code":
+        ui.answer_cb(cb_id, "登录会话已失效，请返回账户重试", show_alert=True)
+        return
+    on_login_xai_start(chat_id, message_id, cb_id, relogin=state["data"].get("relogin"))
 
 
 def on_login_xai_code_input(chat_id: int, text: str) -> None:
     state = states.pop_state(chat_id)
+    relogin = ((state or {}).get("data") or {}).get("relogin")
     if not state or state.get("action") != "oa_xai_code":
-        ui.send_result(chat_id, "❌ 登录会话已失效，请重新发起登录流程。", **_OA_NAV_XAI)
+        ui.send_result(chat_id, "❌ 登录会话已失效，请重新发起登录流程。", **_login_nav(relogin))
         return
     data = state.get("data") or {}
     code, recv_state = _extract_openai_code_and_state(text)
     if not code:
-        ui.send_result(chat_id, "❌ 没有抽到 code，请重新发起登录流程。", **_OA_NAV_XAI)
+        ui.send_result(chat_id, "❌ 没有抽到 code，请重新发起登录流程。", **_login_nav(relogin))
         return
     orig_state = data.get("state", "")
     if recv_state and orig_state and recv_state != orig_state:
@@ -6271,7 +6311,7 @@ def on_login_xai_code_input(chat_id: int, text: str) -> None:
             f"❌ state 不匹配：收到 <code>{ui.escape_html(recv_state[:16])}...</code>，"
             f"期望 <code>{ui.escape_html(orig_state[:16])}...</code>。"
             "可能是会话错乱，请重新发起登录流程。",
-            **_OA_NAV_XAI,
+            **_login_nav(relogin),
         )
         return
     try:
@@ -6285,11 +6325,11 @@ def on_login_xai_code_input(chat_id: int, text: str) -> None:
         ui.send_result(
             chat_id,
             _oauth_error_html(exc, provider="xai", operation="exchange_code"),
-            **_OA_NAV_XAI,
+            **_login_nav(relogin),
         )
         return
 
-    _finish_xai_add(chat_id, tok, source="login")
+    _finish_xai_add(chat_id, tok, source="login", **({"relogin": relogin} if relogin else {}))
 
 
 def on_set_rt_xai_start(chat_id: int, message_id: int, cb_id: str) -> None:
@@ -6366,12 +6406,12 @@ def _xai_token_to_entry(tok: dict, *, fallback_email: str = "") -> tuple[dict, d
     return entry, meta
 
 
-def _finish_xai_add(chat_id: int, tok: dict, *, source: str) -> None:
+def _finish_xai_add(chat_id: int, tok: dict, *, source: str, relogin=None) -> None:
     try:
         entry, meta = _xai_token_to_entry(tok)
         ak = _account_key(entry)
         save_action = _persist_new_or_stage_overwrite(
-            chat_id, entry, source=source,
+            chat_id, entry, source=source, relogin=relogin,
         )
         if save_action == "staged":
             return
@@ -6380,7 +6420,7 @@ def _finish_xai_add(chat_id: int, tok: dict, *, source: str) -> None:
         ui.send_result(
             chat_id,
             f"❌ 保存失败: <code>{ui.escape_html(str(exc))[:500]}</code>",
-            **_OA_NAV_XAI,
+            **_login_nav(relogin),
         )
         return
 
@@ -6399,7 +6439,7 @@ def _finish_xai_add(chat_id: int, tok: dict, *, source: str) -> None:
         f"过期: <code>{_fmt_time_full(meta.get('expired'))}</code>\n"
         "额度: <code>xAI 暂无已确认的零成本 quota 端点</code>\n"
         f"来源: <code>{ui.escape_html(source)}</code>{lb_hint}",
-        **_OA_NAV_XAI,
+        **_login_nav(relogin),
     )
 
 
@@ -6408,7 +6448,7 @@ def _finish_xai_add(chat_id: int, tok: dict, *, source: str) -> None:
 _OA_NAV_ANTIGRAVITY = {"back_label": "◀ 返回新增账户", "back_callback": "oa:add"}
 
 
-def _build_antigravity_login_text_and_kb(url: str) -> tuple[str, dict]:
+def _build_antigravity_login_text_and_kb(url: str, *, relogin=None) -> tuple[str, dict]:
     redirect = (parse_qs(urlparse(url).query).get("redirect_uri") or [oauth_control.antigravity_redirect_uri()])[0]
     callback_help = (
         "登录后请复制官网页面显示的 <b>授权码</b> 发给我；不要转发给其他人。\n\n"
@@ -6427,12 +6467,12 @@ def _build_antigravity_login_text_and_kb(url: str) -> tuple[str, dict]:
     )
     kb = ui.inline_kb([
         [ui.btn("🔄 重新生成登录地址", "oa:login:antigravity:regen")],
-        [ui.btn("❌ 取消", "oa:add")],
+        [ui.btn("❌ 取消", _login_cancel(relogin))],
     ])
-    return text, kb
+    return text + _login_hint(relogin), kb
 
 
-def on_login_antigravity_start(chat_id: int, message_id: int, cb_id: str) -> None:
+def on_login_antigravity_start(chat_id: int, message_id: int, cb_id: str, *, relogin=None) -> None:
     ui.answer_cb(cb_id)
     verifier, challenge = oauth_control.antigravity_pkce_generate()
     state = secrets.token_urlsafe(32)
@@ -6441,23 +6481,29 @@ def on_login_antigravity_start(chat_id: int, message_id: int, cb_id: str) -> Non
         state, code_challenge=challenge, redirect_uri=redirect_uri,
     )
     states.set_state(chat_id, "oa_antigravity_code", {
+        **({"relogin": relogin} if relogin else {}),
         "state": state,
         "token_endpoint": oauth_control.antigravity_token_url(),
         "redirect_uri": redirect_uri,
         "code_verifier": verifier,
     })
-    text, kb = _build_antigravity_login_text_and_kb(url)
+    text, kb = _build_antigravity_login_text_and_kb(url, relogin=relogin)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 def on_login_antigravity_regen(chat_id: int, message_id: int, cb_id: str) -> None:
-    on_login_antigravity_start(chat_id, message_id, cb_id)
+    state = states.get_state(chat_id)
+    if not state or state.get("action") != "oa_antigravity_code":
+        ui.answer_cb(cb_id, "登录会话已失效，请返回账户重试", show_alert=True)
+        return
+    on_login_antigravity_start(chat_id, message_id, cb_id, relogin=state["data"].get("relogin"))
 
 
 def on_login_antigravity_code_input(chat_id: int, text: str) -> None:
     state = states.pop_state(chat_id)
+    relogin = ((state or {}).get("data") or {}).get("relogin")
     if not state or state.get("action") != "oa_antigravity_code":
-        ui.send_result(chat_id, "❌ 登录会话已失效，请重新发起登录流程。", **_OA_NAV_ANTIGRAVITY)
+        ui.send_result(chat_id, "❌ 登录会话已失效，请重新发起登录流程。", **_login_nav(relogin))
         return
     data = state.get("data") or {}
     code_only = bool(
@@ -6471,7 +6517,7 @@ def on_login_antigravity_code_input(chat_id: int, text: str) -> None:
         ui.send_result(
             chat_id,
             f"❌ 没有抽到 code：<code>{ui.escape_html(str(exc))[:300]}</code>",
-            **_OA_NAV_ANTIGRAVITY,
+            **_login_nav(relogin),
         )
         return
     code = parsed.get("code") or ""
@@ -6492,7 +6538,7 @@ def on_login_antigravity_code_input(chat_id: int, text: str) -> None:
             f"❌ state 不匹配：收到 <code>{ui.escape_html(recv_state[:16])}...</code>，"
             f"期望 <code>{ui.escape_html(orig_state[:16])}...</code>。"
             "可能是会话错乱，请重新发起登录流程。",
-            **_OA_NAV_ANTIGRAVITY,
+            **_login_nav(relogin),
         )
         return
     try:
@@ -6506,10 +6552,10 @@ def on_login_antigravity_code_input(chat_id: int, text: str) -> None:
         ui.send_result(
             chat_id,
             _oauth_error_html(exc, provider="antigravity", operation="exchange_code"),
-            **_OA_NAV_ANTIGRAVITY,
+            **_login_nav(relogin),
         )
         return
-    _finish_antigravity_add(chat_id, tok, source="login")
+    _finish_antigravity_add(chat_id, tok, source="login", **({"relogin": relogin} if relogin else {}))
 
 
 def _antigravity_token_to_entry(tok: dict) -> tuple[dict, dict]:
@@ -6544,11 +6590,11 @@ def _antigravity_token_to_entry(tok: dict) -> tuple[dict, dict]:
     return entry, meta
 
 
-def _finish_antigravity_add(chat_id: int, tok: dict, *, source: str) -> None:
+def _finish_antigravity_add(chat_id: int, tok: dict, *, source: str, relogin=None) -> None:
     try:
         entry, meta = _antigravity_token_to_entry(tok)
         save_action = _persist_new_or_stage_overwrite(
-            chat_id, entry, source=source,
+            chat_id, entry, source=source, relogin=relogin,
         )
         if save_action == "staged":
             return
@@ -6557,7 +6603,7 @@ def _finish_antigravity_add(chat_id: int, tok: dict, *, source: str) -> None:
         ui.send_result(
             chat_id,
             f"❌ 保存失败: <code>{ui.escape_html(str(exc))[:500]}</code>",
-            **_OA_NAV_ANTIGRAVITY,
+            **_login_nav(relogin),
         )
         return
 
@@ -6578,7 +6624,7 @@ def _finish_antigravity_add(chat_id: int, tok: dict, *, source: str) -> None:
         f"过期: <code>{_fmt_time_full(meta.get('expired'))}</code>\n"
         "额度: <code>Credits 将在账户详情中刷新</code>\n"
         f"来源: <code>{ui.escape_html(source)}</code>{lb_hint}",
-        **_OA_NAV_ANTIGRAVITY,
+        **_login_nav(relogin),
     )
 
 
@@ -7187,13 +7233,21 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         on_invalid_remove_exec(chat_id, message_id, cb_id, all_items=False)
         return True
 
+    if data.startswith("oa:relogin_cancel:"):
+        _return_from_relogin(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+    if data.startswith("oa:relogin:"):
+        short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])
+        on_relogin(chat_id, message_id, cb_id, short, page, filter_key)
+        return True
     if data.startswith("oa:view:"):
         short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])
         on_view(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
         return True
     if data.startswith("oa:refresh_token:"):
         short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])
-        on_refresh_token(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
+        # Old detail keyboards must not retain a hidden manual refresh action.
+        on_relogin(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
         return True
     if data.startswith("oa:refresh_usage:"):
         short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])

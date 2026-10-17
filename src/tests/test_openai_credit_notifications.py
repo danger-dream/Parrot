@@ -20,7 +20,7 @@ def account(m, monkeypatch):
     _allow(m, key)
     m["config"].update(lambda cfg: cfg.update(notifications={"enabled": True, "events": {}}))
     sent = []
-    monkeypatch.setattr(notifier, "notify", lambda text, **kw: sent.append(text) or True)
+    capture(monkeypatch, lambda kind, text, record: sent.append(text) or True)
     alerts._states.clear()
     yield key, channel, sent
     alerts._states.clear()
@@ -60,9 +60,9 @@ def test_credit_notification_is_shared_by_live_and_monitor_paths(m, account, mon
         monkeypatch.setattr(m["openai_provider"], "_mock_wham_payload", _payload)
         asyncio.run(m["oauth_manager"].quota_monitor_once())
     assert len(sent) == 1
-    assert "套餐额度已耗尽，将使用积分继续" in sent[0]
+    assert "套餐额度耗尽，将使用积分" in sent[0]
     assert "credit-alert@quota.test" in sent[0]
-    assert "关闭「允许使用积分」" in sent[0]
+    assert "暂停积分续用" in sent[0]
     assert m["oauth_manager"].get_account(key)["enabled"] is True
     headers(m, channel)
     m["oauth_manager"].evaluate_and_toggle_by_usage(key, usage(m))
@@ -182,10 +182,10 @@ def test_concurrent_observations_only_enqueue_once(m, account):
 
 def test_enqueue_failure_retries_without_affecting_account(m, account, monkeypatch):
     key, channel, sent = account
-    monkeypatch.setattr(notifier, "notify", lambda *a, **kw: False)
+    capture(monkeypatch, lambda *a: False)
     headers(m, channel)
     assert not alerts._states[key].sent
-    monkeypatch.setattr(notifier, "notify", lambda text, **kw: sent.append(text) or True)
+    capture(monkeypatch, lambda kind, text, record: sent.append(text) or True)
     headers(m, channel)
     assert len(sent) == 1 and m["oauth_manager"].get_account(key)["enabled"]
 
@@ -224,7 +224,7 @@ def test_notification_failure_does_not_break_quota_or_response_path(m, account, 
     key, channel, _sent = account
     def fail(*args, **kwargs):
         raise RuntimeError("queue unavailable")
-    monkeypatch.setattr(notifier, "notify_event", fail)
+    capture(monkeypatch, lambda kind, text, record: fail(kind, text))
     headers(m, channel)
     result = m["oauth_manager"].evaluate_and_toggle_by_usage(key, usage(m))
     assert result["action"] == "kept_enabled"
@@ -240,8 +240,10 @@ def test_tg_notification_has_independent_toggle(m, account, monkeypatch):
     page = recorder.last("editMessageText")
     buttons = [button for row in page["reply_markup"]["inline_keyboard"] for button in row]
     assert any(button["callback_data"] == "sys:notif_toggle:openai_credits_started"
-               and "OpenAI 积分续用" in button["text"] for button in buttons)
+               and "套餐额度耗尽，将使用积分" in button["text"] for button in buttons)
     system_menu._on_notif_toggle_event(42, 100, "toggle", "openai_credits_started")
     events = m["config"].get()["notifications"]["events"]
     assert events["openai_credits_started"] is False
     assert events.get("quota_disabled", True) is True
+
+from src.tests.notification_helpers import capture

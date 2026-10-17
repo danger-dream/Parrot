@@ -155,7 +155,7 @@ def test_actual_tg_login_automatically_initializes_in_one_message(callback_env, 
     def edit(chat, mid, text, **kwargs):
         assert mid == 500, "all progress and the final detail replace the login card"
         messages.append((text, kwargs))
-        if "账户已就绪" in text:
+        if "操作已完成" in text:
             initialized.set()
     monkeypatch.setattr(ui, "send", send)
     monkeypatch.setattr(ui, "edit", edit)
@@ -178,7 +178,7 @@ def test_actual_tg_login_automatically_initializes_in_one_message(callback_env, 
         common.PLATFORM_ORIGIN + "/api/v1/oauth/cli/callback/" + site]
     assert "官方用户名" in messages[-1][0]
     assert not any("请选择目标组织/项目" in text or "账户初始化结果" in text for text, _ in messages)
-    assert "模型目录: 2 个 · 已启用 2 · 禁用 0" in messages[-1][0]
+    assert "模型目录：已完成" in messages[-1][0]
     assert all(kw.get("method", "GET") == "GET" for url, kw in observed if url.endswith("/api_keys"))
     assert sum("client/configs" in url for url, _ in observed) == 1
     assert sum(url.endswith("/access_tokens") for url, _ in observed) == 1
@@ -257,15 +257,26 @@ def test_project_lookup_failure_reuses_credentials_without_reauthorizing(callbac
     assert states.get_state(42) is None and len(om.list_accounts()) == 1
     key = om.get_account_key(om.list_accounts()[0])
     assert len(lookups) == 1 and om.get_account(key), "default project setup runs after saving login"
-    assert "登录已保存" in messages[-1][0]
+    assert "账户已保存" in messages[-1][0]
     assert not om.get_account(key).get("model_key")
     short = ui.register_code(key)
     recovering[0] = True
     now[0] += 360  # Original login TTL no longer owns the saved credentials.
     assert menu.handle_callback(42, 500, "retry", "oa:zh:initialize:" + short)
-    assert "账户已就绪" in messages[-1][0]
+    assert "操作已完成" in messages[-1][0]
     assert om.list_accounts()[0]["project_key_id"] == "existing-id"
     assert "官方用户名" in messages[-1][0]
     assert sum("/cli/poll/" in url for url, _ in observed) == 1
     assert sum(url.endswith("/cli/init") for url, _ in observed) == 1
     assert not any(url.endswith("/oauth/token") for url, _ in observed)
+
+
+@pytest.fixture(autouse=True)
+def structured_operation_wire(monkeypatch):
+    from src.tests.notification_helpers import ui_operation_transport
+    ui_operation_transport(monkeypatch)
+    yield
+    import threading
+    for worker in threading.enumerate():
+        if worker.name == "oauth-model-sync-ui":
+            worker.join(25)

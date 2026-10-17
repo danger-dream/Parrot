@@ -8,6 +8,10 @@
 
 from __future__ import annotations
 
+from src import notifications
+from src.notifications import reporting
+from src.notifications.events import Effect
+
 import threading
 import time
 from types import SimpleNamespace
@@ -313,17 +317,11 @@ def record_error(channel_key: str, model: str, message: str | None = None,
             state_db.error_save(channel_key, model, new_count, cooldown_until, message)
         _entries[(channel_key, model)] = state
         result = dict(state)
+        notification_subject = notifications.subjects.channel(channel_key) if just_became_permanent else None
 
     if just_became_permanent:
         ek = notifier.escape_html
-        notifier.notify_event(
-            "channel_permanent",
-            "🔴 <b>渠道永久冻结</b>\n"
-            f"渠道: <code>{ek(channel_key)}</code> ({ek(model)})\n"
-            f"累计失败 {new_count} 次\n"
-            f"最后错误: <code>{ek((message or '?')[:200])}</code>\n"
-            "如需恢复请到「📡 渠道管理」点「🧹 清错误」"
-        )
+        notifications.channel_event("channel.model.frozen", channel_key, {"model": model, "count": new_count, "error_code": "repeated_upstream_failure"}, Effect("confirmed", "model_paused"), source="cooldown", scope_ref=model, subject=notification_subject)
     return result
 
 
@@ -390,7 +388,10 @@ def clear_on_success(channel_key: str, model: str) -> bool:
         entry = get_state(channel_key, model)
         if entry is None or _was_actively_blocked(entry, now):
             return False
+        subject = notifications.subjects.channel(channel_key)
         clear(channel_key, model, notify_recovered=False)
+        for event_type in ("model.quota.blocked", "model.entitlement.blocked"):
+            notifications.resolve_silently(event_type, subject, scope="model", scope_ref=model)
         return True
 
 
@@ -421,7 +422,7 @@ def clear(channel_key: str, model: Optional[str] = None, *,
             entry = _entries.get(k)
             if entry and _was_actively_blocked(entry, now):
                 was_perm = entry.get("cooldown_until") == _INF
-                recovered.append((k[0], k[1], was_perm))
+                recovered.append((notifications.subjects.channel(k[0]), k[1], was_perm))
         # Persistent deletion is the commit point. If it fails, leave every
         # in-memory entry intact so current-process and restart behavior agree.
         with state_db.optional_write_timeout():
@@ -436,13 +437,9 @@ def clear(channel_key: str, model: Optional[str] = None, *,
 
     if notify_recovered:
         ek = notifier.escape_html
-        for ck, mdl, was_perm in recovered:
+        for subject, mdl, was_perm in recovered:
             tag = "永久冻结" if was_perm else "冷却"
-            notifier.notify_event(
-                "channel_recovered",
-                f"✅ <b>渠道恢复</b>（从{tag}中）\n"
-                f"渠道: <code>{ek(ck)}</code> ({ek(mdl)})",
-            )
+            reporting.channel_recovered(subject, mdl, tag)
 
 
 def clear_all() -> None:

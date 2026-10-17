@@ -44,6 +44,93 @@ class OAuthAccountMutationControlMixin:
         if status == "missing":
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
 
+    def notification_operation(self, context, account_id, expected_account, action, *, stages=None):
+        """Exact single-account management adapter, no global monitor or implicit benefits."""
+        import asyncio
+        import os
+        from src import oauth_manager
+        from src.notifications import reporting
+        self._require(context, Capability.WRITE)
+        if revision(self._account(account_id)) != revision(expected_account):
+            raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+        expected = oauth_manager.account_state_key(expected_account)
+        observation = reporting.observation(account_id)
+        with oauth_manager.exact_operation_target(account_id, expected):
+            if action == "refresh_token":
+                if os.environ.get("PARROT_NO_REFRESH") == "1":
+                    raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+                result = self.refresh_token(context, account_id)
+                reporting.refreshed(account_id, source="notification_action", observation=observation)
+                return {"status": "succeeded"}
+            if action == "sync_models":
+                from src.notifications.events import COMPLETED_STAGES
+                requested = {stage["name"] for stage in stages or [] if stage["status"] not in COMPLETED_STAGES}
+                outcomes = []
+                if stages is None or "模型目录" in requested:
+                    result = asyncio.run(self.backend.refresh_account_models(account_id))
+                    status = result.get("action")
+                    outcomes.append({"name": "模型目录", "status": "succeeded" if status in {"updated", "not_modified"} else "unknown" if status == "timeout" else "failed"})
+                if "元数据" in requested:
+                    from src import model_pricing
+                    result = asyncio.run(model_pricing.refresh_metadata_after_model_sync())
+                    outcomes.append({"name": "元数据", "status": result.get("status", "unknown")})
+                ok = outcomes and all(stage["status"] in COMPLETED_STAGES for stage in outcomes)
+                unknown = any(stage["status"] in {"unknown", "pending", "running"} for stage in outcomes)
+                return {"status": "succeeded" if ok else "unknown" if unknown else "failed", "stages": outcomes}
+            if action != "refresh_usage":
+                raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
+            # Fetch through the existing backend. Commit/evaluate ONLY under the
+            # same-generation lock after I/O; never hold that lock over network.
+            with oauth_manager.usage_commit_observation(expected_account):
+                usage = asyncio.run(self.backend.fetch_usage_snapshot(account_id))
+                with oauth_manager.account_generation_guard(expected) as current:
+                    if not current:
+                        raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+                    oauth_manager.validate_usage_commit(account_id)
+                    usage, result = self._save_and_evaluate_usage(account_id, usage)
+            action_result = (result or {}).get("action")
+            if action_result in {"disabled", "disabled_updated"}:
+                reporting.quota(account_id, usage=usage, windows=(result or {}).get("hit_windows", []), source="notification_action", observation=observation)
+            elif action_result in {"resumed", "resumed_manual"}:
+                reporting.quota(account_id, recovered=True, usage=usage, source="notification_action", observation=observation)
+            failed = bool(action_result) and ("failed" in action_result or "conflict" in action_result or action_result == "noop_missing")
+            unknown = not action_result or any(term in action_result for term in ("unknown", "stale"))
+            status = "failed" if failed else "unknown" if unknown else "succeeded"
+            return {"status": status, "quota_action": action_result,
+                    "stages": [{"name": "额度快照", "status": "succeeded"},
+                               {"name": "状态评估/保存", "status": status}]}
+
+    def set_notification_policy(self, context, account_id, expected_account, *, allow_credits):
+        """Exact CAS setter for confirmed notification intent; never a toggle or network call."""
+        self._require(context, Capability.WRITE)
+        account = self._account(account_id)
+        if revision(account) != revision(expected_account):
+            raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+        if self.backend.provider_of(account) != "openai" or allow_credits is not False:
+            raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
+        outcome = self.backend.update_account_conditional(account_id, expected_account, allow_credits=False)
+        self._raise_conditional_status(outcome)
+        if outcome.get("status") != "updated":
+            raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
+        self.backend.evaluate_cached_quota(account_id)
+        self._audit(context, "oauth.account.allow-credits", account_id)
+        return {"allowed": self._account(account_id).get("allowCredits") is True}
+
+    def clear_notification_cooldown(self, context, account_id, expected_account, model):
+        """Clear only a confirmed exact model under the account lifecycle lock."""
+        from src import oauth_manager, cooldown
+        self._require(context, Capability.WRITE)
+        from src.notifications.providers import capabilities
+        if "clear_cooldown" not in capabilities(self._account(account_id)):
+            raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
+        expected = oauth_manager.account_state_key(expected_account)
+        with oauth_manager.account_generation_guard(expected) as current:
+            if not current or revision(self._account(account_id)) != revision(expected_account):
+                raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+            cooldown.clear(expected, model=model)
+        self._audit(context, "oauth.model.clear-cooldown", account_id)
+        return {"model": model, "cleared": True}
+
     @audit_failures("oauth.account.allow-credits", target_arg="account_id")
     def toggle_openai_credits(self, context: ManagementContext, account_id: str) -> dict:
         """Toggle workspace-local spending consent, then re-evaluate quota."""
@@ -240,9 +327,28 @@ class OAuthAccountMutationControlMixin:
                 with device.lease(context.actor.subject_id, flow_id, flow_secret) as plan, \
                         device.saving(context.actor.subject_id, flow_id, flow_secret):
                     entry = device.ready(plan)
-                    if flow_id.startswith("zhflow_") and not plan.payload.get("source_account_id"):
+                    relogin = plan.payload.get("relogin")
+                    if flow_id.startswith("zhflow_") and not relogin and not plan.payload.get("source_account_id"):
                         entry = self.backend.zhipu_login_entry(entry)
-                    if flow_id.startswith("zhflow_") and plan.payload.get("source_account_id"):
+                    if relogin:
+                        # Bind before any save or post-save provider side effects.
+                        # A wrong browser identity must never become an add/upsert.
+                        old = relogin["account"]
+                        if flow_id.startswith("zhflow_"):
+                            if (any(entry.get(k) != old.get(k) for k in ("provider", "site", "credential_mode", "subject"))
+                                    or any(entry.get(k) and entry[k] != old.get(k) for k in ("organization_id", "project_id"))):
+                                raise ManagementError(ManagementErrorCode.IDENTITY_CONFLICT)
+                            entry.update({k: old[k] for k in ("organization_id", "project_id", "plan_scope") if k in old})
+                        outcome = self.replace_account_entry(
+                            context, relogin["target_key"], entry, expected_account=old,
+                            authenticated_login=flow_id.startswith("zhflow_"),
+                        )
+                        self._raise_conditional_status(outcome)
+                        if outcome.get("status") != "replaced":
+                            raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
+                        account_id = outcome.get("account_key") or relogin["target_key"]
+                        result = OAuthMutationResult(account_id, revision(self._account(account_id)), "replaced", post_save=outcome.get("_post_save"))
+                    elif flow_id.startswith("zhflow_") and plan.payload.get("source_account_id"):
                         account_id, status = self.backend.zhipu_bind_project(
                             plan.payload["source_account_id"], plan.payload["source_account"], entry)
                         post_save = self._post_save_account_effects(account_id, self._account(account_id))

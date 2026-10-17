@@ -1380,20 +1380,8 @@ def _on_quota_threshold_input(chat_id: int, text: str) -> None:
 # ─── 通知设置 ────────────────────────────────────────────────────
 
 # 事件 key → 显示名（顺序即菜单按钮顺序）
-_NOTIF_EVENTS = [
-    ("channel_permanent",     "🔴 渠道永久冻结"),
-    ("channel_recovered",     "✅ 渠道恢复"),
-    ("quota_disabled",        "⚠ 配额禁用"),
-    ("quota_resumed",         "✅ 配额恢复"),
-    ("openai_credits_started", "💳 OpenAI 积分续用"),
-    ("quota_cooldown",        "🟠 配额冷却"),
-    ("oauth_refreshed",       "🔄 OAuth Token 刷新成功"),
-    ("oauth_refresh_failed",  "❌ OAuth Token 刷新失败"),
-    ("no_channels",           "🚨 无可用渠道告警"),
-    ("openai_store_save_failed", "❌ OpenAI Store 写入失败"),
-    ("model_degraded",        "⚠️ 上游模型变更"),
-    ("network_monitor",     "🌐 网络检测失败/恢复"),
-]
+from ...notifications.catalog import CATALOG as _NOTIFICATION_CATALOG, public_key as _notification_public_key, enabled as _notification_enabled, LEGACY_LABELS
+_NOTIF_EVENTS = [(key, spec.title) for key, spec in _NOTIFICATION_CATALOG.items()] + list(LEGACY_LABELS.items())
 
 
 def _show_notif(chat_id: int, message_id: int, cb_id: str) -> None:
@@ -1410,7 +1398,7 @@ def _show_notif(chat_id: int, message_id: int, cb_id: str) -> None:
         "<b>事件分类：</b>",
     ]
     for key, label in _NOTIF_EVENTS:
-        on = events.get(key, True)  # 缺省视为开
+        on = _notification_enabled(key, {"events": events}) if key in _NOTIFICATION_CATALOG else events.get(key, True)  # 缺省视为开
         text_lines.append(f"  {'✅' if on else '🚫'} {label}")
     text_lines.append("")
     text_lines.append("<i>点下方按钮切换。总开关关闭时所有事件都不发。</i>")
@@ -1419,9 +1407,10 @@ def _show_notif(chat_id: int, message_id: int, cb_id: str) -> None:
         [ui.btn("🚫 关闭总开关" if enabled else "✅ 开启总开关", "sys:notif_toggle_main")],
     ]
     for key, label in _NOTIF_EVENTS:
-        on = events.get(key, True)
+        on = _notification_enabled(key, {"events": events}) if key in _NOTIFICATION_CATALOG else events.get(key, True)
         mark = "☑" if on else "☐"
         rows.append([ui.btn(f"{mark} {label}", f"sys:notif_toggle:{key}")])
+    rows.append([ui.btn("📬 查看本人投递记录", "nt:diagnostics")])
     rows.append([ui.btn("◀ 返回设置", "menu:settings")])
     ui.edit(chat_id, message_id, "\n".join(text_lines), reply_markup=ui.inline_kb(rows))
 
@@ -1443,18 +1432,10 @@ def _on_notif_toggle_event(chat_id: int, message_id: int, cb_id: str, event_key:
         return
     notif = _runtime_control.config_snapshot().get("notifications") or {}
     events = notif.get("events") or {}
-    cur = bool(events.get(event_key, True))
+    cur = _notification_enabled(event_key, {"events": events}) if event_key in _NOTIFICATION_CATALOG else bool(events.get(event_key, True))
     new_val = not cur
 
-    public_key = {
-        "channel_permanent": "channelPermanent", "channel_recovered": "channelRecovered",
-        "quota_disabled": "quotaDisabled", "quota_resumed": "quotaResumed",
-        "openai_credits_started": "openaiCreditsStarted",
-        "quota_cooldown": "quotaCooldown", "oauth_refreshed": "oauthRefreshed",
-        "oauth_refresh_failed": "oauthRefreshFailed", "no_channels": "noChannels",
-        "openai_store_save_failed": "openaiStoreSaveFailed", "network_monitor": "networkMonitor",
-        "model_degraded": "modelDegraded",
-    }[event_key]
+    public_key = _notification_public_key(event_key)
     _settings_control.update_notifications(
         _control_context(chat_id), {"events": {public_key: new_val}},
     )
