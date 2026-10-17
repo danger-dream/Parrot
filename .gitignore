@@ -31,13 +31,16 @@ state.db.pre_composite_key.bak
 /runtime-cache.json.bak
 /runtime-cache.json.lock
 /runtime-cache.json.*.tmp
+/.runtime-cache.json.*
 /durable-state.json
 /durable-state.json.bak
 /durable-state.json.lock
 /durable-state.json.*.tmp
+/.durable-state.json.*
 /state-migration.json
 /state-migration.json.lock
 /state-migration.json.*.tmp
+/.state-migration.json.*
 /telegram-stats-cache-v1.json
 /telegram-stats-cache-v1.json.tmp-*
 
