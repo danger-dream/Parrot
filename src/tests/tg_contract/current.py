@@ -6,11 +6,13 @@ from .harness import load_jsonl
 
 # Reviewed additions are not overrides of historical case IDs. Keep an exact
 # registry so missing/unowned additions fail just like unknown overlays.
-OAUTH_ADDITION_CASE_IDS = (
+CLAUDE_RESET_ADDITION_CASE_IDS = (
     'TG-OA-03.claude_reset_cedar_success_duplicate',
     'TG-OA-03.claude_reset_juniper_unconfirmed_duplicate',
     'TG-OA-03.claude_reset_stage_and_expiry_guard',
 )
+RELOGIN_ADDITION_CASE_IDS = ('TG-OA-04.relogin_start_cancel',)
+OAUTH_ADDITION_CASE_IDS = CLAUDE_RESET_ADDITION_CASE_IDS + RELOGIN_ADDITION_CASE_IDS
 
 
 def load_current_additions(segment: str | Path, existing: list[dict]) -> list[dict]:
@@ -18,13 +20,18 @@ def load_current_additions(segment: str | Path, existing: list[dict]) -> list[di
     if segment.name != 'oauth.jsonl':
         return []
     path = segment.parents[2] / 'claude-reset-2026-09-23/additions/oauth.jsonl'
-    additions = load_jsonl(path)
+    reset = load_jsonl(path)
+    relogin = load_jsonl(segment.parents[2] / 'oauth-relogin-2026-10-18/additions/oauth.jsonl')
+    if (tuple(case['caseId'] for case in reset) != CLAUDE_RESET_ADDITION_CASE_IDS
+            or tuple(case['caseId'] for case in relogin) != RELOGIN_ADDITION_CASE_IDS):
+        raise AssertionError('current OAuth addition case coverage differs')
+    additions = reset + relogin
     ids = [case['caseId'] for case in additions]
     if tuple(ids) != OAUTH_ADDITION_CASE_IDS:
         raise AssertionError('current OAuth addition case coverage differs')
     if set(ids) & {case['caseId'] for case in existing}:
         raise AssertionError('current OAuth addition replaces an existing case')
-    if any(case['capabilityId'] != 'TG-OA-03' for case in additions):
+    if any(case['capabilityId'] != case['caseId'].split('.', 1)[0] for case in additions):
         raise AssertionError('current OAuth addition changes capability ownership')
     return additions
 

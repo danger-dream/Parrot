@@ -34,7 +34,7 @@ def test_current_overlay_case_coverage_is_bidirectional_and_unique():
         loaded = current.load_current_jsonl(archived_path)
         extra_ids = list(current.OAUTH_ADDITION_CASE_IDS) if segment == 'oauth' else []
         assert [c['caseId'] for c in loaded] == [c['caseId'] for c in archived] + extra_ids
-        assert [c['capabilityId'] for c in loaded] == [c['capabilityId'] for c in archived] + ['TG-OA-03'] * len(extra_ids)
+        assert [c['capabilityId'] for c in loaded] == [c['capabilityId'] for c in archived] + [case_id.split('.', 1)[0] for case_id in extra_ids]
     assert len(seen) == 151  # includes MCP UI, cold-stat page, notification, discovery and subscription-label traces
 
 
@@ -71,7 +71,7 @@ def test_existing_overlay_loaders_still_reject_duplicate_unknown(module, mutatio
 def test_current_additions_have_exact_ownership_runners_and_both_loaders_agree():
     from src.tests.tg_contract.claude_reset_runner import SCENARIOS
     additions = load_jsonl(ROOT / 'claude-reset-2026-09-23/additions/oauth.jsonl')
-    assert tuple(case['caseId'] for case in additions) == current.OAUTH_ADDITION_CASE_IDS
+    assert tuple(case['caseId'] for case in additions) == current.CLAUDE_RESET_ADDITION_CASE_IDS
     assert {case['capabilityId'] for case in additions} == {'TG-OA-03'}
     assert {case['entry']['scenario'] for case in additions} == set(SCENARIOS)
     assert all(case['caseId'] == 'TG-OA-03.' + case['entry']['scenario'] for case in additions)
@@ -81,11 +81,24 @@ def test_current_additions_have_exact_ownership_runners_and_both_loaders_agree()
         actual = {':'.join(item['callback'].split(':')[:2]) + ':*'
                   for item in case['finalBusinessState']['callbacks']}
         assert expected == actual == {'oa:claude_reset_ask:*', 'oa:claude_reset_confirm:*', 'oa:claude_reset_execute:*'}
+    relogin = load_jsonl(ROOT / 'oauth-relogin-2026-10-18/additions/oauth.jsonl')
+    assert tuple(case['caseId'] for case in relogin) == current.RELOGIN_ADDITION_CASE_IDS
+    assert {case['capabilityId'] for case in relogin} == {'TG-OA-04'}
+    assert {case['entry']['scenario'] for case in relogin} == {'relogin_start_cancel'}
+    for case in relogin:
+        expected = set(case['entry']['callbackFamilies'])
+        actual = {':'.join(callback.split(':')[:2]) + ':*'
+                  for callback in case['finalBusinessState']['callbacks']}
+        assert expected == actual == {'oa:relogin:*', 'oa:relogin_cancel:*'}
+        assert case['entry']['stateFamilies'] == ['oa_login_code']
 
 
-@pytest.mark.parametrize('mutation', ['duplicate', 'missing', 'unknown', 'capability', 'replacement'])
-def test_current_additions_reject_unreviewed_or_replacing_cases(monkeypatch, mutation):
-    additions = load_jsonl(ROOT / 'claude-reset-2026-09-23/additions/oauth.jsonl')
+@pytest.mark.parametrize('mutation', ['duplicate', 'missing', 'unknown', 'capability', 'replacement', 'moved'])
+@pytest.mark.parametrize('group', ['claude-reset-2026-09-23', 'oauth-relogin-2026-10-18'])
+def test_current_additions_reject_unreviewed_or_replacing_cases(monkeypatch, mutation, group):
+    records = {name: load_jsonl(ROOT / f'{name}/additions/oauth.jsonl')
+               for name in ['claude-reset-2026-09-23', 'oauth-relogin-2026-10-18']}
+    additions = records[group]
     existing = []
     if mutation == 'duplicate':
         additions.append(deepcopy(additions[0]))
@@ -97,8 +110,17 @@ def test_current_additions_reject_unreviewed_or_replacing_cases(monkeypatch, mut
         additions[0]['capabilityId'] = 'TG-OA-07'
     elif mutation == 'replacement':
         existing = [deepcopy(additions[0])]
-    monkeypatch.setattr(current, 'load_jsonl', lambda path: additions)
-    with pytest.raises(AssertionError):
+    elif mutation == 'moved':
+        # Even an unchanged combined ID/order must not move a case into the
+        # other feature's owned additions file.
+        if group == 'claude-reset-2026-09-23':
+            records['oauth-relogin-2026-10-18'].insert(0, additions.pop())
+        else:
+            records['claude-reset-2026-09-23'].append(additions.pop(0))
+    monkeypatch.setattr(current, 'load_jsonl', lambda path: deepcopy(records[Path(path).parents[1].name]))
+    message = ('ownership' if mutation == 'capability' else
+               'replaces an existing case' if mutation == 'replacement' else 'coverage differs')
+    with pytest.raises(AssertionError, match=message):
         current.load_current_additions(oauth.SEGMENT, existing)
 
 

@@ -398,35 +398,12 @@ class OAuthControl(
     @audit_failures("oauth.login.start", target_arg="provider")
     def start_login_flow(self, context: ManagementContext, provider: OAuthProvider, *, realm=None, client_profile=None, site=None, relogin_account_id=None) -> OAuthLoginFlow:
         self._require(context, Capability.SECRETS_WRITE)
-        relogin = None
-        if relogin_account_id is not None:
-            account = copy.deepcopy(self._account(relogin_account_id))
-            if (self.backend.provider_of(account) != provider.value
-                    or not self.account_authentication_failed(account)
-                    or provider not in {OAuthProvider.WORKBUDDY, OAuthProvider.ZHIPU}
-                    or (provider is OAuthProvider.ZHIPU and account.get("credential_mode") != "oauth")):
-                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
-            relogin = {"target_key": relogin_account_id, "account": account}
-            if provider is OAuthProvider.WORKBUDDY:
-                realm = account.get("realm") or "cn"
-                client_profile = "ide" if realm == "global" else "cli"
-            else:
-                site = account["site"]
+        relogin, realm, client_profile, site = self._prepare_login_context(
+            provider, realm=realm, client_profile=client_profile, site=site,
+            relogin_account_id=relogin_account_id,
+        )
         if provider is OAuthProvider.ZHIPU:
-            if site not in {"bigmodel", "zai"} or realm is not None or client_profile is not None:
-                raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
             return self._flows.zhipu.start(context.actor.subject_id, site=site, **({"relogin": relogin} if relogin else {}))
-        if site is not None:
-            raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
-        if provider is OAuthProvider.WORKBUDDY:
-            realm = realm or "cn"
-            expected_profile = "ide" if realm == "global" else "cli"
-            if realm not in {"cn", "global"} or client_profile not in (None, expected_profile):
-                raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE,
-                    fields=[ErrorField("clientProfile", "REGION_PROFILE_MISMATCH", "Unsupported WorkBuddy login region/profile")])
-            client_profile = expected_profile
-        elif realm is not None or client_profile is not None:
-            raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
         try:
             flow = (self._flows.workbuddy.start(context.actor.subject_id, realm=realm, client_profile=client_profile, relogin=relogin)
                     if relogin else self._flows.start(context.actor.subject_id, provider, realm=realm, client_profile=client_profile)

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from threading import Thread
 
 from src.management_auth.principal import Capability
 from src.management_control.context import ManagementContext
 from src.management_control.errors import ErrorField, ManagementError, ManagementErrorCode
+
+from .models import OAuthProvider
 
 
 class OAuthAccountOrchestrationControlMixin:
@@ -22,6 +25,44 @@ class OAuthAccountOrchestrationControlMixin:
             account.get("provider") == "zhipu" and account.get("credential_mode") == "oauth"
             and account.get("management_status") == "relogin_required"
         )
+
+    def _prepare_login_context(self, provider: OAuthProvider, *, realm=None, client_profile=None,
+                               site=None, relogin_account_id=None):
+        """Validate the bound account and restore its login location before I/O.
+
+        The public Control entry owns authorization and audit. Keep the exact
+        account snapshot (including generation) for the flow's commit-time CAS.
+        """
+        relogin = None
+        if relogin_account_id is not None:
+            account = copy.deepcopy(self._account(relogin_account_id))
+            if (self.backend.provider_of(account) != provider.value
+                    or not self.account_authentication_failed(account)
+                    or provider not in {OAuthProvider.WORKBUDDY, OAuthProvider.ZHIPU}
+                    or (provider is OAuthProvider.ZHIPU and account.get("credential_mode") != "oauth")):
+                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+            relogin = {"target_key": relogin_account_id, "account": account}
+            if provider is OAuthProvider.WORKBUDDY:
+                realm = account.get("realm") or "cn"
+                client_profile = "ide" if realm == "global" else "cli"
+            else:
+                site = account["site"]
+        if provider is OAuthProvider.ZHIPU:
+            if site not in {"bigmodel", "zai"} or realm is not None or client_profile is not None:
+                raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
+        else:
+            if site is not None:
+                raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
+            if provider is OAuthProvider.WORKBUDDY:
+                realm = realm or "cn"
+                expected_profile = "ide" if realm == "global" else "cli"
+                if realm not in {"cn", "global"} or client_profile not in (None, expected_profile):
+                    raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE,
+                        fields=[ErrorField("clientProfile", "REGION_PROFILE_MISMATCH", "Unsupported WorkBuddy login region/profile")])
+                client_profile = expected_profile
+            elif realm is not None or client_profile is not None:
+                raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
+        return relogin, realm, client_profile, site
 
     def _ensure_legacy_identity_safe(self, entry: dict) -> None:
         """Preserve frozen XAI/Cursor email-fallback identity protection."""

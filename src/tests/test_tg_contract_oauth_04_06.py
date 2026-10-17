@@ -85,6 +85,31 @@ def _run_oa04(case, monkeypatch):
     _patch_random(monkeypatch)
     op = case["entry"]["scenario"]
     steps = []
+    if op == "relogin_start_cancel":
+        key, short = env.key(), env.short()
+        before = env.public_config()
+        account = env.cfg["oauthAccounts"][0]
+        assert account["disabled_reason"] == "auth_error"
+        monkeypatch.setattr(oauth_manager, "pkce_generate", lambda: ("fake-verifier", "fake-challenge"))
+        monkeypatch.setattr(oauth_manager, "build_login_url", lambda challenge, state: f"https://fake.invalid/claude?challenge={challenge}&state={state}")
+        payload = om._callback_payload(short, 3, "invalid")
+        callbacks = []
+        start = "oa:relogin:" + payload
+        assert om.handle_callback(42, 100, "cb-relogin", start) is True
+        callbacks.append(start)
+        steps.append(env.state_snapshot("relogin_started"))
+        assert states.get_state(42)["data"]["relogin"] == {
+            "target_key": key, "account": account, "payload": payload,
+        }
+        cancel = env.capture.calls[-1]["payload"]["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        assert cancel == "oa:relogin_cancel:" + payload
+        assert om.handle_callback(42, 100, "cb-relogin-cancel", cancel) is True
+        callbacks.append(cancel)
+        steps.append(env.state_snapshot("relogin_cancelled"))
+        assert states.get_state(42) is None
+        assert env.public_config() == before
+        assert {':'.join(value.split(':')[:2]) + ':*' for value in callbacks} == set(case["entry"]["callbackFamilies"])
+        return actual(case, env, state_steps=steps, final=env.final(callbacks=callbacks))
     if op == "add_menu_cancel":
         states.set_state(42, "oa_openai_code", {"state": "stale"})
         om.on_add_menu(42, 100, "cb-add")
