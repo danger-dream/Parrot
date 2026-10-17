@@ -15,6 +15,7 @@ import pytest
 
 from src import config, oauth_manager, oauth_model_discovery, state_db
 from src.channel.openai_oauth_channel import OpenAIOAuthChannel
+from src.oauth import antigravity
 from src.openai import codex_constants as constants, codex_identity
 from src.openai.responses_ws_runtime import build_oauth_responses_ws_frame
 from src.state_store import StateStore
@@ -377,6 +378,8 @@ def test_each_provider_model_sync_ttl_only_openai_five_minutes(provider, ttl):
            "last_model_sync_client_version": VERSION, "last_model_sync_profile": PROFILE}
     key = "cursor_model_catalog" if provider == "cursor" else "account_model_catalog"
     acc[key] = {"schema": 2 if provider == "openai" else 1, "models": [{"id": "model"}]}
+    if provider == "antigravity":
+        acc[key]["antigravityGenerationBaseUrl"] = antigravity.effective_request_base_url(acc)
     assert not oauth_manager._model_sync_due(acc, now=now + timedelta(seconds=ttl - 1))
     assert oauth_manager._model_sync_due(acc, now=now + timedelta(seconds=ttl))
     acc["last_model_sync_error"] = "TimeoutError"

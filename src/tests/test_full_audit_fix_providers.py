@@ -321,7 +321,8 @@ def test_providers_p04_unknown_credits_keep_disable_then_explicit_recovery(priva
     config.reload()
     low = {"antigravity": {"known": False}, "five_hour": {"utilization": 1}}
     result = om.evaluate_and_toggle_by_usage(key, low)
-    assert result["action"] == "quota_unknown_keep_disabled" and result["missing_gates"] == ["Credits"]
+    assert result["action"] == "quota_unknown_keep_disabled"
+    assert om.get_account(key)["quota_observation"]["blocked"] == ["Credits"]
     assert om.get_account(key)["enabled"] is False
     known = {**low, "antigravity": {"known": True, "available": True}}
     assert om.evaluate_and_toggle_by_usage(key, known, fresh=False)["action"] == "quota_stale_keep_disabled"
@@ -329,16 +330,20 @@ def test_providers_p04_unknown_credits_keep_disable_then_explicit_recovery(priva
     assert "quota_observation" not in om.get_account(key)
 
 
-def test_providers_p04_partial_snapshots_discharge_only_corresponding_gates(private):
+def test_providers_p04_partial_snapshots_do_not_promote_display_windows_to_gates(private):
     key = add("antigravity", fresh=True)
     initial = {"antigravity": {"known": True, "available": False},
                "five_hour": {"utilization": 99}, "seven_day": {"utilization": 99}}
     assert om.evaluate_and_toggle_by_usage(key, initial)["action"] == "disabled"
-    first = {"antigravity": {"known": True, "available": True}, "five_hour": {"utilization": 1}}
-    assert om.evaluate_and_toggle_by_usage(key, first)["missing_gates"] == ["7d"]
     config.reload()
-    # Credits recovery remains discharged even though the next read omits it.
-    assert om.evaluate_and_toggle_by_usage(key, {"seven_day": {"utilization": 1}})["action"] == "resumed"
+    assert om.get_account(key)["quota_observation"]["blocked"] == ["Credits"]
+    assert om.evaluate_and_toggle_by_usage(key, {"five_hour": {"utilization": 1}})["action"] == "quota_unknown_keep_disabled"
+    assert om.get_account(key)["enabled"] is False
+    first = {"antigravity": {"known": True, "available": True}, "five_hour": {"utilization": 1}}
+    assert om.evaluate_and_toggle_by_usage(key, first)["action"] == "resumed"
+    config.reload()
+    assert "quota_observation" not in om.get_account(key)
+    assert om.evaluate_and_toggle_by_usage(key, {"seven_day": {"utilization": 99}})["action"] == "kept_enabled"
     om.set_enabled(key, False, reason="user")
     assert om.evaluate_and_toggle_by_usage(key, initial)["action"] == "noop_user"
 

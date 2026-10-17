@@ -750,8 +750,10 @@ def test_detail_fixed_rows_and_openai_reset_wording(account_config):
         "openai:a@x:ws-a", refresh_quota=False, actor_chat_id=42,
     )
     labels = [[button["text"] for button in row] for row in kb["inline_keyboard"]]
+    # Healthy accounts expose neither token rotation nor re-login; only an
+    # explicit authentication failure gets the account-bound re-login action.
     assert labels == [
-        ["🔄 刷新 Token", "📊 刷新额度"],
+        ["📊 刷新额度"],
         ["管理模型", "🚦 并发上限"],
         ["🧹 清模型故障", "🔗 清亲和绑定"],
         ["⏸ 停用账户", "🗑 删除账户"],

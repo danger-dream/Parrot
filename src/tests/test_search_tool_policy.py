@@ -2,6 +2,7 @@
 import asyncio
 import copy
 import json
+import uuid
 
 import pytest
 from fastapi.responses import JSONResponse
@@ -386,22 +387,69 @@ async def test_ws_first_and_followup_share_policy(mode, settings, monkeypatch):
         await client.aclose()
 
 
+@pytest.fixture
+def registered_xai(monkeypatch):
+    """Real isolated OAuth identity/token lifecycle; only provider I/O is forbidden."""
+    from src import config, oauth_manager
+    from src.channel.xai_oauth_channel import XAIOAuthChannel
+
+    saved_accounts = copy.deepcopy(config.get().get("oauthAccounts", []))
+    account = {
+        "provider": "xai", "email": "mock@xai.invalid", "subject": "search-" + uuid.uuid4().hex,
+        "access_token": "isolated-not-a-live-token", "refresh_token": "isolated-refresh-token",
+        "expired": "2999-01-01T00:00:00Z", "models": ["test-model"], "enabled": True,
+    }
+    def unexpected_refresh(*args, **kwargs):
+        raise AssertionError("fresh fixture credentials must not contact OAuth refresh")
+    monkeypatch.setattr(oauth_manager.xai_provider, "refresh_sync", unexpected_refresh)
+    oauth_manager.add_account(account)
+    key = oauth_manager.get_account_key(account)
+    channel = XAIOAuthChannel(oauth_manager.get_account(key))
+    observations = []
+    observe = oauth_manager.observe_request_credentials
+    def checked_observation(ch, req, **kwargs):
+        observe(ch, req, **kwargs)  # Do not bypass the real generation/credential guard.
+        if ch is channel:
+            value = req.translator_ctx["oauth_refresh"]
+            assert value["state_key"] == channel.state_key
+            assert oauth_manager.refresh_observation_matches(oauth_manager.get_account(key), value)
+            observations.append(value)
+    monkeypatch.setattr(oauth_manager, "observe_request_credentials", checked_observation)
+    try:
+        yield channel, observations
+    finally:
+        config.update(lambda cfg: cfg.__setitem__("oauthAccounts", saved_accounts))
+
+
+async def test_xai_observation_rejects_retired_generation(registered_xai):
+    from src import oauth_manager
+
+    channel, observations = registered_xai
+    req = await channel.build_upstream_request(request(), "test-model", ingress_protocol="responses")
+    account = copy.deepcopy(oauth_manager.get_account(channel.account_key))
+    oauth_manager.delete_account(channel.account_key)
+    oauth_manager.add_account(account)
+    replacement = oauth_manager.get_account(channel.account_key)
+    assert oauth_manager.account_state_key(replacement) != channel.state_key
+    with pytest.raises(ValueError, match="OAuth account generation was deleted"):
+        oauth_manager.observe_request_credentials(channel, req)
+    with pytest.raises(ValueError, match="OAuth account generation was deleted"):
+        await oauth_manager.ensure_channel_token(channel)
+    assert observations == []
+    assert oauth_manager.get_account(channel.account_key) == replacement
+
+
 @pytest.mark.parametrize("protocol", ["chat", "responses", "anthropic", "ws"])
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("mode", ["managed", "passthrough"])
-async def test_xai_actual_pipeline_cache_key_function_output(protocol, streaming, mode, settings, monkeypatch):
+async def test_xai_actual_pipeline_cache_key_function_output(protocol, streaming, mode, settings, monkeypatch, registered_xai):
     import httpx
     from src.tests import test_protocol_fake_upstreams as fx
-    from src.channel.xai_oauth_channel import XAIOAuthChannel
-    from src import oauth_manager
     m = fx._import_modules()
     fx._setup(m)
     settings["functionMode"] = mode
     fx._install_keys(m, fx._default_key(key="sk-ws" if protocol == "ws" else "ccp-test"))
-    ch = XAIOAuthChannel({"provider": "xai", "email": "mock@xai.invalid", "accessToken": "isolated", "models": ["test-model"]})
-    async def token(_):
-        return "isolated-not-a-live-token"
-    monkeypatch.setattr(oauth_manager, "ensure_channel_token", token)
+    ch, observations = registered_xai
     fx._install_channels(m, [ch])
     captured, searches = [], []
     async def search(args, **kw):
@@ -409,6 +457,7 @@ async def test_xai_actual_pipeline_cache_key_function_output(protocol, streaming
         return {"query": args["query"], "results": []}
     monkeypatch.setattr(search_service, "search", search)
     def model(req):
+        assert req.headers["authorization"] == "Bearer isolated-not-a-live-token"
         payload = json.loads(req.content)
         captured.append(payload)
         assert payload["prompt_cache_key"]
@@ -441,6 +490,7 @@ async def test_xai_actual_pipeline_cache_key_function_output(protocol, streaming
         raw = b"".join([c async for c in response.body_iterator]) if hasattr(response, "body_iterator") else response.body
     try:
         assert b"parrot_fn_" not in raw, raw
+        assert len(observations) == len(captured)
         if mode == "managed":
             if protocol != "ws" and streaming:
                 assert "".join(text_delta(frame, protocol) for frame in decode(raw)) == "Found Python docs", raw
@@ -497,20 +547,15 @@ def test_only_satisfied_choice_released_and_allowed_set_kept():
     assert body["tool_choice"] == {"type": "function", "name": "lookup"}
 
 
-async def test_candidate_failover_does_not_reuse_xai_alias_or_failed_predecessor(monkeypatch):
+async def test_candidate_failover_does_not_reuse_xai_alias_or_failed_predecessor(monkeypatch, registered_xai):
     import httpx
     from src.tests import test_protocol_fake_upstreams as fx
-    from src.channel.xai_oauth_channel import XAIOAuthChannel
-    from src import oauth_manager
     m = fx._import_modules()
     fx._setup(m)
     fx._install_keys(m, fx._default_key())
-    first = XAIOAuthChannel({"provider": "xai", "email": "fail@invalid", "accessToken": "isolated", "models": ["test-model"]})
+    first, observations = registered_xai
     second = fx._make_openai_channel("fallback", "https://fallback.example", protocol="openai-responses", alias="test-model", real="test-model")
     fx._install_channels(m, [first, second])
-    async def token(_):
-        return "isolated"
-    monkeypatch.setattr(oauth_manager, "ensure_channel_token", token)
     original_schedule = m["scheduler"].schedule
     def ordered(*args, **kwargs):
         result = original_schedule(*args, **kwargs)
@@ -523,6 +568,7 @@ async def test_candidate_failover_does_not_reuse_xai_alias_or_failed_predecessor
         return {"query": args["query"], "results": []}
     monkeypatch.setattr(search_service, "search", search)
     def xai(req):
+        assert req.headers["authorization"] == "Bearer isolated-not-a-live-token"
         calls.append("xai")
         assert json.loads(req.content)["tools"][0]["name"].startswith("parrot_fn_")
         return httpx.Response(404, json={"error": {"message": "model unavailable"}})
@@ -539,7 +585,7 @@ async def test_candidate_failover_does_not_reuse_xai_alias_or_failed_predecessor
     try:
         assert response.status_code == 200 and b"Found Python docs" in response.body
         assert calls == ["xai", "fallback", "fallback"]
-        assert len(searches) == 1
+        assert len(searches) == 1 and len(observations) == 1
     finally:
         await client.aclose()
 
