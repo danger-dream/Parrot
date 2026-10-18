@@ -36,6 +36,7 @@ from . import (
     token_counter, upstream,
 )
 from .channel.base import Channel, UpstreamDispatchMetadata
+from .providers.workbuddy_errors import QUOTA_CODES as WORKBUDDY_QUOTA_CODES
 from .channel.openai_oauth_channel import OpenAIOAuthChannel
 from .transform import cc_mimicry
 from .openai import compaction_owner, deepseek_reasoning, reasoning_replay
@@ -924,6 +925,9 @@ def _validate_wire_payload_budget(
         requested_body.get("_client_visible_model")
         or requested_body.get("model") or resolved_model
     ).strip())
+    if getattr(ch, "provider", "") == "workbuddy" and isinstance(wire_body, bytes) and wire_body.startswith(b"\x1f\x8b"):
+        import gzip
+        wire_body = gzip.decompress(wire_body)
     payload = _wire_payload(wire_body)
     if payload is None:
         # All current inference channels are structured JSON. Preserve the
@@ -1132,6 +1136,8 @@ def _structured_attempt_error(
     channel: Optional[Channel] = None,
 ) -> dict:
     quota = bounded_account_quota_error(result, channel)
+    workbuddy_quota = (getattr(channel, "provider", "") == "workbuddy" and quota is not None
+                       and quota.get("code") in WORKBUDDY_QUOTA_CODES)
     status = int(result.http_status) if isinstance(result.http_status, int) else None
     detail = str(result.error_detail or "")
     code = str(result.error_code or "").strip() or None
@@ -1158,6 +1164,8 @@ def _structured_attempt_error(
         classification = "upstream_http_error"
     elif quota is not None:
         classification = quota["classification"]
+        if workbuddy_quota:
+            code = quota["code"]
     elif result.outcome in ("request_invalid", "guard_error", "candidate_guard"):
         classification = "invalid_request"
     elif status == 401:
@@ -1179,7 +1187,8 @@ def _structured_attempt_error(
 
     transient_kind = retryable_transient_error_kind(channel, result) if channel is not None else None
     if quota is not None:
-        retryable, retry_scope = True, "next_candidate"
+        retryable, retry_scope = ((False, "none") if workbuddy_quota
+                                  else (True, "next_candidate"))
     elif transient_kind:
         retryable, retry_scope = True, "same_candidate"
     elif classification == "invalid_request":
@@ -2095,6 +2104,9 @@ async def run_failover(
     if any(getattr(channel, "provider", "") == "zhipu" for channel, _model in all_initial_candidates):
         from .oauth.zhipu.request_context import ensure_request_context
         body = ensure_request_context(body, api_key_name=api_key_name)
+    if any(getattr(channel, "provider", "") == "workbuddy" for channel, _model in all_initial_candidates):
+        from .providers.workbuddy_context import ensure_context
+        body = ensure_context(body, request_id=request_id, api_key_name=api_key_name or "")
     client_visible_model = str(
         body.get("_client_visible_model") or body.get("model") or ""
     ).strip()
@@ -2681,6 +2693,12 @@ async def run_failover(
             idx += 1
             continue
 
+        if (getattr(ch, "provider", "") == "workbuddy" and quota_exhaustion is not None
+                and quota_exhaustion.get("code") in WORKBUDDY_QUOTA_CODES):
+            # Explicit billing exhaustion is not a transient 429. Surface the
+            # classified error without replaying across the account pool.
+            break
+
         # Explicit quota/entitlement/rate errors use bounded existing gates,
         # not the generic failure ladder or an account health penalty.
         if _apply_codex_error_policy(ch, resolved_model, result):
@@ -2737,6 +2755,9 @@ async def run_failover(
         status = 401 if statuses == {401} else 403
     elif structured_attempts and classifications == {"balance_exhausted"}:
         status = 402
+        if (getattr(ch, "provider", "") == "workbuddy" and quota_exhaustion is not None
+                and quota_exhaustion.get("code") in WORKBUDDY_QUOTA_CODES):
+            err_type = "api_error"
     elif structured_attempts and classifications == {"rate_limit_error"}:
         status = 429
     if last_result and last_result.outcome == "candidate_guard":

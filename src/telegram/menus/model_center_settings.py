@@ -71,7 +71,7 @@ def _operation_render(chat_id: int, operation_id: str, back_callback: str) -> tu
                     continue
                 label = ui.escape_html(item.get("label") or "来源")
                 item_status = str(item.get("status") or "unknown")
-                detail = f"{int(item.get('count') or 0)} 个模型" if item_status == "succeeded" else errors.get(str(item.get("errorCode")), "同步未完成，请重试")
+                detail = f"{int(item.get('count') or 0)} 个模型" if item_status == "succeeded" else item.get("errorMessage") or errors.get(str(item.get("errorCode")), "同步未完成，请核对诊断记录")
                 icon = "✅" if item_status == "succeeded" else "⚠️"
                 lines.append(f"{icon} {label} · {ui.escape_html(detail)}")
     if upstream and isinstance(result, Mapping) and isinstance(result.get("metadataSync"), Mapping):

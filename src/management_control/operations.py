@@ -21,6 +21,8 @@ from ._daemon_executor import DaemonBoundedExecutor
 from .context import AuditSink, ManagementContext, audit_record
 from .errors import ManagementError, ManagementErrorCode
 from .public_safety import redact_known_fields
+from src import safe_diagnostics
+import sys
 
 
 class OperationStatus(str, Enum):
@@ -297,6 +299,16 @@ class OperationStore:
             self._items[operation_id] = operation
             return self._snapshot(operation)
 
+    @staticmethod
+    def _failure_message(operation, code, cause=None):
+        # All management workers converge here, including intentionally sanitized
+        # wrappers and unexpected submission/task failures. Ignore raw `message`.
+        cause = cause if cause is not None else sys.exception()
+        if cause is None or (isinstance(cause, ManagementError) and cause.code.value not in safe_diagnostics._GENERIC_CODES):
+            return code.value
+        diagnostic = safe_diagnostics.report(cause, operation=operation.kind)
+        return safe_diagnostics.message(diagnostic) + safe_diagnostics.guidance(diagnostic)
+
     def fail(
         self,
         operation_id: str,
@@ -304,6 +316,7 @@ class OperationStore:
         code: ManagementErrorCode,
         message: str,
         retryable: bool = False,
+        diagnostic: safe_diagnostics.Diagnostic | None = None,
     ) -> ManagementOperation:
         with self._lock:
             operation = self._items.get(operation_id)
@@ -317,7 +330,8 @@ class OperationStore:
                 result=None,
                 # Worker exception text is intentionally not persisted: it may embed
                 # credentials or upstream payloads.  The stable code is safe to expose.
-                error=OperationFailure(code=code, message=code.value, retryable=retryable),
+                error=OperationFailure(code=code, message=(safe_diagnostics.message(diagnostic) + safe_diagnostics.guidance(diagnostic)
+                    if isinstance(diagnostic, safe_diagnostics.Diagnostic) else self._failure_message(operation, code)), retryable=retryable),
                 finished_at=self._now(),
                 cancellable=False,
             )
@@ -382,6 +396,7 @@ class OperationStore:
         *,
         code: ManagementErrorCode,
         retryable: bool,
+        cause: BaseException | None = None,
     ) -> None:
         with self._lock:
             operation = self._items.get(operation_id)
@@ -394,7 +409,7 @@ class OperationStore:
                 operation,
                 status=OperationStatus.FAILED,
                 result=None,
-                error=OperationFailure(code=code, message=code.value, retryable=retryable),
+                error=OperationFailure(code=code, message=self._failure_message(operation, code, cause), retryable=retryable),
                 finished_at=self._now(),
                 cancellable=False,
             )
@@ -467,6 +482,7 @@ class OperationStore:
                 operation_id,
                 code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
                 retryable=True,
+                cause=error,
             )
 
     def create_task(self, operation_id: str, coroutine: Coroutine[Any, Any, Any]) -> None:

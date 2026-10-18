@@ -204,8 +204,8 @@ CURSOR_OAUTH_CAPABILITIES = ProviderCapabilities(
 WORKBUDDY_OAUTH_CAPABILITIES = ProviderCapabilities(
     adapter_name="workbuddy-oauth", family="openai",
     protocols=frozenset({"openai-chat"}), transports=frozenset({"sse"}),
-    passthrough_request_fields={"openai-chat": CHAT_REQ_ALLOWED},
-    native_state=frozenset({"reasoning_content"}),
+    passthrough_request_fields={"openai-chat": CHAT_REQ_ALLOWED | frozenset({"reasoning_summary", "max_thinking_tokens"})},
+    native_state=frozenset({"reasoning_content", "reasoning", "extra_fields"}),
     notes=("WorkBuddy CLI OAuth forces stream=true; non-stream clients aggregate Chat SSE",),
 )
 

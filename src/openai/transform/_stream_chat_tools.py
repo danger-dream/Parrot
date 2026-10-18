@@ -21,6 +21,7 @@ def merge_identifier_delta(current: str, piece: str) -> str:
 class ChatToolDeltaBuffer:
     def __init__(self):
         self.calls: dict[int, dict] = {}
+        self.append_name_deltas = False
         self.pending: list[tuple[str, object]] = []
 
     def feed(self, event: dict) -> list[dict]:
@@ -61,7 +62,8 @@ class ChatToolDeltaBuffer:
             values = call.get(kind) or {}
             target = slot[kind]
             if isinstance(values.get('name'), str) and values['name']:
-                target['name'] = merge_identifier_delta(target.get('name', ''), values['name'])
+                target['name'] = (target.get('name', '') + values['name'] if self.append_name_deltas
+                                  else merge_identifier_delta(target.get('name', ''), values['name']))
             field = 'input' if kind == 'custom' else 'arguments'
             if isinstance(values.get(field), str):
                 target[field] = target.get(field, '') + values[field]

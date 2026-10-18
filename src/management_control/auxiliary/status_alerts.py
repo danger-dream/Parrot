@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from src.safe_diagnostics import diagnose
+
 import copy
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Protocol
@@ -418,6 +420,7 @@ class StatusAlertControl:
             revision=cls._incident_revision(provider, row, muted_row),
         )
 
+    @diagnose('status', 'query', 'request')
     def list_incidents(
         self,
         context: ManagementContext,

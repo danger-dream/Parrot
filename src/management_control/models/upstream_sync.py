@@ -7,6 +7,8 @@ succeeded); Operation failure is reserved for interrupted/unexpected job failure
 
 from __future__ import annotations
 
+from src import safe_diagnostics
+
 import asyncio
 import copy
 import time
@@ -297,15 +299,20 @@ class UpstreamSync:
             }
             started = time.monotonic()
             try:
-                counts = await (self._api(context, source) if source.type is ModelSourceType.API else self._oauth(source))
+                with safe_diagnostics.collect_failures() as failures:
+                    counts = await (self._api(context, source) if source.type is ModelSourceType.API else self._oauth(source))
                 row.update(counts)
                 if counts.get("skippedCount"):
                     row.update(status="partial_failed", errorCode="ALIAS_CONFLICT")
             except ManagementError as exc:
                 row.update(status="failed", errorCode=exc.code.value)
-            except Exception:
+                if exc.code.value in safe_diagnostics._GENERIC_CODES:
+                    diagnostic = failures[-1] if failures else safe_diagnostics.report(exc, provider="models", operation="sync", stage="model_sync")
+                    row["errorMessage"] = safe_diagnostics.message(diagnostic) + safe_diagnostics.guidance(diagnostic)
+            except Exception as exc:
                 # Never publish exceptions, upstream bodies, tokens or URLs.
-                row.update(status="failed", errorCode=ManagementErrorCode.UPSTREAM_ERROR.value)
+                row.update(status="failed", errorCode=ManagementErrorCode.UPSTREAM_ERROR.value,
+                           errorMessage=safe_diagnostics.summary(exc, provider="models", operation="sync", stage="model_sync"))
             row["elapsedMs"] = int((time.monotonic() - started) * 1000)
             row["models"] = self._source_model_names(source)
             items.append(row)
@@ -326,6 +333,7 @@ class UpstreamSync:
                 "phase": "done", "index": index, "total": len(sources),
                 "sourceType": source.type.value, "label": source.label,
                 "status": row["status"], "errorCode": row["errorCode"],
+                **({"errorMessage": row["errorMessage"]} if "errorMessage" in row else {}),
                 "count": int(row.get("count") or 0),
                 "models": list(row["models"]), "elapsedMs": row["elapsedMs"],
             })

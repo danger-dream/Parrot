@@ -1,6 +1,8 @@
 """Single-account OAuth model list/detail menu (non-Cursor)."""
 from __future__ import annotations
 
+from src import safe_diagnostics
+
 import asyncio
 import math
 import threading
@@ -477,7 +479,7 @@ def _handle_bulk_callback(
                 visible_models=models,
             )
         except ValueError as exc:
-            ui.answer_cb(cb_id, str(exc), show_alert=True)
+            ui.answer_cb(cb_id, safe_diagnostics.summary(exc, operation="oauth_management", stage="handle_bulk_callback"), show_alert=True)
             return True
         states.pop_state(chat_id)
         ui.answer_cb(cb_id, f"已停用 {len(selected)} 个账户模型")

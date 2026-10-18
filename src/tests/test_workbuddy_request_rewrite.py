@@ -13,7 +13,7 @@ import pytest
 from src import config
 from src.channel.workbuddy_oauth_channel import WorkBuddyOAuthChannel
 from src.openai.channel.api_channel import OpenAIApiChannel
-from src.tests.test_workbuddy_channel import env, request_body, call, frames
+from src.tests.test_workbuddy_channel import env, request_body, call, frames, wire_json
 from src.tests import test_protocol_fake_upstreams as fake
 from src.workbuddy_request_rewrite import (
     DEFAULT_REQUEST_REWRITE, RewriteConfigError, rewrite_payload, settings_from_config, validate_settings,
@@ -144,12 +144,12 @@ async def test_real_handler_serializes_templates_after_translation_without_mutat
     _set_system(body, ingress, typed)
     before = copy.deepcopy(body)
     def wire(req):
-        emitted = json.loads(req.content)
+        emitted = wire_json(req.content)
         systems = json.dumps([m for m in emitted["messages"] if m["role"] == "system"], ensure_ascii=False)
         assert IDENTITY not in systems and ENV not in systems
         assert NEUTRAL in systems and ENV_SAFE in systems
         assert emitted["messages"][0] == {"role": "system", "content": "You are CodeBuddy Code."}
-        assert emitted["tools"] and emitted["tool_choice"] == "fixture_tool"
+        assert emitted["tools"] and emitted["tool_choice"] == {"type": "function", "function": {"name": "fixture_tool"}}
         return httpx.Response(200, stream=fake.ChunkedByteStream(frames(tool=True)), headers={"content-type": "text/event-stream"})
     with caplog.at_level(logging.DEBUG, logger="src.channel.workbuddy_oauth_channel"):
         response, _, requests = await call(env, ingress, body, wire)
@@ -169,7 +169,7 @@ async def test_global_profile_is_not_rewritten(env, profile):
     config.update(lambda c: c.update(oauthAccounts=[entry]))
     ch = WorkBuddyOAuthChannel(entry)
     body = {"messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": "ping"}]}
-    outgoing = json.loads((await ch.build_upstream_request(body, "glm-fixture", ingress_protocol="chat")).body)
+    outgoing = wire_json((await ch.build_upstream_request(body, "glm-fixture", ingress_protocol="chat")).body)
     assert outgoing["messages"][1]["content"] == SYSTEM
 
 
@@ -178,7 +178,7 @@ async def test_other_provider_and_business_strings_keep_original_request(env):
     body = {"messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": SYSTEM}],
         "tools": [{"type": "function", "function": {"name": "exact", "parameters": {"type": "string", "enum": [ENV, IDENTITY]}}}]}
     before = copy.deepcopy(body)
-    outgoing = json.loads((await wb.build_upstream_request(body, "glm-fixture", ingress_protocol="chat")).body)
+    outgoing = wire_json((await wb.build_upstream_request(body, "glm-fixture", ingress_protocol="chat")).body)
     assert body == before and outgoing["messages"][-1]["content"] == SYSTEM
     assert outgoing["tools"] == body["tools"]
     other = OpenAIApiChannel({"name": "unaffected", "baseUrl": "https://other.example.test", "apiKey": "fixture-only",
@@ -191,7 +191,7 @@ async def test_same_channel_next_request_observes_file_edits_and_custom_rules(en
     _, ch = env
     body = {"messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": "ping"}]}
     async def emitted():
-        return json.loads((await ch.build_upstream_request(body, "glm-fixture", ingress_protocol="chat")).body)["messages"][1]["content"]
+        return wire_json((await ch.build_upstream_request(body, "glm-fixture", ingress_protocol="chat")).body)["messages"][1]["content"]
     def edit(mutator):
         path = Path(config.path())
         cfg = json.loads(path.read_text())

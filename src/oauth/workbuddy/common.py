@@ -1,28 +1,46 @@
 """WorkBuddy CLI wire profile. No credentials or upstream bodies enter errors."""
 from __future__ import annotations
 
+import base64
 import json
 import math
 import os
+import re
+import subprocess
+import uuid
+from functools import lru_cache
 from urllib.parse import urlparse
 
 from ... import network
+from ...safe_diagnostics import diagnose, inherit, transport_diagnostic
 
 PROFILE = "cli"
-USER_AGENT = "CLI/2.63.2 CodeBuddy/2.63.2"
+CLI_VERSION = "2.164.0"
+USER_AGENT = f"CLI/{CLI_VERSION} CodeBuddy/{CLI_VERSION}"
+LEGACY_USER_AGENT = "CLI/2.63.2 CodeBuddy/2.63.2"
 GLOBAL_PROFILE = "ide"
+WORKBUDDY_CLI_PROFILE = "workbuddy-cli"
+WORKBUDDY_CLI_VERSION = "2.168.2"
 GLOBAL_IDE_BASE = "https://www.codebuddy.ai"
-GLOBAL_AUTH_USER_AGENT = "IDE/2.63.2 CodeBuddy/2.63.2"
-GLOBAL_CHAT_USER_AGENT = "IDE/2.108.1 CodeBuddy/2.108.1"
+GLOBAL_CATALOG_VERSION = "4.12.1"
+GLOBAL_AUTH_USER_AGENT = f"CodeBuddyIDE/{GLOBAL_CATALOG_VERSION} CodeBuddy/{GLOBAL_CATALOG_VERSION}"
+GLOBAL_CHAT_USER_AGENT = GLOBAL_AUTH_USER_AGENT
 API_BASES = {"cn": "https://copilot.tencent.com", "global": "https://www.workbuddy.ai"}
 BILLING_BASES = {"cn": "https://www.codebuddy.cn", "global": "https://www.workbuddy.ai"}
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 
 class WorkBuddyError(RuntimeError):
-    def __init__(self, stage: str, *, status: int = 0, code=None, kind: str = "upstream"):
+    def __init__(self, stage: str, *, status: int = 0, code=None, kind: str = "upstream",
+                 response_status: int = 0, transport_kind: str = "none", transport_exception: str = "none"):
         self.stage = stage
         self.status_code = status
+        # Diagnostic-only metadata: do not change retry/auth semantics or retain
+        # raw transport messages, request objects, or response bodies here.
+        self.response_status = response_status or status
+        self.transport_kind = transport_kind
+        self.transport_exception = transport_exception
+        inherit(self)
         self.code = code if isinstance(code, int) and not isinstance(code, bool) else None
         self.kind = kind
         # Locally losing a rotated credential also requires reauthorization;
@@ -67,7 +85,7 @@ def realm_of(account: dict) -> str:
     if not (declared or inferred):
         raise ValueError("WorkBuddy region is required")
     profile = account.get("workbuddy_client_profile") or PROFILE
-    if profile not in {PROFILE, GLOBAL_PROFILE} or (profile == GLOBAL_PROFILE and (declared or inferred) != "global"):
+    if profile not in {PROFILE, GLOBAL_PROFILE, WORKBUDDY_CLI_PROFILE} or (profile in {GLOBAL_PROFILE, WORKBUDDY_CLI_PROFILE} and (declared or inferred) != "global"):
         raise ValueError("Unsupported WorkBuddy realm/client profile")
     return declared or inferred
 
@@ -79,12 +97,20 @@ def profile_of(account: dict) -> str:
 
 
 def login_profile(realm: str, client_profile: str | None = None) -> str:
-    expected = GLOBAL_PROFILE if realm == "global" else PROFILE
-    profile = client_profile or expected
+    profile = client_profile or (WORKBUDDY_CLI_PROFILE if realm == "global" else PROFILE)
     realm_of({"realm": realm, "workbuddy_client_profile": profile})
-    if profile != expected:
+    if realm == "global" and profile not in {WORKBUDDY_CLI_PROFILE, GLOBAL_PROFILE}:
         raise ValueError("Unsupported WorkBuddy login profile for region")
     return profile
+
+
+def route_label(account: dict) -> str:
+    profile = profile_of(account)
+    if profile == WORKBUDDY_CLI_PROFILE:
+        return "WorkBuddy 国际 CLI · workbuddy.ai"
+    if profile == GLOBAL_PROFILE:
+        return "CodeBuddy IDE · codebuddy.ai"
+    return "Legacy Global CLI · workbuddy.ai" if is_legacy(account) else "WorkBuddy 中国 CLI"
 
 
 def api_base_url(account: dict) -> str:
@@ -97,7 +123,111 @@ def billing_base_url(account: dict) -> str:
     return GLOBAL_IDE_BASE if profile_of(account) == GLOBAL_PROFILE else BILLING_BASES[realm]
 
 
+def is_legacy(account: dict) -> bool:
+    return realm_of(account) == "global" and profile_of(account) == PROFILE
+
+
+@lru_cache(maxsize=1)
+def _workbuddy_cli_sdk_headers() -> dict[str, str]:
+    """Pin the emulated CLI deployment to this host's installed Node runtime.
+
+    Only process metadata is evaluated, never the official bundle. Like the
+    SDK's getPlatformHeaders cache this is stable for the gateway process.
+    Missing/unreadable Node is an explicit local prerequisite error, not a
+    guessed runtime version. Other profiles never use this probe.
+    """
+    try:
+        raw = subprocess.check_output(["node", "-p",
+            "JSON.stringify([process.version,process.platform,process.arch])"],
+            text=True, stderr=subprocess.DEVNULL, timeout=2,
+            env={**os.environ, "NODE_OPTIONS": ""})
+        version, system, arch = json.loads(raw)
+        if not all(isinstance(value, str) for value in (version, system, arch)) or not re.fullmatch(r"v\d+\.\d+\.\d+(?:-[A-Za-z0-9.+-]+)?", version):
+            raise ValueError()
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        raise WorkBuddyError("chat", kind="cli_runtime_unavailable") from None
+    platform_name = ("iOS" if "ios" in system.lower() else {
+        "android": "Android", "darwin": "MacOS", "win32": "Windows", "freebsd": "FreeBSD",
+        "openbsd": "OpenBSD", "linux": "Linux"}.get(system.lower(), "Other:" + system if system else "Unknown"))
+    architecture = {"x32": "x32", "x86_64": "x64", "x64": "x64", "arm": "arm",
+                    "aarch64": "arm64", "arm64": "arm64"}.get(arch, "other:" + arch if arch else "unknown")
+    # Official 2.168.2 embeds openai-node 6.25.0 and sets maxRetries:0.
+    # OAuth recovery is a new outer call, not an SDK retry. No per-request SDK
+    # timeout exists in Parrot; do not mislabel connect/idle/total timeouts.
+    return {"x-stainless-lang": "js", "x-stainless-package-version": "6.25.0",
+            "x-stainless-runtime": "node", "x-stainless-runtime-version": version,
+            "x-stainless-os": platform_name, "x-stainless-arch": architecture,
+            "x-stainless-retry-count": "0"}
+
+
 def headers(account: dict, kind: str = "chat") -> dict[str, str]:
+    if is_legacy(account):
+        return _legacy_headers(account, kind)
+    ide = profile_of(account) == GLOBAL_PROFILE
+    client_type = "CodeBuddyIDE" if ide else "CLI"
+    workbuddy_cli = profile_of(account) == WORKBUDDY_CLI_PROFILE
+    version = GLOBAL_CATALOG_VERSION if ide else WORKBUDDY_CLI_VERSION if workbuddy_cli else CLI_VERSION
+    result = {"Content-Type": "application/json", "Accept": "application/json",
+              "User-Agent": GLOBAL_AUTH_USER_AGENT if ide else f"CLI/{version} CodeBuddy/{version}",
+              "X-IDE-Type": client_type, "X-IDE-Name": client_type, "X-IDE-Version": version,
+              "X-Product": "SaaS"}
+    if ide:
+        result.update({"X-Product-Version": version, "X-Env-ID": "production",
+                       "X-Request-Trace-Id": uuid.uuid4().hex})
+    if kind in {"billing", "enterprise"}:
+        origin = billing_base_url(account)
+        result.update({"Origin": origin, "Referer": origin + "/", "X-Requested-With": "XMLHttpRequest"})
+    if kind in {"anonymous", "login_state", "login_token"}:
+        result.update({name: "true" for name in (
+            "X-No-Authorization", "X-No-User-Id", "X-No-Enterprise-Id", "X-No-Department-Info",
+        )})
+        if kind != "login_token":
+            result["X-Domain"] = urlparse(api_base_url(account)).hostname
+        return result
+    domain = text(account.get("domain"), "domain") or ("www.workbuddy.ai" if workbuddy_cli else "")
+    if domain:
+        result["X-Domain"] = domain
+    if kind == "refresh":
+        result.update({"X-Refresh-Token": text(account.get("refresh_token"), "refresh_token", required=True, maximum=32768),
+                       "X-Auth-Refresh-Source": "plugin"})
+    else:
+        result["Authorization"] = "Bearer " + text(account.get("access_token"), "access_token", required=True, maximum=32768)
+    uid = text(account.get("uid"), "uid")
+    enterprise = text(account.get("enterprise_id"), "enterprise_id")
+    if kind == "login_account" or (kind == "account" and not uid):
+        result.update({name: "true" for name in ("X-No-User-Id", "X-No-Enterprise-Id", "X-No-Department-Info")})
+    else:
+        if uid:
+            result["X-User-Id"] = uid
+        if enterprise:
+            result.update({"X-Enterprise-Id": enterprise, "X-Tenant-Id": enterprise})
+        department = text(account.get("department_full_name"), "department_full_name", maximum=2048)
+        if department:
+            result["X-Department-Info"] = department
+    if kind == "models" and not ide:
+        result["Connection"] = "close"
+    if kind == "chat":
+        result.update({"X-Agent-Intent": "craft", "X-Private-Data": "true"})
+        if workbuddy_cli:
+            result.update({"X-Agent-Type": "main", "X-Agent-Runtime": "other"})
+            result.update(_workbuddy_cli_sdk_headers())
+        if not ide:
+            method = text(account.get("auth_method"), "auth_method")
+            source = text(account.get("id_source"), "id_source")
+            if method:
+                result["X-Auth-Method"] = method
+            if source:
+                result["X-Id-Source"] = source
+            if uid and (enterprise or method or source):
+                info = {key: value for key, value in (("uin", uid), ("owner_uin", enterprise),
+                        ("id_source", source), ("token_source", method)) if value}
+                result["X-Userinfo"] = base64.b64encode(json.dumps(info, separators=(",", ":")).encode()).decode()
+    if kind == "enterprise":
+        result["X-Client-Platform"] = "web"
+    return result
+
+
+def _legacy_headers(account: dict, kind: str = "chat") -> dict[str, str]:
     realm = realm_of(account)
     ide = profile_of(account) == GLOBAL_PROFILE
     origin = billing_base_url(account)
@@ -105,11 +235,15 @@ def headers(account: dict, kind: str = "chat") -> dict[str, str]:
     version = "2.108.1" if ide and kind == "chat" else "2.63.2"
     result = {"Content-Type": "application/json", "Accept": "application/json",
               "X-Requested-With": "XMLHttpRequest", "Origin": origin,
-              "Referer": origin + "/", "User-Agent": USER_AGENT,
+              "Referer": origin + "/", "User-Agent": LEGACY_USER_AGENT,
               "X-IDE-Type": client_type, "X-IDE-Name": client_type, "X-IDE-Version": version}
     if ide:
         result.update({"User-Agent": GLOBAL_CHAT_USER_AGENT if kind == "chat" else GLOBAL_AUTH_USER_AGENT,
                        "X-Domain": "www.codebuddy.ai", "X-Product": "SaaS"})
+        if kind == "models":
+            result.update({"User-Agent": f"CodeBuddyIDE/{GLOBAL_CATALOG_VERSION}",
+                           "X-IDE-Type": "CodeBuddyIDE", "X-IDE-Name": "CodeBuddyIDE",
+                           "X-IDE-Version": GLOBAL_CATALOG_VERSION})
         if kind == "chat":
             result["x-codebuddy-request"] = "1"
     elif kind == "chat":
@@ -191,9 +325,11 @@ def require_refresh() -> None:
         raise WorkBuddyError("protection", kind="disabled")
 
 
+@diagnose("workbuddy")
 def request(account: dict, path: str, *, method: str = "POST", body=None,
             kind: str = "billing", account_key: str = "", timeout: float = 15.0,
-            cookies: dict | None = None, pending: bool = False, allow_empty: bool = False):
+            cookies: dict | None = None, pending: bool = False, allow_empty: bool = False,
+            allow_list: bool = False):
     """Single bounded JSON request through Parrot's configured proxy context.
 
     network's route failover retries only pre-request ConnectError/ConnectTimeout;
@@ -207,6 +343,7 @@ def request(account: dict, path: str, *, method: str = "POST", body=None,
         require_refresh()
     base = billing_base_url(account) if kind in {"billing", "enterprise"} else api_base_url(account)
     kwargs = {} if body is None else {"json": body}
+    status = 0
     try:
         with network.sync_client(timeout=max(0.001, timeout), follow_redirects=False,
                                  proxy_purpose="oauth_workbuddy",
@@ -220,30 +357,32 @@ def request(account: dict, path: str, *, method: str = "POST", body=None,
                 for chunk in response.iter_bytes():
                     raw.extend(chunk)
                     if len(raw) > MAX_RESPONSE_BYTES:
-                        raise WorkBuddyError("response", kind="too_large")
+                        raise WorkBuddyError("response", kind="too_large", response_status=status)
                 if cookies is not None:
                     cookies.update(dict(client.cookies.items()))
     except WorkBuddyError:
         raise
-    except Exception:
-        raise WorkBuddyError("request", kind="network") from None
+    except Exception as exc:
+        transport_kind, transport_exception = transport_diagnostic(exc)
+        raise WorkBuddyError("request", kind="network", response_status=status,
+                             transport_kind=transport_kind, transport_exception=transport_exception) from None
     try:
         envelope = json.loads(raw)
     except (ValueError, UnicodeError):
-        raise WorkBuddyError("response", kind="invalid_json") from None
+        raise WorkBuddyError("response", kind="invalid_json", response_status=status) from None
     if not isinstance(envelope, dict) or not isinstance(envelope.get("code"), int) or isinstance(envelope.get("code"), bool):
-        raise WorkBuddyError("response", kind="invalid_envelope")
+        raise WorkBuddyError("response", kind="invalid_envelope", response_status=status)
     if envelope["code"] != 0:
         # "login ing" is explicitly documented by both reference implementations.
         # Do not turn arbitrary 4xx/business errors into endless pending.
         if pending and (envelope["code"] == 11217 or str(envelope.get("msg") or "").strip().lower() == "login ing"):
             return None
-        raise WorkBuddyError("request", code=envelope["code"])
+        raise WorkBuddyError("request", code=envelope["code"], response_status=status)
     data = envelope.get("data")
     if pending and data is None:
         return None
     if allow_empty and data is None:
         return {}
-    if not isinstance(data, dict):
-        raise WorkBuddyError("response", kind="invalid_data")
+    if not isinstance(data, dict) and not (allow_list and isinstance(data, list)):
+        raise WorkBuddyError("response", kind="invalid_data", response_status=status)
     return data

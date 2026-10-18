@@ -10,6 +10,8 @@ from typing import Iterable
 from src.management_auth.principal import AuthMethod, Capability
 from src.management_control.context import ManagementContext
 from src.management_control.errors import ErrorField, ManagementError, ManagementErrorCode
+from src.oauth import add_context
+from src.safe_diagnostics import diagnose
 
 from .contracts import audit_failures, candidate_revision, credential_fingerprint, revision
 from .models import (
@@ -172,6 +174,7 @@ class OAuthAccountMutationControlMixin:
             # Commit always uses this exact exchange/import observation.  The
             # bearer plan remains bounded, process-local, actor-bound and 10m TTL.
             "entry": copy.deepcopy(entry),
+            "add_attempt": add_context.current(),
         }
         if flow_binding is not None:
             payload["flow_id"] = flow_binding[0]
@@ -197,6 +200,11 @@ class OAuthAccountMutationControlMixin:
             token, actor_subject_id=context.actor.subject_id, kind="replace",
         )
         payload = plan.payload
+        with add_context.bind(payload.get("add_attempt")):
+            return self._commit_bound_replace_plan(context, token, payload, candidate, flow_binding)
+
+    @diagnose(operation="account_replace", stage="account_save")
+    def _commit_bound_replace_plan(self, context, token, payload, candidate, flow_binding):
         bound_flow_id = payload.get("flow_id")
         if bound_flow_id is not None:
             if flow_binding is None or flow_binding[0] != bound_flow_id:
@@ -234,6 +242,7 @@ class OAuthAccountMutationControlMixin:
         saved = self._account(account_id)
         return OAuthMutationResult(account_id, revision(saved), "replaced", post_save=post_save)
 
+    @diagnose(operation="account_create", stage="account_save")
     def _create_entry(
         self,
         context: ManagementContext,
@@ -363,6 +372,11 @@ class OAuthAccountMutationControlMixin:
                         try:
                             result = self._create_entry(context, entry, flow_binding=(flow_id, flow_secret))
                         except OAuthReplaceRequired as conflict:
+                            attempt = add_context.current()
+                            if attempt is not None and attempt.target is not None:
+                                # Explicit add routing must not change an existing
+                                # account until its overwrite is confirmed.
+                                raise
                             # WorkBuddy browser login explicitly authorizes saving
                             # this exact identity. Keep the existing CAS replacement
                             # path and its settings preservation; never implicit upsert.
@@ -383,11 +397,12 @@ class OAuthAccountMutationControlMixin:
                 completed = self._flows.complete(
                     context.actor.subject_id, flow_id, flow_secret, command,
                 )
-                result = self._create_entry(
-                    context,
-                    completed.entry,
-                    flow_binding=(flow_id, flow_secret),
-                )
+                with add_context.bind(completed.add_attempt):
+                    result = self._create_entry(
+                        context,
+                        completed.entry,
+                        flow_binding=(flow_id, flow_secret),
+                    )
         except BaseException:
             self._audit(context, "oauth.login.complete", "oauthLogin", "failed")
             raise

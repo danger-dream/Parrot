@@ -91,17 +91,26 @@ def refresh_locked(account: dict, account_key: str, force: bool, *, reuse_curren
             return account["access_token"]
     if state.pending is None:
         try:
-            result = auth.refresh_sync(account["refresh_token"], account=account, account_key=account_key)
+            result = auth.refresh_sync(account.get("refresh_token") or "", account=account, account_key=account_key)
         except Exception:
             state.retry_at, state.failed = now + 60, True
             raise
-        fields = {"access_token": result["access_token"], "expired": "", "last_refresh": auth.utc_text(time.time())}
+        fields = {"access_token": result["access_token"], "expired": result.get("expired") or "",
+                  "last_refresh": auth.utc_text(time.time())}
         if result.get("refresh_token"):
             fields["refresh_token"] = result["refresh_token"]
-        if result.get("domain"):
-            fields["domain"] = result["domain"]
+            if result["refresh_token"] != account.get("refresh_token"):
+                # A previous RT's lifetime does not describe its replacement.
+                fields["refresh_expired"] = ""
+        # An omitted RT is not evidence that the saved RT was revoked. Preserve
+        # it (and its known expiry), rather than copying official session deletion.
+        if "refresh_expired" in result:
+            fields["refresh_expired"] = result["refresh_expired"]
+        for field in ("domain", "auth_method"):
+            if field in result:
+                fields[field] = result[field]
         seconds = common.number(result.get("expires_in"))
-        if seconds is not None and seconds > 0:
+        if "expired" not in result and seconds is not None:
             fields["expired"] = auth.utc_text(time.time() + seconds)
         state.pending, state.pending_until = fields, now + 600
     if state.pending_until <= time.monotonic():
@@ -119,7 +128,9 @@ def refresh_locked(account: dict, account_key: str, force: bool, *, reuse_curren
                 raise common.WorkBuddyError("refresh", kind="stale_generation")
     except common.WorkBuddyError:
         raise
-    except Exception:
+    except Exception as exc:
+        from ...safe_diagnostics import report
+        report(exc, provider="workbuddy", operation="refresh", stage="account_save")
         raise common.WorkBuddyError("refresh", kind="save_failed_retry_save") from None
     saved = dict(account, **fields)
     state.fingerprint = credential_fingerprint(saved)

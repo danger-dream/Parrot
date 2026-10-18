@@ -1,6 +1,8 @@
 """Actor-bound reusable WorkBuddy login flows; never consume a pending poll."""
 from __future__ import annotations
 
+from src.safe_diagnostics import diagnose
+
 import copy
 import hashlib
 import hmac
@@ -10,6 +12,7 @@ from datetime import datetime, timezone
 from threading import Lock, RLock
 
 from src.management_control.errors import ManagementError, ManagementErrorCode
+from src.oauth import add_context
 
 from .models import OAuthLoginFlow, OAuthLoginPoll, OAuthProvider
 from .plans import OneShotPlanStore
@@ -23,13 +26,15 @@ class WorkBuddyFlows:
         self._known = OrderedDict()
         self._known_lock = RLock()
 
+    @diagnose('workbuddy', 'login_init', 'login_init')
     def start(self, actor: str, *, realm="cn", client_profile=None, relogin=None) -> OAuthLoginFlow:
         try:
             payload = (self.backend.workbuddy_start_login() if realm == "cn" and client_profile in (None, "cli")
                        else self.backend.workbuddy_start_login(realm=realm, client_profile=client_profile))
         except Exception:
             raise ManagementError(ManagementErrorCode.UPSTREAM_ERROR, retryable=True) from None
-        payload = dict(payload, lock=Lock(), last_poll=None, relogin=copy.deepcopy(relogin))
+        payload = dict(payload, lock=Lock(), last_poll=None, relogin=copy.deepcopy(relogin),
+                       add_attempt=None if relogin else add_context.current())
         flow_id, secret, plan = self.store.create_split(actor_subject_id=actor, kind="workbuddy-login", revision="", payload=payload)
         with self._known_lock:
             for key, value in list(self._known.items()):
@@ -39,7 +44,8 @@ class WorkBuddyFlows:
                 self._known.popitem(last=False)
             self._known[flow_id] = {"actor": actor, "verifier": hashlib.sha256(secret.encode()).digest(),
                                     "expires_at": plan.expires_at, "status": "pending"}
-        region = "国际区（Google/GitHub）" if realm == "global" else "中国区 CLI"
+        from ...oauth.workbuddy.common import route_label
+        region = route_label(payload) + (" · 国际区（Google/GitHub）" if realm == "global" else "")
         return OAuthLoginFlow(flow_id, secret, OAuthProvider.WORKBUDDY, payload["auth_url"],
                               f"在浏览器完成{region}授权；轮询确认身份后直接保存账户，无需再次确认。", plan.expires_at)
 
@@ -73,7 +79,8 @@ class WorkBuddyFlows:
         try:
             # Another actor-bound request may have consumed it before lock acquisition.
             plan = self.store.inspect_parts(flow_id, secret, actor_subject_id=actor, kind="workbuddy-login")
-            yield plan
+            with add_context.bind(plan.payload.get("add_attempt")):
+                yield plan
         finally:
             lock.release()
 
@@ -97,8 +104,9 @@ class WorkBuddyFlows:
         entry = payload.get("entry")
         if not entry:
             return None
-        return {key: entry.get(key) for key in ("realm", "uid", "enterprise_id", "nickname", "label", "expired")}
+        return {key: entry.get(key) for key in ("realm", "uid", "enterprise_id", "nickname", "label", "expired", "workbuddy_client_profile")}
 
+    @diagnose('workbuddy', 'login_poll', 'token_poll')
     def poll(self, actor: str, flow_id: str, secret: str) -> OAuthLoginPoll:
         terminal = self._terminal(actor, flow_id, secret)
         if terminal is not None:

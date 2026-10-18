@@ -181,7 +181,7 @@ class OAuthIdentityConflictEnvelope(StrictSchema):
 class StartOAuthLoginFlowRequest(StrictSchema):
     provider: OAuthProvider
     realm: Literal["cn", "global"] | None = None
-    clientProfile: Literal["cli", "ide"] | None = None
+    clientProfile: Literal["cli", "ide", "workbuddy-cli"] | None = None
     site: Literal["bigmodel", "zai"] | None = None
 
     @model_validator(mode="after")

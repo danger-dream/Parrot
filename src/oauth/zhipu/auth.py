@@ -1,6 +1,8 @@
 """Explicit credential modes; OAuth polling and read-only existing-key resolution."""
 from __future__ import annotations
 
+from src.safe_diagnostics import diagnose
+
 import copy
 import hashlib
 import hmac
@@ -50,6 +52,7 @@ def normalize_credential(entry):
     return entry
 
 
+@diagnose('zhipu', 'login_init', 'login_init')
 def start_login_sync(*, site="bigmodel"):
     c.site_of({"site": site})
     token = secrets.token_hex(32)
@@ -77,6 +80,7 @@ def start_login_sync(*, site="bigmodel"):
 CALLBACK_URI = "http://127.0.0.1:1456/auth/callback"
 
 
+@diagnose('zhipu', 'login_init', 'login_init')
 def start_callback_login_sync(*, site="bigmodel"):
     """Headless copy/paste flow; no local listener or server polling required."""
     c.site_of({"site": site})
@@ -90,6 +94,7 @@ def start_callback_login_sync(*, site="bigmodel"):
             "status": "awaiting_callback", "expires": time.time() + 300}
 
 
+@diagnose('zhipu', 'login_complete', 'callback_parse')
 def accept_callback_sync(payload, callback_url):
     """Validate the full callback before exchanging its one-use authorization code."""
     parsed = urlparse(str(callback_url).strip())
@@ -110,13 +115,14 @@ def accept_callback_sync(payload, callback_url):
         payload["callback_submitted"] = True
         # Code is never logged/persisted. A lost exchange result must not cause
         # automatic replay of the one-use code; start a fresh authorization.
-        data = c.request(c.PLATFORM_ORIGIN + "/api/v1/oauth/token", method="POST", body={
+        data = c.request(c.PLATFORM_ORIGIN + "/api/v1/oauth/token", method="POST", stage="token_exchange", body={
             "provider": payload["site"], "code": codes[0], "redirect_uri": payload["redirect_uri"], "state": payload["state"]})
         payload["login_result"] = data
     payload["credential"] = credential_from_login(payload["login_result"], payload["site"])
     payload.update(entry=copy.deepcopy(payload["credential"]), status="ready")
 
 
+@diagnose('zhipu', 'login_complete', 'profile_fetch')
 def credential_from_login(data, site):
     if not isinstance(data, dict):
         raise c.ZhipuError("login", "invalid_data")
@@ -125,7 +131,7 @@ def credential_from_login(data, site):
     source_token = business if site == "zai" else ""
     if site == "zai":
         if not data.get("_business_token"):
-            exchanged = c.request(c.BIZ_ORIGINS[site] + "/api/auth/z/login", method="POST", body={"token": business})
+            exchanged = c.request(c.BIZ_ORIGINS[site] + "/api/auth/z/login", method="POST", stage="token_exchange", body={"token": business})
             data["_business_token"] = c.text((exchanged or {}).get("access_token"), "access_token", required=True)
         business = data["_business_token"]
     subject = user.get("user_id")
@@ -151,6 +157,7 @@ def credential_from_login(data, site):
         "refresh_token": tokens.get("refresh_token") or "", "zcode_token": data.get("token")})
 
 
+@diagnose('zhipu', 'login_poll', 'token_poll')
 def poll_login_sync(payload):
     if time.time() >= payload["expires"]:
         payload["status"] = "expired"
@@ -175,6 +182,7 @@ def poll_login_sync(payload):
     payload.update(entry=copy.deepcopy(payload["credential"]), status="ready")
 
 
+@diagnose('zhipu', 'projects', 'project_lookup', emit=False)
 def project_choices(account, *, account_key=""):
     site = c.site_of(account)
     from .project_tokens import business_request

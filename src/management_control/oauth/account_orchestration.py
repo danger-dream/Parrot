@@ -44,7 +44,7 @@ class OAuthAccountOrchestrationControlMixin:
             relogin = {"target_key": relogin_account_id, "account": account}
             if provider is OAuthProvider.WORKBUDDY:
                 realm = account.get("realm") or "cn"
-                client_profile = "ide" if realm == "global" else "cli"
+                client_profile = account.get("workbuddy_client_profile") or "cli"
             else:
                 site = account["site"]
         if provider is OAuthProvider.ZHIPU:
@@ -55,11 +55,12 @@ class OAuthAccountOrchestrationControlMixin:
                 raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
             if provider is OAuthProvider.WORKBUDDY:
                 realm = realm or "cn"
-                expected_profile = "ide" if realm == "global" else "cli"
-                if realm not in {"cn", "global"} or client_profile not in (None, expected_profile):
+                from ...oauth.workbuddy.common import login_profile
+                try:
+                    client_profile = login_profile(realm, client_profile)
+                except ValueError:
                     raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE,
                         fields=[ErrorField("clientProfile", "REGION_PROFILE_MISMATCH", "Unsupported WorkBuddy login region/profile")])
-                client_profile = expected_profile
             elif realm is not None or client_profile is not None:
                 raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
         return relogin, realm, client_profile, site

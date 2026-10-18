@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+from src.safe_diagnostics import diagnose
+
 import io
 import json
 import re
@@ -45,6 +47,7 @@ _MAX_ZIP_JSON_FILES = 200
 _MAX_ZIP_JSON_BYTES = 10 * 1024 * 1024
 
 
+@diagnose('openai', 'import', 'import_parse')
 def parse_openai_import_payload(kind: str, payload: bytes | str, *, filename: str = "") -> list[OpenAIImportCandidate]:
     """解析上传/粘贴内容，返回去重后的候选账号。"""
     kind = _normalize_kind(kind)

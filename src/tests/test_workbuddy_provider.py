@@ -32,7 +32,7 @@ def test_region_and_headers(realm, domain, api, bill):
     assert chat["X-Enterprise-Id"] == "tenant"
     refresh = common.headers(account, "refresh")
     assert refresh["X-Refresh-Token"] == "fixture-refresh"
-    assert refresh["X-Auth-Refresh-Source"] == "workbuddy"
+    assert refresh["X-Auth-Refresh-Source"] == ("workbuddy" if realm == "global" else "plugin")
     assert "Authorization" not in refresh
     assert common.headers(account, "enterprise")["X-Client-Platform"] == "web"
 
@@ -118,7 +118,7 @@ def test_refresh_exact_wire_and_missing_fields(monkeypatch):
     result = auth.refresh_sync("fixture-refresh", account=credential(), account_key="workbuddy:cn:uid-a:p")
     assert result == {"access_token": "new-fixture-access"}
     assert calls[0][1] == "/v2/plugin/auth/token/refresh"
-    assert calls[0][2]["kind"] == "refresh" and "body" not in calls[0][2]
+    assert calls[0][2]["kind"] == "refresh" and calls[0][2]["body"] == {}
 
 
 def test_development_protection_prevents_token_refresh_only(monkeypatch):
@@ -139,7 +139,7 @@ def test_no_token_refresh_still_allows_activity_requests(monkeypatch, action, re
         calls.append(actual_path)
         assert account["access_token"] == "fixture-access"
         assert kwargs.get("kind", "billing") == "billing"
-        return {}
+        return {"credit": 0} if action == "checkin" else {}
     monkeypatch.setattr(common, "request", wire)
     assert billing.execute_action_sync(credential(realm=realm, domain=domain), action)["status"] == "succeeded"
     assert calls == [path] and common.effects_allowed() is True and common.refresh_allowed() is False
@@ -236,7 +236,7 @@ def test_checkin_unknown_not_false(monkeypatch):
 
 def test_catalog_intersection_capabilities_and_account_scope(monkeypatch):
     def wire(account, path, **kwargs):
-        assert path == "/console/enterprises/personal/models"
+        assert path == "/v3/config"
         return {"models": [{"id": "a", "maxInputTokens": 1000, "maxOutputTokens": 200,
                             "reasoning": {"supportedEfforts": ["low", "high"]}},
                            {"id": "b", "disabled": True}, {"id": "other"}],

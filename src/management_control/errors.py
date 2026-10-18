@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable
+import sys
+
+from src import safe_diagnostics
 
 
 class ManagementErrorCode(str, Enum):
@@ -76,6 +79,11 @@ class ManagementError(Exception):
             raise ValueError(f"unknown management error code: {code!r}") from exc
         self.code = stable_code
         self.message = message or _DEFAULT_MESSAGES.get(stable_code, stable_code.value)
+        cause = sys.exception()
+        if cause is not None and stable_code.value in safe_diagnostics._GENERIC_CODES:
+            diagnostic = safe_diagnostics.report(cause)
+            self._safe_diagnostic = diagnostic
+            self.message = safe_diagnostics.message(diagnostic) + safe_diagnostics.guidance(diagnostic)
         self.fields = tuple(fields)
         self.retryable = bool(retryable)
         self.operation_id = operation_id

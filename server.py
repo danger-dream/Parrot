@@ -1411,6 +1411,8 @@ async def proxy_messages(request: Request):
     body["_parrot_client_ip"] = client_ip or ""
     from src.oauth.zhipu.request_context import capture_headers as capture_zcode_headers
     capture_zcode_headers(body, request.headers)
+    from src.providers.workbuddy_context import capture_headers as capture_workbuddy_headers
+    capture_workbuddy_headers(body, request.headers)
     claude_session_id = str(request.headers.get("x-claude-code-session-id") or "").strip()
     if claude_session_id:
         body[PARROT_CC_SESSION_ID_KEY] = claude_session_id

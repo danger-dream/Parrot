@@ -80,6 +80,6 @@ def settings(accountId: AccountId, body: Annotated[WorkBuddySettingsRequest, Bod
 
 
 @router.get("/oauth/workbuddy/settings", operation_id="getOAuthWorkBuddyPolicy",
-    response_model=DataEnvelope[WorkBuddyPolicyData], responses=responses(200, {"clientProfile": "cli", "clientProfilesByRealm": {"cn": "cli", "global": "ide"}, "browserLoginRealms": ["cn", "global"], "importRealms": [], "effectsEnabled": False, "autoCheckinDefault": False, "autoCheckinTime": "09:05", "autoCheckinTimes": ["09:05", "21:05"], "timezone": "Asia/Shanghai", "autoTrial": False}))
+    response_model=DataEnvelope[WorkBuddyPolicyData], responses=responses(200, {"clientProfile": "cli", "clientProfilesByRealm": {"cn": "cli", "global": "workbuddy-cli"}, "supportedClientProfilesByRealm": {"cn": ["cli"], "global": ["workbuddy-cli", "ide"]}, "clientRoutes": {"workbuddy-cli": "WorkBuddy CLI · www.workbuddy.ai", "ide": "CodeBuddy IDE · www.codebuddy.ai"}, "browserLoginRealms": ["cn", "global"], "importRealms": [], "effectsEnabled": False, "autoCheckinDefault": False, "autoCheckinTime": "09:05", "autoCheckinTimes": ["09:05", "21:05"], "timezone": "Asia/Shanghai", "autoTrial": False}))
 def policy(request: Request, context: ReadContext, control: Control):
     return DataEnvelope(data=WorkBuddyPolicyData(**public(control.workbuddy_policy(context))), meta=meta(request))

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from src import safe_diagnostics
+
 import asyncio
 import copy
 from dataclasses import dataclass
@@ -522,7 +524,8 @@ class TranslationControl:
         def run() -> None:
             store.mark_running(operation_id)
             try:
-                result = asyncio.run(self._translation.test_text(str(payload["text"])))
+                with safe_diagnostics.collect_failures() as failures:
+                    result = asyncio.run(self._translation.test_text(str(payload["text"])))
                 if result.get("ok"):
                     store.succeed(operation_id, result)
                 else:
@@ -531,6 +534,7 @@ class TranslationControl:
                         code=ManagementErrorCode.UPSTREAM_ERROR,
                         message=ManagementErrorCode.UPSTREAM_ERROR.value,
                         retryable=True,
+                        diagnostic=failures[-1] if failures else None,
                     )
             except Exception:
                 store.fail(

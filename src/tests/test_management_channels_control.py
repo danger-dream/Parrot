@@ -244,7 +244,7 @@ def test_existing_and_draft_probe_preserve_adjudicated_cooldown_and_affinity(mon
     failed_result = asyncio.run(control.probe_existing(
         ADMIN_CONTEXT, view.id, "model-real",
     ))
-    assert failed_result.ok is False and failed_result.reason == "fixed upstream failure"
+    assert failed_result.ok is False and failed_result.reason == "PROBE_FAILED"
     assert cooldown.get_state(view.id, "model-real") == before
     assert (affinity.snapshot(), affinity.client_snapshot()) == affinity_before
 
@@ -397,7 +397,7 @@ def test_telegram_probe_exception_and_wizard_failure_timing_are_frozen(monkeypat
     result = asyncio.run(channel_menu._probe_with_progress_async(
         42, 100, "probe header", draft, "failed-model",
     ))
-    assert result[:3] == (False, 27, "fixed upstream failure")
+    assert result[:3] == (False, 27, "PROBE_FAILED")
     assert cooldown.get_state("api:Wizard Timing__wiz", "failed-model") is None
 
     states.set_state(42, "ch_wiz_test", {

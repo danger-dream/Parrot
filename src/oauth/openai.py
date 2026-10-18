@@ -19,6 +19,8 @@
 
 from __future__ import annotations
 
+from src.safe_diagnostics import diagnose
+
 import asyncio
 import base64
 import hashlib
@@ -194,6 +196,7 @@ def build_login_url(code_challenge: str, state: str,
 
 # ─── code → token ─────────────────────────────────────────────────
 
+@diagnose('openai', '', 'token_exchange', emit=False)
 def _post_token_form(data: dict) -> dict:
     """同步 POST form-urlencoded 到 token 端点（用于 authorization_code 换 token）。"""
     resp = network.post_sync(
@@ -213,6 +216,7 @@ def _post_token_form(data: dict) -> dict:
     return resp.json()
 
 
+@diagnose('openai', '', 'token_refresh', emit=False)
 def _post_token_json(data: dict, *, proxy_channel: str = "") -> dict:
     """同步 POST application/json 到 token 端点。
 
@@ -495,6 +499,7 @@ def _select_accounts_check_candidate(candidates: list[dict], *, workspace_id: st
     return default_c or paid_c or any_c
 
 
+@diagnose('openai', 'metadata', 'profile_fetch', emit=False)
 def fetch_accounts_check_sync(access_token: str, *, org_id: str | None = None,
                               workspace_id: str | None = None,
                               email: str | None = None,
@@ -564,6 +569,7 @@ def enrich_token_response_sync(data: dict, *, workspace_id: str | None = None,
     enriched.update(codex_workspace_routing_patch(info))
     return enriched
 
+@diagnose('openai', 'login_complete', 'token_exchange')
 def exchange_code_sync(code: str, code_verifier: str,
                        *, redirect_uri: str | None = None) -> dict:
     """同步版：换 token。mockMode 下返回假 token 响应。"""
@@ -585,6 +591,7 @@ async def exchange_code(code: str, code_verifier: str,
     )
 
 
+@diagnose('openai', 'refresh', 'token_refresh')
 def refresh_sync(refresh_token: str, *, email: str | None = None,
                  workspace_id: str | None = None,
                  org_id: str | None = None,

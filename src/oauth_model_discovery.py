@@ -553,10 +553,14 @@ def discover_cursor(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: 
 
 def discover_workbuddy(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str = "") -> DiscoveryResult:
     from .oauth import workbuddy
+    from .oauth.workbuddy import common
     records = workbuddy.fetch_models_sync(
         account, account_key=proxy_channel.removeprefix("oauth:"), timeout=timeout,
     )
-    return DiscoveryResult([item["id"] for item in records], _catalog(records), "upstream:workbuddy", profile_id="cli")
+    profile = common.profile_of(account)
+    version = "2.63.2" if common.is_legacy(account) else common.GLOBAL_CATALOG_VERSION if profile == common.GLOBAL_PROFILE else common.CLI_VERSION
+    return DiscoveryResult([item["id"] for item in records], _catalog(records), "upstream:workbuddy",
+                           client_version=version, profile_id=profile)
 
 
 def discover_zhipu(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str = "") -> DiscoveryResult:

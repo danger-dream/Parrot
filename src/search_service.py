@@ -40,9 +40,12 @@ _CONTEXT_CHARS = {"low": 4000, "medium": 12000, "high": 24000}
 
 class SearchError(RuntimeError):
     def __init__(self, message: str, *, code: str = "search_failed", status_code: int = 502,
-                 retryable: bool = True):
+                 retryable: bool = True, response_status: int = 0):
         super().__init__(message)
         self.message, self.code, self.status_code, self.retryable = message, code, status_code, retryable
+        self.response_status = response_status  # public mapped status is not upstream HTTP evidence
+        from .safe_diagnostics import inherit
+        inherit(self)
 
 
 def _keys(backend: dict) -> list[str]:
@@ -313,7 +316,7 @@ def _endpoint(backend: dict, path: str) -> str:
 def _check_response(response: httpx.Response) -> dict:
     if response.status_code >= 400:
         status = response.status_code
-        raise SearchError(f"搜索上游返回 HTTP {status}", code="search_upstream_error", status_code=502,
+        raise SearchError(f"搜索上游返回 HTTP {status}", code="search_upstream_error", status_code=502, response_status=status,
                           retryable=status in (408, 409, 425, 429) or status >= 500)
     try:
         data = response.json()

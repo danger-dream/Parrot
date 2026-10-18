@@ -18,7 +18,7 @@ from src.oauth.workbuddy import actions, billing, catalog, common
 from src.telegram import menu_cache, states, ui
 from src.telegram.menus import workbuddy_oauth_menu as wb
 from src.tests.test_workbuddy_actions import action_env
-from src.tests.test_workbuddy_channel import env as channel_env
+from src.tests.test_workbuddy_channel import env as channel_env, wire_json
 from src.tests.test_workbuddy_lifecycle import account, context, control
 from src.tests.test_workbuddy_provider import credential
 from src.tests.test_workbuddy_telegram import tg, click
@@ -220,15 +220,15 @@ def test_login_continues_after_vendor_error_and_telegram_edit_error(tg, monkeypa
 def test_client_headers_align_version_and_keep_credentials_in_their_scope(realm, profile, domain, kind):
     entry = credential(realm=realm, workbuddy_client_profile=profile, domain=domain)
     headers = common.headers(entry, kind)
-    name = "IDE" if profile == "ide" else "CLI"
-    version = "2.108.1" if profile == "ide" and kind == "chat" else "2.63.2"
+    name = "CodeBuddyIDE" if profile == "ide" else "CLI"
+    version = "4.12.1" if profile == "ide" else "2.63.2" if realm == "global" else "2.164.0"
     assert headers["X-IDE-Type"] == headers["X-IDE-Name"] == name
     assert headers["X-IDE-Version"] == version and version in headers["User-Agent"]
     assert ("X-Refresh-Token" in headers) is (kind == "refresh")
     assert ("Authorization" in headers) is (kind not in {"refresh", "anonymous"})
     if kind == "chat":
-        assert headers.get("x-codebuddy-request") == ("1" if profile == "ide" else None)
-        assert headers.get("X-Agent-Intent") == ("craft" if profile == "cli" else None)
+        assert "x-codebuddy-request" not in headers
+        assert headers.get("X-Agent-Intent") == "craft"
 
 
 @pytest.mark.parametrize("typed", [False, True])
@@ -251,7 +251,7 @@ async def test_identity_preserves_chat_roles_content_order_and_effort(channel_en
     body = {"model": "glm-fixture", "messages": copy.deepcopy(original), "reasoning_effort": "low"}
     snapshot = copy.deepcopy(body)
     result = await ch.build_upstream_request(body, "glm-fixture", ingress_protocol="chat")
-    payload = json.loads(result.body)
+    payload = wire_json(result.body)
     assert payload["messages"][0] == {"role": "system", "content": CLIENT_IDENTITY}
     assert payload["messages"][1:] == original
     assert body == snapshot and payload["reasoning_effort"] == "low"
@@ -271,7 +271,7 @@ async def test_identity_preserves_translated_business_instructions(channel_env, 
     else:
         body = {"model": "glm-fixture", "instructions": "业务系统指令", "input": "业务问题"}
     result = await ch.build_upstream_request(body, "glm-fixture", ingress_protocol=ingress)
-    payload = json.loads(result.body)
+    payload = wire_json(result.body)
     assert payload["messages"][0] == {"role": "system", "content": CLIENT_IDENTITY}
     tail = payload["messages"][1:]
     assert "业务系统指令" in json.dumps(tail, ensure_ascii=False)
@@ -286,16 +286,16 @@ def catalog_data(agent="cli"):
 
 
 @pytest.mark.parametrize("status", [404, 405])
-@pytest.mark.parametrize("profile", ["cli", "ide"])
-def test_catalog_falls_back_only_to_same_authenticated_profile(monkeypatch, status, profile):
-    entry = credential() if profile == "cli" else credential(realm="global", domain="www.codebuddy.ai", workbuddy_client_profile="ide")
+def test_catalog_falls_back_only_to_same_authenticated_profile(monkeypatch, status):
+    entry = credential(realm="global", domain="www.workbuddy.ai", workbuddy_client_profile="cli")
     calls = []
     def request(actual, path, **kwargs):
-        assert actual is entry and kwargs == {"method": "GET", "kind": "account", "account_key": "fixture-key", "timeout": 7}
+        assert actual is entry and 0 < kwargs["timeout"] <= 7
+        assert {key: value for key, value in kwargs.items() if key != "timeout"} == {"method": "GET", "kind": "account", "account_key": "fixture-key"}
         calls.append(path)
         if len(calls) == 1:
             raise common.WorkBuddyError("request", status=status)
-        return catalog_data(profile)
+        return catalog_data()
     monkeypatch.setattr(common, "request", request)
     records = catalog.fetch_models_sync(entry, account_key="fixture-key", timeout=7)
     assert calls == ["/console/enterprises/personal/models", "/v3/config"]
@@ -320,7 +320,7 @@ def test_empty_or_invalid_catalog_never_becomes_success(monkeypatch, fallback, d
     request = Mock(side_effect=[common.WorkBuddyError("request", status=404), data] if fallback else [data])
     monkeypatch.setattr(common, "request", request)
     with pytest.raises(common.WorkBuddyError):
-        catalog.fetch_models_sync(credential())
+        catalog.fetch_models_sync(credential(realm="global", domain="www.workbuddy.ai", workbuddy_client_profile="cli"))
     assert request.call_count == (2 if fallback else 1)
 
 
@@ -331,7 +331,7 @@ def test_successful_primary_catalog_is_not_merged(monkeypatch):
     assert request.call_count == 1
 
 
-@pytest.mark.parametrize("failure", ["primary500", "fallback_empty", "fallback503"])
+@pytest.mark.parametrize("failure", ["server500", "empty", "server503"])
 async def test_model_sync_failure_preserves_last_good_catalog_and_selection(account, monkeypatch, failure):
     monkeypatch.setenv("PARROT_NO_REFRESH", "1")
     monkeypatch.delenv("DISABLE_OAUTH_NETWORK_CALLS", raising=False)
@@ -339,9 +339,8 @@ async def test_model_sync_failure_preserves_last_good_catalog_and_selection(acco
     config.update(lambda c: (c.setdefault("oauth", {}).update(mockMode=False),
         c["oauthAccounts"][0].update(models=["last-good"], disabledModels=["last-good"],
             account_model_catalog=old_catalog, last_model_sync_at="2026-09-07T00:00:00Z")))
-    replies = [common.WorkBuddyError("request", status=500)] if failure == "primary500" else [
-        common.WorkBuddyError("request", status=404),
-        {"enterpriseId": "fixture", "productFeatures": {}} if failure == "fallback_empty" else common.WorkBuddyError("request", status=503)]
+    replies = [{"productFeatures": {}}] if failure == "empty" else [
+        common.WorkBuddyError("request", status=500 if failure == "server500" else 503)]
     request = Mock(side_effect=replies)
     monkeypatch.setattr(common, "request", request)
     result = await om._discover_account_models_once(account, timeout_s=10)

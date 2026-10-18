@@ -247,7 +247,10 @@ def test_segment_schema_unique_ids_capabilities_callback_and_state_bidirectional
     frozen_states = {item for case in cases for item in case["entry"].get("stateFamilies", [])}
     retired_callbacks = {item for item in frozen_callbacks if item.startswith("odm:")}
     assert retired_callbacks == {"odm:*"}
-    assert frozen_callbacks - retired_callbacks == _source_callback_families()
+    # Approved add-page routes; exact buttons/reachability and lifecycle are
+    # exercised in test_oauth_add_proxy rather than rewriting archived traces.
+    add_callbacks = {"oa:add:proxy", "oa:add_proxy:*", "oa:add:xai", "oa:add:workbuddy"}
+    assert (frozen_callbacks - retired_callbacks) | add_callbacks == _source_callback_families()
     assert frozen_states == {
         "oa_login_code", "oa_set_json", "oa_openai_code", "oa_openai_rt",
         "oa_xai_code", "oa_xai_rt", "oa_antigravity_code", "oa_openai_import",

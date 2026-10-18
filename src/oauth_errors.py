@@ -15,6 +15,8 @@ from typing import Any
 
 import httpx
 
+from . import safe_diagnostics
+
 
 class OAuthRefreshStateError(RuntimeError):
     """Local refresh coordination failure, never proof of revoked credentials."""
@@ -70,9 +72,7 @@ def _norm_operation(operation: str | None) -> str:
 
 
 def _technical_from_exception(exc: BaseException | str) -> str:
-    if isinstance(exc, str):
-        return exc[:500]
-    return f"{type(exc).__name__}: {str(exc)[:500]}"
+    return json.dumps(safe_diagnostics.capture(exc).fields(), ensure_ascii=False, sort_keys=True)
 
 
 def _http_status(exc: BaseException | str) -> int | None:
@@ -149,7 +149,8 @@ def describe_oauth_error(
     op = _norm_operation(operation)
     status = _http_status(exc)
     body_code = _response_error_code(exc)
-    technical = _technical_from_exception(exc)
+    diagnostic = safe_diagnostics.capture(exc, provider=prov, operation=op, stage=op)
+    technical = json.dumps(diagnostic.fields(), ensure_ascii=False, sort_keys=True)
 
     if isinstance(exc, OAuthRefreshStateError):
         if exc.kind == "account_unavailable":
@@ -196,6 +197,8 @@ def describe_oauth_error(
     if prov == "zhipu":
         from .oauth.zhipu.common import ZhipuError
         if isinstance(exc, ZhipuError):
+            from .oauth.zhipu.diagnostics import error_facts
+            facts = error_facts(exc)
             guidance = {
                 "project_required": ("登录已保存，初始化未完成", "尚未取得模型 Key 所属项目。", "点击「重试初始化」继续，无需重新登录。"),
                 "personal_project_missing": ("登录已保存，未找到个人项目", "此账号没有可用的个人项目。", "如果使用团队套餐，请选择对应团队项目。"),
@@ -215,12 +218,12 @@ def describe_oauth_error(
                 title, reason = "智谱 TLS 握手失败", "TCP 已连接，但 TLS 握手未完成。"
             if exc.request_not_sent:
                 reason += " 本次 HTTP 请求尚未发送。"
-            if exc.code is not None:
+            if exc.code is not None and safe_diagnostics.safe_code(exc.code) != "unrecognized":
                 reason += f" 业务码 {exc.code}。"
-            if exc.target_host:
-                reason += " 目标：" + exc.target_host + "。"
-            if exc.proxy_route and exc.proxy_route != "unobserved":
-                reason += " 实际出口：" + exc.proxy_route + ("（已回退）" if exc.fallback_used else "") + "。"
+            if facts["target_host"]:
+                reason += " 目标：" + facts["target_host"] + "。"
+            if facts["proxy_route"] and facts["proxy_route"] != "unobserved":
+                reason += " 实际出口：" + facts["proxy_route"] + ("（已回退）" if facts["fallback_used"] else "") + "。"
             if exc.auth_error:
                 title, reason, action = ("智谱鉴权未通过", "上游拒绝了本次请求所用的凭据。", "核对模型 Key 或管理登录凭据；配置缺失与登录过期是不同问题。")
             stage_label = {"project_lookup": "组织/项目查询", "projects": "组织/项目查询", "subscription": "订阅查询", "key_list": "已有 Key 查询",
@@ -534,8 +537,8 @@ def describe_oauth_error(
     return OAuthDisplayError(
         code=f"{prov}_{op}_failed",
         title="OAuth 操作失败",
-        reason="本次操作没有完成，具体原因已记录到日志。",
-        action="稍后重试；如果持续失败，请重新登录对应账号。",
+        reason=safe_diagnostics.message(diagnostic),
+        action=safe_diagnostics.guidance(diagnostic),
         retryable=True,
         status=status,
         provider=prov,
@@ -557,6 +560,14 @@ def format_oauth_error_html(
 ) -> str:
     """Return Telegram-HTML-safe multi-line error text."""
     err = describe_oauth_error(exc, provider=provider, operation=operation)
+    # Classification still owns retry/auth semantics. Presentation may add safe
+    # phase/cause facts but never change business decisions based on err.code.
+    diagnostic = safe_diagnostics.report(exc, provider=provider or "", operation=operation or "") if isinstance(exc, BaseException) else None
+    if diagnostic is not None and not isinstance(exc, OAuthRefreshStateError) and (diagnostic.kind != "unexpected" or err.code.endswith("_failed")):
+        from dataclasses import replace
+        persistence = getattr(exc, "kind", None) in ("save_failed_retry_save", "save_candidate_expired_relogin", "save_failed")
+        action = ((err.action + " ") if err.auth_error or persistence else "") + safe_diagnostics.guidance(diagnostic)
+        err = replace(err, reason=safe_diagnostics.message(diagnostic), action=action)
     lines: list[str] = []
     if include_title:
         lines.append(f"❌ {html.escape(err.title)}")
@@ -574,7 +585,8 @@ def format_oauth_error_html(
 
 
 def technical_detail(exc: BaseException | str | OAuthDisplayError) -> str:
-    """Raw-ish detail for logs only. Never put this directly in Telegram UI."""
+    """Bounded safe diagnostics for logs, without exception text or IO data."""
     if isinstance(exc, OAuthDisplayError):
-        return exc.technical
-    return _technical_from_exception(exc)
+        return "OAuth display error"  # technical may originate from external callers
+    diagnostic = safe_diagnostics.report(exc) if isinstance(exc, BaseException) else safe_diagnostics.capture(exc)
+    return json.dumps(diagnostic.fields(), ensure_ascii=False, sort_keys=True)

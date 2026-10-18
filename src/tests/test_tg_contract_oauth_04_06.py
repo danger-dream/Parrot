@@ -462,30 +462,65 @@ def _run_oa06(case, monkeypatch):
 RUNNERS = {"TG-OA-04": _run_oa04, "TG-OA-05": _run_oa05, "TG-OA-06": _run_oa06}
 
 
+def _approved_add_menu_delta(case):
+    from copy import deepcopy
+    expected = deepcopy(case)
+    scenario = case["entry"]["scenario"]
+    if scenario == "add_menu_cancel":
+        payload = expected["tgApi"][1]["payload"]
+        payload["text"] = ("<b>新增 OAuth 账户</b>\n请选择类型：\n\n本次新增代理：继承现有规则"
+                           "\n<i>代理仅控制服务端请求，不控制浏览器出口。</i>")
+        brands = [
+            [("Anthropic", "oa:add:claude", "6140995813788099525"), ("OpenAI", "oa:add:openai", "6141162084857031383"), ("Grok", "oa:add:xai", "6138882363460952713")],
+            [("Cursor", "oa:login:cursor", "6062261319426390107"), ("Antigravity", "oa:login:antigravity", "6077644693984779782"), ("WorkBuddy", "oa:add:workbuddy", "6120617435214132136")],
+            [("智谱", "oa:zh:add", "6140727700454645813")],
+        ]
+        payload["reply_markup"]["inline_keyboard"] = [
+            [{"text": text, "callback_data": cb, "icon_custom_emoji_id": icon} for text, cb, icon in row]
+            for row in brands] + [[{"text": "⚙ 设置代理", "callback_data": "oa:add:proxy"},
+                                  {"text": "🏠 返回主菜单", "callback_data": "menu:main"},
+                                  {"text": "◀ 返回列表", "callback_data": "menu:oauth"}]]
+        openai_rows = expected["tgApi"][-1]["payload"]["reply_markup"]["inline_keyboard"]
+        openai_rows[-1:-1] = [[{"text": "📄 Sub2API 文件", "callback_data": "oa:import:sub2api"}],
+                             [{"text": "📄 CPA 文件", "callback_data": "oa:import:cpa"}]]
+    if scenario == "import_cancel":
+        add_case = next(item for item in CASES if item["caseId"] == "TG-OA-04.add_menu_cancel")
+        submenu = _approved_add_menu_delta(add_case)["tgApi"][-1]["payload"]
+        expected["tgApi"][1]["payload"]["text"] = submenu["text"]
+        expected["tgApi"][1]["payload"]["reply_markup"] = submenu["reply_markup"]
+    if scenario in {"start_provider", "import_start", "cursor_done"}:
+        for step in expected["stateSteps"]:
+            if step["state"]:
+                step["state"]["data"]["_oauth_add_attempt"] = "fakehex12"
+    provider = case["entry"].get("provider")
+    parent = (provider if scenario in {"start_provider", "refresh_token_input"} else
+              "claude" if scenario == "json_input" else
+              "openai" if scenario == "import_document" and not case["entry"].get("fileId", "fake-file") else None)
+    if parent in {"claude", "openai", "xai"}:
+        for call in expected["tgApi"]:
+            for row in call["payload"].get("reply_markup", {}).get("inline_keyboard", []):
+                for button in row:
+                    if button.get("callback_data") == "oa:add":
+                        button["callback_data"] = "oa:add:" + parent
+                        if button["text"] != "❌ 取消":
+                            button["text"] = "◀ 上一步"
+    return expected
+
+
 @pytest.mark.parametrize("case", CASES, ids=lambda item: item["caseId"])
 def test_oauth_04_06_strict_trace(case, monkeypatch):
     observed = RUNNERS[case["capabilityId"]](case, monkeypatch)
     expected = case
-    if case["caseId"] in {"TG-OA-04.add_menu_cancel", "TG-OA-06.import_cancel"}:
-        # The v0.31.13 recording stays immutable. This explicitly approved
-        # feature delta adds two WorkBuddy rows and one Zhipu row, without masking
-        # any actual output, state changes, existing labels, or old row order.
-        from copy import deepcopy
-        expected = deepcopy(case)
-        payload = expected["tgApi"][1]["payload"]
-        assert payload["text"].startswith("<b>新增 OAuth 账户</b>")
-        payload["text"] += '、<tg-emoji emoji-id="6120617435214132136">✉</tg-emoji> WorkBuddy'
-        rows = payload["reply_markup"]["inline_keyboard"]
-        assert len(rows) == 12 and rows[-2][0]["callback_data"] == "menu:oauth"
-        rows[-2:-2] = [
-            [{"text": "WorkBuddy 中国区登录", "callback_data": "oa:wb:login", "icon_custom_emoji_id": "6120617435214132136"}],
-            [{"text": "WorkBuddy 国际区登录", "callback_data": "oa:wb:login:global", "icon_custom_emoji_id": "6120617435214132136"}],
-            [{"text": "智谱 / Z.ai（Key / OAuth）", "callback_data": "oa:zh:add", "icon_custom_emoji_id": "6140727700454645813"}],
-        ]
+    # Keep archived recordings immutable; change only the explicitly approved
+    # brand layout, parent navigation, and new attempt binding in expected data.
+    expected = _approved_add_menu_delta(expected)
     if case["caseId"] == "TG-OA-04.start_antigravity_regen":
         from copy import deepcopy
         expected = deepcopy(expected)
-        expected["stateSteps"][0]["state"]["data"]["code_verifier"] = "fake-verifier"
+        data = expected["stateSteps"][0]["state"]["data"]
+        attempt = data.pop("_oauth_add_attempt")
+        data["code_verifier"] = "fake-verifier"
+        data["_oauth_add_attempt"] = attempt
     check_trace(expected, observed)
 
 

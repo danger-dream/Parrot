@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from src import config, oauth_manager
-from src.tests.test_workbuddy_channel import env
+from src.tests.test_workbuddy_channel import env, wire_json
 from src.tests.test_workbuddy_request_rewrite import private_config, ENV, ENV_SAFE, IDENTITY
 from src.workbuddy_request_rewrite import RewriteConfigError
 
@@ -44,7 +44,7 @@ async def test_inline_markup_and_selfclosing_scope_through_real_builder(env, ing
     else:
         body.update(messages=[{"role": "system", "content": text}, {"role": "user", "content": "ping"}])
     before = copy.deepcopy(body)
-    emitted = json.loads((await ch.build_upstream_request(body, "glm-fixture", ingress_protocol=ingress)).body)
+    emitted = wire_json((await ch.build_upstream_request(body, "glm-fixture", ingress_protocol=ingress)).body)
     system = emitted["messages"][1]["content"]
     assert (ENV_SAFE in system) is changed
     assert (ENV in system) is (not changed)
@@ -58,7 +58,7 @@ async def test_nested_quote_inside_real_env_does_not_change_quoted_label(env):
     _, ch = env
     text = f"{IDENTITY}\n<env>\n<quote>Example:\n{ENV}: quoted\n</quote>\n{ENV}: real\n</env>"
     body = {"messages": [{"role": "system", "content": text}, {"role": "user", "content": "ping"}]}
-    output = json.loads((await ch.build_upstream_request(body, "glm-fixture", ingress_protocol="chat")).body)["messages"][1]["content"]
+    output = wire_json((await ch.build_upstream_request(body, "glm-fixture", ingress_protocol="chat")).body)["messages"][1]["content"]
     assert ENV + ": quoted" in output and ENV_SAFE + ": real" in output
     assert ENV_SAFE + ": quoted" not in output and body["messages"][0]["content"] == text
 

@@ -282,8 +282,38 @@ def invoke_safely(callable_obj, *args, **kwargs):
 
 
 def check_trace(case, observed):
-    """Strict replay only: the committed baseline has no snapshot-update path."""
-    assert_strict_equal(case, observed)
+    """Strict replay, with only the explicitly changed safe-error wording overlaid.
+
+    Archived interaction order, keyboards, mutations and state remain byte-exact.
+    These independent expectations do not call the production diagnostic formatter.
+    """
+    import re
+    expected = deepcopy(case)
+    stages = {"refresh_token": "凭据刷新", "fetch_usage": "用量查询", "exchange_code": "授权码交换",
+              "rate_limit_reset_credit": "使用重置额度", "discovery": "授权发现"}
+    replacements = {
+        "fake registry failure": "management / 删除账户：未分类异常，具体原因尚不确定。",
+        "fake config failure": "management / 更新并发限制：未分类异常，具体原因尚不确定。",
+        "fake parse failure": "management / 导入文件解析：未分类异常，具体原因尚不确定。",
+        "Expecting property name enclosed in double quotes: line 1 column 2 (char 1)":
+            "management / 导入文件解析：响应不是有效 JSON。",
+    }
+    for call in expected.get("tgApi", []):
+        payload = call.get("payload", {})
+        text = payload.get("text")
+        if not isinstance(text, str):
+            continue
+        match = re.search(r"<code>(claude|openai|xai|cursor|antigravity)_([a-z_]+)_failed</code>", text)
+        if match and "本次操作没有完成，具体原因已记录到日志。" in text:
+            provider, operation = match.groups()
+            text = text.replace("本次操作没有完成，具体原因已记录到日志。",
+                f"{provider} / {stages.get(operation, operation)}：未分类异常，具体原因尚不确定。")
+            text = text.replace("稍后重试；如果持续失败，请重新登录对应账号。",
+                "请按时间核对服务器诊断及操作记录。远端操作结果未确认时，不要盲目重复提交。")
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+        payload["text"] = text
+    assert_strict_equal(expected, observed)
 
 
 def _current_cases():

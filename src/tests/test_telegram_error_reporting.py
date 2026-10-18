@@ -29,9 +29,9 @@ def test_report_correlates_full_chain_without_raw_exception_or_input(capsys):
 
 @pytest.mark.parametrize("exc,expected", [
     (ManagementError(ManagementErrorCode.REVISION_CONFLICT, "secret-detail"), "账号或设置已变更"),
-    (httpx.ReadTimeout("secret-url"), "上游响应超时"),
+    (httpx.ReadTimeout("secret-url"), "等待响应超时"),
     (httpx.HTTPStatusError("secret-body", request=httpx.Request("GET", "https://upstream.test?secret=x"),
-        response=httpx.Response(403)), "上游拒绝认证或权限"),
+        response=httpx.Response(403)), "上游 HTTP 拒绝 HTTP 403"),
 ])
 def test_known_failures_use_safe_reason(exc, expected, capsys):
     text = errors.report(exc, operation="测试操作")
@@ -83,9 +83,9 @@ def test_zhipu_project_error_keeps_business_code_and_stage(capsys):
     exc = ZhipuError("project_lookup", "business", status=200, code="1234")
     text = errors.report(exc, operation="智谱组织/项目查询")
     report = json.loads(capsys.readouterr().out.split("[tg-error] ", 1)[1])
-    assert report["error_code"] == 1234 and report["http_status"] == 200
+    assert report["error_code"] == "unrecognized" and report["http_status"] == 200
     assert report["upstream_stage"] == "project_lookup" and report["upstream_kind"] == "business"
-    assert "业务码 1234" in text and "HTTP 200" not in text
+    assert "1234" not in text and "组织/项目查询" in text
 
 
 def test_zhipu_http_success_business_failure_keeps_both_codes(monkeypatch):

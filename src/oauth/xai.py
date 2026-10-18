@@ -18,6 +18,8 @@ network calls.
 
 from __future__ import annotations
 
+from src.safe_diagnostics import diagnose, summary
+
 import asyncio
 import base64
 import hashlib
@@ -217,6 +219,7 @@ def validate_oauth_endpoint(raw_url: str, field: str = "endpoint") -> str:
     return raw
 
 
+@diagnose('xai', 'login_init', 'discovery')
 def discover_sync() -> dict:
     """Resolve xAI OAuth endpoints through OIDC discovery.
 
@@ -330,6 +333,7 @@ def _attach_identity_fields(data: dict, *, token_endpoint: str | None = None,
     return out
 
 
+@diagnose('xai', 'login_complete', 'token_exchange')
 def exchange_code_sync(
     code: str,
     code_verifier: str,
@@ -368,6 +372,7 @@ async def exchange_code(
     )
 
 
+@diagnose('xai', 'refresh', 'token_refresh')
 def refresh_sync(
     refresh_token: str,
     *,
@@ -502,7 +507,7 @@ def _optional_cli_get_json_sync(access_token: str, path_and_query: str,
             access_token, path_and_query, timeout=_CLI_OPTIONAL_HTTP_TIMEOUT,
         ), None
     except Exception as exc:
-        return None, f"{type(exc).__name__}: {exc}"
+        return None, summary(exc, provider="xai", operation="usage", stage="request")
 
 
 def _history_items(raw_history: Any) -> list[dict[str, Any]]:
@@ -589,7 +594,7 @@ def fetch_cli_billing_usage_sync(access_token: str, *, account_key: str = "") ->
             try:
                 optional_results[name] = fut.result()
             except Exception as exc:
-                optional_results[name] = (None, f"{type(exc).__name__}: {exc}")
+                optional_results[name] = (None, summary(exc, provider="xai", operation="usage", stage="request"))
 
     credits, credits_err = optional_results.get("credits", (None, "not fetched"))
     user, user_err = optional_results.get("user", (None, "not fetched"))

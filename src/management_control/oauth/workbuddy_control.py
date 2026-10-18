@@ -45,7 +45,9 @@ class WorkBuddyControlMixin:
 
     def workbuddy_policy(self, context):
         self._require(context, Capability.READ)
-        return {"client_profile": "cli", "client_profiles_by_realm": {"cn": "cli", "global": "ide"},
+        return {"client_profile": "cli", "client_profiles_by_realm": {"cn": "cli", "global": "workbuddy-cli"},
+                "supported_client_profiles_by_realm": {"cn": ["cli"], "global": ["workbuddy-cli", "ide"]},
+                "client_routes": {"workbuddy-cli": "WorkBuddy CLI · www.workbuddy.ai", "ide": "CodeBuddy IDE · www.codebuddy.ai"},
                 "browser_login_realms": ["cn", "global"], "import_realms": [],
                 "effects_enabled": self.backend.workbuddy_effects_enabled(), "auto_checkin_default": False,
                 "auto_checkin_time": "09:05", "auto_checkin_times": ["09:05", "21:05"],

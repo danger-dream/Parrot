@@ -27,7 +27,7 @@ from typing import Any, Optional
 
 import httpx
 
-from . import config, network
+from . import config, network, safe_diagnostics
 from .channel import registry
 from .channel.base import Channel
 from .protocols import errors as protocol_errors
@@ -934,6 +934,7 @@ def _extract_text_from_sse(raw: bytes, protocol: str, resolved_model: str) -> Op
     return None
 
 
+@safe_diagnostics.diagnose("translation", "test", "request", emit=False)
 async def _call_model(
     model_name: str, text: str, system_prompt: str, timeout_s: float,
     cfg: Optional[dict] = None,
@@ -960,7 +961,7 @@ async def _call_model(
                 body, resolved_model, ingress_protocol=ingress,
             )
         except Exception as exc:
-            print(f"[translation] build_upstream_request failed: {exc}")
+            safe_diagnostics.report(exc, provider="translation", stage="request_build")
             return None
 
         try:
@@ -979,14 +980,16 @@ async def _call_model(
                     timeout=timeout_s,
                 )
         except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
-            print(f"[translation] timeout calling {model_name}: {exc}")
+            safe_diagnostics.report(exc, provider="translation", stage="request")
             return None
         except Exception as exc:
-            print(f"[translation] http error calling {model_name}: {exc}")
+            safe_diagnostics.report(exc, provider="translation", stage="request")
             return None
 
         if resp.status_code != 200:
-            print(f"[translation] HTTP {resp.status_code} from {model_name}: {resp.text[:200]}")
+            failure = RuntimeError("translation HTTP failure")
+            failure.status_code = resp.status_code
+            safe_diagnostics.report(failure, provider="translation", stage="request")
             return None
 
         def _valid(value: Optional[str]) -> Optional[str]:
@@ -1003,12 +1006,12 @@ async def _call_model(
 
         try:
             data = resp.json()
-        except Exception:
+        except Exception as exc:
             # 有些上游 content-type 不准但实际吐 SSE，再兜一次。
             result = _valid(_extract_text_from_sse(raw, proto, resolved_model))
             if result is not None:
                 return result
-            print(f"[translation] non-JSON response from {model_name}")
+            safe_diagnostics.report(exc, provider="translation", stage="response")
             return None
 
         incomplete = _completion_incomplete_reason(data, proto)
@@ -1268,12 +1271,13 @@ async def translate_text_for_test(text: str) -> dict[str, Any]:
         print("[translation] dropping unsafe cached translation during test; retrying")
         _cache_delete(cache_key)
 
-    result = await _translate_text(text, cfg)
+    with safe_diagnostics.collect_failures() as failures:
+        result = await _translate_text(text, cfg)
     if result is None:
         _record_failure(cfg)
         return {
             "ok": False,
-            "reason": "翻译调用失败（主请求会静默回退原文）",
+            "reason": safe_diagnostics.message(failures[-1]) if failures else "翻译未返回有效结果（主请求会静默回退原文）；请核对模型响应。",
             "targetLanguage": target_lang,
             "original": text,
             "translated": text,

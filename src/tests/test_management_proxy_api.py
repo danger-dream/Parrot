@@ -463,11 +463,10 @@ def test_proxy_probe_exception_never_leaks_submitted_credential(
     terminal = _poll(client, admin, started.json()["data"]["id"])
     assert terminal["status"] == "failed"
     assert terminal["result"] is None
-    assert terminal["error"] == {
-        "code": "UPSTREAM_ERROR",
-        "message": "UPSTREAM_ERROR",
-        "retryable": True,
-    }
+    assert terminal["error"]["code"] == "UPSTREAM_ERROR"
+    assert terminal["error"]["retryable"] is True
+    assert "proxy.test" in terminal["error"]["message"]
+    assert "具体原因尚不确定" in terminal["error"]["message"]
     assert marker not in repr(terminal)
     assert marker not in repr(runtime.state_store.audit_snapshot())
 

@@ -1,6 +1,8 @@
 """安全、受限的 OpenAI-compatible ``/models`` 自动发现。"""
 from __future__ import annotations
 
+from src.safe_diagnostics import diagnose, inherit
+
 import asyncio
 import json
 from collections.abc import Callable
@@ -19,6 +21,11 @@ ALLOWED_PARSERS = {"openai-data-id", "dashscope-output-model"}
 
 class ModelsDiscoveryError(Exception):
     """可安全展示给用户的简短错误；绝不包含上游响应或凭据。"""
+
+    def __init__(self, message, *, status=0, kind=""):
+        super().__init__(message)
+        self.status_code, self.kind = status, kind
+        inherit(self)
 
 
 
@@ -69,25 +76,26 @@ def _normalize_model_ids(items: list[object], field: str) -> list[str]:
         if len(out) >= MAX_MODELS:
             break
     if not out:
-        raise ModelsDiscoveryError("上游未返回可用模型")
+        raise ModelsDiscoveryError("上游未返回可用模型", kind="invalid_data")
     return out
 
 
 def _parse_openai_data_id(payload: object) -> list[str]:
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-        raise ModelsDiscoveryError("模型列表响应格式不受支持")
+        raise ModelsDiscoveryError("模型列表响应格式不受支持", kind="invalid_data")
     return _normalize_model_ids(payload["data"], "id")
 
 
 def _parse_dashscope_output_model(payload: object) -> list[str]:
     if not isinstance(payload, dict):
-        raise ModelsDiscoveryError("模型列表响应格式不受支持")
+        raise ModelsDiscoveryError("模型列表响应格式不受支持", kind="invalid_data")
     output = payload.get("output")
     if not isinstance(output, dict) or not isinstance(output.get("models"), list):
-        raise ModelsDiscoveryError("模型列表响应格式不受支持")
+        raise ModelsDiscoveryError("模型列表响应格式不受支持", kind="invalid_data")
     return _normalize_model_ids(output["models"], "model")
 
 
+@diagnose('models', 'discover', 'model_discovery')
 async def discover_models(endpoint: str, api_key: str, *, auth: str = "bearer",
                           parser: str = "openai-data-id", total_timeout: float = 12.0,
                           provider: str = "", channel_key: str = "",
@@ -104,14 +112,14 @@ async def discover_models(endpoint: str, api_key: str, *, auth: str = "bearer",
                                proxy_provider=provider, proxy_channel=channel_key) as client:
                 async with client.stream("GET", endpoint, headers=_headers(auth, api_key)) as response:
                     if response.is_redirect:
-                        raise ModelsDiscoveryError("模型服务返回了重定向，已拒绝携带 Key 跟随")
+                        raise ModelsDiscoveryError("模型服务返回了重定向，已拒绝携带 Key 跟随", status=response.status_code)
                     if not 200 <= response.status_code < 300:
-                        raise ModelsDiscoveryError(f"模型服务请求失败（HTTP {response.status_code}）")
+                        raise ModelsDiscoveryError(f"模型服务请求失败（HTTP {response.status_code}）", status=response.status_code)
                     body = bytearray()
                     async for chunk in response.aiter_bytes():
                         body.extend(chunk)
                         if len(body) > MAX_RESPONSE_BYTES:
-                            raise ModelsDiscoveryError("模型列表响应过大")
+                            raise ModelsDiscoveryError("模型列表响应过大", kind="too_large")
     except ModelsDiscoveryError:
         raise
     except TimeoutError as exc:

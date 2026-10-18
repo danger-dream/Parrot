@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import gzip
 import time
 import uuid
 
@@ -42,6 +43,11 @@ def env(monkeypatch):
     yield m, ch
     config.update(lambda c: (c.clear(), c.update(before)))
     fake._install_channels(m, [])
+
+
+def wire_json(raw):
+    """Decode captured WorkBuddy JSON, including modern default gzip bodies."""
+    return json.loads(gzip.decompress(raw) if isinstance(raw, bytes) and raw.startswith(b"\x1f\x8b") else raw)
 
 
 def ev(value):
@@ -98,7 +104,7 @@ async def call(env, ingress, body, response_factory):
         assert str(req.url) == "https://copilot.tencent.com/v2/chat/completions"
         assert req.headers["authorization"] == "Bearer fixture-access"
         assert "x-refresh-token" not in req.headers
-        payload = json.loads(req.content)
+        payload = json.loads(gzip.decompress(req.content) if req.headers.get("content-encoding") == "gzip" else req.content)
         assert payload["stream"] is True and payload["stream_options"]["include_usage"] is True
         assert "reasoning_effort" not in payload
         assert not any(k.startswith("_parrot") for k in payload)
@@ -123,7 +129,7 @@ async def test_six_protocol_paths_text_tools_usage_and_mime(env, ingress, stream
     body = request_body(ingress, stream, tool=tool)
     def wire(req):
         if tool:
-            assert json.loads(req.content)["tool_choice"] == "fixture_tool"
+            assert wire_json(req.content)["tool_choice"] == {"type": "function", "function": {"name": "fixture_tool"}}
         return httpx.Response(200, stream=fake.ChunkedByteStream(frames(tool=tool)), headers={"content-type": "text/event-stream"})
     response, text, requests = await call(env, ingress, body, wire)
     assert len(requests) == 1 and response.status_code == 200, text
@@ -164,7 +170,7 @@ async def test_tool_result_roundtrip_preserves_call_id_and_content(env, ingress)
         body["messages"] += [{"role": "assistant", "content": [{"type": "tool_use", "id": "call-fixture", "name": "fixture_tool", "input": {}}]},
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call-fixture", "content": "工具原始结果"}]}]
     request = await ch.build_upstream_request(body, "glm-fixture", ingress_protocol=ingress)
-    payload = json.loads(request.body)
+    payload = wire_json(request.body)
     result = next(x for x in payload["messages"] if x["role"] == "tool")
     assert result["tool_call_id"] == "call-fixture" and result["content"] == "工具原始结果"
 
@@ -204,11 +210,11 @@ async def test_no_default_effort_no_model_name_heuristics_and_disabled_models(en
         for ingress in ["chat", "responses", "anthropic"]:
             body = request_body(ingress, False)
             request = await ch.build_upstream_request(body, model, ingress_protocol=ingress)
-            payload = json.loads(request.body)
+            payload = wire_json(request.body)
             assert "reasoning_effort" not in payload and "thinking" not in payload
     body = request_body("chat", False)
     body["reasoning_effort"] = "low"
-    assert json.loads((await ch.build_upstream_request(body, "glm-fixture", ingress_protocol="chat")).body)["reasoning_effort"] == "low"
+    assert wire_json((await ch.build_upstream_request(body, "glm-fixture", ingress_protocol="chat")).body)["reasoning_effort"] == "low"
     body["reasoning_effort"] = "max"
     with pytest.raises(GuardError):
         await ch.build_upstream_request(body, "glm-fixture", ingress_protocol="chat")
@@ -220,13 +226,13 @@ async def test_no_default_effort_no_model_name_heuristics_and_disabled_models(en
     assert WorkBuddyOAuthChannel(dict(om.get_account(ch.account_key), models=[])).list_client_models() == []
 
 
-@pytest.mark.parametrize("choice,wanted", [("none", None), ({"type": "none"}, None), ({"type": "auto"}, "auto"),
-    ({"type": "required"}, "required"), ({"type": "function", "function": {"name": "f"}}, "f")])
-def test_choice_string_wire_shape(choice, wanted):
+@pytest.mark.parametrize("choice,wanted", [("none", "none"), ({"type": "none"}, "none"), ({"type": "auto"}, "auto"),
+    ({"type": "required"}, "required"), ({"type": "function", "function": {"name": "f"}}, {"type": "function", "function": {"name": "f"}})])
+def test_choice_official_wire_shape(choice, wanted):
     body = {"tool_choice": choice, "tools": [{"type": "function"}], "messages": [{"role": "user", "content": "unaltered"}]}
     normalize_tool_choice(body)
     assert body.get("tool_choice") == wanted
-    assert ("tools" in body) is (wanted is not None)
+    assert "tools" in body
     assert body["messages"][0]["content"] == "unaltered"
 
 

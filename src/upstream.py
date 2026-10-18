@@ -598,6 +598,8 @@ class ChatSSEAssistantBuilder:
         self._role = "assistant"
         self._content_parts: list[str] = []
         self._reasoning_parts: list[str] = []
+        self._provider_reasoning: dict = {}
+        self.preserve_provider_reasoning = False
         self._refusal_parts: list[str] = []
         # tool_calls 按 index 聚合，保留首次的 id/name，arguments 拼接
         self._tool_calls: dict[int, dict] = {}
@@ -638,6 +640,7 @@ class ChatSSEAssistantBuilder:
                 own.append(choice)
             else:
                 builder = self._choice_builders.setdefault(index, ChatSSEAssistantBuilder())
+                builder.preserve_provider_reasoning = self.preserve_provider_reasoning
                 builder._apply({"choices": [{**choice, "index": 0}]})
         if not own:
             return
@@ -649,6 +652,9 @@ class ChatSSEAssistantBuilder:
         content = delta.get("content")
         if isinstance(content, str) and content:
             self._content_parts.append(content)
+        if self.preserve_provider_reasoning:
+            from .providers.workbuddy_replay import accumulate
+            accumulate(self._provider_reasoning, delta)
         reasoning = delta.get("reasoning_content")
         if isinstance(reasoning, str) and reasoning:
             self._reasoning_parts.append(reasoning)
@@ -665,7 +671,10 @@ class ChatSSEAssistantBuilder:
                 slot["id"] = merge_identifier_delta(slot["id"] or "", tc["id"])
             fn = tc.get(kind) or {}
             if fn.get("name"):
-                slot[kind]["name"] = merge_identifier_delta(slot[kind]["name"] or "", fn["name"])
+                # WorkBuddy's official name fragments concatenate; only IDs
+                # have the repeated-identifier normalization contract.
+                slot[kind]["name"] = ((slot[kind]["name"] or "") + fn["name"] if self.preserve_provider_reasoning
+                                      else merge_identifier_delta(slot[kind]["name"] or "", fn["name"]))
             args_piece = fn.get(field)
             if isinstance(args_piece, str) and args_piece:
                 slot[kind][field] += args_piece
@@ -685,6 +694,7 @@ class ChatSSEAssistantBuilder:
         msg["content"] = "".join(self._content_parts) or None
         if self._reasoning_parts:
             msg["reasoning_content"] = "".join(self._reasoning_parts)
+        msg.update(self._provider_reasoning)
         if self._refusal_parts:
             msg["refusal"] = "".join(self._refusal_parts)
         if self._tool_calls:

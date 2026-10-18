@@ -11,6 +11,9 @@ import httpx
 from ..management_control.errors import ManagementError
 from ..oauth.zhipu.common import ZhipuError
 from . import states, ui
+from .. import safe_diagnostics
+from pathlib import Path
+import re
 
 _MENUS = {
     "oa": "OAuth账户管理", "mc": "模型中心", "map": "模型映射", "ak": "API Key管理",
@@ -68,18 +71,25 @@ def _stack(exc: BaseException) -> list[dict]:
     """
     result, seen = [], set()
     current = exc
-    while current is not None and id(current) not in seen:
+    while current is not None and id(current) not in seen and len(result) < 12:
         seen.add(id(current))
         frames = [{"file": frame.filename, "line": frame.lineno, "function": frame.name}
-                  for frame in traceback.extract_tb(current.__traceback__)]
-        result.append({"type": type(current).__name__, "frames": frames})
+                  for frame in traceback.extract_tb(current.__traceback__)
+                  if frame.filename.startswith(str(Path(__file__).parents[1]) + "/")
+                  and re.fullmatch(r"[A-Za-z0-9_./-]+", frame.filename)
+                  and re.fullmatch(r"[A-Za-z0-9_<>]+", frame.name)][-12:]
+        name = type(current).__name__
+        known = {"RuntimeError", "KeyError", "ValueError", "TypeError", "OSError", "TimeoutError",
+                 "ManagementError", "ZhipuError", "WorkBuddyError", "ReadTimeout", "ConnectTimeout",
+                 "WriteTimeout", "PoolTimeout", "HTTPStatusError", "ConnectError", "JSONDecodeError"}
+        result.append({"type": name if name in known else "Exception", "frames": frames})
         current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
     return result
 
 
 def report(exc: BaseException, *, operation: str, event_kind="background", route="", state_action="", update_id=None) -> str:
     incident = "TG-" + datetime.now(timezone.utc).strftime("%Y%m%d") + "-" + uuid.uuid4().hex[:10].upper()
-    code = exc.code.value if isinstance(exc, ManagementError) else exc.code if isinstance(exc, ZhipuError) else ""
+    code = exc.code.value if isinstance(exc, ManagementError) else safe_diagnostics.safe_code(exc.code) if isinstance(exc, ZhipuError) else ""
     stage = exc.stage if isinstance(exc, ZhipuError) and exc.stage in {
         "request", "response", "login", "project_lookup", "model_key", "quota", "network",
         "projects", "profile", "subscription", "key_list", "key_copy", "project_token", "business_token", "key_create", "key_save", "mcp",
@@ -116,12 +126,16 @@ def report(exc: BaseException, *, operation: str, event_kind="background", route
         from ..oauth_errors import describe_oauth_error
         diagnostics = error_facts(exc)
         message = describe_oauth_error(exc, provider="zhipu").reason
+    safe = safe_diagnostics.capture(exc)
+    if (isinstance(exc, ManagementError) and exc.code.value in safe_diagnostics._GENERIC_CODES
+            or not isinstance(exc, ManagementError) and (not isinstance(exc, ZhipuError) or safe.kind != "unexpected")):
+        message = safe_diagnostics.message(safe) + safe_diagnostics.guidance(safe)
     stack = _stack(exc)
     print("[tg-error] " + json.dumps({"incident_id": incident, "operation": operation,
         "event_kind": event_kind, "update_id": update_id, "route": route,
         "state_action": state_action, "error_code": code, "http_status": status,
         "upstream_stage": stage, "upstream_kind": kind, "timeout_phase": timeout_phase,
-        **diagnostics, "exceptions": stack}, ensure_ascii=False), flush=True)
+        **diagnostics, "failure": safe.fields(), "exceptions": stack}, ensure_ascii=False), flush=True)
     return (f"❌ <b>{ui.escape_html(operation)}失败</b>\n{ui.escape_html(message)}\n"
             f"故障编号：<code>{incident}</code>\n"
             "涉及消费或提交时，请先核对结果，不要直接重复操作。")

@@ -300,12 +300,14 @@ def on_config_reload(_cfg: dict | None = None) -> None:
         from .telegram import ui as tg_ui
         tg_ui.rebuild_session()
     except Exception as exc:
-        print(f"[network] telegram session rebuild failed: {exc}")
+        from .safe_diagnostics import report
+        report(exc, provider="telegram", operation="session_rebuild", stage="client_build")
     try:
         from . import upstream
         upstream.reset_client_sync()
     except Exception as exc:
-        print(f"[network] upstream client reset failed: {exc}")
+        from .safe_diagnostics import report
+        report(exc, operation="client_reset", stage="client_build")
 
 
 def init() -> None:
@@ -751,10 +753,14 @@ def _configured_proxy_chain_or_none(*, proxy_purpose: str, proxy_channel: str, p
     from .proxy import manager as pm
     from .proxy.connector import ProxyConnectError
 
-    configured = False
+    from .oauth.add_context import request_target
+    # Resolve the attempt before the legacy/default branch, including explicit
+    # direct when no new-proxy configuration exists. Expiry must fail closed.
+    selected_target = request_target(proxy_purpose, proxy_channel)
+    configured = selected_target is not None
     try:
         pm.init()
-        configured = pm.is_configured()
+        configured = configured or pm.is_configured()
         if not configured:
             if pm.has_non_direct_routing_rules():
                 raise ProxyConnectError("configured non-direct proxy route could not be initialized")
@@ -772,7 +778,8 @@ def _configured_proxy_chain_or_none(*, proxy_purpose: str, proxy_channel: str, p
         )
         if is_antigravity and proxy_channel.startswith("oauth:"):
             route_kwargs["account_key"] = proxy_channel[len("oauth:"):]
-        source_chain = pm.resolve_proxy_chain(**route_kwargs)
+        source_chain = (pm.expand_target(selected_target) if selected_target is not None
+                        else pm.resolve_proxy_chain(**route_kwargs))
         chain = []
         for name in source_chain:
             connector = pm.get_connector(name)
@@ -787,7 +794,7 @@ def _configured_proxy_chain_or_none(*, proxy_purpose: str, proxy_channel: str, p
         if pm.direct_fallback_enabled():
             direct = pm.get_connector("direct")
             if direct is not None:
-                print(f"[proxy] network route has no usable target; using enabled direct fallback: {source_chain}")
+                print("[proxy] network route has no usable target; using enabled direct fallback")
                 return [("direct", direct)]
         raise ProxyConnectError(f"proxy route has no valid target: {source_chain}")
     except ProxyConnectError:
@@ -796,9 +803,11 @@ def _configured_proxy_chain_or_none(*, proxy_purpose: str, proxy_channel: str, p
         if pm.direct_fallback_enabled():
             direct = pm.get_connector("direct")
             if direct is not None:
-                print(f"[proxy] network route resolution failed; using enabled direct fallback: {exc}")
+                from .safe_diagnostics import report
+                report(exc, stage="route_resolve")
+                print("[proxy] network route resolution failed; using enabled direct fallback")
                 return [("direct", direct)]
-        if configured or pm.has_non_direct_routing_rules():
+        if selected_target is not None or configured or pm.has_non_direct_routing_rules():
             raise ProxyConnectError(f"proxy route resolution failed: {exc}") from exc
         return None
 
@@ -987,7 +996,7 @@ def async_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
     if chain is not None:
         from .proxy.connector import ProxyConnectError
         clients: list[tuple[str, httpx.AsyncClient]] = []
-        errors: list[str] = []
+        last_error = None
         for pname, conn in chain:
             try:
                 client = conn.create_httpx_client(
@@ -996,14 +1005,14 @@ def async_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
                 )
                 clients.append((pname, client))
             except Exception as exc:
-                errors.append(f"{pname}: {exc}")
-                print(f"[proxy] async client construction failed for {pname}: {exc}")
+                last_error = exc
+                from .safe_diagnostics import report
+                report(exc, stage="client_build")
         if clients:
             return _install_async_route_failover(clients)
         raise ProxyConnectError(
             "configured proxy route has no usable async client"
-            + (f": {'; '.join(errors)}" if errors else "")
-        )
+        ) from last_error
 
     # No configured new-proxy route: preserve legacy SOCKS5/default behavior.
     opts = dict(kwargs)
@@ -1043,7 +1052,7 @@ def sync_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
     if chain is not None:
         from .proxy.connector import ProxyConnectError
         clients: list[tuple[str, httpx.Client]] = []
-        errors: list[str] = []
+        last_error = None
         for pname, conn in chain:
             try:
                 candidate_opts = dict(opts)
@@ -1058,17 +1067,15 @@ def sync_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
                 elif conn.type == "ss2022":
                     client = conn.create_sync_httpx_client(**candidate_opts)
                 else:
-                    errors.append(f"{pname}: unsupported type {conn.type}")
                     continue
                 clients.append((pname, client))
             except Exception as exc:
-                errors.append(f"{pname}: {exc}")
+                last_error = exc
         if clients:
             return _install_sync_route_failover(clients)
         raise ProxyConnectError(
             "configured proxy route has no sync-compatible target"
-            + (f": {'; '.join(errors)}" if errors else "")
-        )
+        ) from last_error
 
     proxy = active_socks5_url()
     if proxy:

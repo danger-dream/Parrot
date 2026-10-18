@@ -1,6 +1,8 @@
 """Actor-bound ZCode polling, cancellation and explicit org/project selection."""
 from __future__ import annotations
 
+from src.safe_diagnostics import diagnose
+
 import copy
 import hashlib
 import hmac
@@ -9,6 +11,7 @@ from datetime import datetime, timezone
 from threading import Lock, RLock
 
 from src.management_control.errors import ManagementError, ManagementErrorCode as Code
+from src.oauth import add_context
 from .models import OAuthLoginFlow, OAuthLoginPoll, OAuthProvider
 from .plans import OneShotPlanStore
 
@@ -47,11 +50,13 @@ class ZhipuFlows:
         return OAuthLoginFlow(flow_id, secret, OAuthProvider.ZHIPU, payload.get("auth_url", ""),
                               "授权后自动保存账户并配置个人项目、专用模型 Key（不存在则创建）、额度及模型。", plan.expires_at)
 
+    @diagnose('zhipu', 'login_init', 'login_init')
     def start(self, actor, *, site, callback_mode=False, relogin=None):
         generation = self._reserve(actor)
         payload = (self.backend.zhipu_start_callback_login(site=site) if callback_mode
                    else self.backend.zhipu_start_login(site=site))
         payload["relogin"] = copy.deepcopy(relogin)
+        payload["add_attempt"] = None if relogin else add_context.current()
         return self._register(actor, generation, payload)
 
     def projects(self, actor, account_id, account):
@@ -84,7 +89,9 @@ class ZhipuFlows:
         if not lock.acquire(blocking=False):
             raise ManagementError(Code.STATE_CONFLICT, retryable=True)
         try:
-            yield self.active(actor, flow_id, secret)
+            plan = self.active(actor, flow_id, secret)
+            with add_context.bind(plan.payload.get("add_attempt")):
+                yield plan
         finally:
             lock.release()
 
@@ -107,6 +114,7 @@ class ZhipuFlows:
         return {"site": payload.get("site"), "label": (payload.get("credential") or {}).get("label"),
                 "choices": copy.deepcopy(payload.get("choices") or [])}
 
+    @diagnose('zhipu', 'login_poll', 'token_poll')
     def poll(self, actor, flow_id, secret):
         record = self.record(actor, flow_id, secret)
         if record["status"] != "pending":

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from src import safe_diagnostics
+
 import asyncio
 import copy
 import hashlib
@@ -826,13 +828,14 @@ class ChannelControl(ChannelOperationWorkers):
         progress_cb: ProgressCallback | None,
         pre_save: bool,
     ) -> ProbeResult:
-        ok, elapsed, reason = await probe.probe_with_progress(
-            channel,
-            model,
-            progress_cb=progress_cb,
-            timeout_s=None,
-            progress_interval=10,
-        )
+        with safe_diagnostics.collect_failures() as failures:
+            ok, elapsed, reason = await probe.probe_with_progress(
+                channel,
+                model,
+                progress_cb=progress_cb,
+                timeout_s=None,
+                progress_interval=10,
+            )
         cleared = False
         permanent = False
         if ok:
@@ -851,7 +854,8 @@ class ChannelControl(ChannelOperationWorkers):
             cooldown.record_error(
                 channel.key, model, f"initial probe failed: {reason}"
             )
-        return ProbeResult(ok, elapsed, reason, cleared, permanent)
+        public_reason = (safe_diagnostics.message(failures[-1]) if failures else "PROBE_FAILED") if not ok else None
+        return ProbeResult(ok, elapsed, public_reason, cleared, permanent)
 
     async def probe_draft(
         self,

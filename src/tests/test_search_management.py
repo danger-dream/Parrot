@@ -172,7 +172,7 @@ def test_real_service_probe_is_single_source_and_does_not_failover(memory, contr
         called.append((backend["id"], credential, operation))
         raise search_service.SearchError("safe failure")
     monkeypatch.setattr(search_service, "_http_adapter", adapter)
-    with pytest.raises(ManagementError, match="safe failure"):
+    with pytest.raises(ManagementError, match="search / 上游请求.*具体原因尚不确定"):
         asyncio.run(control.test(ctx, "tavily", query="test query"))
     assert called == [("tavily", "t1", "search"), ("tavily", "t2", "search"), ("tavily", "t1", "search")]
     called.clear()

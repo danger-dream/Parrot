@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from urllib.parse import urlsplit
+import re
 
 import httpx
 
@@ -48,4 +49,11 @@ class RequestTrace:
 
 
 def error_facts(exc):
-    return {name: getattr(exc, name, False if name in {"request_not_sent", "fallback_used"} else "") for name in FIELDS}
+    host = getattr(exc, "target_host", "")
+    route = getattr(exc, "proxy_route", "")
+    phase = getattr(exc, "network_phase", "")
+    return {"request_not_sent": getattr(exc, "request_not_sent", False) is True,
+            "fallback_used": getattr(exc, "fallback_used", False) is True,
+            "network_phase": phase if isinstance(phase, str) and phase in {"connect", "tls", "write", "read"} else "",
+            "target_host": host if isinstance(host, str) and re.fullmatch(r"[A-Za-z0-9.-]{1,253}", host) else "",
+            "proxy_route": route if isinstance(route, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", route) else "unobserved"}

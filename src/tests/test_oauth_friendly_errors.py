@@ -62,7 +62,7 @@ def test_claude_usage_403_is_user_friendly():
         exc, provider="claude", operation="fetch_usage",
     )
     assert "Claude 用量接口拒绝访问" in text
-    assert "先刷新 Token" in text
+    assert "核对上游服务状态、授权或接口限制" in text and "不要盲目重复提交" in text
     assert "claude_usage_403" in text
     assert "developer.mozilla" not in text
     assert "api.anthropic.com" not in text

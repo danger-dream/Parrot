@@ -19,8 +19,20 @@ _states: dict[int, dict[str, Any]] = {}
 
 
 def set_state(chat_id: int, action: str, data: Optional[dict] = None) -> None:
-    with _lock:
-        _states[chat_id] = {"action": action, "data": data or {}, "ts": time.time()}
+    from ..oauth.add_context import current
+    # The selection lives separately; input states only retain the immutable
+    # attempt binding so a later callback cannot borrow a newer selection.
+    value = data if data is not None else {}
+    attempt = current() if action.startswith("oa_") and not value.get("relogin") else None
+    if attempt is not None:
+        with attempt.lock:
+            attempt.check()
+            value["_oauth_add_attempt"] = attempt.nonce
+            with _lock:
+                _states[chat_id] = {"action": action, "data": value, "ts": time.time()}
+    else:
+        with _lock:
+            _states[chat_id] = {"action": action, "data": value, "ts": time.time()}
 
 
 def get_state(chat_id: int) -> Optional[dict]:
@@ -49,6 +61,8 @@ def pop_state_if_current(chat_id: int, data: dict) -> Optional[dict]:
 
 def cleanup() -> int:
     """清理过期状态，返回清理条数。"""
+    from .menus import oauth_add_session
+    oauth_add_session.cleanup()
     now = time.time()
     with _lock:
         expired = [cid for cid, s in _states.items() if now - s["ts"] > _DEFAULT_TTL]
@@ -63,5 +77,7 @@ def size() -> int:
 
 
 def clear_all() -> None:
+    from .menus import oauth_add_session
+    oauth_add_session.clear_all()
     with _lock:
         _states.clear()

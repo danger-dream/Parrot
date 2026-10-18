@@ -14,6 +14,10 @@
 
 from __future__ import annotations
 
+from src import safe_diagnostics
+
+from src.safe_diagnostics import diagnose
+
 from . import notifications
 from .notifications import reporting
 from .notifications.events import Effect
@@ -50,6 +54,7 @@ from .oauth_ids import (
     split_account_key as _split_ak,
     xai_subject as _xai_subject,
 )
+from .oauth import add_context
 from .oauth import antigravity as antigravity_provider
 from .oauth import cursor as cursor_provider
 from .oauth import openai as openai_provider
@@ -496,6 +501,7 @@ def _has_pending_refresh(state_key: str) -> bool:
         return state_key in _pending_refreshes
 
 
+@diagnose(operation="refresh", stage="account_save")
 def _commit_refresh_candidate(state_key: str, fingerprint: str, fields: dict) -> str:
     """Save under credential CAS, retaining failed writes for save-only retry."""
     from . import channel_state
@@ -853,6 +859,7 @@ def _save_token_fields_serialized(account_key: str, new: dict) -> bool:
     return True
 
 
+@diagnose('claude', 'refresh', 'token_refresh', emit=False)
 def _post_refresh_candidate(url: str, refresh_token: str, *, scope: str | None,
                             proxy_channel: str = "") -> dict:
     body = {
@@ -894,7 +901,10 @@ def _raise_last_refresh_error(errors: list[BaseException]) -> None:
     if classified and all(err.code in {"claude_oauth_network_error", "claude_oauth_timeout"} for err in classified):
         raise errors[-1]
     summary = [f"{err.code}:{err.status or '-'}" for err in classified]
-    raise RuntimeError("Claude OAuth refresh compatibility failed: " + ", ".join(summary))
+    failure = RuntimeError("Claude OAuth refresh compatibility failed: " + ", ".join(summary))
+    cause = next((exc for exc, err in zip(errors, classified) if not err.auth_error), errors[-1])
+    safe_diagnostics.inherit(failure, cause)
+    raise failure
 
 
 def _is_invalid_scope_error(exc: BaseException) -> bool:
@@ -912,6 +922,7 @@ def _is_invalid_scope_error(exc: BaseException) -> bool:
     return "invalid_scope" in " ".join(fragments).lower()
 
 
+@diagnose('claude', 'refresh', 'token_refresh')
 def _do_refresh_http(refresh_token: str, scopes: str = "", *,
                      account_key: str = "") -> dict:
     """Claude OAuth refresh with v280 defaults and bounded legacy fallbacks.
@@ -974,6 +985,7 @@ def _do_refresh_mock(refresh_token: str) -> dict:
     }
 
 
+@diagnose(operation="refresh", stage="token_refresh")
 def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: str | None = None, observation: dict | None = None) -> str:
     """同步刷新（持 threading.Lock，跨线程跨 loop 串行）。
 
@@ -1155,7 +1167,7 @@ def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: s
                                 continue
                         new_fields[k] = v
                 except Exception as exc:
-                    print(f"[oauth] openai refresh: id_token decode failed for {email}: {exc}")
+                    safe_diagnostics.report(exc, operation="refresh_sync_locked")
             if data.get("plan_type"):
                 new_fields["plan_type"] = data["plan_type"]
             if data.get("subscription_expires_at"):
@@ -1201,7 +1213,7 @@ def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: s
                         new_fields["subject"] = info["subject"]
                         new_fields["sub"] = info["subject"]
                 except Exception as exc:
-                    print(f"[oauth] xai refresh: id_token decode failed for {email}: {exc}")
+                    safe_diagnostics.report(exc, operation="refresh_sync_locked")
             for k in ("subject", "sub", "base_url", "token_endpoint", "redirect_uri"):
                 if data.get(k):
                     new_fields[k] = data[k]
@@ -1235,7 +1247,7 @@ def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: s
                     if v not in (None, ""):
                         new_fields[k] = v
             except Exception as exc:
-                print(f"[oauth] claude refresh: profile fetch failed for {email}: {exc}")
+                safe_diagnostics.report(exc, operation="refresh_sync_locked")
 
         return _commit_refresh_candidate(
             expected_state_key, _refresh_credential_fingerprint(acc), new_fields,
@@ -1305,6 +1317,7 @@ def _mock_usage() -> dict:
     }
 
 
+@diagnose('claude', '', 'profile_fetch', emit=False)
 def _profile_sync(access_token: str, *, account_key: str = "") -> dict:
     if mock_mode_enabled():
         return _mock_profile()
@@ -1482,7 +1495,7 @@ def _record_openai_usage_failure(account_key: str, expected_state_key: str,
         )
     except Exception as exc:
         # Display metadata must not replace the original refresh error.
-        print(f"[oauth] failed to record credits freshness: {type(exc).__name__}")
+        safe_diagnostics.report(exc, operation="record_openai_usage_failure")
 
 
 async def _fetch_openai_usage(account_key: str, *, access_token: str | None = None) -> dict:
@@ -1740,7 +1753,7 @@ async def fetch_usage_snapshot(account_key: str, *,
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        print(f"[oauth] reset-credit detail refresh failed for {account_key}: {exc}")
+        safe_diagnostics.report(exc, operation="fetch_usage_snapshot")
         return preserve_openai_reset_credit_details(account_key, usage)
 
 
@@ -1787,7 +1800,7 @@ async def ensure_quota_fresh(account_key: str, *, timeout_s: float = 5.0) -> boo
     try:
         account_key = _resolve_existing_account_key_or_raise(account_key)
     except Exception as exc:
-        print(f"[oauth] ensure_quota_fresh unknown account {account_key}: {exc}")
+        safe_diagnostics.report(exc, operation="ensure_quota_fresh")
         return False
     if _should_skip_access_refresh():
         return False
@@ -1819,7 +1832,7 @@ async def ensure_quota_fresh(account_key: str, *, timeout_s: float = 5.0) -> boo
             print(f"[oauth] ensure_quota_fresh timeout ({timeout_s}s): {account_key}")
             return False
         except Exception as exc:
-            print(f"[oauth] ensure_quota_fresh failed for {account_key}: {exc}")
+            safe_diagnostics.report(exc, operation="ensure_quota_fresh")
             return False
         try:
             usage = preserve_antigravity_cached_summary(account_key, usage)
@@ -1829,7 +1842,7 @@ async def ensure_quota_fresh(account_key: str, *, timeout_s: float = 5.0) -> boo
                 state_db.quota_save(account_key, flatten_usage(usage),
                                     email=account_key_to_email(account_key))
         except Exception as exc:
-            print(f"[oauth] ensure_quota_fresh save failed for {account_key}: {exc}")
+            safe_diagnostics.report(exc, operation="ensure_quota_fresh")
             return False
         # 访问路径刷新到新鲜用量后，也要按 quotaMonitor.disableThresholdPercent
         # 立即收敛状态；否则 UI 会显示已超当前配置阈值但账户仍保持 enabled，
@@ -1837,7 +1850,7 @@ async def ensure_quota_fresh(account_key: str, *, timeout_s: float = 5.0) -> boo
         try:
             evaluate_and_toggle_by_usage(account_key, usage, expected_state_key=expected_state_key)
         except Exception as exc:
-            print(f"[oauth] ensure_quota_fresh evaluate failed for {account_key}: {exc}")
+            safe_diagnostics.report(exc, operation="ensure_quota_fresh")
     return True
 
 
@@ -1863,7 +1876,7 @@ def ensure_quota_fresh_sync(account_keys: list[str] | str, *,
         else:
             asyncio.run(ensure_quota_fresh_many(account_keys, timeout_s=timeout_s))
     except Exception as exc:
-        print(f"[oauth] ensure_quota_fresh_sync error: {exc}")
+        safe_diagnostics.report(exc, operation="ensure_quota_fresh_sync")
 
 
 # ─── 配额缓存辅助 ─────────────────────────────────────────────────
@@ -3181,7 +3194,7 @@ def _evaluate_antigravity_credits(
         try:
             result = set_disabled_by_quota(account_key, None, observation=observation)
         except Exception as exc:
-            print(f"[oauth] Antigravity quota disable failed: {type(exc).__name__}")
+            safe_diagnostics.report(exc, operation="evaluate_antigravity_credits")
             return {**base, "action": "disable_failed"}
         state = result.get("state")
         return {**base, "action": "still_over_quota" if state == "already_quota_disabled" else state,
@@ -3236,7 +3249,7 @@ def _evaluate_antigravity_credits(
             expected_quota_observation_generation=expected_quota_generation,
         )
     except Exception as exc:
-        print(f"[oauth] Antigravity quota resume failed: {type(exc).__name__}")
+        safe_diagnostics.report(exc, operation="evaluate_antigravity_credits")
         return {**base, "action": "resume_failed"}
     state = (result or {}).get("state")
     if state != "enabled":
@@ -3387,7 +3400,7 @@ def _evaluate_and_toggle_by_usage_current(account_key: str, usage: dict,
         try:
             disable_result = set_disabled_by_quota(account_key, latest_reset)
         except Exception as exc:
-            print(f"[oauth] evaluate WHAM disable failed for {account_key}: {exc}")
+            safe_diagnostics.report(exc, operation="evaluate_and_toggle_by_usage_current")
             return {"action": "disable_failed", "utils": utils,
                     "any_over": True, "hit_windows": hit_windows,
                     "disabled_until": None}
@@ -3430,7 +3443,7 @@ def _evaluate_and_toggle_by_usage_current(account_key: str, usage: dict,
         try:
             disable_result = set_disabled_by_quota(account_key, latest_reset)
         except Exception as exc:
-            print(f"[oauth] evaluate set_disabled_by_quota failed for {account_key}: {exc}")
+            safe_diagnostics.report(exc, operation="evaluate_and_toggle_by_usage_current")
             return {"action": "disable_failed", "utils": utils,
                     "any_over": True, "hit_windows": hit_windows,
                     "disabled_until": None}
@@ -3509,7 +3522,7 @@ def _evaluate_and_toggle_by_usage_current(account_key: str, usage: dict,
                 expected_quota_observation_generation=expected_quota_generation,
             )
         except Exception as exc:
-            print(f"[oauth] evaluate set_enabled failed for {account_key}: {exc}")
+            safe_diagnostics.report(exc, operation="evaluate_and_toggle_by_usage_current")
             return {"action": "resume_failed", "utils": utils,
                     "any_over": False, "hit_windows": [],
                     "disabled_until": acc.get("disabled_until"),
@@ -4004,10 +4017,12 @@ def _replace_exact_identity_in_config(
         result["status"] = "identity_conflict"
         return result
     accounts[index] = replacement
+    add_context.persist_account_route(cfg, expected_account_key)
     result.update(status="replaced", index=index, account=copy.deepcopy(replacement))
     return result
 
 
+@add_context.publication_guard
 def replace_exact_identity(
     expected_account_key: str,
     entry: dict,
@@ -4134,6 +4149,7 @@ def add_account(entry: dict) -> None:
         _add_account_serialized(entry)
 
 
+@add_context.publication_guard
 def add_account_if_identity_absent(entry: dict) -> dict:
     """Atomically add only while the incoming canonical identity is still absent."""
     incoming_key = _canonical_key(entry)
@@ -4529,6 +4545,7 @@ def _add_account_serialized(
                 )
             return
         accounts.append(normalized)
+        add_context.persist_account_route(cfg, normalized_key)
         added["v"] = True
 
     def rollback(cfg):
@@ -4586,6 +4603,7 @@ def _apply_import_candidate_to_config(
     return "added", str(result["account_key"])
 
 
+@add_context.publication_guard
 def commit_import_batch_if_unchanged(
     expected_accounts: list[dict],
     candidates: Iterable[dict],
@@ -4800,10 +4818,7 @@ def _best_effort_revoke_openai_accounts(accounts: Iterable[dict]) -> None:
         except Exception as exc:
             # Codex logout is explicitly best effort: credentials and all local
             # routing state must still be removed when auth.openai.com is down.
-            print(
-                f"[oauth] OpenAI revoke failed before local delete for "
-                f"{account_key}: {type(exc).__name__}"
-            )
+            safe_diagnostics.report(exc, operation="best_effort_revoke_openai_accounts")
 
 
 def _delete_account_serialized(account_key: str) -> None:
@@ -5134,7 +5149,7 @@ def _clear_oauth_runtime_state(canonical: str, *, clear_quota_cache: bool,
         out["cooldown_cleared"] = True
     except Exception as exc:
         out["cooldown_error"] = type(exc).__name__
-        print(f"[oauth] runtime clear cooldown failed for {canonical}: {exc}")
+        safe_diagnostics.report(exc, operation="clear_oauth_runtime_state")
 
     if clear_quota_cache:
         try:
@@ -5142,7 +5157,7 @@ def _clear_oauth_runtime_state(canonical: str, *, clear_quota_cache: bool,
             out["quota_cache_cleared"] = True
         except Exception as exc:
             out["quota_cache_error"] = type(exc).__name__
-            print(f"[oauth] runtime clear quota cache failed for {canonical}: {exc}")
+            safe_diagnostics.report(exc, operation="clear_oauth_runtime_state")
 
     try:
         from . import failover
@@ -5151,7 +5166,7 @@ def _clear_oauth_runtime_state(canonical: str, *, clear_quota_cache: bool,
         out["snapshots_cleared"] = True
     except Exception as exc:
         out["snapshot_error"] = type(exc).__name__
-        print(f"[oauth] runtime clear snapshot failed for {canonical}: {exc}")
+        safe_diagnostics.report(exc, operation="clear_oauth_runtime_state")
     forget_openai_probe(canonical)
     out["required_state_cleared"] = bool(
         out["cooldown_cleared"]
@@ -5202,7 +5217,7 @@ def reset_quota(account_key: str) -> dict:
                 canonical, True, expected_disabled_reason="quota",
             )
         except Exception as exc:
-            print(f"[oauth] reset quota enable failed for {canonical}: {exc}")
+            safe_diagnostics.report(exc, operation="reset_quota")
             return {
                 "action": "reset_failed",
                 "error_code": "account_enable_failed",
@@ -5302,7 +5317,7 @@ async def redeem_openai_rate_limit_reset_credit(account_key: str,
     try:
         usage = await fetch_usage_snapshot(canonical)
     except Exception as exc:
-        out["refresh_error"] = str(exc)
+        out["refresh_error"] = safe_diagnostics.summary(exc, operation="oauth_management", stage="redeem_openai_rate_limit_reset_credit")
         out["quota_action"] = {"action": "refresh_failed_keep_disabled"}
         return out
 
@@ -5472,7 +5487,7 @@ async def ensure_openai_metadata_fresh(account_key: str, *,
     except asyncio.TimeoutError:
         return {"action": "timeout", "account_key": account_key}
     except Exception as exc:
-        return {"action": "error", "account_key": account_key, "error": str(exc)}
+        return {"action": "error", "account_key": account_key, "error": safe_diagnostics.summary(exc, operation="oauth_management", stage="ensure_openai_metadata_fresh")}
 
 
 async def ensure_openai_metadata_fresh_many(account_keys: list[str], *,
@@ -5502,7 +5517,7 @@ def ensure_openai_metadata_fresh_sync(account_keys: list[str] | str, *,
                 timeout_s=timeout_s,
             ))
     except Exception as exc:
-        print(f"[oauth] ensure_openai_metadata_fresh_sync error: {exc}")
+        safe_diagnostics.report(exc, operation="ensure_openai_metadata_fresh_sync")
 
 
 def account_disabled_models(account_or_key: dict | str) -> set[str]:
@@ -6431,7 +6446,7 @@ async def oauth_model_sync_once(
                     key, timeout_s=OAUTH_MODEL_SYNC_REQUEST_TIMEOUT_SECONDS,
                 )
             except Exception as exc:
-                result = {"action": "error", "account_key": key, "error": str(exc)}
+                result = {"action": "error", "account_key": key, "error": safe_diagnostics.summary(exc, operation="oauth_management", stage="run")}
         if (
             notify_changes and trigger == "background"
             and result.get("action") == "updated"
@@ -6443,7 +6458,7 @@ async def oauth_model_sync_once(
                     Effect("confirmed", "catalog_updated"), source="model_sync",
                     observation=(notifications.subjects.account(snapshot), 0))
             except Exception as exc:
-                print(f"[oauth] model change notification failed: {type(exc).__name__}")
+                safe_diagnostics.report(exc, operation="run")
         return result
 
     results = await asyncio.gather(*(run(key, account) for key, account in selected))
@@ -6469,7 +6484,7 @@ async def oauth_model_sync_loop() -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            print(f"[oauth] model sync loop failed: {type(exc).__name__}: {exc}")
+            safe_diagnostics.report(exc, operation="oauth_model_sync_loop")
         await asyncio.sleep(OAUTH_MODEL_SYNC_CHECK_INTERVAL_SECONDS)
 
 
@@ -6690,6 +6705,7 @@ def build_login_url(code_challenge: str, state: str) -> str:
     return f"{OAUTH_AUTHORIZE_URL}?{urlencode(params)}"
 
 
+@diagnose('claude', 'login_complete', 'token_exchange')
 def exchange_code(code: str, code_verifier: str, state: str) -> dict:
     """用 authorization code 换 token（返回原始 token 响应）。"""
     if mock_mode_enabled():
@@ -6848,7 +6864,7 @@ def _build_refresh_notice(
             parts.append(line)
             parts.append(f"💵 {telegram_ui.fmt_cost(ts)}")
     except Exception as exc:
-        print(f"[oauth] monthly stats lookup failed: {exc}")
+        safe_diagnostics.report(exc, operation="build_refresh_notice")
     return "\n".join(parts)
 
 
@@ -6894,7 +6910,7 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
                     ak, min_interval_seconds=meta_interval, timeout_s=5.0,
                 )
             except Exception as exc:
-                print(f"[oauth] openai metadata refresh failed for {ak}: {exc}")
+                safe_diagnostics.report(exc, operation="proactive_refresh_once")
 
         expired = _token_expiry(acc)
         pending_save = _has_pending_refresh(account_state_key(acc))
@@ -6935,7 +6951,7 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
                     usage_flat = flatten_usage(usage)
                     state_db.quota_save(ak, usage_flat, email=email)
             except Exception as exc:
-                print(f"[oauth] usage fetch after refresh failed for {ak}: {exc}")
+                safe_diagnostics.report(exc, operation="proactive_refresh_once")
 
             reporting.refreshed(ak, observation=notification_observation)
         except Exception as exc:
@@ -6987,7 +7003,7 @@ async def quota_monitor_once() -> dict:
                 if latest and zhipu_runtime.c.fingerprint(latest) == zhipu_runtime.c.fingerprint(acc):
                     await asyncio.to_thread(zhipu_actions.auto_claim, ak, latest, cards)
             except Exception as exc:
-                print(f"[oauth] zhipu card maintenance failed: type={type(exc).__name__}")
+                safe_diagnostics.report(exc, operation="quota_monitor_once")
         try:
             usage = await fetch_usage_snapshot(ak)
         except Exception as exc:
@@ -7069,7 +7085,7 @@ async def preload_openai_reset_credit_details_once() -> dict[str, str]:
             raise
         except Exception as exc:
             out[ak] = f"failed:{type(exc).__name__}"
-            print(f"[oauth] startup quota preload failed for {ak}: {exc}")
+            safe_diagnostics.report(exc, operation="preload_openai_reset_credit_details_once")
     return out
 
 
@@ -7081,12 +7097,12 @@ async def proactive_refresh_loop() -> None:
             if os.environ.get("PARROT_NO_REFRESH") != "1":
                 await proactive_refresh_once()
         except Exception as exc:
-            print(f"[oauth_manager] proactive_refresh_once error: {exc}")
+            safe_diagnostics.report(exc, operation="proactive_refresh_loop")
         try:
             from .oauth.workbuddy.actions import auto_checkin_once
             await asyncio.to_thread(auto_checkin_once)
         except Exception as exc:
-            print(f"[oauth_manager] WorkBuddy auto-checkin error: {type(exc).__name__}")
+            safe_diagnostics.report(exc, operation="proactive_refresh_loop")
         await asyncio.sleep(60)
 
 
@@ -7105,7 +7121,7 @@ async def quota_monitor_loop() -> None:
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        print(f"[oauth_manager] startup quota preload error: {exc}")
+        safe_diagnostics.report(exc, operation="quota_monitor_loop")
 
     # Preserve the original stagger before the first quota-state evaluation.
     await asyncio.sleep(45)
@@ -7118,5 +7134,5 @@ async def quota_monitor_loop() -> None:
         try:
             await quota_monitor_once()
         except Exception as exc:
-            print(f"[oauth_manager] quota_monitor_once error: {exc}")
+            safe_diagnostics.report(exc, operation="quota_monitor_loop")
         await asyncio.sleep(int(monitor_cfg.get("intervalSeconds", 60)))

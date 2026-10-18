@@ -1,6 +1,8 @@
 """Search management: one sparse, secret-preserving config boundary for API/TG."""
 from __future__ import annotations
 
+from src.safe_diagnostics import diagnose
+
 import asyncio
 import copy
 import math
@@ -146,6 +148,7 @@ class SearchControl(DomainControl):
                          "credentialConfigured": bool((account.get("model_key") or account.get("project_key_id")) if provider == "zhipu" else account.get("access_token"))})
         return rows
 
+    @diagnose('search', 'settings', 'account_save')
     def _commit(self, context, action, mutate, expected_revision=None, *, read_back=True):
         self._write(context)
         try:
@@ -463,6 +466,7 @@ class SearchControl(DomainControl):
             })
         return result
 
+    @diagnose('search', 'test', 'request')
     async def test(self, context, backend_id, *, operation="search", query=None, url=None):
         self._write(context)
         self._backend(search_service.settings(), backend_id)

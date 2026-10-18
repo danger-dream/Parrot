@@ -12,13 +12,17 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from ...management_control import ManagementError
-from ...management_control.oauth import OAuthProvider
+from ...management_control.oauth import OAuthProvider, CompleteOAuthLoginCommand
+from ...management_control.oauth.account_mutations import OAuthReplaceRequired
+from . import oauth_add_session as add_session
 from ...management_control.oauth.menu_bridge import control as oauth_control, telegram_context
 from .. import menu_cache, states, ui
+from ... import safe_diagnostics
+from ...oauth.workbuddy import common as wb_common
 
 _BJT = timezone(timedelta(hours=8))
 _PREFIX = "oa:wb:"
-_NAV = {"back_label": "◀ 返回新增账户", "back_callback": "oa:add"}
+_NAV = {"back_label": "◀ 上一步", "back_callback": "oa:add:workbuddy"}
 _LOGIN_INTERVAL = 5.0
 _login_jobs: dict[int, dict] = {}
 _login_jobs_lock = threading.RLock()
@@ -66,7 +70,7 @@ def provider_line(account, *, detail=False):
     region = "中国区" if account.get("realm") == "cn" else "国际区"
     scope = "企业" if account.get("enterprise_id") else "个人"
     selection = oauth_control.account_model_selection_snapshot(account)
-    line = f"🏷️ 账户: {scope} · {region}"
+    line = f"🏷️ 账户: {scope} · {region} · {ui.escape_html(wb_common.route_label(account))}"
     if detail:
         disabled = len(set(selection.get("models") or []) & set(selection.get("disabled_models") or []))
         line += f"\n🧬 模型目录: {len(selection.get('effective_models') or [])} 个可用模型 · 禁用 {disabled}"
@@ -180,7 +184,8 @@ def _error(exc):
     code = getattr(getattr(exc, "code", None), "value", "UPSTREAM_ERROR")
     if code in {"REVISION_CONFLICT", "INVALID_OPERATION_STATE", "STATE_CONFLICT"}:
         return "⚠️ 确认已失效或账户发生变化，请返回页面重新确认。"
-    return "⚠️ 查询或操作未能完成；若请求已发出，结果可能未知，请先查询记录核对，不要重复提交。"
+    diagnostic = safe_diagnostics.report(exc, provider="workbuddy")
+    return "⚠️ " + ui.escape_html(safe_diagnostics.message(diagnostic) + safe_diagnostics.guidance(diagnostic))
 
 
 def _query_error_detail(error):
@@ -192,10 +197,12 @@ def _query_error_detail(error):
               "repeated_page": "资源包分页重复", "count_mismatch": "资源包数量不一致",
               "incomplete_pages": "资源包分页不完整", "page_limit": "资源包查询达到分页上限"}
     reason = "登录凭据已失效，请重新登录" if error.get("auth_error") else labels.get(kind, "上游查询失败")
+    if kind == "network" and not error.get("auth_error"):
+        reason = safe_diagnostics._KIND_TEXT.get(error.get("diagnostic_kind"), reason)
     details = []
     for field, label in (("http_status", "HTTP"), ("code", "code")):
         value = error.get(field)
-        if isinstance(value, int) and not isinstance(value, bool) and (field == "code" or value > 0):
+        if type(value) is int and ((field == "code" and safe_diagnostics.safe_code(value) != "unrecognized") or (field == "http_status" and 100 <= value <= 599)):
             details.append(f"{label} {value}")
     return reason + ("（" + "，".join(details) + "）" if details else "")
 
@@ -301,6 +308,10 @@ def result_text(record):
         return text
     if status == "already_done":
         return f"ℹ️ 上游确认{action}已完成，未重复提交。"
+    if status == "not_eligible":
+        return "ℹ️ 上游确认无签到资格；本日不再提交领取。"
+    if status == "activity_inactive":
+        return "ℹ️ 上游确认签到活动已结束；本日不再提交领取。"
     if status in {"pending", "unknown"}:
         return "⚠️ 结果未知，可能已提交；仅查询核对，不自动重放请求。"
     if status in {"failed", "rejected"}:
@@ -357,7 +368,7 @@ def render_activity(key, nav, *, chat_id=0, query_feedback=""):
         lines.append("⚠️ 账户已停用或认证失效，活动暂停。")
     rows = [[ui.btn("🔄 查询活动/余额", _cb("refresh_activity", nav)), ui.btn("📜 操作记录", _cb("records", nav))]]
     uncertain = prior and prior.get("status") in {"pending", "unknown"}
-    done = (prior and prior.get("status") in {"succeeded", "already_done"}) or (cn and checkin_label(snap) == "今日已签到")
+    done = (prior and prior.get("status") in {"succeeded", "already_done", "not_eligible", "activity_inactive"}) or (cn and checkin_label(snap) == "今日已签到")
     if uncertain:
         rows.append([ui.btn("🔎 核对结果（不重试）", _cb("refresh_activity", nav))])
     elif not done:
@@ -449,7 +460,7 @@ def _plan_action(chat_id, message_id, key, nav, *, allow_unknown=False, trial_co
             ui.edit(chat_id, message_id, _error(exc), reply_markup=ui.inline_kb([[ui.btn("◀ 返回活动", _cb("activity", nav))]]))
         return
     prior = plan.get("prior_result") or {}
-    if prior.get("status") in {"succeeded", "already_done", "pending", "unknown"} or (plan.get("observed_status") or {}).get("today_checked_in") is True:
+    if prior.get("status") in {"succeeded", "already_done", "not_eligible", "activity_inactive", "pending", "unknown"} or (plan.get("observed_status") or {}).get("today_checked_in") is True:
         text = result_text(prior) if prior else "ℹ️ 今日已签到，未重复提交。"
         ui.edit(chat_id, message_id, text, reply_markup=ui.inline_kb([[ui.btn("🔎 查询核对", _cb("refresh_activity", nav))], [_back(nav)]]))
         return
@@ -460,20 +471,25 @@ def _plan_action(chat_id, message_id, key, nav, *, allow_unknown=False, trial_co
     _confirm(chat_id, message_id, text=text, data={"kind": "action", "key": key, "nav": nav, "plan_token": plan["plan_token"]})
 
 
-def _login_start(chat_id, message_id, *, realm="cn", relogin=None):
+@add_session.start("workbuddy")
+def _login_start(chat_id, message_id, *, realm="cn", client_profile=None, relogin=None):
     discard_state(chat_id)
     try:
         flow = oauth_control.start_login_flow(telegram_context(chat_id), OAuthProvider.WORKBUDDY,
-            realm=realm, client_profile="ide" if realm == "global" else "cli",
+            realm=realm, client_profile=client_profile,
             **({"relogin_account_id": relogin["target_key"]} if relogin else {}))
     except Exception as exc:
-        ui.edit(chat_id, message_id, _error(exc), reply_markup=ui.inline_kb([[ui.btn(_parent()._login_nav(relogin)["back_label"], _parent()._login_cancel(relogin))]]))
+        ui.edit(chat_id, message_id, _error(exc), reply_markup=ui.inline_kb([[ui.btn(_parent()._login_nav(relogin, provider="workbuddy")["back_label"], _parent()._login_cancel(relogin, provider="workbuddy"))]]))
         return
+    route_account = (oauth_control.account_snapshot(relogin["target_key"]) if relogin else None) or {
+        "realm": realm, "workbuddy_client_profile": wb_common.login_profile(realm, client_profile)}
+    route = wb_common.route_label(route_account)
     data = _set_state(chat_id, "oa_wb_login", {"flow_id": flow.flow_id, "flow_secret": flow.flow_secret,
-        "realm": realm, "auth_url": flow.auth_url, "expires_at": flow.expires_at, "relogin": relogin})
+        "realm": realm, "workbuddy_client_profile": wb_common.profile_of(route_account),
+        "auth_url": flow.auth_url, "expires_at": flow.expires_at, "relogin": relogin})
     region = "国际区" if realm == "global" else "中国区"
     login_hint = "使用 Google / GitHub 在官方页面登录并授权。\n" if realm == "global" else ""
-    ui.edit(chat_id, message_id, f"🌐 <b>WorkBuddy {region}登录</b>\n{login_hint}在浏览器登录并授权后，后台每 5 秒自动检查，成功即保存并显示身份。同一身份重新登录只更新授权，保留原有设置。\n有效期 5 分钟。" + _parent()._login_hint(relogin),
+    ui.edit(chat_id, message_id, f"🌐 <b>WorkBuddy {region}登录</b>\n路线: {ui.escape_html(route)}\n{login_hint}在浏览器登录并授权后，后台每 5 秒自动检查，成功即保存并显示身份。同一身份重新登录只更新授权，保留原有设置。\n有效期 5 分钟。" + _parent()._login_hint(relogin),
         reply_markup=ui.inline_kb([[{"text": "🌐 打开授权页面", "url": flow.auth_url}],
             [ui.btn("🔎 检查登录", _PREFIX + "poll:" + data["nonce"])],
             [ui.btn("❌ 取消", _PREFIX + "cancel:" + data["nonce"])]]))
@@ -494,11 +510,12 @@ def _login_feedback(data, poll=None, error=None):
         text += "\n" + ui.escape_html(str(preview.get("label") or preview.get("nickname") or preview.get("uid") or "WorkBuddy"))
         region = "国际区" if preview.get("realm", data.get("realm")) == "global" else "中国区"
         text += f"\n区域: {region} · " + ("企业" if preview.get("enterprise_id") else "个人")
+        text += "\n路线: " + ui.escape_html(wb_common.route_label({**data, **preview}))
         text += "\n模型和额度以各自最新同步状态为准，后续同步失败不会回滚已保存授权。"
         return text, ui.inline_kb([[ui.btn("查看账户", "oa:view:" + ui.register_code(poll.account_id) + ":1")],
                                   [ui.btn("◀ 返回列表", "menu:oauth")]])
     if status in {"cancelled", "expired"}:
-        return "ℹ️ 登录流程已取消或过期，请重新开始。", ui.inline_kb([[ui.btn(_parent()._login_nav(data.get("relogin"))["back_label"], _parent()._login_cancel(data.get("relogin")))]])
+        return "ℹ️ 登录流程已取消或过期，请重新开始。", ui.inline_kb([[ui.btn(_parent()._login_nav(data.get("relogin"), provider="workbuddy")["back_label"], _parent()._login_cancel(data.get("relogin"), provider="workbuddy"))]])
     text = "⌛ 等待浏览器授权，后台自动检查中；成功后直接保存。"
     if status == "identity_pending":
         text = "⌛ 已取得授权，正在自动确认账户身份；仅继续获取身份，不重复获取 Token。"
@@ -518,7 +535,22 @@ def _run_login_job(chat_id, job):
             job["wake"].clear()
             poll, error = None, None
             try:
+                if data.pop("replace_confirmed", False):
+                    owner.complete_login_flow(telegram_context(chat_id), data["flow_id"], data["flow_secret"],
+                        CompleteOAuthLoginCommand(completed=True, replace_plan_token=data["replace_plan_token"]))
+                    data.pop("replace_plan_token", None)
                 poll = owner.poll_login_flow(telegram_context(chat_id), data["flow_id"], data["flow_secret"])
+            except OAuthReplaceRequired as exc:
+                data["replace_plan_token"] = exc.plan_token
+                job["awaiting_confirm"] = True
+                def confirm():
+                    if _state(chat_id, data["nonce"], "oa_wb_login") is data:
+                        ui.edit(chat_id, job["message_id"], "账户已存在。是否覆盖凭据并将本次选择保存为该账户代理？取消不修改账户。",
+                            reply_markup=ui.inline_kb([
+                                [ui.btn("✅ 确认覆盖", _PREFIX + "replace:" + data["nonce"])],
+                                [ui.btn("❌ 取消", _PREFIX + "cancel:" + data["nonce"])]]))
+                menu_cache.run_if_current(chat_id, job["message_id"], job["view_token"], confirm)
+                break
             except Exception as exc:
                 error = exc
             rejected_target = bool(data.get("relogin")) and getattr(getattr(error, "code", None), "value", "") in {
@@ -531,7 +563,7 @@ def _run_login_job(chat_id, job):
                 text = "❌ 登录身份不匹配或原账户已变化；未修改或新增账户。请返回原账户重新登录。"
                 kb = ui.inline_kb([[ui.btn("◀ 返回账户", _parent()._login_cancel(data["relogin"]))]])
             if expired:
-                text, kb = "ℹ️ 登录等待已到期，请重新开始。", ui.inline_kb([[ui.btn(_parent()._login_nav(data.get("relogin"))["back_label"], _parent()._login_cancel(data.get("relogin")))]])
+                text, kb = "ℹ️ 登录等待已到期，请重新开始。", ui.inline_kb([[ui.btn(_parent()._login_nav(data.get("relogin"), provider="workbuddy")["back_label"], _parent()._login_cancel(data.get("relogin"), provider="workbuddy"))]])
             with _login_jobs_lock:
                 message_id, token = job["message_id"], job["view_token"]
             render_key = (message_id, token, text)
@@ -566,7 +598,7 @@ def _login_poll(chat_id, message_id, data):
     token = menu_cache.begin_view(chat_id, message_id)
     with _login_jobs_lock:
         job = _login_jobs.get(chat_id)
-        if job and job["data"] is data and not job["stop"].is_set():
+        if job and job["data"] is data and not job["stop"].is_set() and not job.get("awaiting_confirm"):
             job.update(message_id=message_id, view_token=token)
             job["wake"].set()
             return
@@ -589,7 +621,8 @@ def reject_removed_import(chat_id):
     ui.send(chat_id, "ℹ️ WorkBuddy JSON 导入已移除，中国区和国际区均请使用网页登录；已有账户不受影响。",
         reply_markup=ui.inline_kb([
             [ui.provider_button("WorkBuddy 中国区登录", "oa:wb:login", "workbuddy")],
-            [ui.provider_button("WorkBuddy 国际区登录", "oa:wb:login:global", "workbuddy")],
+            [ui.provider_button("WorkBuddy 国际 CLI 登录", "oa:wb:login:global", "workbuddy")],
+            [ui.provider_button("CodeBuddy IDE 国际登录", "oa:wb:login:global:ide", "workbuddy")],
             [ui.btn("◀ 返回新增账户", "oa:add")]]))
 
 
@@ -602,9 +635,10 @@ def handle_callback(chat_id, message_id, cb_id, callback):
     if kind == "noop":
         return True
     if kind == "login":
-        realm = "cn" if len(parts) == 1 else parts[1] if len(parts) == 2 else ""
-        if realm in {"cn", "global"}:
-            _login_start(chat_id, message_id, realm=realm)
+        realm = "cn" if len(parts) == 1 else parts[1] if len(parts) in {2, 3} else ""
+        profile = parts[2] if len(parts) == 3 else None
+        if realm in {"cn", "global"} and (profile is None or (realm == "global" and profile == "ide")):
+            _login_start(chat_id, message_id, realm=realm, client_profile=profile)
         return True
     if kind == "import" or kind.startswith("import_"):
         reject_removed_import(chat_id)
@@ -626,9 +660,13 @@ def handle_callback(chat_id, message_id, cb_id, callback):
             elif nav and _resolve(nav):
                 _show_activity(chat_id, message_id, _resolve(nav), nav)
             else:
-                _parent().on_add_menu(chat_id, message_id, "")
+                _parent().on_add_workbuddy(chat_id, message_id, "")
         elif action == "oa_wb_login" and kind in {"poll", "save", "replace"}:
-            # Old save/replace buttons now wake the same automatic flow.
+            if data.get("replace_plan_token"):
+                if kind != "replace":
+                    return True
+                data["replace_confirmed"] = True
+            # Old save/replace buttons still wake the same bounded worker.
             _login_poll(chat_id, message_id, data)
         elif kind in {"terms", "unknown"} and action == ("oa_wb_terms" if kind == "terms" else "oa_wb_unknown"):
             states.pop_state(chat_id)

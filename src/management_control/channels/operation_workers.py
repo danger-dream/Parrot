@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from typing import Any
+from src import safe_diagnostics
 from ..context import ManagementContext
 from ..errors import ManagementError, ManagementErrorCode
 from .models import DiscoveryCommand, DraftProbeCommand
@@ -26,11 +27,13 @@ class ChannelOperationWorkers:
         assert self._operation_store is not None
         self._operation_store.mark_running(operation_id)
         try:
-            result = await self.discover_model_ids(context, command)
+            with safe_diagnostics.collect_failures() as failures:
+                result = await self.discover_model_ids(context, command)
             if not result.models:
                 self._operation_store.fail(
                     operation_id, code=ManagementErrorCode.UPSTREAM_ERROR,
                     message=ManagementErrorCode.UPSTREAM_ERROR.value, retryable=result.retry_available,
+                    diagnostic=failures[-1] if failures else None,
                 )
             else:
                 self._operation_store.succeed(operation_id, asdict(result))
@@ -56,9 +59,10 @@ class ChannelOperationWorkers:
         assert self._operation_store is not None
         self._operation_store.mark_running(operation_id)
         try:
-            result = await self.probe_draft(context, command)
+            with safe_diagnostics.collect_failures() as failures:
+                result = await self.probe_draft(context, command)
             public = asdict(result)
-            public["reason"] = None if result.ok else "PROBE_FAILED"
+            public["reason"] = None if result.ok else safe_diagnostics.message(failures[-1]) if failures else "PROBE_FAILED"
             self._operation_store.succeed(operation_id, public)
         except ManagementError as exc:
             self._operation_store.fail(operation_id, code=exc.code, message=exc.code.value)
@@ -80,11 +84,12 @@ class ChannelOperationWorkers:
         assert self._operation_store is not None
         self._operation_store.mark_running(operation_id)
         try:
-            result = await self.probe_existing(
-                context, payload["channel_id"], payload["model"]
-            )
+            with safe_diagnostics.collect_failures() as failures:
+                result = await self.probe_existing(
+                    context, payload["channel_id"], payload["model"]
+                )
             public = asdict(result)
-            public["reason"] = None if result.ok else "PROBE_FAILED"
+            public["reason"] = None if result.ok else safe_diagnostics.message(failures[-1]) if failures else "PROBE_FAILED"
             self._operation_store.succeed(operation_id, public)
         except ManagementError as exc:
             self._operation_store.fail(operation_id, code=exc.code, message=exc.code.value)

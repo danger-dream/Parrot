@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from src import safe_diagnostics
+
 import asyncio
 import re
 from dataclasses import dataclass
@@ -665,7 +667,9 @@ class ProxyControl(DomainControl):
             },
             "error": None if ok else {
                 "code": ManagementErrorCode.UPSTREAM_ERROR.value,
-                "message": "Proxy probe failed",
+                "message": ("代理连接测试：" + safe_diagnostics._KIND_TEXT[item["diagnostic_kind"]] + "；请核对网络、代理或 TLS 配置。"
+                            if isinstance(item.get("diagnostic_kind"), str) and item["diagnostic_kind"] in safe_diagnostics._KIND_TEXT
+                            else "Proxy probe failed"),
             },
         }
         if member_name is not None:

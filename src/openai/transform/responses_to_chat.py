@@ -670,6 +670,7 @@ def translate_response(chat: dict, *, model: str,
                        current_input_items: Optional[list] = None,
                        output_item_transform=None,
                        output_prefix: Optional[list[dict]] = None,
+                       output_suffix: Optional[list[dict]] = None,
                        output_ordering=None) -> dict:
     """Chat 非流式 JSON → Responses 非流式 JSON。
 
@@ -762,6 +763,7 @@ def translate_response(chat: dict, *, model: str,
             "status": "completed",
         })
 
+    output_items.extend(output_suffix or [])
     status, incomplete = _finish_reason_to_status(finish_reason, bool(msg.get("tool_calls")))
 
     if output_ordering is not None:

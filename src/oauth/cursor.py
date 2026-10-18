@@ -7,6 +7,8 @@ reverse-engineered Cursor AgentService bridge in :mod:`src.cursor_bridge`.
 
 from __future__ import annotations
 
+from src.safe_diagnostics import diagnose
+
 import base64
 import hashlib
 import json
@@ -54,10 +56,12 @@ def _http_client(*, account_key: str = "", timeout: float = 20.0) -> httpx.Clien
     )
 
 
+@diagnose('cursor', 'login_init', 'login_init')
 def generate_login() -> CursorAuthParams:
     return generate_auth_params()
 
 
+@diagnose('cursor', 'login_poll', 'token_poll', expected=(CursorAuthPending,))
 def poll_login_once(login_uuid: str, verifier: str) -> CursorTokens:
     if _mock_mode_enabled():
         now = int(time.time() * 1000)
@@ -70,6 +74,7 @@ def poll_login_once(login_uuid: str, verifier: str) -> CursorTokens:
         return poll_cursor_auth_once(login_uuid, verifier, client=client)
 
 
+@diagnose('cursor', 'refresh', 'token_refresh')
 def refresh_sync(refresh_token: str, *, account_key: str = "", **_kwargs) -> dict[str, Any]:
     if _mock_mode_enabled():
         now = int(time.time() * 1000)
@@ -139,6 +144,7 @@ def _normalize_profile(raw: dict[str, Any]) -> dict[str, Any]:
     return profile
 
 
+@diagnose('cursor', '', 'profile_fetch', emit=False)
 def fetch_profile_sync(
     access_token: str, *, account_key: str = "", timeout: float = 20.0,
 ) -> dict[str, Any]:
@@ -166,12 +172,16 @@ def fetch_profile_sync(
     except httpx.HTTPError as exc:
         raise classify_cursor_failure("Cursor 账号资料请求失败") from exc
     if response.status_code in {401, 403}:
-        raise CursorAuthError(f"Cursor 账号资料未授权 ({response.status_code})")
+        error = CursorAuthError(f"Cursor 账号资料未授权 ({response.status_code})")
+        error.response_status = response.status_code
+        raise error
     if not response.is_success:
-        raise classify_cursor_failure(
+        error = classify_cursor_failure(
             f"Cursor 账号资料接口返回 HTTP {response.status_code}",
             http_status=response.status_code,
         )
+        error.response_status = response.status_code
+        raise error
     try:
         raw = response.json()
     except ValueError as exc:

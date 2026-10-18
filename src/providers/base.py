@@ -55,6 +55,9 @@ class ProviderAdapter:
         """
         if not isinstance(payload, dict):
             return {}
+        if self.name != "workbuddy-oauth":
+            from .workbuddy_replay import strip_foreign
+            payload = strip_foreign(payload, protocol)
         if protocol == "openai-responses":
             from ..openai.anthropic_reasoning_replay import without_native_items
             payload = without_native_items(payload)
@@ -120,6 +123,10 @@ class WorkBuddyOAuthAdapter(ProviderAdapter):
         if converter is None:
             raise ValueError("WorkBuddy response requires its per-attempt stream decoder")
         return converter.feed(chunk)
+
+    async def finish_response_bytes(self, ctx: ProviderAttemptContext) -> bytes:
+        converter = (ctx.translator_ctx or {}).get("workbuddy_stream")
+        return converter.finish() if converter is not None else b""
 
 
 class OpenAICodexAdapter(ProviderAdapter):

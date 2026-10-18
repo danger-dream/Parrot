@@ -1,0 +1,14 @@
+data: {"id":"chatcmpl-02fixtext","created":1760000100,"model":"primary-model","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-02fixtext","created":1760000100,"model":"primary-model","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"Trivial question, answer directly."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-02fixtext","created":1760000100,"model":"primary-model","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"a.py defines "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-02fixtext","created":1760000100,"model":"primary-model","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"a helper module."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-02fixtext","created":1760000100,"model":"primary-model","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-02fixtext","created":1760000100,"model":"primary-model","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":412,"completion_tokens":36,"total_tokens":448,"prompt_tokens_details":{"cached_tokens":256},"completion_tokens_details":{"reasoning_tokens":12},"prompt_cache_hit_tokens":256,"prompt_cache_miss_tokens":156,"prompt_cache_write_tokens":0,"cache_read_input_tokens":256,"cache_creation_input_tokens":0,"reasoning_tokens":12,"credit":4}}
+
+data: [DONE]
+

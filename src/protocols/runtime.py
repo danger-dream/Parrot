@@ -145,6 +145,8 @@ def _make_stream_translator(translator_ctx: Optional[dict]):
         )
     if name == "responses_to_chat":
         from ..openai.transform.stream_c2r import StreamTranslator as _C2R
+        if translator_ctx.get("workbuddy_replay"):
+            from ..providers.workbuddy_bridge import ResponsesStream as _C2R
         return _C2R(
             model=model,
             previous_response_id=translator_ctx.get("previous_response_id"),
@@ -154,6 +156,8 @@ def _make_stream_translator(translator_ctx: Optional[dict]):
         )
     if name == "anthropic_to_chat":
         from ..openai.transform.stream_chat_to_anthropic import StreamTranslator as _C2A
+        if translator_ctx.get("workbuddy_replay"):
+            from ..providers.workbuddy_bridge import AnthropicStream as _C2A
         return _C2A(model=model, model_override=translator_ctx.get("response_model_override"), request_body=translator_ctx.get("request_body"))
     if name == "anthropic_to_responses":
         from ..openai.transform.stream_responses_to_anthropic import StreamTranslator as _R2A
@@ -208,6 +212,13 @@ def apply_non_stream_response_translator(obj: dict, translator_ctx: dict) -> dic
         return _t(apply_responses_stop(obj, translator_ctx.get("request_body")), model=model)
     if name == "responses_to_chat":
         from ..openai.transform.responses_to_chat import translate_response as _t2
+        suffix = []
+        if translator_ctx.get("workbuddy_replay"):
+            from ..providers.workbuddy_replay import response_item
+            msg = ((obj.get("choices") or [{}])[0].get("message") or {})
+            item = response_item(msg)
+            suffix = [item] if item else []
+            obj = {**obj, "choices": [{**c, "message": {k: v for k, v in (c.get("message") or {}).items() if k not in ("reasoning", "reasoning_content")}} for c in obj.get("choices") or []]}
         return _t2(
             obj,
             model=model,
@@ -215,11 +226,18 @@ def apply_non_stream_response_translator(obj: dict, translator_ctx: dict) -> dic
             api_key_name=translator_ctx.get("api_key_name"),
             channel_key=translator_ctx.get("channel_key"),
             current_input_items=translator_ctx.get("current_input_items"),
+            output_suffix=suffix,
         )
     if name == "anthropic_to_chat":
         from ..openai.transform.anthropic_to_chat import translate_response as _t3
         from ..openai.transform.anthropic_compat import apply_stop_sequences
-        return apply_stop_sequences(_t3(obj, model=model), translator_ctx.get("request_body"))
+        result = _t3(obj, model=model)
+        if translator_ctx.get("workbuddy_replay"):
+            from ..providers.workbuddy_replay import thinking_block
+            item = thinking_block(((obj.get("choices") or [{}])[0].get("message") or {}))
+            if item:
+                result["content"].append(item)
+        return apply_stop_sequences(result, translator_ctx.get("request_body"))
     if name == "chat_to_anthropic":
         from ..openai.transform.chat_to_anthropic import translate_response as _t4
         return _t4(obj, model=model)
@@ -698,6 +716,12 @@ def bounded_account_quota_error(result: AttemptResult, channel: Any = None) -> d
         status = int(getattr(result, "http_status", None) or 0)
     except (TypeError, ValueError):
         return None
+    if str(getattr(channel, "provider", "")) == "workbuddy":
+        from ..providers.workbuddy_errors import quota_code
+        code = quota_code(result)
+        if code:
+            return {"classification": "balance_exhausted", "code": code,
+                    "message": "WorkBuddy account quota exhausted"}
     if status not in (402, 403, 429):
         return None
     if status == 429 and str(getattr(channel, "provider", "")) == "antigravity":
@@ -799,6 +823,10 @@ def retryable_transient_error_kind(channel: Any, result: AttemptResult) -> str |
         return None
     if getattr(result, "outcome", None) not in _RETRYABLE_TRANSIENT_OUTCOMES:
         return None
+    if str(getattr(channel, "provider", "")) == "workbuddy":
+        from ..providers.workbuddy_errors import quota_code
+        if quota_code(result):
+            return None
     try:
         status = int(getattr(result, "http_status", None) or 0)
     except (TypeError, ValueError):

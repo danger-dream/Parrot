@@ -348,7 +348,14 @@ EXPECTED = {case["caseId"]: case for case in _cases() if case["capabilityId"].st
 @pytest.mark.parametrize("case_name", CASE_NAMES)
 def test_proxy_and_routing_strict_trace(case_name, monkeypatch):
     assert case_name in EXPECTED, f"missing fixture case {case_name}"
-    assert_strict_equal(EXPECTED[case_name], _actual(case_name, monkeypatch))
+    expected = deepcopy(EXPECTED[case_name])
+    # Only the formerly raw exception text is replaced; call order/state stays frozen.
+    for call in expected.get("tgApi", []):
+        payload = call.get("payload", {})
+        if isinstance(payload.get("text"), str):
+            for old in ("fake transport exploded", "fake group exploded"):
+                payload["text"] = payload["text"].replace(old, "proxy / 上游请求：未分类异常，具体原因尚不确定。")
+    assert_strict_equal(expected, _actual(case_name, monkeypatch))
 
 
 def _normalize_callback(value: str) -> str:

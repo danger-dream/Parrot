@@ -6,6 +6,7 @@ import copy
 from collections.abc import Iterable
 
 from src.management_auth.principal import Capability
+from src.safe_diagnostics import summary
 from src.management_control.errors import ManagementError, ManagementErrorCode
 from src.oauth.openai_import import OpenAIImportCandidate as ParsedImportCandidate
 
@@ -74,7 +75,7 @@ class OAuthImportControlMixin:
                 OAuthImportProblem(
                     index=None,
                     code="PARSE_FAILED",
-                    message=type(exc).__name__,
+                    message=summary(exc, operation="import", stage="import_parse"),
                 )
             )
 
@@ -105,7 +106,7 @@ class OAuthImportControlMixin:
                     OAuthImportProblem(
                         index=index,
                         code="INVALID_CANDIDATE",
-                        message=type(exc).__name__,
+                        message=summary(exc, operation="import", stage="import_validate"),
                     )
                 )
                 continue

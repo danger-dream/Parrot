@@ -192,10 +192,11 @@ WorkBuddy 新增账号仅提供“中国区登录”“国际区登录”，不�
 
 ### 客户端身份与模型来源
 
-- WorkBuddy 请求补 `X-IDE-Type/Name/Version`：中国区及存量国际区 CLI 为 `CLI / 2.63.2`；国际 IDE 聊天为 `IDE / 2.108.1`，认证／查询沿原 `IDE / 2.63.2`。CLI 聊天补 `X-Agent-Intent: craft`，IDE 聊天保留 `x-codebuddy-request: 1`。不换主机或混用 Token，刷新凭据仍只发刷新端点。
+- WorkBuddy 请求补 `X-IDE-Type/Name/Version`：中国区及存量国际区 CLI 为 `CLI / 2.63.2`；国际 IDE 聊天为 `IDE / 2.108.1`，认证／额度查询沿原 `IDE / 2.63.2`。国际 IDE 模型查询单独使用 `CodeBuddyIDE / 4.12.1`，User-Agent 为 `CodeBuddyIDE/4.12.1`。CLI 聊天补 `X-Agent-Intent: craft`，IDE 聊天保留 `x-codebuddy-request: 1`。不换主机或混用 Token，刷新凭据仍只发刷新端点。
 - 聊天最前补 `system: You are CodeBuddy Code.`；原 system/developer 原样保留，不删除、不迁到 user、不清理正文，也不强制 high。已有相同首条身份提示不重复注入。这是客户端兼容身份提示，不宣称能保证不被识别。
-- 主模型源仍为 `/console/enterprises/personal/models`；只有 HTTP 404/405 才请求同账户／同主机／同 profile 的 `/v3/config`，且必须验证有效、非空的客户端模型目录。不合并两个来源；401/403/429/5xx、业务错误或 200 缺目录不会触发切源。失败保留最后成功目录及用户选择。
-- 已实测的国际区主目录 500、备用 200 无模型目录仍是未解决问题，不能把本轮兼容处理当作该问题已解决。
+- 中国区及存量国际区 CLI 主模型源仍为 `/console/enterprises/personal/models`；只有 HTTP 404/405 才请求同账户／同主机／同 profile 的 `/v3/config`，取 `agents[name=cli].models` 与未禁用的模型记录交集。不合并两个来源；401/403/429/5xx、业务错误或 200 缺目录不会触发切源。失败保留最后成功目录及用户选择。
+- 国际 IDE 直接请求 `www.codebuddy.ai/v3/config`，取 `agents[name=craft].models` 与未禁用的模型记录交集，不混入补全、图片、其他 agent 或客户端内置模型。不回退旧 personal/models 接口。HTTP 200 但缺少有效非空目录仍视为失败，不生成静态名单。
+- 国际区协议依据为官方 CodeBuddy IDE `4.12.1.39217423` 内置 `genie` 扩展：`CloudProductManagerImpl` 请求 `/v3/config`，产品平台为 `CodeBuddyIDE`。实测旧 `IDE/2.63.2 CodeBuddy/2.63.2` User-Agent 仅返回功能配置，`CodeBuddyIDE/4.12.1` 返回包含 `models` 和 `craft` 的目录；旧 personal/models 接口仍返回 500。模型查询标识独立于既有登录、刷新、聊天和额度查询标识。
 
 ### 自动签到：两轮机会，而非两次提交
 

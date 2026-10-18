@@ -142,6 +142,9 @@ def audit_failures(action: str, *, target_arg: str | None = None, target: str = 
     def decorate(method):
         signature = inspect.signature(method)
 
+        from src.safe_diagnostics import diagnose
+
+        @diagnose(operation=action, stage=action)
         @functools.wraps(method)
         def wrapped(self, *args, **kwargs):
             context = args[0] if args else kwargs.get("context")

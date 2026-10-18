@@ -120,7 +120,8 @@ def _build_snapshot(cfg: dict, previous: _ProxySnapshot) -> _ProxySnapshot:
                 connector.stats = old_stats[name]
             connectors[name] = connector
         except Exception as exc:
-            print(f"[proxy] failed to build connector '{name}': {exc}")
+            from ..safe_diagnostics import report
+            report(exc, stage="client_build")
 
     groups: dict[str, tuple[Any, ...]] = {}
     raw_groups = net.get("groups") or {}
@@ -406,11 +407,11 @@ async def create_client_with_failover(
         except Exception as e:
             last_err = e
             conn.stats.total_failures += 1
-            conn.stats.last_error = str(e)[:200]
-            print(f"[proxy] {pname} failed: {e}, trying next...")
+            from ..safe_diagnostics import summary
+            conn.stats.last_error = summary(e, stage="client_build")
             continue
 
-    raise ProxyConnectError(f"all proxies failed, last error: {last_err}")
+    raise ProxyConnectError("all proxy clients failed") from last_err
 
 
 async def test_proxy(name: str, *, timeout: float = 8.0) -> dict:

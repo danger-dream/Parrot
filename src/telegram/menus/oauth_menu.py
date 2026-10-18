@@ -24,6 +24,8 @@ mockMode 保护（`config.oauth.mockMode=true` 或 env DISABLE_OAUTH_NETWORK_CAL
 
 from __future__ import annotations
 
+from src import safe_diagnostics
+
 import asyncio
 import calendar
 import concurrent.futures
@@ -59,6 +61,7 @@ from ...management_control.oauth.menu_bridge import (
     update_checker,
 )
 from .. import menu_cache, states, ui
+from . import oauth_add_session as add_session
 from . import main as main_menu
 from . import workbuddy_oauth_menu as workbuddy_menu
 from . import zhipu_oauth_menu as zhipu_menu
@@ -221,7 +224,7 @@ def _foreground_account_model_sync(
         except concurrent.futures.TimeoutError:
             result = {"action": "error" if future.done() else "foreground_timeout", "account_key": account_key, "error": "timeout"}
         except Exception as exc:
-            result = {"action": "error", "account_key": account_key, "error": str(exc)}
+            result = {"action": "error", "account_key": account_key, "error": safe_diagnostics.summary(exc, operation="oauth_management", stage="finish")}
 
         if subjects.current(notification_subject) is None:
             return  # deleted/replaced while waiting: never update a new incarnation's UI
@@ -352,6 +355,7 @@ def on_oauth_overwrite_cancel(chat_id: int, message_id: int, cb_id: str, nonce: 
             reply_markup=ui.inline_kb([[ui.btn("◀ 返回新增账户", "oa:add")]]))
 
 
+@add_session.resume
 def on_oauth_overwrite_confirm(chat_id: int, message_id: int, cb_id: str, nonce: str) -> None:
     # Consume before touching config so double-click can never repeat a replace.
     data = _overwrite_state(chat_id, nonce, consume=True)
@@ -458,7 +462,7 @@ def _evaluate_quota_action(
     try:
         return oauth_control.evaluate_usage(_management_context(chat_id), ak, usage)
     except Exception as exc:
-        print(f"[oauth_menu] quota evaluate failed for {ak}: {exc}")
+        safe_diagnostics.report(exc, operation="evaluate_quota_action")
         return None
 
 
@@ -775,7 +779,7 @@ def _schedule_openai_metadata_for_ui(account_keys: list[str] | str, *, force: bo
                 pending, force=force, min_interval_seconds=3600, timeout_s=5.0,
             )
         except Exception as exc:
-            print(f"[oauth_menu] background openai metadata refresh failed: {exc}")
+            safe_diagnostics.report(exc, operation="worker")
         finally:
             with _METADATA_REFRESH_LOCK:
                 for k in pending:
@@ -816,7 +820,7 @@ def _schedule_oauth_cache_refresh_for_ui(
                     print(f"[oauth_menu] background quota refresh failed for {ak}: {result.get('error')}")
                     continue
             except Exception as exc:
-                print(f"[oauth_menu] background quota refresh error for {ak}: {exc}")
+                safe_diagnostics.report(exc, operation="worker")
             finally:
                 with _BACKGROUND_REFRESH_LOCK:
                     _BACKGROUND_REFRESH_INFLIGHT.discard(ak)
@@ -2641,7 +2645,7 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL, *,
         try:
             oauth_control.evaluate_cached_quota_raw(account_key)
         except Exception as exc:
-            print(f"[oauth_menu] cached quota evaluate failed for {account_key}: {exc}")
+            safe_diagnostics.report(exc, operation="list_text_and_kb")
     if account_keys:
         accounts_all = oauth_control.account_entries_snapshot()
     total_all = len(accounts_all)
@@ -2936,7 +2940,7 @@ def _converge_cached_quota_state() -> None:
         try:
             oauth_control.evaluate_cached_quota_raw(account_key)
         except Exception as exc:
-            print(f"[oauth_menu] cached quota evaluate failed for {account_key}: {exc}")
+            safe_diagnostics.report(exc, operation="converge_cached_quota_state")
 
 
 def _schedule_list_stats(
@@ -3352,7 +3356,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         try:
             oauth_control.evaluate_cached_quota_raw(account_key)
         except Exception as exc:
-            print(f"[oauth_menu] cached quota evaluate failed for {account_key}: {exc}")
+            safe_diagnostics.report(exc, operation="detail_text_and_kb")
         acc = oauth_control.account_snapshot(account_key) or acc
         if _should_refresh_account_for_ui(acc):
             if actor_chat_id is None:
@@ -4313,7 +4317,7 @@ def on_cursor_disable_save(
             visible_models=data.get("models") or [],
         )
     except ValueError as exc:
-        ui.answer_cb(cb_id, str(exc), show_alert=True)
+        ui.answer_cb(cb_id, safe_diagnostics.summary(exc, operation="oauth_management", stage="on_cursor_disable_save"), show_alert=True)
         return
     states.pop_state(chat_id)
     ui.answer_cb(cb_id, f"已禁用 {len(saved)} 个 Cursor 模型")
@@ -4496,7 +4500,7 @@ def on_cursor_max_context_toggle(chat_id: int, message_id: int, cb_id: str, payl
             _management_context(chat_id), account_key, model_id, not current,
         )
     except ValueError as exc:
-        ui.answer_cb(cb_id, str(exc), show_alert=True)
+        ui.answer_cb(cb_id, safe_diagnostics.summary(exc, operation="oauth_management", stage="on_cursor_max_context_toggle"), show_alert=True)
         return
     ui.answer_cb(cb_id, f"Max Context 默认已{'开启' if saved else '关闭'}")
     on_cursor_model_detail(chat_id, message_id, "", f"{ref}:{page}")
@@ -4874,7 +4878,7 @@ def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str, page: 
         oauth_control.delete_account(_management_context(chat_id), ak)
     except Exception as exc:
         ui.answer_cb(cb_id, "删除失败")
-        ui.send(chat_id, f"❌ 删除失败: <code>{ui.escape_html(str(exc))}</code>")
+        ui.send(chat_id, f"❌ 删除失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="on_delete_exec"))}</code>")
         return
     ui.answer_cb(cb_id, "已删除")
     extra = ""
@@ -5017,7 +5021,7 @@ def _run_oauth_update_panel(chat_id: int, progress_mid: int, account_keys: list[
                 _set_item(idx0, ak, "  ✅ 刷新成功")
         except Exception as exc:
             fail_count += 1
-            items[idx0] = _progress_account_block(ak, idx0 + 1, f"  ❌ 更新异常: <code>{ui.escape_html(str(exc))[:120]}</code>")
+            items[idx0] = _progress_account_block(ak, idx0 + 1, f"  ❌ 更新异常: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="run_oauth_update_panel"))[:120]}</code>")
             _flush()
         finally:
             with _BACKGROUND_REFRESH_LOCK:
@@ -5057,7 +5061,7 @@ def _run_oauth_update_panel(chat_id: int, progress_mid: int, account_keys: list[
                         page, filter_key, view_token,
                     )
     except Exception as exc:
-        print(f"[oauth_menu] final panel render failed: {exc}")
+        safe_diagnostics.report(exc, operation="run_oauth_update_panel")
 
     if send_fallback_summary:
         ui.send(chat_id, _build_oauth_update_panel(
@@ -5244,7 +5248,7 @@ def _run_refresh_all_legacy_panel(chat_id: int, progress_mid: int, account_keys:
                 lines.append("  ❌ 自动解禁写入失败，见 systemd 日志")
         except Exception as exc:
             fail_count += 1
-            lines[-1] = f"  ❌ 刷新异常: <code>{ui.escape_html(str(exc))[:120]}</code>"
+            lines[-1] = f"  ❌ 刷新异常: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="token_refresh"))[:120]}</code>"
         finally:
             with _BACKGROUND_REFRESH_LOCK:
                 _BACKGROUND_REFRESH_INFLIGHT.discard(ak)
@@ -5262,7 +5266,7 @@ def _run_refresh_all_legacy_panel(chat_id: int, progress_mid: int, account_keys:
         if list_text and target_mid != -1:
             ui.edit(chat_id, target_mid, list_text, reply_markup=list_kb)
     except Exception as exc:
-        print(f"[oauth_menu] final list render failed: {exc}")
+        safe_diagnostics.report(exc, operation="run_refresh_all_legacy_panel")
 
     if send_fallback_summary:
         ui.send(chat_id, ui.truncate("\n".join(lines)))
@@ -5337,37 +5341,32 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str, page: int = 1, fil
 # ─── 新增账户：入口 ──────────────────────────────────────────────
 
 def on_add_menu(chat_id: int, message_id: int, cb_id: str) -> None:
-    """新增 OAuth 账户：把常用登录/导入入口扁平化到一级。"""
+    """新增 OAuth 账户：品牌入口，单一登录方式直接进入。"""
     # 这里也是所有新增流程的「取消」落点，进入时清掉等待输入状态，避免后续文本误触发旧流程。
-    workbuddy_menu.discard_state(chat_id)
-    zhipu_menu.discard_state(chat_id)
-    states.pop_state(chat_id)
+    add_session.clear_input(chat_id)
     ui.answer_cb(cb_id)
     ui.edit(
         chat_id, message_id,
-        f"<b>新增 OAuth 账户</b>\n请选择类型：\n\n{_provider_tag('claude')}、{_provider_tag('openai')}、{_provider_tag('xai')}、{_provider_tag('cursor')}、{_provider_tag('antigravity')}、{_provider_tag('workbuddy')}",
+        "<b>新增 OAuth 账户</b>\n请选择类型：\n\n本次新增代理：" + add_session.description(chat_id) +
+        "\n<i>代理仅控制服务端请求，不控制浏览器出口。</i>",
         reply_markup=ui.inline_kb([
-            [ui.provider_button("Claude 登录获取 Token", "oa:login", "claude")],
-            [ui.provider_button("Claude 手动设置 JSON", "oa:set_json", "claude")],
-            [ui.provider_button("OpenAI 登录获取 Token", "oa:login:openai", "openai")],
-            [ui.provider_button("OpenAI 粘贴 refresh_token", "oa:set_rt:openai", "openai")],
-            [ui.provider_button("Grok 登录获取 Token", "oa:login:xai", "xai")],
-            [ui.provider_button("Grok 粘贴 refresh_token", "oa:set_rt:xai", "xai")],
-            [ui.provider_button("Cursor 登录", "oa:login:cursor", "cursor")],
-            [ui.provider_button("Antigravity 登录获取 Token", "oa:login:antigravity", "antigravity")],
-            [ui.provider_button("OpenAI 导入 Sub2API 文件", "oa:import:sub2api", "openai")],
-            [ui.provider_button("OpenAI 导入 CPA 文件", "oa:import:cpa", "openai")],
-            [ui.provider_button("WorkBuddy 中国区登录", "oa:wb:login", "workbuddy")],
-            [ui.provider_button("WorkBuddy 国际区登录", "oa:wb:login:global", "workbuddy")],
-            [ui.provider_button("智谱 / Z.ai（Key / OAuth）", "oa:zh:add", "zhipu")],
-            [ui.btn("◀ 返回列表", "menu:oauth")],
-            [ui.btn("🏠 返回主菜单", "menu:main")],
+            [ui.provider_button("Anthropic", "oa:add:claude", "claude"),
+             ui.provider_button("OpenAI", "oa:add:openai", "openai"),
+             ui.provider_button("Grok", "oa:add:xai", "xai")],
+            [ui.provider_button("Cursor", "oa:login:cursor", "cursor"),
+             ui.provider_button("Antigravity", "oa:login:antigravity", "antigravity"),
+             ui.provider_button("WorkBuddy", "oa:add:workbuddy", "workbuddy")],
+            [ui.provider_button("智谱", "oa:zh:add", "zhipu")],
+            [ui.btn("⚙ 设置代理", "oa:add:proxy"),
+             ui.btn("🏠 返回主菜单", "menu:main"),
+             ui.btn("◀ 返回列表", "menu:oauth")],
         ]),
     )
 
 
 def on_add_claude(chat_id: int, message_id: int, cb_id: str) -> None:
-    """Claude 子菜单（原 on_add_menu 内容）。"""
+    """Anthropic 子菜单。"""
+    add_session.clear_input(chat_id)
     ui.answer_cb(cb_id)
     ui.edit(
         chat_id, message_id,
@@ -5382,6 +5381,7 @@ def on_add_claude(chat_id: int, message_id: int, cb_id: str) -> None:
 
 def on_add_openai(chat_id: int, message_id: int, cb_id: str) -> None:
     """OpenAI 子菜单。"""
+    add_session.clear_input(chat_id)
     ui.answer_cb(cb_id)
     ui.edit(
         chat_id, message_id,
@@ -5393,19 +5393,44 @@ def on_add_openai(chat_id: int, message_id: int, cb_id: str) -> None:
         reply_markup=ui.inline_kb([
             [ui.btn("🌐 登录获取 Token", "oa:login:openai")],
             [ui.btn("📝 粘贴 refresh_token", "oa:set_rt:openai")],
+            [ui.btn("📄 Sub2API 文件", "oa:import:sub2api")],
+            [ui.btn("📄 CPA 文件", "oa:import:cpa")],
             [ui.btn("◀ 上一步", "oa:add")],
         ]),
     )
 
 
-def _login_nav(relogin=None):
+def on_add_xai(chat_id: int, message_id: int, cb_id: str) -> None:
+    add_session.clear_input(chat_id)
+    ui.answer_cb(cb_id)
+    ui.edit(chat_id, message_id, "<b>新增 Grok OAuth 账户</b>\n请选择方式：",
+        reply_markup=ui.inline_kb([
+            [ui.btn("🌐 网页登录", "oa:login:xai")],
+            [ui.btn("📝 粘贴 refresh_token", "oa:set_rt:xai")],
+            [ui.btn("◀ 上一步", "oa:add")],
+        ]))
+
+
+def on_add_workbuddy(chat_id: int, message_id: int, cb_id: str) -> None:
+    add_session.clear_input(chat_id)
+    ui.answer_cb(cb_id)
+    ui.edit(chat_id, message_id, "<b>新增 WorkBuddy OAuth 账户</b>\n请选择产品路线（分别登录，保留已有授权）：",
+        reply_markup=ui.inline_kb([
+            [ui.btn("中国区", "oa:wb:login")],
+            [ui.btn("WorkBuddy 国际区 CLI · workbuddy.ai", "oa:wb:login:global")],
+            [ui.btn("CodeBuddy IDE 国际区 · codebuddy.ai", "oa:wb:login:global:ide")],
+            [ui.btn("◀ 上一步", "oa:add")],
+        ]))
+
+
+def _login_nav(relogin=None, *, provider=""):
     if relogin:
         return {"back_label": "◀ 返回账户", "back_callback": "oa:relogin_cancel:" + relogin["payload"]}
-    return {"back_label": "◀ 返回新增账户", "back_callback": "oa:add"}
+    return add_session.nav(provider)
 
 
-def _login_cancel(relogin=None):
-    return _login_nav(relogin)["back_callback"]
+def _login_cancel(relogin=None, *, provider=""):
+    return _login_nav(relogin, provider=provider)["back_callback"]
 
 
 def _login_hint(relogin=None):
@@ -5425,6 +5450,8 @@ def _return_from_relogin(chat_id, message_id, cb_id, payload):
 
 
 def on_relogin(chat_id, message_id, cb_id, short, page=1, filter_key=_FILTER_ALL):
+    add_session.clear_input(chat_id)
+    add_session.discard(chat_id)
     key = _account_key_from_short(short)
     account = oauth_control.account_snapshot(key) if key else None
     if not account or not oauth_control.account_authentication_failed(account):
@@ -5454,6 +5481,7 @@ def on_relogin(chat_id, message_id, cb_id, short, page=1, filter_key=_FILTER_ALL
 
 # ─── PKCE 登录流程 ────────────────────────────────────────────────
 
+@add_session.start("claude")
 def on_login_start(chat_id: int, message_id: int, cb_id: str, *, relogin=None) -> None:
     ui.answer_cb(cb_id)
     code_verifier, code_challenge = oauth_control.claude_pkce_generate()
@@ -5476,6 +5504,7 @@ def on_login_start(chat_id: int, message_id: int, cb_id: str, *, relogin=None) -
     )
 
 
+@add_session.resume
 def on_login_code_input(chat_id: int, text: str) -> None:
     state = states.pop_state(chat_id)
     relogin = ((state or {}).get("data") or {}).get("relogin")
@@ -5544,7 +5573,7 @@ def on_login_code_input(chat_id: int, text: str) -> None:
         )
     except Exception as exc:
         ui.send_result(chat_id,
-                       f"❌ 保存失败: <code>{ui.escape_html(str(exc))}</code>",
+                       f"❌ 保存失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="account_save"))}</code>",
                        **nav)
         return
     if save_action == "staged":
@@ -5576,24 +5605,29 @@ def on_login_code_input(chat_id: int, text: str) -> None:
 
 # ─── 手动设置 JSON ────────────────────────────────────────────────
 
+@add_session.start("claude")
 def on_set_json_start(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
     states.set_state(chat_id, "oa_set_json")
     ui.edit(
         chat_id, message_id,
         f"请粘贴 {_provider_tag('claude')} OAuth JSON（需包含 <code>email / access_token / refresh_token / expired</code>）：",
-        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "oa:add")]]),
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", 'oa:add:claude')]]),
     )
 
 
+@add_session.resume
 def on_set_json_input(chat_id: int, text: str) -> None:
-    states.pop_state(chat_id)
-    nav = {"back_label": "◀ 返回新增账户", "back_callback": "oa:add"}
+    state = states.pop_state(chat_id)
+    nav = add_session.nav("claude")
+    if not state or state.get("action") != "oa_set_json":
+        ui.send_result(chat_id, "❌ 输入会话已失效，请重新开始。", **nav)
+        return
     try:
         data = json.loads((text or "").strip())
     except Exception as exc:
         ui.send_result(chat_id,
-                       f"❌ JSON 解析失败: <code>{ui.escape_html(str(exc))}</code>",
+                       f"❌ JSON 解析失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="import_parse"))}</code>",
                        **nav)
         return
     if not isinstance(data, dict):
@@ -5626,7 +5660,7 @@ def on_set_json_input(chat_id: int, text: str) -> None:
         )
     except Exception as exc:
         ui.send_result(chat_id,
-                       f"❌ 保存失败: <code>{ui.escape_html(str(exc))}</code>",
+                       f"❌ 保存失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="import_parse"))}</code>",
                        **nav)
         return
     if save_action == "staged":
@@ -5645,6 +5679,7 @@ def on_set_json_input(chat_id: int, text: str) -> None:
 _OA_NAV_CURSOR = {"back_label": "◀ 返回新增账户", "back_callback": "oa:add"}
 
 
+@add_session.start("cursor")
 def on_login_cursor_start(chat_id: int, message_id: int, cb_id: str, *, relogin=None) -> None:
     ui.answer_cb(cb_id)
     try:
@@ -5683,6 +5718,7 @@ def on_login_cursor_start(chat_id: int, message_id: int, cb_id: str, *, relogin=
     )
 
 
+@add_session.resume
 def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
     state = states.get_state(chat_id)
     if not state or state.get("action") != "oa_cursor_login":
@@ -5811,7 +5847,7 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
         ui.edit(
             chat_id,
             message_id,
-            f"❌ 保存 Cursor 账户失败：<code>{ui.escape_html(str(exc))[:500]}</code>",
+            f"❌ 保存 Cursor 账户失败：<code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="account_save"))[:500]}</code>",
             reply_markup=ui.inline_kb([[ui.btn(_login_nav(relogin)["back_label"], _login_cancel(relogin))]]),
         )
         return
@@ -5832,7 +5868,7 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
 #   4. 拿到 token 后解 id_token 得到 email / chatgpt_account_id / plan_type。
 
 
-_OA_NAV_OPENAI = {"back_label": "◀ 返回新增账户", "back_callback": "oa:add"}
+_OA_NAV_OPENAI = {"back_label": "◀ 上一步", "back_callback": "oa:add:openai"}
 
 
 def _build_openai_login_text_and_kb(url: str, *, relogin=None) -> tuple[str, dict]:
@@ -5854,6 +5890,7 @@ def _build_openai_login_text_and_kb(url: str, *, relogin=None) -> tuple[str, dic
     return text + _login_hint(relogin), kb
 
 
+@add_session.start("openai")
 def on_login_openai_start(chat_id: int, message_id: int, cb_id: str, *, relogin=None) -> None:
     ui.answer_cb(cb_id)
     verifier, challenge = oauth_control.openai_pkce_generate()
@@ -5869,6 +5906,7 @@ def on_login_openai_start(chat_id: int, message_id: int, cb_id: str, *, relogin=
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
+@add_session.resume
 def on_login_openai_regen(chat_id: int, message_id: int, cb_id: str) -> None:
     """重新生成 PKCE + 登录 URL，覆盖旧状态。"""
     state = states.get_state(chat_id)
@@ -5913,6 +5951,7 @@ def _extract_openai_code_and_state(text: str) -> tuple[str, str]:
     return raw, ""
 
 
+@add_session.resume
 def on_login_openai_code_input(chat_id: int, text: str) -> None:
     state = states.pop_state(chat_id)
     relogin = ((state or {}).get("data") or {}).get("relogin")
@@ -5977,6 +6016,7 @@ def on_login_openai_code_input(chat_id: int, text: str) -> None:
     _finish_openai_add(chat_id, tok, source="login", **({"relogin": relogin} if relogin else {}))
 
 
+@add_session.start("openai")
 def on_set_rt_openai_start(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
     states.set_state(chat_id, "oa_openai_rt")
@@ -5984,12 +6024,16 @@ def on_set_rt_openai_start(chat_id: int, message_id: int, cb_id: str) -> None:
         chat_id, message_id,
         "请粘贴 <b>refresh_token</b>（纯字符串即可，代理会立即用它刷新一次 "
         "token 并从 id_token 解出 email 等账户信息）：",
-        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "oa:add")]]),
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", 'oa:add:openai')]]),
     )
 
 
+@add_session.resume
 def on_set_rt_openai_input(chat_id: int, text: str) -> None:
-    states.pop_state(chat_id)
+    state = states.pop_state(chat_id)
+    if not state or state.get("action") != "oa_openai_rt":
+        ui.send_result(chat_id, "❌ 输入会话已失效，请重新开始。", **_OA_NAV_OPENAI)
+        return
     rt = (text or "").strip()
     # 宽松清洗：用户可能贴了 "refresh_token: xxx" 这类前缀
     m = re.search(r"([A-Za-z0-9_\-\.]{20,})", rt)
@@ -6177,7 +6221,7 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str, relogin=None) ->
     except Exception as exc:
         ui.send_result(
             chat_id,
-            f"❌ 保存失败: <code>{ui.escape_html(str(exc))[:500]}</code>",
+            f"❌ 保存失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="account_save"))[:500]}</code>",
             **_login_nav(relogin),
         )
         return
@@ -6230,7 +6274,7 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str, relogin=None) ->
 
 # ─── xAI / Grok OAuth 登录 ───────────────────────────────────────
 
-_OA_NAV_XAI = {"back_label": "◀ 返回新增账户", "back_callback": "oa:add"}
+_OA_NAV_XAI = {"back_label": "◀ 上一步", "back_callback": "oa:add:xai"}
 
 
 def _build_xai_login_text_and_kb(url: str, *, relogin=None) -> tuple[str, dict]:
@@ -6252,6 +6296,7 @@ def _build_xai_login_text_and_kb(url: str, *, relogin=None) -> tuple[str, dict]:
     return text + _login_hint(relogin), kb
 
 
+@add_session.start("xai")
 def on_login_xai_start(chat_id: int, message_id: int, cb_id: str, *, relogin=None) -> None:
     ui.answer_cb(cb_id)
     verifier, challenge = oauth_control.xai_pkce_generate()
@@ -6285,6 +6330,7 @@ def on_login_xai_start(chat_id: int, message_id: int, cb_id: str, *, relogin=Non
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
+@add_session.resume
 def on_login_xai_regen(chat_id: int, message_id: int, cb_id: str) -> None:
     state = states.get_state(chat_id)
     if not state or state.get("action") != "oa_xai_code":
@@ -6293,6 +6339,7 @@ def on_login_xai_regen(chat_id: int, message_id: int, cb_id: str) -> None:
     on_login_xai_start(chat_id, message_id, cb_id, relogin=state["data"].get("relogin"))
 
 
+@add_session.resume
 def on_login_xai_code_input(chat_id: int, text: str) -> None:
     state = states.pop_state(chat_id)
     relogin = ((state or {}).get("data") or {}).get("relogin")
@@ -6332,6 +6379,7 @@ def on_login_xai_code_input(chat_id: int, text: str) -> None:
     _finish_xai_add(chat_id, tok, source="login", **({"relogin": relogin} if relogin else {}))
 
 
+@add_session.start("xai")
 def on_set_rt_xai_start(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
     states.set_state(chat_id, "oa_xai_rt")
@@ -6339,12 +6387,16 @@ def on_set_rt_xai_start(chat_id: int, message_id: int, cb_id: str) -> None:
         chat_id, message_id,
         f"请粘贴 {_provider_tag('xai', full=True)} <b>refresh_token</b>（纯字符串即可，代理会立即刷新一次 "
         "token 并从 id_token 解出 email / subject）：",
-        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "oa:add")]]),
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", 'oa:add:xai')]]),
     )
 
 
+@add_session.resume
 def on_set_rt_xai_input(chat_id: int, text: str) -> None:
-    states.pop_state(chat_id)
+    state = states.pop_state(chat_id)
+    if not state or state.get("action") != "oa_xai_rt":
+        ui.send_result(chat_id, "❌ 输入会话已失效，请重新开始。", **_OA_NAV_XAI)
+        return
     rt = (text or "").strip()
     m = re.search(r"([A-Za-z0-9_\-\.]{20,})", rt)
     rt_clean = m.group(1) if m else rt
@@ -6419,7 +6471,7 @@ def _finish_xai_add(chat_id: int, tok: dict, *, source: str, relogin=None) -> No
     except Exception as exc:
         ui.send_result(
             chat_id,
-            f"❌ 保存失败: <code>{ui.escape_html(str(exc))[:500]}</code>",
+            f"❌ 保存失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="account_save"))[:500]}</code>",
             **_login_nav(relogin),
         )
         return
@@ -6472,6 +6524,7 @@ def _build_antigravity_login_text_and_kb(url: str, *, relogin=None) -> tuple[str
     return text + _login_hint(relogin), kb
 
 
+@add_session.start("antigravity")
 def on_login_antigravity_start(chat_id: int, message_id: int, cb_id: str, *, relogin=None) -> None:
     ui.answer_cb(cb_id)
     verifier, challenge = oauth_control.antigravity_pkce_generate()
@@ -6491,6 +6544,7 @@ def on_login_antigravity_start(chat_id: int, message_id: int, cb_id: str, *, rel
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
+@add_session.resume
 def on_login_antigravity_regen(chat_id: int, message_id: int, cb_id: str) -> None:
     state = states.get_state(chat_id)
     if not state or state.get("action") != "oa_antigravity_code":
@@ -6499,6 +6553,7 @@ def on_login_antigravity_regen(chat_id: int, message_id: int, cb_id: str) -> Non
     on_login_antigravity_start(chat_id, message_id, cb_id, relogin=state["data"].get("relogin"))
 
 
+@add_session.resume
 def on_login_antigravity_code_input(chat_id: int, text: str) -> None:
     state = states.pop_state(chat_id)
     relogin = ((state or {}).get("data") or {}).get("relogin")
@@ -6516,7 +6571,7 @@ def on_login_antigravity_code_input(chat_id: int, text: str) -> None:
     except Exception as exc:
         ui.send_result(
             chat_id,
-            f"❌ 没有抽到 code：<code>{ui.escape_html(str(exc))[:300]}</code>",
+            f"❌ 没有抽到 code：<code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="callback_parse"))[:300]}</code>",
             **_login_nav(relogin),
         )
         return
@@ -6602,7 +6657,7 @@ def _finish_antigravity_add(chat_id: int, tok: dict, *, source: str, relogin=Non
     except Exception as exc:
         ui.send_result(
             chat_id,
-            f"❌ 保存失败: <code>{ui.escape_html(str(exc))[:500]}</code>",
+            f"❌ 保存失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="account_save"))[:500]}</code>",
             **_login_nav(relogin),
         )
         return
@@ -6636,6 +6691,7 @@ _OPENAI_IMPORT_LABELS = {
 }
 
 
+@add_session.start("openai")
 def on_import_openai_start(chat_id: int, message_id: int, cb_id: str, kind: str) -> None:
     kind = (kind or "").strip().lower()
     label = _OPENAI_IMPORT_LABELS.get(kind)
@@ -6661,14 +6717,14 @@ def _parse_openai_import_or_report(chat_id: int, kind: str, payload, *, filename
     except OpenAIImportParseError as exc:
         ui.send_result(
             chat_id,
-            f"❌ 解析失败: <code>{ui.escape_html(str(exc))[:800]}</code>",
+            f"❌ 解析失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="import_parse"))[:800]}</code>",
             back_label="◀ 返回新增账户", back_callback="oa:add",
         )
         return None
     except Exception as exc:
         ui.send_result(
             chat_id,
-            f"❌ 解析失败: <code>{ui.escape_html(str(exc))[:800]}</code>",
+            f"❌ 解析失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="import_parse"))[:800]}</code>",
             back_label="◀ 返回新增账户", back_callback="oa:add",
         )
         return None
@@ -6697,6 +6753,7 @@ def _show_openai_import_preview(chat_id: int, kind: str, items: list[dict]) -> N
     )
 
 
+@add_session.resume
 def on_import_openai_text_input(chat_id: int, text: str) -> None:
     state = states.get_state(chat_id)
     data = (state.get("data") or {}) if state else {}
@@ -6711,6 +6768,7 @@ def on_import_openai_text_input(chat_id: int, text: str) -> None:
     _show_openai_import_preview(chat_id, kind, items)
 
 
+@add_session.resume
 def on_import_openai_document_input(chat_id: int, msg: dict) -> None:
     state = states.get_state(chat_id)
     data = (state.get("data") or {}) if state else {}
@@ -6730,7 +6788,7 @@ def on_import_openai_document_input(chat_id: int, msg: dict) -> None:
     except Exception as exc:
         ui.send_result(
             chat_id,
-            f"❌ 文件下载失败: <code>{ui.escape_html(str(exc))[:500]}</code>",
+            f"❌ 文件下载失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="file_download"))[:500]}</code>",
             **_OA_NAV_OPENAI,
         )
         return
@@ -6744,13 +6802,13 @@ def on_import_openai_document_input(chat_id: int, msg: dict) -> None:
 
 def on_import_openai_cancel(chat_id: int, message_id: int, cb_id: str) -> None:
     states.pop_state(chat_id)
-    on_add_menu(chat_id, message_id, cb_id)
+    on_add_openai(chat_id, message_id, cb_id)
 
 
 def _format_import_error(exc: Exception | None) -> str:
     if exc is None:
         return "未知错误"
-    return str(exc)[:240]
+    return safe_diagnostics.summary(exc, operation="oauth_management", stage="import_validate")[:240]
 
 
 def _stage_openai_import_candidates(items: list[dict]) -> dict:
@@ -6873,6 +6931,7 @@ def _render_openai_import_result(chat_id: int, message_id: int, label: str, resu
     ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb([[ui.btn("◀ 返回 OAuth 列表", "menu:oauth")]]))
 
 
+@add_session.resume
 def on_import_openai_exec(chat_id: int, message_id: int, cb_id: str) -> None:
     state = states.pop_state(chat_id)
     if not state or state.get("action") != "oa_openai_import_confirm":
@@ -6896,6 +6955,7 @@ def on_import_openai_exec(chat_id: int, message_id: int, cb_id: str) -> None:
     )
 
 
+@add_session.resume
 def on_import_openai_overwrite(chat_id: int, message_id: int, cb_id: str, nonce: str, *, confirm: bool) -> None:
     state = states.get_state(chat_id)
     data = (state.get("data") or {}) if state and state.get("action") == "oa_openai_import_overwrite_confirm" else {}
@@ -7085,6 +7145,13 @@ def _redirect_legacy_cursor_callback(
 
 
 def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> bool:
+    add_session.before_callback(chat_id, data)
+    if data == "oa:add:proxy":
+        add_session.show_picker(chat_id, message_id, cb_id)
+        return True
+    if data.startswith("oa:add_proxy:"):
+        add_session.select(chat_id, message_id, cb_id, data[len("oa:add_proxy:"):])
+        return True
     if zhipu_menu.handle_callback(chat_id, message_id, cb_id, data):
         return True
     if workbuddy_menu.handle_callback(chat_id, message_id, cb_id, data):
@@ -7162,6 +7229,12 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         return True
     if data == "oa:add:openai":
         on_add_openai(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:add:xai":
+        on_add_xai(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:add:workbuddy":
+        on_add_workbuddy(chat_id, message_id, cb_id)
         return True
     if data == "oa:login":
         on_login_start(chat_id, message_id, cb_id)
@@ -7432,7 +7505,7 @@ def on_edit_max_concurrent_input(chat_id: int, text: str) -> None:
     try:
         oauth_control.set_account_max_concurrent(_management_context(chat_id), ak, v)
     except Exception as exc:
-        ui.send(chat_id, f"❌ 失败: <code>{ui.escape_html(str(exc))}</code>")
+        ui.send(chat_id, f"❌ 失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="on_edit_max_concurrent_input"))}</code>")
         return
     states.pop_state(chat_id)
     label = "默认" if v == 0 else str(v)

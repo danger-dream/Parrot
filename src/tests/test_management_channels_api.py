@@ -767,11 +767,10 @@ def test_runtime_audit_and_http_polled_failures_are_stable_and_secret_free(tmp_p
 
     for request_id, operation in failed_operations:
         assert operation["status"] == "failed", (request_id, operation)
-        assert operation["error"] == {
-            "code": "UPSTREAM_ERROR",
-            "message": "UPSTREAM_ERROR",
-            "retryable": True,
-        }
+        assert operation["error"]["code"] == "UPSTREAM_ERROR"
+        assert operation["error"]["retryable"] is True
+        assert "具体原因尚不确定" in operation["error"]["message"]
+        assert "channel." in operation["error"]["message"]
         assert operation["result"] is None
     audits = runtime.state_store.audit_snapshot()
     channel_audit = next(

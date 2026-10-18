@@ -123,6 +123,25 @@ def test_key_usage_io_is_background_and_leaving_menu_suppresses_late_result(call
     assert display == before
 
 
+@pytest.mark.parametrize("returned_error", [False, True])
+def test_key_usage_failure_renders_diagnostic_and_clears_pending_state(callback_env, display, monkeypatch, returned_error):
+    control, _, _ = callback_env
+    entry = credential("api_key")
+    om.add_account(entry)
+    key = om.get_account_key(entry)
+    error = common.ZhipuError("usage", "timeout")
+    def fetch(*a, **kw):
+        if returned_error:
+            return {"error": error}
+        raise error
+    monkeypatch.setattr(control, "refresh_usage_now", fetch)
+    monkeypatch.setattr(zh, "_submit_remote", lambda run: run())
+    refresh(key)
+    assert states.get_state(42) is None
+    assert any("超时" in text for text in display)
+    assert "正在读取已有 Key" not in display[-1]
+
+
 @pytest.mark.parametrize("kind,expected", [("project_required", "重试初始化"),
     ("creation_confirmation_required", "自动取得专用模型 Key"), ("network", "网络请求"), ("timeout", "超时")])
 def test_zhipu_typed_errors_do_not_misreport_configuration_or_network_as_login_expiry(kind, expected):

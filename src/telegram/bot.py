@@ -587,6 +587,7 @@ def _handle_callback(cb: dict) -> None:
         return
 
     # Leave owned input flows before any early navigation return.
+    oauth_menu.add_session.before_callback(chat_id, data)
     model_center_menu.before_callback(chat_id, data)
     search_menu.before_callback(chat_id, data)
     zhipu_oauth_menu.before_callback(chat_id, data)
@@ -699,6 +700,7 @@ def _handle_message(msg: dict) -> None:
 
     # Navigation leaves owned input/login flows before text-state dispatch.
     # Other menus retain their historical command/input semantics.
+    oauth_menu.add_session.before_command(chat_id, text)
     model_center_menu.before_command(chat_id, text)
     search_menu.before_command(chat_id, text)
     zhipu_oauth_menu.before_command(chat_id, text)

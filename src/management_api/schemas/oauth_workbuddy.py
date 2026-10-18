@@ -56,6 +56,8 @@ class WorkBuddySettingsData(StrictSchema):
 class WorkBuddyPolicyData(StrictSchema):
     clientProfile: str
     clientProfilesByRealm: dict[str, str]
+    supportedClientProfilesByRealm: dict[str, list[str]]
+    clientRoutes: dict[str, str]
     browserLoginRealms: list[str]
     importRealms: list[str]
     effectsEnabled: bool

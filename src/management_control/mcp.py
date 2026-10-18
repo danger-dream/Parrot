@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+from src.safe_diagnostics import diagnose
+
 import copy
 import json
 import time
@@ -71,6 +73,7 @@ class MCPControl(DomainControl):
 
     # ----- 写入 ---------------------------------------------------------
 
+    @diagnose('mcp', 'settings', 'account_save')
     def _commit(self, context, action, mutate, expected_revision=None, *, read_back=True):
         self._write(context)
         try:

@@ -6,6 +6,8 @@ callback_data 前缀：``px:``
 
 from __future__ import annotations
 
+from src import safe_diagnostics
+
 import asyncio
 import re
 from typing import Optional
@@ -460,7 +462,7 @@ def _finalize_add(chat_id: int, name: str, parsed: dict) -> None:
     try:
         test = asyncio.run(proxy_control.test_proxy(name, timeout=10))
     except Exception as e:
-        test = {"ok": False, "error": str(e)[:200]}
+        test = {"ok": False, "error": safe_diagnostics.summary(e, provider="proxy", operation="connectivity_test", stage="request")}
 
     if test.get("ok"):
         text = (
@@ -487,7 +489,7 @@ def _test_proxy(chat_id: int, message_id: int, cb_id: str, name: str, *, back_cb
     try:
         r = asyncio.run(proxy_control.test_proxy(name, timeout=10))
     except Exception as e:
-        r = {"ok": False, "error": str(e)[:200]}
+        r = {"ok": False, "error": safe_diagnostics.summary(e, provider="proxy", operation="connectivity_test", stage="request")}
 
     icon = "✅" if r.get("ok") else "❌"
     if r.get("ok"):
@@ -801,7 +803,7 @@ def _grp_test(chat_id: int, message_id: int, cb_id: str, gname: str, *, back_cb:
     try:
         results = asyncio.run(proxy_control.test_group(gname, timeout=10))
     except Exception as e:
-        results = [{"name": gname, "ok": False, "error": str(e)[:200]}]
+        results = [{"name": gname, "ok": False, "error": safe_diagnostics.summary(e, provider="proxy", operation="connectivity_test", stage="request")}]
 
     lines = [f"🔍 <b>测试代理组: {ui.escape_html(gname)}</b>", ""]
     all_ok = True

@@ -1,0 +1,16 @@
+data: {"id":"chatcmpl-01fixtool","created":1760000000,"model":"primary-model","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-01fixtool","created":1760000000,"model":"primary-model","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"The user wants to read a.py. "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-01fixtool","created":1760000000,"model":"primary-model","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"First call read_file, then summarize."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-01fixtool","created":1760000000,"model":"primary-model","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"extra_fields":{"signature":"sig-3f9c2a7b8d1e4f60"},"tool_calls":[{"index":0,"id":"call_ab12","type":"function","function":{"name":"read_file","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-01fixtool","created":1760000000,"model":"primary-model","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"a.py\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-01fixtool","created":1760000000,"model":"primary-model","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"chatcmpl-01fixtool","created":1760000000,"model":"primary-model","object":"chat.completion.chunk","choices":null,"usage":{"prompt_tokens":1204,"completion_tokens":312,"total_tokens":1516,"prompt_tokens_details":{"cached_tokens":960},"completion_tokens_details":{"reasoning_tokens":188},"prompt_cache_hit_tokens":960,"prompt_cache_miss_tokens":244,"prompt_cache_write_tokens":0,"cache_read_input_tokens":960,"cache_creation_input_tokens":0,"reasoning_tokens":188,"credit":31}}
+
+data: [DONE]
+

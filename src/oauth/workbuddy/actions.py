@@ -130,7 +130,13 @@ def execute(account_key: str, action: str, *, actor: str, source: str = "manual"
             raise common.WorkBuddyError("action", kind="stale_generation")
         key = action_key(account_key, action, day)
         old = state_db.workbuddy_action_load(key)
-        if old and old.get("status") in {"succeeded", "already_done"}:
+        if (action == "checkin" and old and old.get("status") == "rejected"
+                and old.get("code") in billing.CHECKIN_BUSINESS_STATUSES):
+            # Existing ledgers may predate the wire-code classification. They
+            # are still determined outcomes, not evening/manual retry permits.
+            old = state_db.workbuddy_action_finish(key, old["attempt_id"],
+                {"status": billing.CHECKIN_BUSINESS_STATUSES[old["code"]]})
+        if old and old.get("status") in {"succeeded", "already_done", "not_eligible", "activity_inactive"}:
             return public_record(old)
         if old and old.get("status") in {"pending", "unknown"}:
             return _reconcile(account_key, account, key, old)

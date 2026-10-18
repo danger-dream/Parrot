@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from contextvars import copy_context
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 import math
@@ -10,11 +11,14 @@ import secrets
 import threading
 import time
 
+from ... import safe_diagnostics
 from ...management_control.oauth import OAuthProvider, JsonCredential, CreateOAuthAccountCommand, UpdateOAuthAccountCommand, CompleteOAuthLoginCommand
 from ...management_control.oauth.contracts import revision
 from ...oauth.zhipu.common import ZhipuError
 from ...management_control.oauth.menu_bridge import control, telegram_context
 from .. import error_reporting, states, ui
+from . import oauth_add_session as add_session
+from ...management_control.oauth.account_mutations import OAuthReplaceRequired
 
 PREFIX = "oa:zh:"
 _remote_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="zhipu-management")
@@ -51,7 +55,8 @@ def _run_remote(chat_id, data, work, done, failed, *, abandoned=None):
                 abandoned(result)
         finally:
             data["busy"] = False
-    return _submit_remote(run)
+    context = copy_context()
+    return _submit_remote(lambda: context.run(run))
 
 
 def model_route_available(account):
@@ -290,10 +295,11 @@ def _cancel_flow(chat_id, flow):
 
 
 def _login_back(data):
-    nav = parent()._login_nav(data.get("relogin"))
+    nav = parent()._login_nav(data.get("relogin"), provider="zhipu")
     return ui.btn(nav["back_label"], nav["back_callback"])
 
 
+@add_session.start("zhipu")
 def _login(chat_id, message_id, site, *, relogin=None):
     discard_state(chat_id)
     data = _state(chat_id, "oa_zh_login", relogin=relogin)
@@ -326,7 +332,8 @@ def _start_login_wait(chat_id, message_id, data):
             _wait_for_login(chat_id, message_id, data, data["flow"])
         finally:
             data["polling"] = False
-    threading.Thread(target=run, daemon=True, name="zhipu-oauth-login").start()
+    context = copy_context()
+    threading.Thread(target=lambda: context.run(run), daemon=True, name="zhipu-oauth-login").start()
 
 
 def _wait_for_login(chat_id, message_id, data, flow):
@@ -357,6 +364,14 @@ def _wait_for_login(chat_id, message_id, data, flow):
                 ui.edit(chat_id, message_id, "❌ 官方授权未完成或已过期，请重新发起登录。",
                         reply_markup=ui.inline_kb([[_login_back(data)]]))
                 return
+        except OAuthReplaceRequired as exc:
+            if current():
+                data["plan_token"] = exc.plan_token
+                ui.edit(chat_id, message_id, "账户已存在。是否覆盖凭据并将本次选择保存为该账户代理？取消不修改账户。",
+                    reply_markup=ui.inline_kb([
+                        [ui.btn("✅ 确认覆盖", PREFIX + "replace:" + data["nonce"])],
+                        [ui.btn("❌ 取消", PREFIX + "cancel:" + data["nonce"])]]))
+            return
         except Exception as exc:
             if not current():
                 return
@@ -412,10 +427,7 @@ def refresh_usage(chat_id, message_id, key, page=1, filter_key="all"):
     def failed(exc):
         # ZhipuError retains only bounded, credential-free facts. Do not print
         # arbitrary transport errors, URLs, account IDs or response bodies.
-        if isinstance(exc, ZhipuError):
-            print(f"[zhipu] fetch_usage failed: stage={exc.stage} kind={exc.kind} phase={exc.timeout_phase or '-'} http={exc.status_code} code={exc.code}")
-        else:
-            print(f"[zhipu] fetch_usage failed: type={type(exc).__name__}")
+        safe_diagnostics.report(exc, provider="zhipu", operation="usage", stage="usage")
         render(parent()._oauth_error_html(exc, provider="zhipu", operation="fetch_usage"))
 
     def done(result):
@@ -613,6 +625,27 @@ def _plan_action(chat_id, message_id, key, action, *, reset_type=None, card_inde
 
 
 def handle_callback(chat_id, message_id, cb_id, callback):
+    kind = callback[len(PREFIX):].split(":", 1)[0] if callback.startswith(PREFIX) else ""
+    if kind in {"cancel", "project", "replace", "retry_login"}:
+        return _resume_callback(chat_id, message_id, cb_id, callback)
+    return _handle_callback(chat_id, message_id, cb_id, callback)
+
+
+@add_session.resume
+def _resume_callback(chat_id, message_id, cb_id, callback):
+    return _handle_callback(chat_id, message_id, cb_id, callback)
+
+
+@add_session.start("zhipu")
+def _start_input(chat_id, message_id, parts):
+    kind = parts[0]
+    _state(chat_id, "oa_zh_input", site=parts[1] if len(parts) == 2 else None, key_only=kind == "key")
+    ui.edit(chat_id, message_id, "请发送 Coding Plan API Key；若为团队请使用 JSON 导入并指定组织/项目。" if kind == "key" else
+            '发送账户 JSON。必填 site=bigmodel|zai、credential_mode=api_key|oauth；Key模式填 model_key；OAuth填 subject/access_token/zcode_token。团队另填 plan_scope=team、organization_id/project_id。',
+            reply_markup=ui.inline_kb([[ui.btn("◀ 上一步", PREFIX + "add")]]))
+
+
+def _handle_callback(chat_id, message_id, cb_id, callback):
     if not callback.startswith(PREFIX):
         return False
     ui.answer_cb(cb_id)
@@ -622,7 +655,7 @@ def handle_callback(chat_id, message_id, cb_id, callback):
         ui.delete_message(chat_id, message_id)
         return True
     if kind == "add":
-        discard_state(chat_id)
+        add_session.clear_input(chat_id)
         rows = []
         for site, label in (("bigmodel", "BigModel 中国站"), ("zai", "Z.ai 国际站")):
             rows.append([ui.btn(label + " OAuth 登录", PREFIX + "login:" + site)])
@@ -634,10 +667,7 @@ def handle_callback(chat_id, message_id, cb_id, callback):
         _login(chat_id, message_id, parts[1])
         return True
     if kind in {"key", "import"}:
-        discard_state(chat_id)
-        _state(chat_id, "oa_zh_input", site=parts[1] if len(parts) == 2 else None, key_only=kind == "key")
-        ui.edit(chat_id, message_id, "请发送 Coding Plan API Key；若为团队请使用 JSON 导入并指定组织/项目。" if kind == "key" else
-                '发送账户 JSON。必填 site=bigmodel|zai、credential_mode=api_key|oauth；Key模式填 model_key；OAuth填 subject/access_token/zcode_token。团队另填 plan_scope=team、organization_id/project_id。', reply_markup=ui.inline_kb([[_back()]]))
+        _start_input(chat_id, message_id, parts)
         return True
     if kind == "name_skip":
         state = states.get_state(chat_id)
@@ -668,7 +698,7 @@ def handle_callback(chat_id, message_id, cb_id, callback):
             if data.get("relogin"):
                 parent()._return_from_relogin(chat_id, message_id, "", data["relogin"]["payload"])
             else:
-                parent().on_add_menu(chat_id, message_id, "")
+                _handle_callback(chat_id, message_id, "", PREFIX + "add")
             return True
         if kind == "cancel_action":
             cancellation = data.get("action_cancellation")
@@ -758,8 +788,13 @@ def handle_callback(chat_id, message_id, cb_id, callback):
                 data["plan_token"], cancellation=cancellation, on_stage=progress), done, failed)
         elif kind == "replace":
             ui.edit(chat_id, message_id, "🔄 正在更新账户并同步额度、模型及元数据…")
-            _run_remote(chat_id, data, lambda: control.create_account(telegram_context(chat_id),
-                CreateOAuthAccountCommand(JsonCredential(OAuthProvider.ZHIPU, data["payload"]), data["plan_token"])), saved, failed)
+            if data.get("flow_id"):
+                _run_remote(chat_id, data, lambda: control.complete_login_flow(telegram_context(chat_id),
+                    data["flow_id"], data["flow_secret"], CompleteOAuthLoginCommand(completed=True,
+                    replace_plan_token=data["plan_token"])), saved, failed)
+            else:
+                _run_remote(chat_id, data, lambda: control.create_account(telegram_context(chat_id),
+                    CreateOAuthAccountCommand(JsonCredential(OAuthProvider.ZHIPU, data["payload"]), data["plan_token"])), saved, failed)
         return True
     if len(parts) < 2:
         return True
@@ -796,6 +831,7 @@ def handle_callback(chat_id, message_id, cb_id, callback):
     return True
 
 
+@add_session.resume
 def handle_text(chat_id, action, text):
     if action == "oa_zh_callback":
         state = states.get_state(chat_id)

@@ -13,6 +13,7 @@ import httpx
 from ...proxy.connector import ProxyConnectError, UpstreamConnectError
 
 from ... import network
+from ...safe_diagnostics import inherit, report, scope
 from .diagnostics import RequestTrace, error_facts
 
 VERSION = "3.15.3"
@@ -28,6 +29,7 @@ class ZhipuError(RuntimeError):
     def __init__(self, stage, kind="upstream", *, status=0, code=None, fail_open=False, timeout_phase="",
                  request_not_sent=False, network_phase="", target_host="", proxy_route="", fallback_used=False):
         self.stage, self.kind, self.status_code = stage, kind, status
+        self.response_status = status
         self.timeout_phase = timeout_phase
         self.request_not_sent, self.network_phase = request_not_sent, network_phase
         self.target_host, self.proxy_route, self.fallback_used = target_host, proxy_route, fallback_used
@@ -37,6 +39,7 @@ class ZhipuError(RuntimeError):
         self.auth_error = status in (401, 403)
         self.retryable = kind in {"network", "timeout"} or status in (408, 429) or status >= 500
         super().__init__(f"Zhipu {stage}: {kind} (HTTP {status}, code {self.code})")
+        inherit(self)
 
 
 def text(value, field, *, required=False, maximum=32768):
@@ -126,16 +129,15 @@ def require_network():
 
 def request(url, *, headers=None, method="GET", body=None, account_key="", timeout=None, envelope=True,
             read_attempts=1, stage=None):
-    try:
-        return _request(url, headers=headers, method=method, body=body, account_key=account_key,
-                        timeout=timeout, envelope=envelope, read_attempts=read_attempts, stage=stage)
-    except ZhipuError as exc:
-        if stage:
-            exc.stage = stage
-        print("[zhipu-request] " + json.dumps({"stage": exc.stage, "kind": exc.kind,
-            "http_status": exc.status_code, "code": exc.code, "timeout_phase": exc.timeout_phase,
-            **error_facts(exc)}, ensure_ascii=False), flush=True)
-        raise
+    with scope(provider="zhipu", stage=stage or ""):
+        try:
+            return _request(url, headers=headers, method=method, body=body, account_key=account_key,
+                            timeout=timeout, envelope=envelope, read_attempts=read_attempts, stage=stage)
+        except ZhipuError as exc:
+            if stage:
+                exc.stage = stage
+            report(exc, provider="zhipu", stage=stage or "")
+            raise
 
 
 def _request(url, *, headers, method, body, account_key, timeout, envelope, read_attempts, stage):

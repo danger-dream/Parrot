@@ -18,6 +18,8 @@ Tests can enable mock mode via ``oauth.mockMode`` or
 
 from __future__ import annotations
 
+from src.safe_diagnostics import diagnose
+
 import asyncio
 import base64
 import hashlib
@@ -292,6 +294,7 @@ def redirect_uri_or_default(value: str | None = None) -> str:
     return raw or redirect_uri()
 
 
+@diagnose('antigravity', 'login_complete', 'callback_parse')
 def parse_callback_url(raw: str) -> dict[str, str]:
     """Extract ``code`` / ``state`` / ``error`` from a pasted localhost callback URL."""
     text = str(raw or "").strip()
@@ -373,6 +376,7 @@ def _mock_token_response(
     )
 
 
+@diagnose('antigravity', 'login_complete', 'token_exchange')
 def exchange_code_sync(
     code: str,
     *,
@@ -416,6 +420,7 @@ async def exchange_code(
     )
 
 
+@diagnose('antigravity', 'refresh', 'token_refresh')
 def refresh_sync(
     refresh_token: str,
     *,
@@ -507,6 +512,7 @@ def _auth_headers(access_token: str, *, user_agent: str | None = None,
     return headers
 
 
+@diagnose('antigravity', '', 'profile_fetch', emit=False)
 def fetch_userinfo_sync(access_token: str) -> dict:
     if _mock_mode_enabled():
         return {"email": f"mock-ag-{secrets.token_hex(4)}@gmail.com"}
@@ -533,6 +539,7 @@ async def fetch_userinfo(access_token: str) -> dict:
     return await asyncio.to_thread(fetch_userinfo_sync, access_token)
 
 
+@diagnose('antigravity', '', 'project_lookup', emit=False)
 def load_code_assist_sync(access_token: str, *, account_key: str = "") -> dict:
     if _mock_mode_enabled():
         return {
@@ -566,6 +573,7 @@ async def load_code_assist(access_token: str) -> dict:
     return await asyncio.to_thread(load_code_assist_sync, access_token)
 
 
+@diagnose('antigravity', '', 'project_lookup', emit=False)
 def onboard_user_sync(access_token: str, tier_id: str | None = None) -> str:
     if _mock_mode_enabled():
         return f"mock-project-{secrets.token_hex(4)}"
@@ -594,8 +602,9 @@ def onboard_user_sync(access_token: str, tier_id: str | None = None) -> str:
             proxy_purpose="oauth_antigravity",
         )
         if resp.status_code != 200:
-            preview = (resp.text or "").strip()[:200]
-            raise RuntimeError(f"antigravity onboardUser http {resp.status_code}: {preview}")
+            error = RuntimeError("antigravity onboardUser HTTP failure")
+            error.status_code = resp.status_code
+            raise error
         data = resp.json() if resp.content else {}
         if isinstance(data, dict) and data.get("done") is True:
             nested = data.get("response") if isinstance(data.get("response"), dict) else data
@@ -612,6 +621,7 @@ async def onboard_user(access_token: str, tier_id: str | None = None) -> str:
     return await asyncio.to_thread(onboard_user_sync, access_token, tier_id)
 
 
+@diagnose('antigravity', '', 'project_lookup', emit=False)
 def fetch_project_id_sync(access_token: str) -> str:
     load_resp = load_code_assist_sync(access_token)
     project_id = extract_project_id(load_resp)
@@ -627,6 +637,7 @@ async def fetch_project_id(access_token: str) -> str:
     return await asyncio.to_thread(fetch_project_id_sync, access_token)
 
 
+@diagnose('antigravity', 'login_complete', 'login')
 def complete_login_sync(
     code: str,
     *,

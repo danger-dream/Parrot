@@ -35,9 +35,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TZ=Asia/Shanghai \
     ANTHROPIC_PROXY_DATA_DIR=/app/data
 
-# 时区 + curl（HEALTHCHECK 用）
+# 时区、健康检查与 WorkBuddy CLI 部署身份所需的 Node 运行时
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        tzdata curl gosu \
+        tzdata curl gosu nodejs \
     && ln -sf /usr/share/zoneinfo/${TZ} /etc/localtime \
     && echo ${TZ} > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*

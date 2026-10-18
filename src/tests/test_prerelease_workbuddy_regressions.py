@@ -27,11 +27,12 @@ def test_policy_describes_real_login_regions_and_accepted_profiles(api, monkeypa
     assert policy["browserLoginRealms"] == ["cn", "global"]
     assert policy["importRealms"] == []
     assert policy["clientProfile"] == "cli"
-    assert policy["clientProfilesByRealm"] == {"cn": "cli", "global": "ide"}
+    assert policy["clientProfilesByRealm"] == {"cn": "cli", "global": "workbuddy-cli"}
+    assert policy["supportedClientProfilesByRealm"]["global"] == ["workbuddy-cli", "ide"]
     calls = []
     def start(*, realm="cn", client_profile="cli"):
         calls.append((realm, client_profile))
-        return {"realm": realm, "status": "pending", "auth_url": "https://login.invalid", "state": "fixture"}
+        return {"realm": realm, "workbuddy_client_profile": client_profile, "status": "pending", "auth_url": "https://login.invalid", "state": "fixture"}
     monkeypatch.setattr(ctl.backend, "workbuddy_start_login", start)
     for realm in policy["browserLoginRealms"]:
         response = call("POST", "/oauth/login-flows", {"provider": "workbuddy", "realm": realm,
@@ -40,7 +41,7 @@ def test_policy_describes_real_login_regions_and_accepted_profiles(api, monkeypa
         data = response.json()["data"]
         assert call("POST", "/oauth/login-flows/" + data["flowId"] + "/cancel",
                     {"flowSecret": data["flowSecret"]}).status_code == 204
-    assert calls == [("cn", "cli"), ("global", "ide")]
+    assert calls == [("cn", "cli"), ("global", "workbuddy-cli")]
     assert ledger["calls"] == 0
     assert not policy["autoCheckinDefault"] and not policy["autoTrial"]
 

@@ -570,6 +570,7 @@ async def aggregate_stream_as_non_stream_response(
     if chat_upstream:
         from .chat_aggregate import ChatAggregateBuilder
         builder = ChatAggregateBuilder()
+        builder.preserve_provider_reasoning = getattr(channel, "provider", "") == "workbuddy"
     else:
         builder = toolkit["stream_builder"]()
     tracker = toolkit["stream_tracker"]()
@@ -892,6 +893,8 @@ async def prepare_stream_response_start(
     toolkit = toolkit_for_channel(channel)
     tracker = toolkit["stream_tracker"]()
     builder = toolkit["stream_builder"]()
+    if getattr(channel, "provider", "") == "workbuddy":
+        builder.preserve_provider_reasoning = True
     if partial_state is not None:
         partial_state["tracker"] = tracker
     ch_proto = getattr(channel, "protocol", "anthropic")

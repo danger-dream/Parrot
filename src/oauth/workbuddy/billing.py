@@ -6,48 +6,75 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from . import common
+from ... import safe_diagnostics
 
 MAX_PAGES = 50
 PAGE_SIZE = 100
 CN_TIMEZONE = ZoneInfo("Asia/Shanghai")
+CHECKIN_BUSINESS_STATUSES = {1001: "already_done", 1002: "not_eligible", 1003: "activity_inactive"}
 
 
 def _error(exc: Exception) -> dict:
+    diagnostic = safe_diagnostics.report(exc, provider="workbuddy", operation="usage", stage="usage")
     if isinstance(exc, common.WorkBuddyError):
-        return {"code": exc.code, "http_status": exc.status_code, "kind": exc.kind,
-                "retryable": exc.retryable, "auth_error": exc.auth_error}
-    return {"kind": "invalid_data", "retryable": False}
+        code = safe_diagnostics.safe_code(exc.code)
+        return {"code": code if code != "unrecognized" else None, "http_status": exc.status_code, "kind": exc.kind,
+                "retryable": exc.retryable, "auth_error": exc.auth_error, "diagnostic_kind": diagnostic.kind}
+    return {"kind": "invalid_data", "retryable": False, "diagnostic_kind": diagnostic.kind}
 
 
 def _time(value, realm: str) -> str | None:
-    if not isinstance(value, str) or not value:
-        return None
     try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        # Billing timestamps also occur as epoch milliseconds, including
+        # digit-only strings. Never interpret them as seconds.
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)) or (isinstance(value, str) and value.isdigit()):
+            milliseconds = common.number(value)
+            # Zero is an unset billing timestamp, not an expiry at the epoch.
+            # This constraint is time-only: an explicit zero credit is valid.
+            if milliseconds is None or milliseconds <= 0:
+                return None
+            dt = datetime.fromtimestamp(milliseconds / 1000, timezone.utc)
+        elif isinstance(value, str) and value:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        else:
+            return None
         if dt.tzinfo is None:
             if realm != "cn":
                 return None  # Global's unzoned billing dates are not yet verified.
             dt = dt.replace(tzinfo=CN_TIMEZONE)
         return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    except (ValueError, OverflowError):
+    except (ValueError, OverflowError, OSError):
         return None
 
 
 def normalize_package(raw: dict, realm: str) -> dict:
     suffixes = ("Size", "Remain", "Used")
-    prefix = "CycleCapacity" if any(
-        "CycleCapacity" + suffix + precision in raw
-        for suffix in suffixes for precision in ("", "Precise")
-    ) else "Capacity"
+    source = raw
+    if common.number(raw.get("CapacityType")) == 4:
+        prefix = "SlicePeriodCapacity"
+        details = raw.get("SlicePeriodUsageDetails")
+        # Type 4 is the current slice, not the lifetime/cycle allowance. An
+        # absent slice must stay unknown rather than falling back to that pool.
+        source = details[0] if isinstance(details, list) and details and isinstance(details[0], dict) else {}
+    else:
+        size = common.number(raw.get("CapacitySizePrecise"))
+        has_cycle = any("CycleCapacity" + suffix + precision in raw
+                        for suffix in suffixes for precision in ("", "Precise"))
+        # Official resolution: positive total capacity first, then cycle.
+        # Preserve all-zero total-only packages and the old integer-only wire
+        # compatibility. Malformed explicit precision never becomes known zero.
+        prefix = "Capacity" if (size is not None and size > 0) or not has_cycle else "CycleCapacity"
+        if "CapacitySizePrecise" in raw and size is None:
+            prefix = "Capacity"
     # The integer fields truncate independently (e.g. 412 + 87 != 500).
     # Prefer the matching precise field, including explicit zero; only an
     # ABSENT precise field may fall back to the legacy field. Keep precision
     # for reconciliation, aggregation and quota decisions; round only in UI.
-    values = [common.number(raw.get(prefix + suffix + "Precise")
-                            if prefix + suffix + "Precise" in raw
-                            else raw.get(prefix + suffix)) for suffix in suffixes]
+    values = [common.number(source.get(prefix + suffix + "Precise")
+                            if prefix + suffix + "Precise" in source or prefix == "SlicePeriodCapacity"
+                            else source.get(prefix + suffix)) for suffix in suffixes]
     capacity, remaining, used = values
-    invalid_precise = any(prefix + suffix + "Precise" in raw and value is None
+    invalid_precise = any(prefix + suffix + "Precise" in source and value is None
                           for suffix, value in zip(suffixes, values))
     reliable = remaining is not None and not invalid_precise
     if capacity is not None and remaining is not None:
@@ -58,17 +85,9 @@ def normalize_package(raw: dict, realm: str) -> dict:
             reliable = False
     if capacity is not None and used is not None and used > capacity:
         reliable = False
-    expiry = _time(raw.get("PackageEndTime") or raw.get("EndTime"), realm)
-    if expiry is None:
-        # The live billing API's deduction-validity endpoint is epoch milliseconds,
-        # distinct from CycleEndTime (which can be a monthly allowance boundary).
-        deduction_end = common.number(raw.get("DeductionEndTime"))
-        if deduction_end is not None and deduction_end > 0:
-            try:
-                expiry = datetime.fromtimestamp(deduction_end / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            except (ValueError, OverflowError, OSError):
-                pass
-    return {"id": common.text(str(raw.get("AccountId") or raw.get("PackageId") or ""), "package id"),
+    expiry = next((parsed for key in ("PackageEndTime", "EndTime", "DeductionEndTime", "ExpiredTime")
+                   if (parsed := _time(raw.get(key), realm)) is not None), None)
+    return {"id": common.text(str(raw.get("ResourceId") or raw.get("AccountId") or raw.get("PackageId") or ""), "package id"),
             "name": common.text(raw.get("PackageName") or "未命名资源包", "package name", maximum=512),
             "scope": "personal", "unit": "credits", "capacity": capacity, "remaining": remaining,
             "used": used, "reliable": reliable, "basis": prefix,
@@ -150,16 +169,27 @@ def fetch_personal_sync(account: dict, *, account_key: str = "", timeout: float 
 
 
 def fetch_enterprise_sync(account: dict, *, account_key: str = "") -> dict:
-    if common.realm_of(account) != "cn" or not account.get("enterprise_id"):
+    realm = common.realm_of(account)
+    if not account.get("enterprise_id") or common.is_legacy(account):
         raise ValueError("Unsupported WorkBuddy enterprise scope")
-    data = common.request(account, "/billing/meter/get-enterprise-user-usage", body={}, kind="enterprise", account_key=account_key)
+    # Only Global IDE has a matching host/profile contract for this change.
+    # CN's existing codebuddy.cn billing combination is verified usable, not
+    # verified equivalent to the IDE copilot.tencent.com /v2 entry point.
+    prefix = "/v2" if common.profile_of(account) == common.GLOBAL_PROFILE else ""
+    data = common.request(account, prefix + "/billing/meter/get-enterprise-user-usage", body={}, kind="enterprise", account_key=account_key)
+    for _ in range(2):
+        if "limitNum" in data or not isinstance(data.get("data"), dict):
+            break
+        data = data["data"]
     used, capacity = common.number(data.get("credit")), common.number(data.get("limitNum"))
-    reliable = used is not None and capacity is not None and capacity > 0
+    # Missing/invalid credit is not evidence of no consumption; retain the
+    # conservative rule instead of the official client's default-to-zero UI.
+    reliable = used is not None and capacity is not None
     remaining = max(0, capacity - used) if reliable else None
     return {"scope": "enterprise", "unit": "credits", "used": used, "capacity": capacity,
-            "remaining": remaining, "used_percent": min(100, used * 100 / capacity) if reliable else None,
-            "reliable": reliable, "cycle_start": _time(data.get("cycleStartTime"), "cn"),
-            "cycle_end": _time(data.get("cycleEndTime"), "cn")}
+            "remaining": remaining, "used_percent": min(100, used * 100 / capacity) if reliable and capacity else None,
+            "reliable": reliable, "cycle_start": _time(data.get("cycleStartTime"), realm),
+            "cycle_end": _time(data.get("cycleResetTime", data.get("cycleEndTime")), realm)}
 
 
 def fetch_checkin_sync(account: dict, *, account_key: str = "") -> dict:
@@ -238,14 +268,22 @@ def execute_action_sync(account: dict, action: str, *, account_key: str = "") ->
     else:
         raise ValueError("WorkBuddy action is not supported for this region")
     try:
-        data = common.request(account, path, body={}, account_key=account_key, allow_empty=True)
+        data = common.request(account, path, body={}, account_key=account_key, allow_empty=action == "claim_trial")
     except common.WorkBuddyError as exc:
+        if action == "checkin" and exc.code in CHECKIN_BUSINESS_STATUSES:
+            return {"status": CHECKIN_BUSINESS_STATUSES[exc.code],
+                    "code": exc.code}
         if action == "claim_trial" and exc.code == 14051:
             return {"status": "already_done", "code": exc.code}
         raise
     result = {"status": "succeeded"}
     # Only explicit response fields establish an award, never a balance delta.
-    award = common.number(data.get("todayCredit", data.get("today_credit")))
+    award = common.number(data.get("credit", data.get("todayCredit", data.get("today_credit")))
+                          if action == "checkin" else data.get("todayCredit", data.get("today_credit")))
+    if action == "checkin" and award is None:
+        # code=0 with empty/missing result is not an acknowledged award. The
+        # durable action owner will only reconcile this intent via status reads.
+        return {"status": "unknown"}
     if award is not None:
         result["awarded_credits"] = award
     return result

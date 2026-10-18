@@ -1,0 +1,26 @@
+{
+  "model": "primary-model",
+  "messages": [
+    {"role": "system", "content": "You are a coding agent."},
+    {"role": "user", "content": "Just tell me what tools you have. Do not call anything."}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "Read a file from the workspace.",
+        "parameters": {
+          "type": "object",
+          "properties": {"path": {"type": "string"}},
+          "required": ["path"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "none",
+  "temperature": 1,
+  "max_tokens": 72000,
+  "stream": true,
+  "stream_options": {"include_usage": true}
+}

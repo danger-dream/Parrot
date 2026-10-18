@@ -79,7 +79,7 @@ def test_global_device_flow_pending_identity_retry_persistence_and_refresh(wire,
     ctl = OAuthControl(clock=lambda: clock[0])
     monkeypatch.setattr(ctl, "_post_save_account_effects", lambda *a, **k: {})
     ctx = context()
-    flow = ctl.start_login_flow(ctx, OAuthProvider.WORKBUDDY, realm="global")
+    flow = ctl.start_login_flow(ctx, OAuthProvider.WORKBUDDY, realm="global", client_profile="ide")
     assert "国际区" in flow.instruction and flow.auth_url.startswith("https://www.codebuddy.ai/")
     assert ctl.poll_login_flow(ctx, flow.flow_id, flow.flow_secret).status == "pending"
     clock[0] += timedelta(seconds=3)
@@ -132,12 +132,12 @@ def test_login_rejects_wrong_profile_before_network(realm, profile, monkeypatch)
 def test_global_profile_headers_and_legacy_profile_are_distinct():
     account = {"realm": "global", "uid": "u", "access_token": "fixture-at", "refresh_token": "fixture-rt"}
     assert common.api_base_url(account) == "https://www.workbuddy.ai"
-    assert common.headers(account)["User-Agent"] == common.USER_AGENT
+    assert common.headers(account)["User-Agent"] == common.LEGACY_USER_AGENT
     account["workbuddy_client_profile"] = "ide"
     assert common.api_base_url(account) == common.billing_base_url(account) == "https://www.codebuddy.ai"
     headers = common.headers(account)
     assert headers["User-Agent"] == common.GLOBAL_CHAT_USER_AGENT
-    assert headers["X-IDE-Name"] == "IDE" and headers["x-codebuddy-request"] == "1"
+    assert headers["X-IDE-Name"] == "CodeBuddyIDE" and "x-codebuddy-request" not in headers
     assert headers["Authorization"] == "Bearer fixture-at" and "X-No-Authorization" not in headers
     for kind in ("anonymous", "refresh", "account", "billing"):
         assert common.headers(account, kind)["User-Agent"] == common.GLOBAL_AUTH_USER_AGENT
@@ -145,12 +145,11 @@ def test_global_profile_headers_and_legacy_profile_are_distinct():
         common.headers(dict(account, domain="www.codebuddy.cn"))
 
 
-@pytest.mark.parametrize("agent_name", ["ide", "cli"])
-def test_global_dynamic_catalog_uses_only_authenticated_client_models(agent_name, monkeypatch):
+def test_global_dynamic_catalog_uses_only_authenticated_client_models(monkeypatch):
     account = {"realm": "global", "workbuddy_client_profile": "ide"}
     monkeypatch.setattr(common, "request", lambda *a, **k: {
         "models": [{"id": "auto"}, {"id": "disabled", "disabled": True}, {"id": "not-advertised"}],
-        "agents": [{"name": agent_name, "models": ["auto", "disabled"]}],
+        "agents": [{"name": "craft", "models": ["auto", "disabled"]}],
     })
     assert [r["id"] for r in catalog.fetch_models_sync(account)] == ["auto"]
 
@@ -182,8 +181,9 @@ def test_global_tg_automatic_login_and_saved_identity_use_international_region(t
         "realm": kwargs["realm"], "workbuddy_client_profile": kwargs["client_profile"],
         "auth_url": "https://www.codebuddy.ai/login", "state": "fixture-state", "status": "pending"})
     oauth_menu.handle_callback(42, 900, "cb", "oa:add")
+    click(tg, "WorkBuddy")
     assert any(b.get("callback_data") == "oa:wb:login:global" for b in buttons(output[-1][1]))
-    click(tg, "国际区登录")
+    click(tg, "CodeBuddy IDE")
     assert "国际区登录" in output[-1][0] and "Google / GitHub" in output[-1][0]
     entry = dict(om.get_account(key), realm="global", domain="www.codebuddy.ai", workbuddy_client_profile="ide")
     monkeypatch.setattr(ctl.backend, "workbuddy_poll_login", lambda p: p.update(status="ready", entry=entry))

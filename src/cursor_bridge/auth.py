@@ -143,7 +143,11 @@ def refresh_cursor_token(refresh_token: str, *, client: httpx.Client | None = No
             content=b"{}",
         )
         if not response.is_success:
-            raise RuntimeError(f"Cursor token refresh failed: {response.text}")
+            error = RuntimeError("Cursor token refresh HTTP failure")
+            error.response_status = response.status_code
+            from ..safe_diagnostics import _response_code
+            error.code = _response_code(response)
+            raise error
         data = response.json()
         access = data["accessToken"]
         refresh = data.get("refreshToken") or refresh_token

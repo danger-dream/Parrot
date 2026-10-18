@@ -189,8 +189,11 @@ class Connector:
         except Exception as e:
             lat = round((time.time() - t0) * 1000)
             self.stats.total_failures += 1
-            self.stats.last_error = str(e)[:200]
-            return {"ok": False, "ip": "", "latency_ms": lat, "error": str(e)[:200]}
+            from .. import safe_diagnostics
+            diagnostic = safe_diagnostics.report(e, provider="proxy", operation="connectivity_test", stage="request")
+            self.stats.last_error = safe_diagnostics.message(diagnostic)
+            return {"ok": False, "ip": "", "latency_ms": lat, "error": self.stats.last_error,
+                    "diagnostic_kind": diagnostic.kind}
 
 
 class SyncRoutedStream:

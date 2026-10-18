@@ -10,6 +10,8 @@ OAuth 的恢复由 `quota_monitor_once` 负责（通过用量判断 < 95% 后解
 
 from __future__ import annotations
 
+from src import safe_diagnostics
+
 import asyncio
 import json
 import re
@@ -119,6 +121,7 @@ def _probe_payload_for(ch: Channel, *, max_tokens: int, user_message: str) -> tu
     return body, "anthropic"
 
 
+@safe_diagnostics.diagnose("channels", "probe", "request", emit=False)
 async def probe_channel_model(
     ch: Channel, model: str, timeout_s: Optional[float] = None,
 ) -> tuple[bool, int, Optional[str]]:
@@ -146,6 +149,7 @@ async def probe_channel_model(
     try:
         upstream_req = await ch.build_upstream_request(body, model, ingress_protocol=ingress)
     except Exception as exc:
+        safe_diagnostics.report(exc, provider="channels", operation="probe", stage="request_build")
         return False, 0, f"transform error: {exc}"
 
     # 用临时 client（独立于服务端主 client 的连接池；避免主池长连接影响 probe 结果）
@@ -166,30 +170,45 @@ async def probe_channel_model(
                 ),
                 timeout=timeout,
             )
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
+            safe_diagnostics.report(exc)
             return False, int((time.time() - t0) * 1000), f"timeout > {timeout}s"
-        except httpx.ConnectTimeout:
+        except httpx.ConnectTimeout as exc:
+            safe_diagnostics.report(exc)
             return False, int((time.time() - t0) * 1000), f"connect timeout > {timeout}s"
         except httpx.ConnectError as exc:
+            safe_diagnostics.report(exc)
             return False, int((time.time() - t0) * 1000), f"connect error: {exc}"
         except httpx.TimeoutException as exc:
+            safe_diagnostics.report(exc)
             return False, int((time.time() - t0) * 1000), f"timeout: {exc}"
         except Exception as exc:
+            safe_diagnostics.report(exc)
             return False, int((time.time() - t0) * 1000), f"transport: {exc}"
 
         elapsed_ms = int((time.time() - t0) * 1000)
 
         if resp.status_code != 200:
+            error = RuntimeError("probe HTTP failure")
+            error.status_code = resp.status_code
+            safe_diagnostics.report(error)
             return False, elapsed_ms, f"HTTP {resp.status_code}: {resp.text[:200]}"
 
         try:
             obj = resp.json()
-        except Exception:
+        except Exception as exc:
+            safe_diagnostics.report(exc, stage="response")
             return False, elapsed_ms, f"non-JSON response: {resp.text[:200]}"
 
         if isinstance(obj, dict) and (
             obj.get("type") == "error" or isinstance(obj.get("error"), dict)
         ):
+            error = RuntimeError("probe business failure")
+            error.kind = "business"
+            error.response_status = 200
+            detail = obj.get("error") if isinstance(obj.get("error"), dict) else obj
+            error.code = detail.get("code", "unrecognized")
+            safe_diagnostics.report(error, stage="response")
             return False, elapsed_ms, f"upstream error: {json.dumps(obj.get('error', obj))[:200]}"
 
         # A health/info endpoint can also return HTTP 200 JSON. Recovery needs
@@ -199,6 +218,9 @@ async def probe_channel_model(
             obj, getattr(ch, "protocol", "anthropic"), allow_async=False,
         )
         if terminal_error:
+            error = ValueError("probe response has no terminal")
+            error.kind = "invalid_data"
+            safe_diagnostics.report(error, stage="response")
             return False, elapsed_ms, terminal_error
 
         return True, elapsed_ms, None
@@ -309,7 +331,7 @@ async def recovery_run_once() -> int:
                     continue
 
             # 其他失败：只打日志，不额外记 cooldown（本身就在 cooldown 中）
-            print(f"[probe] still failing {ch.key}:{entry['model']} — {reason}")
+            print("[probe] recovery check still failing; see management_failure diagnostics")
     return cleared
 
 

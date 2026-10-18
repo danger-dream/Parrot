@@ -543,6 +543,8 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
             400, errors.ErrTypeOpenAI.INVALID_REQUEST, exc.message, param=exc.param,
         )
     if ingress_protocol == "chat":
+        from ..providers.workbuddy_replay import capture_chat_fields
+        capture_chat_fields(body)
         normalize_chat_reasoning_alias(body)
 
     # Preserve the original client-provided field set before Parrot mutates the
@@ -606,6 +608,8 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     body["_api_key_name"] = key_name or ""
     from ..oauth.zhipu.request_context import capture_headers as capture_zcode_headers
     capture_zcode_headers(body, request.headers)
+    from ..providers.workbuddy_context import capture_headers as capture_workbuddy_headers
+    capture_workbuddy_headers(body, request.headers)
     claude_session_id = str(
         request.headers.get("x-claude-code-session-id") or ""
     ).strip()

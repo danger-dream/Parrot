@@ -314,7 +314,12 @@ def test_old_import_input_states_do_not_parse_or_download_credentials(tg, monkey
 def test_add_menu_only_offers_workbuddy_browser_login_and_keeps_other_imports(tg):
     menu.on_add_menu(42, 900, "cb")
     callbacks = [b.get("callback_data") for b in buttons(tg[3][-1][1])]
-    assert [v for v in callbacks if v and v.startswith("oa:wb:")] == ["oa:wb:login", "oa:wb:login:global"]
+    assert "oa:add:workbuddy" in callbacks and "oa:add:openai" in callbacks
+    menu.handle_callback(42, 900, "cb", "oa:add:workbuddy")
+    callbacks = [b.get("callback_data") for b in buttons(tg[3][-1][1])]
+    assert [v for v in callbacks if v and v.startswith("oa:wb:")] == ["oa:wb:login", "oa:wb:login:global", "oa:wb:login:global:ide"]
+    menu.handle_callback(42, 900, "cb", "oa:add:openai")
+    callbacks = [b.get("callback_data") for b in buttons(tg[3][-1][1])]
     assert "oa:import:cpa" in callbacks and "oa:import:sub2api" in callbacks
 
 

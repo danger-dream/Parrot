@@ -808,7 +808,7 @@ def workbuddy_action_begin(key: str, row: dict, *, retry_failed: bool = False) -
 def workbuddy_action_finish(key: str, attempt_id: str, fields: dict) -> dict:
     patch = {name: value for name, value in fields.items() if name in {
         "status", "phase", "code", "http_status", "awarded_credits", "balance_updated", "reconciled"}}
-    if patch.get("status") not in {"succeeded", "already_done", "failed", "rejected", "unknown"}:
+    if patch.get("status") not in {"succeeded", "already_done", "not_eligible", "activity_inactive", "failed", "rejected", "unknown"}:
         raise ValueError("invalid WorkBuddy action result")
     def op(data):
         old = data.get(key)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from src.safe_diagnostics import diagnose, summary
+
 import asyncio
 import hashlib
 import json
@@ -12,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
 from src.management_control.errors import ErrorField, ManagementError, ManagementErrorCode
+from src.oauth import add_context
 
 from .backend import OAuthBackend
 from .models import (
@@ -32,6 +35,7 @@ from .zhipu_flows import ZhipuFlows
 class CompletedCredential:
     entry: dict
     source: str
+    add_attempt: add_context.AddAttempt | None = None
 
 
 def _utc_text(value: datetime) -> str:
@@ -84,7 +88,7 @@ class OAuthFlowService:
     def start(self, actor_subject_id: str, provider: OAuthProvider, *, realm="cn", client_profile=None) -> OAuthLoginFlow:
         if provider is OAuthProvider.WORKBUDDY:
             return self.workbuddy.start(actor_subject_id, realm=realm, client_profile=client_profile)
-        payload: dict = {"provider": provider.value}
+        payload: dict = {"provider": provider.value, "add_attempt": add_context.current()}
         instruction: str | None = None
         auth_url: str | None
         if provider is OAuthProvider.CLAUDE:
@@ -183,7 +187,8 @@ class OAuthFlowService:
             kind=f"login:{provider.value}",
         )
         try:
-            entry = self._complete_provider(provider, payload, command)
+            with add_context.bind(payload.get("add_attempt")):
+                entry = self._complete_provider(provider, payload, command)
         except ManagementError:
             raise
         except Exception as exc:
@@ -191,7 +196,8 @@ class OAuthFlowService:
                 ManagementErrorCode.UPSTREAM_ERROR,
                 retryable=True,
             ) from exc
-        return CompletedCredential(entry=entry, source=f"{provider.value} login")
+        return CompletedCredential(entry=entry, source=f"{provider.value} login",
+                                   add_attempt=payload.get("add_attempt"))
 
     def _antigravity_submission(self, payload: dict, command: CompleteOAuthLoginCommand):
         source = str(command.callback_url or command.code or "").strip()
@@ -337,6 +343,7 @@ class OAuthFlowService:
         )
         return self.antigravity_entry(token, now=now)
 
+    @diagnose('', 'import', 'import_validate')
     def credential_entry(self, credential: OAuthCredential) -> dict:
         if credential.provider is OAuthProvider.ZHIPU:
             if not isinstance(credential, JsonCredential):
@@ -346,8 +353,9 @@ class OAuthFlowService:
                 if not isinstance(value, dict):
                     raise ValueError()
                 return self.backend.zhipu_prepare_credential(value)
-            except (ValueError, TypeError):
-                raise ManagementError(ManagementErrorCode.VALIDATION_FAILED) from None
+            except (ValueError, TypeError) as exc:
+                raise ManagementError(ManagementErrorCode.VALIDATION_FAILED,
+                    summary(exc, provider="zhipu", operation="import", stage="import_parse")) from None
         if credential.provider is OAuthProvider.WORKBUDDY:
             raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
         now = self._now()
@@ -378,7 +386,8 @@ class OAuthFlowService:
             try:
                 value = json.loads(credential.payload)
             except Exception as exc:
-                raise ManagementError(ManagementErrorCode.VALIDATION_FAILED) from exc
+                raise ManagementError(ManagementErrorCode.VALIDATION_FAILED,
+                    summary(exc, provider=credential.provider.value, operation="import", stage="import_parse")) from exc
             if not isinstance(value, dict):
                 raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
             return self.credential_entry(

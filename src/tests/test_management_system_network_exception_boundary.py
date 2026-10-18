@@ -244,7 +244,8 @@ def test_network_worker_terminal_failures_are_stable_operations_and_single_audit
     assert terminal.result is None
     assert terminal.error is not None
     assert terminal.error.code is ManagementErrorCode.DEPENDENCY_UNAVAILABLE
-    assert terminal.error.message == "DEPENDENCY_UNAVAILABLE"
+    assert "network." in terminal.error.message and "具体原因尚不确定" in terminal.error.message
+    assert "不要盲目重复提交" in terminal.error.message
     assert MARKER not in repr(terminal)
     records = [row for row in fixture.audit.snapshot() if row.action == action]
     assert len(records) == 1

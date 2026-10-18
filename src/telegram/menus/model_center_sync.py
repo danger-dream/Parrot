@@ -196,7 +196,7 @@ def _progress_text(operation_id: str) -> str:
                 lines.append(
                     f"{index}. {label}\n"
                     f"❌ {_STATUS_TEXT.get(status, status)}："
-                    f"{ui.escape_html(_ERROR_TEXT.get(reason, '同步未完成，请重试'))}"
+                    f"{ui.escape_html(event.get('errorMessage') or _ERROR_TEXT.get(reason, '同步未完成，请核对诊断记录'))}"
                 )
             lines.append("")
         elif phase == "cancelled":

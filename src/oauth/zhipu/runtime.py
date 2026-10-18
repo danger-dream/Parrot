@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime, timezone
 
 from . import auth, common as c, signing, project_tokens
+from .. import add_context
 
 
 def ensure_device_id(account_key, expected_account):
@@ -174,6 +175,11 @@ def bind_project(account_key, source, entry):
         fields = {key: copy.deepcopy(entry[key]) for key in (*auth.ACCOUNT_FIELDS, "provider", "type", "access_token", "refresh_token", "email") if key in entry}
         shell = not current.get("organization_id") and not current.get("project_id") and not c.has_model_key(current)
         if target is not None:
+            attempt = add_context.current()
+            if attempt is not None and attempt.target is not None and account_key != target_key:
+                # An initialization race must not overwrite another saved scope
+                # (including its route) without that identity's confirmation.
+                raise ManagementError(Code.IDENTITY_CONFLICT)
             result = om.replace_exact_identity(target_key, fields, expected_account=target)
             if result.get("status") != "replaced":
                 raise ManagementError(Code.REVISION_CONFLICT)
@@ -195,11 +201,24 @@ def bind_project(account_key, source, entry):
             index = next(i for i, value in enumerate(accounts) if key_of(value) == account_key)
             accounts[index] = copy.deepcopy(replacement)
             om._rename_priority_orders_in_config(cfg, "oauth:" + account_key, "oauth:" + target_key, "anthropic")
+            routes = ((cfg.get("network") or {}).get("routing") or {}).get("accounts") or {}
+            for old, new in ((account_key, target_key), ("oauth:" + account_key, "oauth:" + target_key)):
+                if old in routes:
+                    routes.setdefault(new, routes.pop(old))
+            add_context.persist_account_route(cfg, target_key)
         def rollback(cfg):
             cfg["oauthAccounts"] = copy.deepcopy(before.get("oauthAccounts", []))
             cfg["loadBalancing"] = copy.deepcopy(before.get("loadBalancing", {}))
+            old_routes = ((before.get("network") or {}).get("routing") or {}).get("accounts")
+            routing = (cfg.get("network") or {}).get("routing") or {}
+            if old_routes is None:
+                routing.pop("accounts", None)
+            else:
+                routing["accounts"] = copy.deepcopy(old_routes)
         om._rename_runtime_oauth_identity(account_key, target_key, config_mutator=mutate, rollback_mutator=rollback,
                                           email=current.get("email"))
+        if add_context.current() is not None:
+            add_context.current().published.add("oauth:" + target_key)
         return target_key, "updated"
 
 

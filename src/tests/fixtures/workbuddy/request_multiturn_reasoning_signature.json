@@ -1,0 +1,42 @@
+{
+  "model": "primary-model",
+  "messages": [
+    {"role": "system", "content": "You are a coding agent."},
+    {"role": "user", "content": "Look at a.py and tell me what is inside."},
+    {"role": "assistant",
+     "content": null,
+     "reasoning": "The user wants the contents of a.py. I should call read_file first, then summarize the result for them.",
+     "extra_fields": {"signature": "sig-3f9c2a7b8d1e4f60"},
+     "tool_calls": [
+       {"id": "call_ab12", "type": "function",
+        "function": {"name": "read_file", "arguments": "{\"path\":\"a.py\"}"}}
+     ]},
+    {"role": "tool", "tool_call_id": "call_ab12",
+     "content": "FILE: a.py (12 lines)\ndef helper(x):\n    return x + 1\n"},
+    {"role": "assistant",
+     "content": [{"type": "text", "text": "a.py is a small helper module: it defines helper(x), which returns x + 1.", "annotations": []}],
+     "reasoning": "The file is tiny; a one-sentence summary is enough.",
+     "extra_fields": {"signature": "sig-8a41d0c6b2e5f733"}},
+    {"role": "user", "content": "Copy it to b.py."}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "Read a file from the workspace.",
+        "parameters": {
+          "type": "object",
+          "properties": {"path": {"type": "string"}},
+          "required": ["path"]
+        }
+      }
+    }
+  ],
+  "temperature": 1,
+  "max_tokens": 72000,
+  "stream": true,
+  "stream_options": {"include_usage": true},
+  "reasoning_effort": "high",
+  "verbosity": "high"
+}
