@@ -4878,7 +4878,7 @@ def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str, page: 
         oauth_control.delete_account(_management_context(chat_id), ak)
     except Exception as exc:
         ui.answer_cb(cb_id, "删除失败")
-        ui.send(chat_id, f"❌ 删除失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="on_delete_exec"))}</code>")
+        ui.send(chat_id, f"❌ 删除失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation='oauth_management', stage='on_delete_exec'))}</code>")
         return
     ui.answer_cb(cb_id, "已删除")
     extra = ""
@@ -5021,7 +5021,7 @@ def _run_oauth_update_panel(chat_id: int, progress_mid: int, account_keys: list[
                 _set_item(idx0, ak, "  ✅ 刷新成功")
         except Exception as exc:
             fail_count += 1
-            items[idx0] = _progress_account_block(ak, idx0 + 1, f"  ❌ 更新异常: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="run_oauth_update_panel"))[:120]}</code>")
+            items[idx0] = _progress_account_block(ak, idx0 + 1, f"  ❌ 更新异常: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation='oauth_management', stage='run_oauth_update_panel'))[:120]}</code>")
             _flush()
         finally:
             with _BACKGROUND_REFRESH_LOCK:
@@ -5248,7 +5248,7 @@ def _run_refresh_all_legacy_panel(chat_id: int, progress_mid: int, account_keys:
                 lines.append("  ❌ 自动解禁写入失败，见 systemd 日志")
         except Exception as exc:
             fail_count += 1
-            lines[-1] = f"  ❌ 刷新异常: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="token_refresh"))[:120]}</code>"
+            lines[-1] = f"  ❌ 刷新异常: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation='oauth_management', stage='token_refresh'))[:120]}</code>"
         finally:
             with _BACKGROUND_REFRESH_LOCK:
                 _BACKGROUND_REFRESH_INFLIGHT.discard(ak)
@@ -5573,7 +5573,7 @@ def on_login_code_input(chat_id: int, text: str) -> None:
         )
     except Exception as exc:
         ui.send_result(chat_id,
-                       f"❌ 保存失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="account_save"))}</code>",
+                       f"❌ 保存失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation='oauth_management', stage='account_save'))}</code>",
                        **nav)
         return
     if save_action == "staged":
@@ -5627,7 +5627,7 @@ def on_set_json_input(chat_id: int, text: str) -> None:
         data = json.loads((text or "").strip())
     except Exception as exc:
         ui.send_result(chat_id,
-                       f"❌ JSON 解析失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="import_parse"))}</code>",
+                       f"❌ JSON 解析失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation='oauth_management', stage='import_parse'))}</code>",
                        **nav)
         return
     if not isinstance(data, dict):
@@ -5660,7 +5660,7 @@ def on_set_json_input(chat_id: int, text: str) -> None:
         )
     except Exception as exc:
         ui.send_result(chat_id,
-                       f"❌ 保存失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="import_parse"))}</code>",
+                       f"❌ 保存失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation='oauth_management', stage='import_parse'))}</code>",
                        **nav)
         return
     if save_action == "staged":
@@ -5847,7 +5847,7 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
         ui.edit(
             chat_id,
             message_id,
-            f"❌ 保存 Cursor 账户失败：<code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="account_save"))[:500]}</code>",
+            f"❌ 保存 Cursor 账户失败：<code>{ui.escape_html(safe_diagnostics.summary(exc, operation='oauth_management', stage='account_save'))[:500]}</code>",
             reply_markup=ui.inline_kb([[ui.btn(_login_nav(relogin)["back_label"], _login_cancel(relogin))]]),
         )
         return
@@ -6221,7 +6221,7 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str, relogin=None) ->
     except Exception as exc:
         ui.send_result(
             chat_id,
-            f"❌ 保存失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="account_save"))[:500]}</code>",
+            f"❌ 保存失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation='oauth_management', stage='account_save'))[:500]}</code>",
             **_login_nav(relogin),
         )
         return
@@ -6471,7 +6471,7 @@ def _finish_xai_add(chat_id: int, tok: dict, *, source: str, relogin=None) -> No
     except Exception as exc:
         ui.send_result(
             chat_id,
-            f"❌ 保存失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="account_save"))[:500]}</code>",
+            f"❌ 保存失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation='oauth_management', stage='account_save'))[:500]}</code>",
             **_login_nav(relogin),
         )
         return
@@ -6571,7 +6571,7 @@ def on_login_antigravity_code_input(chat_id: int, text: str) -> None:
     except Exception as exc:
         ui.send_result(
             chat_id,
-            f"❌ 没有抽到 code：<code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="callback_parse"))[:300]}</code>",
+            f"❌ 没有抽到 code：<code>{ui.escape_html(safe_diagnostics.summary(exc, operation='oauth_management', stage='callback_parse'))[:300]}</code>",
             **_login_nav(relogin),
         )
         return
@@ -6657,7 +6657,7 @@ def _finish_antigravity_add(chat_id: int, tok: dict, *, source: str, relogin=Non
     except Exception as exc:
         ui.send_result(
             chat_id,
-            f"❌ 保存失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="account_save"))[:500]}</code>",
+            f"❌ 保存失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation='oauth_management', stage='account_save'))[:500]}</code>",
             **_login_nav(relogin),
         )
         return
@@ -6717,14 +6717,14 @@ def _parse_openai_import_or_report(chat_id: int, kind: str, payload, *, filename
     except OpenAIImportParseError as exc:
         ui.send_result(
             chat_id,
-            f"❌ 解析失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="import_parse"))[:800]}</code>",
+            f"❌ 解析失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation='oauth_management', stage='import_parse'))[:800]}</code>",
             back_label="◀ 返回新增账户", back_callback="oa:add",
         )
         return None
     except Exception as exc:
         ui.send_result(
             chat_id,
-            f"❌ 解析失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="import_parse"))[:800]}</code>",
+            f"❌ 解析失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation='oauth_management', stage='import_parse'))[:800]}</code>",
             back_label="◀ 返回新增账户", back_callback="oa:add",
         )
         return None
@@ -6788,7 +6788,7 @@ def on_import_openai_document_input(chat_id: int, msg: dict) -> None:
     except Exception as exc:
         ui.send_result(
             chat_id,
-            f"❌ 文件下载失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="file_download"))[:500]}</code>",
+            f"❌ 文件下载失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation='oauth_management', stage='file_download'))[:500]}</code>",
             **_OA_NAV_OPENAI,
         )
         return
@@ -7505,7 +7505,7 @@ def on_edit_max_concurrent_input(chat_id: int, text: str) -> None:
     try:
         oauth_control.set_account_max_concurrent(_management_context(chat_id), ak, v)
     except Exception as exc:
-        ui.send(chat_id, f"❌ 失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation="oauth_management", stage="on_edit_max_concurrent_input"))}</code>")
+        ui.send(chat_id, f"❌ 失败: <code>{ui.escape_html(safe_diagnostics.summary(exc, operation='oauth_management', stage='on_edit_max_concurrent_input'))}</code>")
         return
     states.pop_state(chat_id)
     label = "默认" if v == 0 else str(v)
