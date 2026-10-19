@@ -7,6 +7,8 @@ error rendering while the typed HTTP use cases use higher-level methods.
 
 from __future__ import annotations
 
+import os
+
 from src.management_auth.principal import Capability
 from src.management_control.context import ManagementContext
 
@@ -54,7 +56,25 @@ class OAuthLegacyOperationsControlMixin:
         return self.backend.evaluate_cached_quota(account_id)
 
     async def force_refresh_raw(self, account_id: str) -> str:
-        return await self.backend.force_refresh(account_id)
+        from src import oauth_errors, oauth_manager, oauth_refresh_failure
+        if os.environ.get("PARROT_NO_REFRESH") == "1":
+            raise oauth_errors.OAuthRefreshStateError("refresh_disabled")
+        account = self._legacy_account(account_id)
+        account_id = self.backend.account_id(account)
+        expected = oauth_manager.account_state_key(account)
+        observation = oauth_manager.refresh_observation(account)
+        provider = self.backend.provider_of(account)
+        try:
+            with oauth_manager.exact_operation_target(account_id, expected):
+                return await self.backend.force_refresh(account_id)
+        except Exception as exc:
+            error, effect = oauth_refresh_failure.apply(
+                account_id, exc, expected_state_key=expected,
+                provider=provider, observation=observation,
+            )
+            if error.auth_error and effect is None:
+                raise oauth_errors.OAuthRefreshStateError("credentials_changed") from None
+            raise
 
     def ensure_openai_metadata_fresh_sync_raw(self, *args, **kwargs):
         return self.backend.ensure_openai_metadata_fresh_sync(*args, **kwargs)

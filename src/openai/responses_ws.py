@@ -2137,8 +2137,9 @@ async def _try_ws_channel(
                     if (
                         next_resolved_model is not None
                         and bool(getattr(ch, "enabled", True))
-                        and model_state.is_global_enabled(requested_model)
-                        and model_state.is_source_enabled(ch.key, requested_model)
+                        and all(model_state.is_global_enabled(model, source_key=ch.key)
+                                and model_state.is_source_enabled(ch.key, model)
+                                for model in model_mapping.request_model_names(body, next_resolved_model))
                         and route_name in route_names
                     ):
                         resolved_model = next_resolved_model
@@ -2614,8 +2615,9 @@ async def _run_codex_sse_fallback_session(
             requested_model = str(next_body.get("model") or "")
             next_model = ch.supports_model(requested_model)
             if (next_model is None or not ch.enabled
-                    or not model_state.is_global_enabled(requested_model)
-                    or not model_state.is_source_enabled(ch.key, requested_model)):
+                    or not all(model_state.is_global_enabled(model, source_key=ch.key)
+                               and model_state.is_source_enabled(ch.key, model)
+                               for model in model_mapping.request_model_names(next_body, next_model))):
                 await _send_request_invalid_error_frame(websocket, "model is not available on the active route", param="model")
                 continue
             full = rebuild_full_request(next_body, api_key_name=api_key_name,

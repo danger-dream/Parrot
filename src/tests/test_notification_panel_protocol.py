@@ -158,6 +158,52 @@ def test_missing_existing_panel_recreated_once_and_old_refs_fail_closed(env, pro
     assert store.get('deliveries', row['id'])['panel_id'] == current['panel_id']
 
 
+def test_close_deletes_only_target_without_replacement_message(env, protocol):
+    rows = delivered(event(), env)
+    row = rows[0]
+    before_accounts = copy.deepcopy(env[0]['oauthAccounts'])
+    before_messages = copy.deepcopy(protocol.messages)
+    before = len(protocol.calls)
+    click(row, 'close')
+    calls = protocol.calls[before:]
+    assert [method for method, payload in calls] == ['answerCallbackQuery', 'deleteMessage']
+    before_messages.pop((row['chat_id'], row['message_id']))
+    assert protocol.messages == before_messages
+    assert store.get('deliveries', row['id'])['state'] == 'closed'
+    assert store.get('deliveries', rows[1]['id'])['state'] == 'sent'
+    assert env[0]['oauthAccounts'] == before_accounts
+
+    before = len(protocol.calls)
+    click(row, 'close')
+    assert [method for method, payload in protocol.calls[before:]] == ['answerCallbackQuery']
+    assert protocol.messages == before_messages
+
+
+@pytest.mark.parametrize('rejected', [True, False])
+def test_close_failure_keeps_error_feedback_without_claiming_deletion(env, protocol, rejected):
+    row = delivered(event(), env)[0]
+    original = delivery.transport()
+    attempts = []
+
+    def fail_delete(method, payload):
+        if method == 'deleteMessage':
+            attempts.append(payload)
+            return {'ok': False, 'error_code': 400} if rejected else None
+        return original(method, payload)
+
+    delivery.install(fail_delete, recover=False)
+    before = len(protocol.calls)
+    click(row, 'close')
+    assert len(attempts) == 1
+    assert (row['chat_id'], row['message_id']) in protocol.messages
+    current = store.get('deliveries', row['id'])
+    assert current['state'] == 'sent'
+    assert current['close_result'] == ('failed' if rejected else 'unknown')
+    feedback = [payload['text'] for method, payload in protocol.calls[before:] if method == 'sendMessage']
+    assert len(feedback) == 1 and '未允许删除或未返回确认' in feedback[0]
+    assert '已关闭' not in feedback[0]
+
+
 def test_ack_precedes_panel_io_and_never_claims_success(env, protocol):
     row = delivered(event(), env)[0]
     before = len(protocol.calls)

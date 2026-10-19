@@ -89,10 +89,15 @@ def test_empty_drops_old_credit_fallback_but_unknown_retains_it(monkeypatch, rea
     assert failed["last_success_packages"] == old["packages"] and failed["last_success_at"] == 100
 
 
-def test_empty_packages_neither_disable_account_nor_resume_existing_quota(account, monkeypatch):
+@pytest.mark.parametrize("realm", ["cn", "global"])
+def test_empty_packages_neither_disable_account_nor_resume_existing_quota(account, monkeypatch, realm):
+    if realm == "global":
+        config.update(lambda c: c["oauthAccounts"][0].update(realm=realm, domain="www.workbuddy.ai",
+                                                           workbuddy_client_profile="workbuddy-cli"))
+        account = om.get_account_key(om.list_accounts()[0])
     monkeypatch.setattr(common, "request", lambda *a, **k: _page(None, 0))
     block = billing.fetch_personal_sync(om.get_account(account))
-    usage = observation(account, **block)
+    usage = observation(account, realm=realm, **block)
     assert om.evaluate_and_toggle_by_usage(account, usage, fresh=True)["action"] == "noop_unknown"
     assert om.get_account(account)["enabled"]
     om.set_disabled_by_quota(account, None)
@@ -144,7 +149,11 @@ def test_query_progress_result_time_and_error_survive_rerender(tg, monkeypatch, 
     monkeypatch.setenv("PARROT_NO_REFRESH", "1")
     nav = (ui.register_code(key), 3, "quota")
     text, _ = wb.render_activity(key, nav, chat_id=42)
-    assert "320" in text and "数据更新于" in text and not paths
+    if realm == "cn":
+        assert "320" in text and "数据更新于" in text
+    else:
+        assert "320" not in text and "积分" not in text and "资源包" not in text
+    assert not paths
     def query():
         if entrypoint == "detail":
             menu.on_refresh_usage(42, 900, "cb", nav[0], page=nav[1], filter_key=nav[2])
@@ -155,6 +164,16 @@ def test_query_progress_result_time_and_error_survive_rerender(tg, monkeypatch, 
         output.clear()
         ui.answer_cb.reset_mock()
         query()
+        if realm == "global":
+            assert output and not paths
+            ui.answer_cb.assert_called_once_with("cb")
+            for text, kb in output:
+                assert "查询中" not in text and "查询结束" not in text
+                assert "积分" not in text and "资源包" not in text and "计费类型" not in text
+                assert "未执行签到" not in text and "未申请试用额度" not in text
+                assert kb and "fixture-at" not in text and "fixture-rt" not in text
+            assert om.get_account(key) == before and ledger["calls"] == 0
+            continue
         assert len(output) == 2 and "查询中" in output[0][0]
         text, kb = output[-1]
         assert "查询结束:" in text and wb._date(time.time()*1000)[:16] in text
@@ -172,10 +191,7 @@ def test_query_progress_result_time_and_error_survive_rerender(tg, monkeypatch, 
         else:
             assert "❌ 查询失败" in text and "网络请求失败" in text and "HTTP 503" in text
             assert "页面数据未更新" in text and "320" in text and not paths
-        if realm == "global":
-            assert "未执行签到" not in text and "未申请试用额度" in text
-        else:
-            assert "未执行签到" in text
+        assert "未执行签到" in text
         assert kb and ledger["calls"] == 0
         assert om.get_account(key) == before
         assert "fixture-at" not in text and "fixture-rt" not in text

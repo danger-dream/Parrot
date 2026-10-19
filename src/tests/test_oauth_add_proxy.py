@@ -231,7 +231,11 @@ def test_device_flow_keeps_proxy_across_threads_and_requires_duplicate_confirmat
     om.add_account(entry)
     def start(**kwargs):
         seen.append(route("oauth_" + provider.value))
-        return {"auth_url": "https://example.test/login", "status": "pending", "site": "bigmodel", "interval": 1}
+        payload = {"auth_url": "https://example.test/login", "status": "pending", "site": "bigmodel", "interval": 1}
+        if provider is OAuthProvider.WORKBUDDY:
+            # Real WorkBuddy start_login_sync includes its selected route.
+            payload.update(realm="cn", workbuddy_client_profile="cli")
+        return payload
     def poll(payload):
         seen.append(route("oauth_" + provider.value))
         payload.update(status="ready", entry=dict(entry, access_token="new-at"))

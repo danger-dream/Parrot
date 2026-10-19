@@ -66,7 +66,7 @@ def test_registry_and_scheduler_enforce_global_and_api_source_state_without_dele
         ingress_protocol="anthropic",
     )
     assert result.candidates == []
-    assert result.exclusions == [{"channel": None, "reason": "global_model_disabled"}]
+    assert result.exclusions == [{"channel": "api:one", "reason": "global_model_disabled"}]
 
 
 @pytest.mark.asyncio

@@ -411,7 +411,7 @@ OAuth 的明确传输故障（连接/读写/首包/空闲/总时限超时、连�
 ### 📡 渠道管理
 添加向导（4 步 + 测试面板）、渠道详情、编辑、测试模型（单/全部）。
 
-> **Base URL 自适应**（v0.5.0+）：默认填上游域名即可，代理按协议追加 `/v1/messages`、`/v1/chat/completions`、`/v1/responses`。若上游接口挂在非标准路径（如智谱 Coding Plan 的 `https://open.bigmodel.cn/api/coding/paas/v4/chat/completions`），直接把**完整调用路径**贴进来，向导会自动拆分为 `baseUrl + apiPath` 存储，协议不匹配时给出交互式选择（采用识别到的协议 / 坚持当前协议清空路径 / 返回修改）。
+> **Base URL 自适应**：支持上游域名、带版本目录的地址（如 `https://provider.example/v1`）以及完整接口地址。默认按协议追加接口，已有 `/v1` 等版本目录不会重复追加，反代前缀原样保留；完整接口地址在配置文件和管理向导中均可使用。若上游接口挂在非标准路径（如智谱 Coding Plan 的 `https://open.bigmodel.cn/api/coding/paas/v4/chat/completions`），向导会自动拆分为 `baseUrl + apiPath` 存储，协议不匹配时给出交互式选择（采用识别到的协议 / 坚持当前协议清空路径 / 返回修改）。显式 `apiPath` 仍按相对整个 `baseUrl` 追加的方式执行，不自动改写自定义路径。模型发现和图片接口从相同的接口根目录推导。
 
 ### 🔐 管理 OAuth
 - ➕ 新增账户：支持 Claude / OpenAI / Grok / Cursor；Cursor 显示可点击的浏览器登录链接，完成后点「已登录」即可自动获取并持久化 Token、套餐额度、账号模型和原生变体

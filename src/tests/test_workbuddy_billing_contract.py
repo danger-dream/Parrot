@@ -157,7 +157,7 @@ def test_activity_ui_does_not_offer_retry_for_terminal_result(monkeypatch, statu
     record = {"action": "checkin", "status": status, "business_date": actions.business_date()}
     monkeypatch.setattr(wb.oauth_control, "workbuddy_snapshot", lambda key: snap)
     monkeypatch.setattr(wb.oauth_control, "get_workbuddy", lambda *a: {"snapshot": snap, "actions": [record]})
-    monkeypatch.setattr(wb.oauth_control, "account_snapshot", lambda key: {})
+    monkeypatch.setattr(wb.oauth_control, "account_snapshot", lambda key: {"provider": "workbuddy", "realm": "cn"})
     monkeypatch.setattr(wb.oauth_control, "config_snapshot", lambda: {})
     text, keyboard = wb.render_activity("fixture", ("short", 1, "all"))
     assert "本日不再提交" in text

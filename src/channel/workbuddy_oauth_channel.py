@@ -30,6 +30,30 @@ def add_client_identity(payload: dict) -> None:
         payload["messages"] = [identity, *messages]
 
 
+def merge_tool_call_messages(payload: dict) -> None:
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return
+    merged = []
+    previous_tool_only = False
+    for message in messages:
+        tool_only = (
+            isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and message.get("content") in (None, "", [])
+            and isinstance(message.get("tool_calls"), list)
+            and bool(message["tool_calls"])
+            and not (message.keys() - {"role", "content", "tool_calls"})
+        )
+        # Signed/thinking messages keep their original turn boundaries.
+        if tool_only and previous_tool_only:
+            merged[-1] = {**merged[-1], "tool_calls": [*merged[-1]["tool_calls"], *message["tool_calls"]]}
+        else:
+            merged.append(message)
+        previous_tool_only = tool_only
+    payload["messages"] = merged
+
+
 def normalize_tool_choice(payload: dict) -> None:
     """Official Chat shape: enum strings or a nested function choice."""
     choice = payload.get("tool_choice")
@@ -132,6 +156,8 @@ class WorkBuddyOAuthChannel(OpenAIApiChannel):
         request = await super().build_upstream_request(copy.deepcopy(requested_body), resolved_model, ingress_protocol=ingress_protocol)
         payload = json.loads(request.body)
         workbuddy_replay.restore_chat_fields(payload)
+        if ingress_protocol != "anthropic" or not workbuddy_replay.has_unreplayed_anthropic_thinking(requested_body.get("messages") or []):
+            merge_tool_call_messages(payload)
         if payload.get("n", 1) not in (None, 1):
             raise guard.GuardError(400, "invalid_request_error", "WorkBuddy supports one completion per request", param="n", scope="candidate")
         if payload.get("functions") or payload.get("function_call"):

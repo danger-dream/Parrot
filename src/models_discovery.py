@@ -6,11 +6,12 @@ from src.safe_diagnostics import diagnose, inherit
 import asyncio
 import json
 from collections.abc import Callable
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import httpx
 
 from . import network
+from .channel.url_utils import resolve_api_endpoint
 
 MAX_RESPONSE_BYTES = 1_000_000
 MAX_MODELS = 2_000
@@ -31,22 +32,11 @@ class ModelsDiscoveryError(Exception):
 
 def derive_custom_models_url(base_url: str, api_path: str | None = None) -> str:
     """按同源规则从 custom URL 推导 models endpoint。"""
-    raw = base_url.rstrip("/") + ((api_path or "") if api_path else "")
-    parts = urlsplit(raw)
+    parts = urlsplit(base_url.strip())
     if parts.scheme not in ("http", "https") or not parts.netloc:
         raise ModelsDiscoveryError("无法从 URL 推导模型列表地址")
-    path = parts.path.rstrip("/")
-    for suffix in ("/chat/completions", "/messages", "/responses"):
-        if path.endswith(suffix):
-            path = path[:-len(suffix)]
-            break
-    if path.endswith("/v1"):
-        models_path = path + "/models"
-    elif path.endswith("/models"):
-        models_path = path
-    else:
-        models_path = path + "/v1/models"
-    return urlunsplit((parts.scheme, parts.netloc, models_path or "/v1/models", "", ""))
+    endpoint = urlsplit(resolve_api_endpoint(base_url, "/models", api_path))
+    return endpoint._replace(query="", fragment="").geturl()
 
 
 def _headers(auth: str, api_key: str) -> dict[str, str]:

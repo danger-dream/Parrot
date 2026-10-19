@@ -20,7 +20,11 @@ CHAT_FIELDS = "_parrot_workbuddy_reasoning_fields"
 def capture_chat_fields(body):
     # Chat ingress canonicalizes reasoning for generic providers. Keep the
     # original spelling beside its own message, not in an index/global cache.
-    for message in body.get("messages") or []:
+    # This runs before ingress validation; leave malformed collections for the
+    # guard to reject as HTTP 400 instead of raising during local iteration.
+    if not isinstance(body.get("messages"), list):
+        return
+    for message in body["messages"]:
         if not isinstance(message, dict):
             continue
         message.pop(CHAT_FIELDS, None)
@@ -113,6 +117,26 @@ def response_item(value):
             "encrypted_content": encode(data)}
 
 
+def has_unreplayed_anthropic_thinking(messages):
+    """Conversion may discard foreign thinking; that must not authorize merging.
+
+    A thinking-only turn can disappear entirely, so conservatively keep all
+    remaining assistant boundaries in such a request. Never forge a WorkBuddy
+    replay value from another provider's signature.
+    """
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict) or block.get("type") not in ("thinking", "redacted_thinking"):
+                continue
+            carrier = block.get("signature") if block["type"] == "thinking" else block.get("data")
+            if not decode(carrier):
+                return True
+    return False
+
+
 def anthropic_messages(messages):
     from ..openai.transform.anthropic_to_chat import _convert_messages
     out = []
@@ -174,7 +198,13 @@ def responses_messages(items):
             if text:
                 replay["reasoning"] = text
         elif kind in ("function_call", "custom_tool_call") or item.get("role") == "assistant":
-            if item.get("role") == "assistant" and any(i.get("role") == "assistant" for i in group):
+            # A message after calls starts another Chat assistant boundary.
+            # Flush before collecting its metadata, otherwise flush() would
+            # attach the new message's replay to the preceding call's assistant.
+            if item.get("role") == "assistant" and any(
+                i.get("role") == "assistant" or i.get("type") in ("function_call", "custom_tool_call")
+                for i in group
+            ):
                 flush()
             group.append(item)
             update_fields(replay, item)

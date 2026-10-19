@@ -4,7 +4,10 @@ from __future__ import annotations
 import json
 
 from ..protocols.sse import split_sse_events
-from .workbuddy_errors import unapproved_channel_error_info, error_payload, QUOTA_CODES
+from .workbuddy_errors import (
+    request_rejection_info, error_payload, QUOTA_CODES,
+    ACCOUNT_RESTRICTED_CODE, ACCOUNT_RESTRICTED_MESSAGE,
+)
 
 
 class WorkBuddyStream:
@@ -21,6 +24,7 @@ class WorkBuddyStream:
         self.argument_prefix = {}  # At most the initial '{}' ambiguity per call.
         # Trusted per-attempt fact; set only after exact vendor-code/message match.
         self.request_rejection: tuple[str, str] | None = None
+        self.account_restricted = False
 
     @staticmethod
     def _emit(value):
@@ -30,6 +34,10 @@ class WorkBuddyStream:
         self.done = True
         self.buffer = b""
         quota = str(code) in QUOTA_CODES
+        if str(code) == ACCOUNT_RESTRICTED_CODE:
+            self.account_restricted = True
+            return self._emit({"error": {"type": "permission_error", "code": ACCOUNT_RESTRICTED_CODE,
+                                        "message": ACCOUNT_RESTRICTED_MESSAGE}})
         return self._emit({"error": {"type": "insufficient_quota" if quota else "upstream_error", "code": str(code),
             "message": f"WorkBuddy account quota exhausted (code {code})" if quota else
                        "WorkBuddy upstream returned an error or malformed stream"}})
@@ -87,7 +95,7 @@ class WorkBuddyStream:
                     raise ValueError()
                 error = obj.get("error")
                 if isinstance(error, dict) or error or obj.get("type") == "error" or event_error or obj.get("code") not in (None, 0):
-                    rejection = unapproved_channel_error_info(obj)
+                    rejection = request_rejection_info(obj)
                     if rejection is not None:
                         self.request_rejection = rejection
                         self.done, self.buffer = True, b""

@@ -246,7 +246,7 @@ def public_snapshot(account: dict | None, row: dict | None) -> dict:
     errors = block.get("errors")
     result["errors"] = {key: subset(value, {"code", "http_status", "kind", "retryable", "auth_error"})
                         for key, value in (errors or {}).items() if key in {"credits", "pagination", "enterprise", "checkin", "payment_type"}} if isinstance(errors, dict) else {}
-    result.update({key: account.get(key) for key in ("realm", "uid", "enterprise_id", "nickname", "workbuddy_client_profile", "workbuddy_identity_source")})
+    result.update({key: account.get(key) for key in ("realm", "uid", "enterprise_id", "nickname", "workbuddy_client_profile", "workbuddy_identity_source", "workbuddy_account_type")})
     result["auto_checkin"] = account.get("workbuddy_auto_checkin") is True
     result["effects_enabled"] = common.effects_allowed()
     return result

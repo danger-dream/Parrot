@@ -43,6 +43,7 @@ from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 from ... import model_names, quota_errors
+from ...cooldown import ACCOUNT_SCOPE
 from ...oauth.plan_labels import openai_plan_label, xai_plan_label
 from ...management_control.oauth import CchMode, OAuthUsageDisplayMode
 from ...management_control.oauth.menu_bridge import (
@@ -881,6 +882,14 @@ def _fmt_time_full(iso_str: Optional[str]) -> str:
     return f"{time_str}（{remaining}）"
 
 
+def _account_restriction(acc: dict) -> dict | None:
+    if acc.get("provider") != "workbuddy":
+        return None
+    key = f"oauth:{_account_key(acc)}"
+    return next((entry for entry in oauth_control.cooldown_entries_snapshot()
+                 if entry.get("channel_key") == key and entry.get("model") == ACCOUNT_SCOPE), None)
+
+
 def _status_icon(acc: dict) -> str:
     """账户状态 icon。"""
     reason = acc.get("disabled_reason")
@@ -892,6 +901,8 @@ def _status_icon(acc: dict) -> str:
         return "⚠"
     if not acc.get("enabled", True):
         return "🔕"
+    if _account_restriction(acc):
+        return "⛔"
     if acc.get("provider") == "zhipu" and not zhipu_menu.model_route_available(acc):
         return "❔"
     return "✅"
@@ -1883,6 +1894,8 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
         tag = " [配额禁用]" if prov in {"workbuddy", "zhipu"} and not du else f" [配额禁用 · 预计 {_format_bjt(du)}]"
     elif reason == "auth_error":
         tag = " [认证失败]"
+    elif _account_restriction(acc):
+        tag = " [供应商限制]"
 
     # 第一行：icon + email + provider
     prov_tag = " " + _provider_tag(prov) if prov else ""
@@ -2073,6 +2086,10 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
         e for e in oauth_control.cooldown_entries_snapshot()
         if e.get("channel_key") == ck
     ]
+    account_pause = next((e for e in cds if e.get("model") == ACCOUNT_SCOPE), None)
+    if account_pause:
+        lines.append("⛔ 供应商限制账户 · 暂停全部模型，请在官方客户端申诉")
+        cds = [e for e in cds if e.get("model") != ACCOUNT_SCOPE]
     cds, quota_groups = _split_cursor_quota_pauses(acc, cds)
     if quota_groups:
         paused_n = sum(len(entries) for entries in quota_groups.values())
@@ -2483,7 +2500,7 @@ def _filter_account(acc: dict, filter_key: str) -> bool:
     if filter_key == _FILTER_AVAILABLE:
         if acc.get("provider") == "zhipu" and not zhipu_menu.model_route_available(acc):
             return False
-        return bool(acc.get("enabled", True)) and not acc.get("disabled_reason")
+        return bool(acc.get("enabled", True)) and not acc.get("disabled_reason") and not _account_restriction(acc)
     if filter_key == _FILTER_QUOTA:
         return acc.get("disabled_reason") == "quota"
     if filter_key == _FILTER_INVALID:
@@ -2649,7 +2666,7 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL, *,
     if account_keys:
         accounts_all = oauth_control.account_entries_snapshot()
     total_all = len(accounts_all)
-    normal = sum(1 for a in accounts_all if a.get("enabled", True) and not a.get("disabled_reason"))
+    normal = sum(1 for a in accounts_all if a.get("enabled", True) and not a.get("disabled_reason") and not _account_restriction(a))
     quota_disabled = sum(1 for a in accounts_all if a.get("disabled_reason") == "quota")
     user_disabled = sum(1 for a in accounts_all if a.get("disabled_reason") == "user")
     auth_err = sum(1 for a in accounts_all if a.get("disabled_reason") == "auth_error")
@@ -3457,13 +3474,15 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         f"⏳ Token: <code>{_fmt_time_full(acc.get('expired'))}</code>\n"
         f"🔄 刷新: <code>{_format_bjt(acc.get('last_refresh'))}</code>\n"
     )
+    restriction = _account_restriction(acc)
+    status_label = reason if acc.get("disabled_reason") or not acc.get("enabled", True) else "供应商限制" if restriction else "enabled"
     text = (
         f"{icon} <b>{ui.escape_html(email)}</b> {prov_icon}\n\n"
-        f"状态: <code>{ui.escape_html('enabled' if acc.get('enabled', True) and not acc.get('disabled_reason') else reason)}</code>\n"
+        f"状态: <code>{ui.escape_html(status_label)}</code>\n"
         f"{provider_line}"
         f"⚡ 并发上限: <code>{max_cc_label}</code>\n"
-        f"{credential_text}\n"
-        f"<b>📊 使用量</b>\n{usage_text}"
+        f"{credential_text}"
+        + (f"\n<b>📊 使用量</b>\n{usage_text}" if usage_text else "")
     )
     reset_cards_block = (
         _format_reset_credit_cards_block(
@@ -3492,6 +3511,12 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     # 显示当前模型的冷却状态
     ck = f"oauth:{account_key}"
     cd_models = [e for e in oauth_control.cooldown_entries_snapshot() if e["channel_key"] == ck]
+    if restriction:
+        remaining = max(0, (restriction["cooldown_until"] - int(time.time() * 1000)) // 1000)
+        text += (f"\n\n<b>⛔ 供应商限制账户（11140）</b>\n"
+                 f"全部模型暂停，本地退避剩 {remaining}s（不是官方解封时间）。\n"
+                 "请在官方客户端提交反馈申诉；确认解除后可点击下方按钮清除本地暂停。")
+        cd_models = [e for e in cd_models if e.get("model") != ACCOUNT_SCOPE]
     cd_models, quota_groups = _split_cursor_quota_pauses(acc, cd_models)
     quota_block = _format_cursor_quota_pauses(quota_groups)
     if quota_block:
@@ -3510,13 +3535,17 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
             text += f" (累计失败 {e['error_count']} 次)\n"
 
     payload = _callback_payload(short, page, filter_key)
-    credential_buttons = []
-    if oauth_control.account_authentication_failed(acc):
-        if prov == "zhipu" and acc.get("credential_mode") != "oauth":
-            credential_buttons.append(ui.btn("🔄 刷新连接", f"oa:zh:refresh:{short}"))
-        else:
-            credential_buttons.append(ui.btn("🔐 重新登录", f"oa:relogin:{payload}"))
-    rows = [credential_buttons + [ui.btn("📊 刷新额度", f"oa:refresh_usage:{payload}")]]
+    if prov == "zhipu" and acc.get("credential_mode") != "oauth":
+        credential_buttons = [ui.btn("🔄 刷新连接", f"oa:zh:refresh:{short}")]
+    elif oauth_control.account_authentication_failed(acc):
+        credential_buttons = [ui.btn("🔐 重新登录", f"oa:relogin:{payload}")]
+    elif prov == "zhipu":
+        credential_buttons = [ui.btn("🔄 更新凭据", f"oa:zh:refresh:{short}")]
+    else:
+        credential_buttons = [ui.btn("🔄 刷新 Token", f"oa:refresh_token:{payload}")]
+    if prov != "workbuddy" or workbuddy_menu.supports_credit_ui(acc):
+        credential_buttons.append(ui.btn("📊 刷新额度", f"oa:refresh_usage:{payload}"))
+    rows = [credential_buttons] if credential_buttons else []
     # All OAuth providers enter the same source-filtered model center.  The
     # source identity crossing this boundary is the public accountId, never the
     # legacy private account key carried by old ``oam:`` callbacks.
@@ -3531,7 +3560,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     rows += [
         [ui.provider_button("管理模型", manage_models_cb, prov),
          ui.btn("🚦 并发上限", f"oa:emax:{payload}")],
-        [ui.btn("🧹 清模型故障", f"oa:clear_errors:{payload}"),
+        [ui.btn("▶️ 限制已解除，清除暂停" if restriction else "🧹 清模型故障", f"oa:clear_errors:{payload}"),
          ui.btn("🔗 清亲和绑定", f"oa:clear_affinity:{payload}")],
         [ui.btn(toggle_label, f"oa:toggle:{payload}"),
          ui.btn("🗑 删除账户", f"oa:delete_ask:{payload}")],
@@ -3551,7 +3580,8 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     if prov == "workbuddy":
         nav = (short, max(1, int(page or 1)), filter_key)
         rows.extend(workbuddy_menu.package_page_buttons(account_key, nav, workbuddy_package_page))
-        rows.append([ui.btn("🎁 签到/领额度", workbuddy_menu._cb("activity", nav))])
+        if workbuddy_menu.supports_credit_ui(acc):
+            rows.append([ui.btn("🎁 签到/领额度", workbuddy_menu._cb("activity", nav))])
     if prov == "claude":
         rows.append([ui.btn("♻️ 官方额度重置/状态", f"oa:claude_reset_ask:{payload}")])
     if prov == "openai":
@@ -3816,9 +3846,17 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
+    account = oauth_control.account_snapshot(ak)
+    if account is None:
+        ui.answer_cb(cb_id, "账户已不存在")
+        return
+    provider = oauth_control.provider_of_snapshot(account)
+    if provider == "zhipu":
+        return zhipu_menu.handle_callback(chat_id, message_id, cb_id, f"oa:zh:refresh:{short}")
+    if oauth_control.account_authentication_failed(account):
+        return on_relogin(chat_id, message_id, cb_id, short, page, filter_key)
     ui.answer_cb(cb_id, "刷新中...")
 
-    provider = oauth_control.provider_of_snapshot(ak)
     if provider == "workbuddy" and not oauth_control.workbuddy_refresh_enabled_snapshot():
         _edit_cached_detail(
             chat_id, message_id, ak, page, filter_key,
@@ -3828,9 +3866,12 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page
         return
     result = _run_sync(oauth_control.force_refresh_raw(ak))
     if isinstance(result, Exception):
-        ui.send(chat_id, _oauth_error_html(
-            result, provider=provider, operation="refresh_token",
-        ))
+        feedback = _oauth_error_html(result, provider=provider, operation="refresh_token")
+        if not _edit_cached_detail(
+            chat_id, message_id, ak, page, filter_key,
+            prefix=feedback + "\n\n", refresh_quota=False,
+        ):
+            ui.send(chat_id, feedback)
         return
 
     email = _account_email(ak)
@@ -3873,6 +3914,9 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         zhipu_menu.refresh_usage(chat_id, message_id, ak, page, filter_key)
         return
     if provider == "workbuddy":
+        if not workbuddy_menu.supports_credit_ui(oauth_control.account_snapshot(ak) or {}):
+            on_view(chat_id, message_id, cb_id, short, page, filter_key)
+            return
         ui.answer_cb(cb_id, "查询中…")
         render_state = {"loading": False}
 
@@ -3917,14 +3961,17 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
     )
     if refresh_result.get("error") is not None:
         err = refresh_result["error"]
-        ui.send(chat_id, _oauth_error_html(
-            err, provider=provider, operation="fetch_usage",
-        ))
-        if provider == "openai" and oauth_control.quota_snapshot(ak):
-            _edit_cached_detail(
+        feedback = _oauth_error_html(err, provider=provider, operation="fetch_usage")
+        if provider == "openai":
+            prefix = feedback + "\n\n⚠️ 用量刷新失败"
+            if oauth_control.quota_snapshot(ak):
+                prefix += "，保留上次数据"
+            if _edit_cached_detail(
                 chat_id, message_id, ak, page, filter_key,
-                prefix="⚠️ 用量刷新失败，保留上次数据\n\n", refresh_quota=False,
-            )
+                prefix=prefix + "\n\n", refresh_quota=False,
+            ):
+                return
+        ui.send(chat_id, feedback)
         return
     usage_result = refresh_result.get("usage")
     if not isinstance(usage_result, dict):
@@ -4513,8 +4560,9 @@ def on_clear_errors(chat_id: int, message_id: int, cb_id: str, short: str, page:
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
+    restricted = _account_restriction(oauth_control.account_snapshot(ak) or {})
     oauth_control.clear_errors(_management_context(chat_id), ak)
-    ui.answer_cb(cb_id, "已清除该账号的所有模型冷却")
+    ui.answer_cb(cb_id, "已清除本地账户暂停，不代表供应商已解除限制" if restricted else "已清除该账号的所有模型冷却")
     _edit_cached_detail(chat_id, message_id, ak, page, filter_key)
 
 
@@ -5414,11 +5462,10 @@ def on_add_xai(chat_id: int, message_id: int, cb_id: str) -> None:
 def on_add_workbuddy(chat_id: int, message_id: int, cb_id: str) -> None:
     add_session.clear_input(chat_id)
     ui.answer_cb(cb_id)
-    ui.edit(chat_id, message_id, "<b>新增 WorkBuddy OAuth 账户</b>\n请选择产品路线（分别登录，保留已有授权）：",
+    ui.edit(chat_id, message_id, "<b>新增 WorkBuddy OAuth 账户</b>\n请选择账户区域：",
         reply_markup=ui.inline_kb([
             [ui.btn("中国区", "oa:wb:login")],
-            [ui.btn("WorkBuddy 国际区 CLI · workbuddy.ai", "oa:wb:login:global")],
-            [ui.btn("CodeBuddy IDE 国际区 · codebuddy.ai", "oa:wb:login:global:ide")],
+            [ui.btn("国际区", "oa:wb:login:global")],
             [ui.btn("◀ 上一步", "oa:add")],
         ]))
 
@@ -7319,8 +7366,7 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         return True
     if data.startswith("oa:refresh_token:"):
         short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])
-        # Old detail keyboards must not retain a hidden manual refresh action.
-        on_relogin(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
+        on_refresh_token(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
         return True
     if data.startswith("oa:refresh_usage:"):
         short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])

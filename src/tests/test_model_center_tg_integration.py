@@ -417,7 +417,7 @@ def test_tg_eighty_chat_models_page_filter_detail_and_clear_with_real_controls(
         assert "<b>model-009</b>" in detail_text
         assert "类型：<code>对话</code>" in detail_text
         assert "上游名：<code>wire-a-009</code>" in detail_text
-        assert "此模型：<code>停用</code> · 渠道：<code>启用</code> · 当前可用：<code>否</code>" in detail_text
+        assert "本来源模型开关：<code>停用</code> · 渠道：<code>启用</code> · 当前可用：<code>否</code>" in detail_text
         session = menu._session(42)
         assert (session.tab, session.source, session.status, session.text, session.page) == expected_session
         menu.handle_callback(

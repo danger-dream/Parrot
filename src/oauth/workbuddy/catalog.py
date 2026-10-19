@@ -1,7 +1,9 @@
 """Account catalogs from authenticated product config, without builtin fallbacks."""
 from __future__ import annotations
 
+import re
 import time
+from decimal import Decimal, InvalidOperation
 from urllib.parse import quote
 
 from . import common
@@ -47,10 +49,27 @@ def _resolve(value, entries: dict[str, dict], *, aliases: bool) -> str | None:
     return None
 
 
+def credit_multiplier(value) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    text = str(value).strip()
+    match = re.fullmatch(r"[xX×]?\s*(\d+(?:\.\d*)?|\.\d+)(?:\s+credits)?", text) if len(text) <= 64 else None
+    if not match:
+        return None
+    try:
+        number = Decimal(match[1])
+    except InvalidOperation:
+        return None
+    return format(number, "f")
+
+
 def _record(source: dict, *, agent: str, ide: bool, legacy: bool, gzip: bool | None) -> dict:
     model_id = source["id"]
     record = {"id": model_id, "name": common.text(source.get("name") or model_id, "model name"),
               "source": f"workbuddy:{agent}", "inputModalities": ["text"], "outputModalities": ["text"]}
+    multiplier = credit_multiplier(source.get("credits"))
+    if multiplier is not None:
+        record["workbuddyCreditMultiplier"] = multiplier
     for key in ("maxInputTokens", "maxOutputTokens", "maxAllowedSize", "maxImageCount"):
         value = common.number(source.get(key))
         if isinstance(value, int) and value > 0:

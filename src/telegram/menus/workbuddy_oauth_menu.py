@@ -68,10 +68,16 @@ def checkin_label(snapshot):
 
 def provider_line(account, *, detail=False):
     region = "中国区" if account.get("realm") == "cn" else "国际区"
-    scope = "企业" if account.get("enterprise_id") else "个人"
+    account_type = account.get("workbuddy_account_type") or ""
+    scope = {"personal": "个人", "pro": "个人 Pro", "ultimate": "企业版", "exclusive": "专享版",
+             "premise": "私有部署"}.get(account_type)
+    if scope is None:
+        scope = "类型未知" if account_type else "企业" if account.get("enterprise_id") else "个人"
     selection = oauth_control.account_model_selection_snapshot(account)
-    line = f"🏷️ 账户: {scope} · {region} · {ui.escape_html(wb_common.route_label(account))}"
+    line = f"🏷️ 账户: {scope} · {region}"
     if detail:
+        line += f"\n🪪 官方账户类型: {ui.escape_html(account_type) if account_type else '未获取'}"
+        line += f"\n🔗 接入: {ui.escape_html(wb_common.route_label(account))}"
         disabled = len(set(selection.get("models") or []) & set(selection.get("disabled_models") or []))
         line += f"\n🧬 模型目录: {len(selection.get('effective_models') or [])} 个可用模型 · 禁用 {disabled}"
     else:
@@ -109,8 +115,14 @@ def _package_page(snapshot, page=1):
     return packages, page, pages
 
 
+def supports_credit_ui(account):
+    return account.get("realm") == "cn"
+
+
 def usage_block(account_id, *, detail=False, package_page=1, snapshot=None):
     snap = oauth_control.workbuddy_snapshot(account_id) if snapshot is None else snapshot
+    if not supports_credit_ui(snap):
+        return ""
     credits = snap.get("credits") or {}
     complete = snap.get("complete") is True
     empty = _empty_packages(snap)
@@ -246,7 +258,7 @@ def query_result_text(snapshot, *, error=None):
         if not _empty_packages(snapshot) and snapshot.get("last_success_credits"):
             lines.append("积分显示上次成功值（旧快照），不是本次余额。")
     lines.append("🕒 查询结束: " + _date(time.time() * 1000))
-    lines.append("本次仅查询，未执行签到。" if snapshot.get("realm") == "cn" else "本次仅查询，未申请试用额度。")
+    lines.append("本次仅查询，未执行签到。" if snapshot.get("realm") == "cn" else "本次仅查询账户用量。")
     return "\n".join(lines)
 
 
@@ -266,6 +278,15 @@ def start_status_query(
     """Keep vendor waits off polling; only the still-current page may be edited."""
     owner = control if control is not None else oauth_control
     token = menu_cache.begin_view(chat_id, message_id)
+    if not supports_credit_ui(owner.account_snapshot(key) or {}):
+        def finish():
+            text, kb = render("")
+            if text:
+                ui.edit(chat_id, message_id, text, reply_markup=kb)
+            if callable(after_render):
+                after_render("")
+        menu_cache.run_if_current(chat_id, message_id, token, finish)
+        return None
     show_query_progress(chat_id, message_id)
 
     def worker():
@@ -322,6 +343,8 @@ def result_text(record):
 
 
 def package_page_buttons(key, nav, page=1):
+    if not supports_credit_ui(oauth_control.account_snapshot(key) or {}):
+        return []
     _packages, page, pages = _package_page(oauth_control.workbuddy_snapshot(key), page)
     if pages <= 1:
         return []
@@ -342,6 +365,8 @@ def render_credits(key, nav, page=1):
 
 
 def render_activity(key, nav, *, chat_id=0, query_feedback=""):
+    if not supports_credit_ui(oauth_control.account_snapshot(key) or {}):
+        return render_credits(key, nav)
     value = oauth_control.get_workbuddy(telegram_context(chat_id), key)
     snap, records = value["snapshot"], value["actions"]
     cn = snap.get("realm") == "cn"
@@ -621,8 +646,7 @@ def reject_removed_import(chat_id):
     ui.send(chat_id, "ℹ️ WorkBuddy JSON 导入已移除，中国区和国际区均请使用网页登录；已有账户不受影响。",
         reply_markup=ui.inline_kb([
             [ui.provider_button("WorkBuddy 中国区登录", "oa:wb:login", "workbuddy")],
-            [ui.provider_button("WorkBuddy 国际 CLI 登录", "oa:wb:login:global", "workbuddy")],
-            [ui.provider_button("CodeBuddy IDE 国际登录", "oa:wb:login:global:ide", "workbuddy")],
+            [ui.provider_button("WorkBuddy 国际区登录", "oa:wb:login:global", "workbuddy")],
             [ui.btn("◀ 返回新增账户", "oa:add")]]))
 
 
@@ -631,14 +655,18 @@ def handle_callback(chat_id, message_id, cb_id, callback):
         return False
     parts = callback[len(_PREFIX):].split(":")
     kind = parts[0]
-    ui.answer_cb(cb_id, "查询中…") if kind in {"refresh_credits", "refresh_activity"} else ui.answer_cb(cb_id)
+    query = kind in {"refresh_credits", "refresh_activity"}
+    if not query:
+        ui.answer_cb(cb_id)
     if kind == "noop":
         return True
     if kind == "login":
         realm = "cn" if len(parts) == 1 else parts[1] if len(parts) in {2, 3} else ""
         profile = parts[2] if len(parts) == 3 else None
-        if realm in {"cn", "global"} and (profile is None or (realm == "global" and profile == "ide")):
-            _login_start(chat_id, message_id, realm=realm, client_profile=profile)
+        if realm == "global" and profile == "ide":
+            ui.send_result(chat_id, "ℹ️ 旧 CodeBuddy IDE 新增入口已停用，请返回选择 WorkBuddy 国际区。", **_NAV)
+        elif realm in {"cn", "global"} and profile is None:
+            _login_start(chat_id, message_id, realm=realm)
         return True
     if kind == "import" or kind.startswith("import_"):
         reject_removed_import(chat_id)
@@ -652,6 +680,11 @@ def handle_callback(chat_id, message_id, cb_id, callback):
             return True
         state = states.get_state(chat_id)
         action = state["action"]
+        if action in {"oa_wb_confirm", "oa_wb_terms", "oa_wb_unknown"} and not supports_credit_ui(oauth_control.account_snapshot(data["key"]) or {}):
+            states.pop_state_if_current(chat_id, data)
+            text, kb = render_credits(data["key"], data["nav"])
+            ui.edit(chat_id, message_id, text, reply_markup=kb)
+            return True
         if kind == "cancel":
             nav = data.get("nav")
             discard_state(chat_id)
@@ -685,15 +718,26 @@ def handle_callback(chat_id, message_id, cb_id, callback):
             ui.edit(chat_id, message_id, text, reply_markup=ui.inline_kb([[ui.btn("◀ 返回活动", _cb("activity", data["nav"]))], [_back(data["nav"])]]))
         return True
     if len(parts) != 5:
+        if query:
+            ui.answer_cb(cb_id)
         return True
     try:
         nav = (parts[1], max(1, int(parts[2])), _parent()._normalize_filter(parts[3]))
         page = max(1, int(parts[4]))
     except ValueError:
+        if query:
+            ui.answer_cb(cb_id)
         return True
     key = _resolve(nav)
+    credit_ui = supports_credit_ui(oauth_control.account_snapshot(key) or {}) if key else False
+    if query:
+        ui.answer_cb(cb_id, "查询中…") if credit_ui else ui.answer_cb(cb_id)
     if not key:
         ui.send_result(chat_id, "⚠️ 账户已不存在。", **_NAV)
+        return True
+    if kind in {"credits", "refresh_credits", "activity", "refresh_activity", "records", "plan", "auto"} and not credit_ui:
+        text, kb = render_credits(key, nav)
+        ui.edit(chat_id, message_id, text, reply_markup=kb)
         return True
     if kind in {"refresh_credits", "refresh_activity"}:
         def render_query(feedback):

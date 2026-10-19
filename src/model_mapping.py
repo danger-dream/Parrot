@@ -189,8 +189,25 @@ def apply_mapping(body: dict, ingress: str) -> Optional[tuple[str, str]]:
     real = mapping.get(alias)
     if not real or real == alias:
         return None
+    # Keep the requested alias for source-scoped runtime checks after mapping.
+    body["_parrot_model_alias"] = alias
+    body["_parrot_model_alias_target"] = real
     body["model"] = real
     return (alias, real)
+
+
+def request_model_names(body: dict, resolved_model: str) -> set[str]:
+    """All identities whose enablement must hold on the same candidate source."""
+    names = {str(value).strip() for value in (
+        body.get("_client_visible_model"), body.get("model"), resolved_model,
+    ) if value}
+    # Internal compression requests can copy the outer body but select a different
+    # logical model. Only the mapped request itself owns the original alias.
+    if body.get("_parrot_model_alias_target") == body.get("model"):
+        names.update(str(value).strip() for value in (
+            body.get("_parrot_model_alias"), body.get("_parrot_original_model"),
+        ) if value)
+    return names
 
 
 # ─── 写 (给 TG bot 菜单用) ────────────────────────────────────────

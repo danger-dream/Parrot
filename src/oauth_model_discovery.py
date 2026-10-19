@@ -11,6 +11,7 @@ from typing import Any, Callable
 from urllib.parse import urlencode
 
 from . import config, network
+from .channel.url_utils import resolve_api_endpoint
 from .oauth import antigravity as antigravity_provider
 from .oauth import cursor as cursor_provider
 from .oauth import xai as xai_provider
@@ -353,10 +354,10 @@ def discover_xai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str
     deadline = _Deadline(timeout)
     token = str(account.get("access_token") or "")
     if not token: raise ValueError("missing access token")
-    base = str(account.get("base_url") or account.get("baseUrl") or xai_provider.api_base_url()).rstrip("/")
-    if not base.endswith("/v1"): base += "/v1"
+    base = str(account.get("base_url") or account.get("baseUrl") or xai_provider.api_base_url())
     headers = {"authorization": f"Bearer {token}", "accept": "application/json"}
-    payload = _json_object(network.get_sync(base + "/language-models", headers=headers, timeout=deadline.remaining(), proxy_purpose="oauth_xai", proxy_channel=proxy_channel))
+    catalog_url = resolve_api_endpoint(base, "/language-models", preserve_custom_path=True)
+    payload = _json_object(network.get_sync(catalog_url, headers=headers, timeout=deadline.remaining(), proxy_purpose="oauth_xai", proxy_channel=proxy_channel))
     records = payload.get("data", payload.get("models"))
     if not isinstance(records, list): raise ValueError("xAI model catalog has invalid schema")
     def model_id(item):
@@ -374,7 +375,8 @@ def discover_xai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str
     if not models: raise ValueError("xAI model catalog has no verified language models")
     enrichment: dict[str, dict] = {}
     try:
-        extra = _json_object(network.get_sync(base + "/models", headers=headers, timeout=deadline.remaining(), proxy_purpose="oauth_xai", proxy_channel=proxy_channel))
+        models_url = resolve_api_endpoint(base, "/models", preserve_custom_path=True)
+        extra = _json_object(network.get_sync(models_url, headers=headers, timeout=deadline.remaining(), proxy_purpose="oauth_xai", proxy_channel=proxy_channel))
         values = extra.get("data", extra.get("models"))
         if isinstance(values, list):
             enrichment = {model_id(item): item for item in values if model_id(item)}
@@ -558,7 +560,14 @@ def discover_workbuddy(account: dict, *, timeout: float = _TIMEOUT, proxy_channe
         account, account_key=proxy_channel.removeprefix("oauth:"), timeout=timeout,
     )
     profile = common.profile_of(account)
-    version = "2.63.2" if common.is_legacy(account) else common.GLOBAL_CATALOG_VERSION if profile == common.GLOBAL_PROFILE else common.CLI_VERSION
+    if common.is_legacy(account):
+        version = "2.63.2"
+    elif profile == common.GLOBAL_PROFILE:
+        version = common.GLOBAL_CATALOG_VERSION
+    elif profile == common.WORKBUDDY_CLI_PROFILE:
+        version = common.WORKBUDDY_CLI_VERSION
+    else:
+        version = common.CLI_VERSION
     return DiscoveryResult([item["id"] for item in records], _catalog(records), "upstream:workbuddy",
                            client_version=version, profile_id=profile)
 

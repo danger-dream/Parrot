@@ -129,6 +129,7 @@ def _model(item: ModelView) -> ModelData:
                 sourceEnabled=source.source_enabled,
                 containerEnabled=source.container_enabled,
                 effectiveRoutable=source.effective_routable,
+                enabledOverride=source.enabled_override,
                 unavailableReason=source.unavailable_reason,
                 effectiveMetadata=dict(source.effective_metadata),
                 valueSource=dict(source.value_source),

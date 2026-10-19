@@ -48,6 +48,7 @@ class _ParsedRequest:
     stream: bool = False
     # Prepared once by runtime before paid attempts; never accepted from JSON.
     _api_edit_files: list | None = field(default=None, repr=False)
+    requested_model: str | None = None
 
 
 # ── 公共小工具 ─────────────────────────────────────────────────────────────
@@ -366,13 +367,17 @@ async def _run_handler(request: Request, *, action: str) -> JSONResponse:
             param="image",
         )
 
-    requested_model = parsed.model
+    requested_model = parsed.requested_model = parsed.model
     parsed.model = model_mapping.get_global_map().get(requested_model, requested_model)
     # Both an explicitly granted alias and an explicitly granted real model work;
     # neither can bypass model/source disablement.
     if allowed_models and requested_model not in allowed_models and parsed.model not in allowed_models:
         return _json_error(403, errors.ErrTypeOpenAI.PERMISSION, "model is not allowed for this API key")
-    if not model_state.is_global_enabled(parsed.model) or not model_state.is_global_enabled(requested_model):
+    names = {parsed.model, requested_model}
+    if not all(model_state.is_global_enabled(model) for model in names) and not any(
+        all(model_state.is_global_enabled(model, source_key=source.key) for model in names)
+        for source in image_catalog.sources() if source.model == parsed.model
+    ):
         return _json_error(403, errors.ErrTypeOpenAI.PERMISSION, "image model is disabled")
     if parsed.model not in image_catalog.models():
         return _bad_request("unknown image model; configure an image source or alias", param="model")

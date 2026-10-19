@@ -2,8 +2,8 @@
 
 The configuration is authoritative.  This module deliberately keeps no cache so a
 successful ``config.update`` is immediately visible to schedulers and discovery.
-OAuth model disablement remains owned by each OAuth account; only global state and
-API-source state live under ``modelCenter``.
+OAuth model disablement remains owned by each OAuth account; global defaults,
+source enable overrides and API-source state live under ``modelCenter``.
 """
 
 from __future__ import annotations
@@ -38,11 +38,18 @@ def state_snapshot(cfg: Mapping[str, Any] | None = None) -> dict[str, Any]:
             models = sorted(_strings(values))
             if source and models:
                 api_disabled[source] = models
+    enabled_raw = root.get("sourceEnabledModels")
+    enabled = {
+        str(source).strip(): sorted(_strings(values))
+        for source, values in enabled_raw.items()
+        if isinstance(source, str) and source.strip() and _strings(values)
+    } if isinstance(enabled_raw, Mapping) else {}
     return {
         "schemaVersion": SCHEMA_VERSION,
         "disabledModels": disabled,
         "hiddenModels": hidden,
         "apiSourceDisabledModels": dict(sorted(api_disabled.items())),
+        "sourceEnabledModels": dict(sorted(enabled.items())),
     }
 
 
@@ -58,6 +65,8 @@ def _root_for_write(cfg: dict[str, Any]) -> dict[str, Any]:
         raw["hiddenModels"] = sorted(_strings(raw.get("hiddenModels")))
     if not isinstance(raw.get("apiSourceDisabledModels"), dict):
         raw["apiSourceDisabledModels"] = {}
+    if not isinstance(raw.get("sourceEnabledModels"), dict):
+        raw["sourceEnabledModels"] = {}
     return raw
 
 
@@ -66,7 +75,35 @@ def is_global_enabled(
 ) -> bool:
     model = str(model_id or "").strip()
     disabled = state_snapshot(cfg)["disabledModels"]
-    return bool(model) and not model_names.matching_keys(model_names.channel_provider(source_key), model, disabled)
+    return bool(model) and (not model_names.matching_keys(model_names.channel_provider(source_key), model, disabled)
+                            or has_source_enable_override(source_key, model, cfg))
+
+
+def has_source_enable_override(
+    source_key: str | None, model_id: str, cfg: Mapping[str, Any] | None = None,
+) -> bool:
+    source = str(source_key or "").strip()
+    values = state_snapshot(cfg)["sourceEnabledModels"].get(source, ())
+    return bool(source and model_names.matching_keys(model_names.channel_provider(source), model_id, values))
+
+
+def set_source_enable_override_in_config(
+    cfg: dict[str, Any], source_key: str, model_ids: Iterable[str], enabled: bool,
+) -> None:
+    source = str(source_key or "").strip()
+    if not source.startswith(("api:", "oauth:")):
+        raise ValueError("Model source must be api or oauth")
+    mapping = _root_for_write(cfg)["sourceEnabledModels"]
+    values = _strings(mapping.get(source))
+    provider = model_names.channel_provider(source)
+    for model in _strings(model_ids):
+        values.difference_update(model_names.matching_keys(provider, model, values))
+        if enabled:
+            values.add(model_names.canonical_id(provider, model))
+    if values:
+        mapping[source] = sorted(values)
+    else:
+        mapping.pop(source, None)
 
 
 def is_discovery_visible(
@@ -74,9 +111,8 @@ def is_discovery_visible(
 ) -> bool:
     model = str(model_id or "").strip()
     snapshot = state_snapshot(cfg)
-    return bool(model) and not model_names.matching_keys(
-        model_names.channel_provider(source_key), model,
-        [*snapshot["disabledModels"], *snapshot["hiddenModels"]],
+    return is_global_enabled(model, cfg, source_key=source_key) and not model_names.matching_keys(
+        model_names.channel_provider(source_key), model, snapshot["hiddenModels"],
     )
 
 
@@ -117,13 +153,17 @@ def set_global_enabled_in_config(
     cfg: dict[str, Any], model_ids: Iterable[str], enabled: bool,
 ) -> None:
     root = _root_for_write(cfg)
+    models = _strings(model_ids)
     values = _strings(root.get("disabledModels"))
-    for model in _strings(model_ids):
+    for model in models:
         if enabled:
             values.discard(model)
         else:
             values.add(model)
     root["disabledModels"] = sorted(values)
+    if not enabled:
+        for source in list(root["sourceEnabledModels"]):
+            set_source_enable_override_in_config(cfg, source, models, False)
 
 
 def set_visible_in_config(
@@ -148,7 +188,8 @@ def set_api_source_enabled_in_config(
     root = _root_for_write(cfg)
     mapping = root["apiSourceDisabledModels"]
     values = _strings(mapping.get(source))
-    for model in _strings(model_ids):
+    models = _strings(model_ids)
+    for model in models:
         if enabled:
             values.discard(model)
         else:
@@ -157,11 +198,28 @@ def set_api_source_enabled_in_config(
         mapping[source] = sorted(values)
     else:
         mapping.pop(source, None)
+    set_source_enable_override_in_config(cfg, source, models, enabled)
+
+
+def remove_source_enable_overrides_in_config(cfg: dict[str, Any], source_keys: Iterable[str]) -> None:
+    mapping = (cfg.get("modelCenter") or {}).get("sourceEnabledModels")
+    if isinstance(mapping, dict):
+        for source in source_keys:
+            mapping.pop(source, None)
+
+
+def rename_source_enable_overrides_in_config(cfg: dict[str, Any], old: str, new: str) -> None:
+    mapping = (cfg.get("modelCenter") or {}).get("sourceEnabledModels")
+    if isinstance(mapping, dict) and old != new and old in mapping:
+        values = _strings(mapping.pop(old)) | _strings(mapping.get(new))
+        if values:
+            mapping[new] = sorted(values)
 
 
 def remove_api_source_in_config(cfg: dict[str, Any], source_id: str) -> None:
     root = _root_for_write(cfg)
     root["apiSourceDisabledModels"].pop(str(source_id or "").strip(), None)
+    root["sourceEnabledModels"].pop(str(source_id or "").strip(), None)
 
 
 def rename_api_source_in_config(
@@ -171,11 +229,13 @@ def rename_api_source_in_config(
     mapping = root["apiSourceDisabledModels"]
     old = str(old_source_id or "").strip()
     new = str(new_source_id or "").strip()
-    if not old or not new or old == new or old not in mapping:
+    if not old or not new or old == new:
         return
-    values = _strings(mapping.pop(old)) | _strings(mapping.get(new))
-    if values:
-        mapping[new] = sorted(values)
+    for mapping in (mapping, root["sourceEnabledModels"]):
+        if old in mapping:
+            values = _strings(mapping.pop(old)) | _strings(mapping.get(new))
+            if values:
+                mapping[new] = sorted(values)
 
 
 def known_model(model_id: str, cfg: Mapping[str, Any] | None = None) -> bool:

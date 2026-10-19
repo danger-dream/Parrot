@@ -5,6 +5,7 @@ The model_center_menu facade owns the one control binding and session state.
 from __future__ import annotations
 
 import math
+from decimal import Decimal
 from typing import Any, Mapping
 
 from ...management_control import ManagementError
@@ -252,22 +253,24 @@ def _model_state(view: ModelView, source: ModelSourceRef | None) -> tuple[bool |
     if source is not None:
         if source_view is None:
             return False, "不在当前来源"
-        enabled = bool(source_view.source_enabled)
+        enabled = bool(source_view.source_enabled and (view.global_enabled or source_view.enabled_override))
         if not source_view.container_enabled:
             return enabled, "来源整体已停用"
         if not view.global_enabled:
-            return enabled, "模型已全局停用"
+            return (True, "本来源启用（覆盖全局停用）") if enabled else (False, "继承全局停用")
         return enabled, "启用" if enabled else "此来源停用"
-    return bool(view.global_enabled), "启用" if view.global_enabled else "停用"
+    if not view.global_enabled and view.available_in():
+        return False, "部分来源启用（全局默认停用）"
+    return bool(view.global_enabled), "启用" if view.global_enabled else "全局停用"
 
 
 def _list_model_state(view: ModelView, source: ModelSourceRef | None) -> tuple[bool | None, str]:
     """One concise effective state; raw switches remain on the detail page."""
     if view.identity.kind not in (ModelKind.CHAT, ModelKind.IMAGE):
         return None, "已配置"
-    if not view.global_enabled:
-        return False, "停用"
     if view.available_in(source):
+        if not view.global_enabled:
+            return True, "覆盖全局停用" if source is not None else "来源例外启用"
         return True, ""
     sources = tuple(
         row for row in view.sources
@@ -276,6 +279,8 @@ def _list_model_state(view: ModelView, source: ModelSourceRef | None) -> tuple[b
     )
     if not sources:
         return False, "无来源"
+    if not view.global_enabled and not any(row.enabled_override for row in sources):
+        return False, "全局停用"
     if all(not row.container_enabled for row in sources):
         kinds = {row.type for row in sources}
         noun = "账户" if kinds == {ModelSourceType.OAUTH} else "渠道" if kinds == {ModelSourceType.API} else "来源"
@@ -414,7 +419,9 @@ def _batch_value(view: ModelView, field: ModelStateField, source: ModelSourceRef
     if field is ModelStateField.VISIBLE:
         return bool(view.visible)
     source_view = menu._source_for_view(view, source)
-    return bool(source_view.source_enabled) if source is not None and source_view is not None else bool(view.global_enabled)
+    if source is not None and source_view is not None:
+        return bool(source_view.source_enabled and (view.global_enabled or source_view.enabled_override))
+    return bool(view.global_enabled or any(row.enabled_override for row in view.sources))
 
 
 def _batch_button(
@@ -434,7 +441,10 @@ def _batch_button(
     if mixed:
         status = "混合"
     elif field is ModelStateField.ENABLED:
-        status = "启用" if values[0] else "禁用"
+        if source is None and values[0] and any(not view.global_enabled for view in views):
+            status = "部分来源启用"
+        else:
+            status = "启用" if values[0] else "禁用"
     else:
         status = "开" if values[0] else "关"
     target = not all(values)
@@ -448,6 +458,25 @@ def _batch_button(
         detail_key=None,
     )
     return ui.btn(prefix + status, callback)
+
+
+def _workbuddy_rate(metadata: Mapping[str, Any]) -> str:
+    from ...oauth.workbuddy.catalog import credit_multiplier
+    value = credit_multiplier(metadata.get("workbuddyCreditMultiplier"))
+    if value is None:
+        return "倍率未知"
+    return f"×{value}（免费）" if Decimal(value) == 0 else f"×{value}"
+
+
+def _workbuddy_rate_lines(view: ModelView, source: ModelSourceRef | None) -> list[str]:
+    selected = menu._source_for_view(view, source)
+    sources = (selected,) if selected is not None else view.sources if source is None else ()
+    rates = list(dict.fromkeys(_workbuddy_rate(item.effective_metadata)
+                              for item in sources if item.provider == "workbuddy"))
+    if not rates:
+        return []
+    suffix = "（随账户不同，详见详情）" if len(rates) > 1 else ""
+    return ["💳 WorkBuddy 倍率：" + " / ".join(rates) + suffix]
 
 
 def _model_list_render(chat_id: int) -> tuple[str, dict]:
@@ -516,6 +545,7 @@ def _model_list_render(chat_id: int) -> tuple[str, dict]:
                 else f" · {ui.escape_html(ui.provider_label(view.identity.provider or ''))}{owner_note}"
             )
         )
+        lines.extend("      " + line for line in _workbuddy_rate_lines(view, s.source))
         stats_lines = usage.format_lines((cached.value or {}).get(view.model_id))
         if stats_lines:
             lines.extend("      " + line for line in stats_lines)
@@ -601,6 +631,7 @@ def _detail_render(
         enabled, state_text = menu._model_state(view, s.source)
         lines.extend([
             f"状态：<code>{ui.escape_html(state_text)}</code>",
+            f"全局默认：<code>{'启用' if view.global_enabled else '停用'}</code>",
             f"下游展示开关：<code>{'开' if view.visible else '关'}</code>",
             "关闭时不出现在 /v1/models，仍可按名称调用；开启不代表停用模型会出现在列表，只有可用来源才会贡献模型。",
             "",
@@ -634,11 +665,15 @@ def _detail_render(
                     "",
                     f"{brand_prefix}<b>{ui.escape_html(human_source)}</b>",
                     f"上游名：<code>{ui.escape_html(source_view.outbound_model)}</code>",
-                    f"此模型：<code>{'启用' if source_view.source_enabled else '停用'}</code> · "
+                    f"本来源模型开关：<code>{'显式启用' if source_view.enabled_override and source_view.source_enabled else '允许' if source_view.source_enabled else '停用'}</code> · "
                     f"{'图片来源' if view.identity.kind is ModelKind.IMAGE else menu._container_label(source_view.type)}：<code>{'启用' if source_view.container_enabled else '停用'}</code> · "
                     f"当前可用：<code>{'是' if source_view.effective_routable else '否'}</code>",
+                    *(["💳 WorkBuddy 倍率：" + _workbuddy_rate(source_view.effective_metadata)]
+                      if source_view.provider == "workbuddy" else []),
                     *menu._metadata_lines(source_view.effective_metadata),
                 ])
+                if source_view.unavailable_reason == "account_restricted":
+                    lines.append("⛔ 供应商限制账户（11140），全部模型暂停；请在账户详情确认解除后清除暂停。")
                 if view.identity.kind is ModelKind.IMAGE and (source_view.provider == 'xai' or source_view.outbound_model.startswith('grok-imagine-image')):
                     lines.extend([
                         "xAI 当前图片适配不支持透明背景：实测返回 JPEG，无 alpha；请用 background=auto/opaque，或选择支持透明的图片来源。",
@@ -670,9 +705,15 @@ def _detail_render(
             lines.extend(menu._metadata_lines(view.common_metadata))
         target_enabled = not bool(enabled)
         state_scope = s.source if s.source is not None else None
+        if state_scope is None:
+            state_button = "停用模型" if enabled else "启用模型"
+        elif enabled:
+            state_button = "停用此来源"
+        else:
+            state_button = "启用此来源" if view.global_enabled else "仅启用此来源（覆盖全局停用）"
         rows.append([
             ui.btn(
-                ("停用" if enabled else "启用") + ("此来源" if state_scope is not None else "模型"),
+                state_button,
                 menu._freeze(
                     chat_id,
                     "set_state",
@@ -698,6 +739,13 @@ def _detail_render(
                 ),
             ),
         ])
+        if not view.global_enabled and any(item.enabled_override for item in view.sources):
+            rows.append([ui.btn("全局停用（清除所有来源例外）", menu._freeze(
+                chat_id, "set_state",
+                selection=ModelSelection(mode=ModelSelectionMode.IDS, model_ids=(view.model_id,)),
+                scope=None, target=ModelStateTarget(ModelStateField.ENABLED, False),
+                revision=view.revision, detail_key=view.resource_key, detail_back=back_callback,
+            ))])
         rows.append([
             ui.btn("调整元数据", menu._freeze(
                 chat_id, "metadata_targets", resource_key=view.resource_key,

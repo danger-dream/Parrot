@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from . import auth, affinity, channel_state, concurrency, config, cooldown, fingerprint, load_balancing, model_state, quota_errors, scorer
+from . import auth, affinity, channel_state, concurrency, config, cooldown, fingerprint, load_balancing, model_mapping, model_state, quota_errors, scorer
 from .channel import registry
 from .channel.base import Channel
 from .protocols.matrix import (
@@ -102,9 +102,6 @@ def _filter_candidates(requested_model: str,
     route_plans: dict[tuple[str, str], RoutePlan] = {}
     guard_errors: list[str] = []
     excluded = diagnostics if diagnostics is not None else []
-    if not model_state.is_global_enabled(requested_model):
-        excluded.append({"channel": None, "reason": "global_model_disabled"})
-        return available, saturated, route_plans, guard_errors
     for ch in registry.all_channels():
         if not auth.channel_allowed(api_key_name, ch.key):
             excluded.append({"channel": ch.key, "reason": "api_key_channel_denied"})
@@ -125,9 +122,11 @@ def _filter_candidates(requested_model: str,
         if not model_state.is_source_enabled(ch.key, requested_model):
             excluded.append({"channel": ch.key, "reason": "source_model_disabled"})
             continue
-        if callable(resolver) and resolved != requested_model and (
-            not model_state.is_global_enabled(resolved, source_key=ch.key)
-            or not model_state.is_source_enabled(ch.key, resolved)
+        if any(
+            not model_state.is_global_enabled(model, source_key=ch.key)
+            or not model_state.is_source_enabled(ch.key, model)
+            for model in model_mapping.request_model_names(request_body, resolved)
+            if model != requested_model
         ):
             excluded.append({"channel": ch.key, "reason": "resolved_model_disabled"})
             continue

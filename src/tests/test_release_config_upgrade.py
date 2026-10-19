@@ -204,7 +204,8 @@ def test_release_first_load_preserves_keys_accounts_channels_and_is_idempotent(u
     assert not auth.images_allowed('string-key') and not auth.videos_allowed('string-key')
     assert all(not auth.mcp_allowed(key) for key in loaded['apiKeys'])
     assert loaded['modelCenter'] == {'schemaVersion': 1, 'disabledModels': [],
-                                    'hiddenModels': [], 'apiSourceDisabledModels': {}}
+                                    'hiddenModels': [], 'apiSourceDisabledModels': {},
+                                    'sourceEnabledModels': {}}
     assert loaded['modelMetadataOverrides'] == {'defaults': {}, 'scoped': {}}
     snapshot = path.read_bytes()
     stat = path.stat().st_mtime_ns

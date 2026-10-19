@@ -72,14 +72,19 @@ def wire(monkeypatch):
     config.update(lambda c: (c.clear(), c.update(before)))
 
 
-def test_global_device_flow_pending_identity_retry_persistence_and_refresh(wire, monkeypatch):
+def test_legacy_ide_relogin_pending_identity_retry_persistence_and_refresh(wire, monkeypatch):
     requests, options, _ = wire
     options.update(pending=True, identity_failures=1)
     clock = [datetime.now(timezone.utc)]
     ctl = OAuthControl(clock=lambda: clock[0])
     monkeypatch.setattr(ctl, "_post_save_account_effects", lambda *a, **k: {})
     ctx = context()
-    flow = ctl.start_login_flow(ctx, OAuthProvider.WORKBUDDY, realm="global", client_profile="ide")
+    entry = auth.normalize_credential({"realm": "global", "uid": options["identity"]["uid"],
+        "workbuddy_client_profile": "ide", "domain": "www.codebuddy.ai",
+        "access_token": "old-fixture-at", "refresh_token": "old-fixture-rt"})
+    entry.update(enabled=False, disabled_reason="auth_error")
+    om.add_account(entry)
+    flow = ctl.start_login_flow(ctx, OAuthProvider.WORKBUDDY, relogin_account_id=om.get_account_key(entry))
     assert "国际区" in flow.instruction and flow.auth_url.startswith("https://www.codebuddy.ai/")
     assert ctl.poll_login_flow(ctx, flow.flow_id, flow.flow_secret).status == "pending"
     clock[0] += timedelta(seconds=3)
@@ -87,7 +92,7 @@ def test_global_device_flow_pending_identity_retry_persistence_and_refresh(wire,
     clock[0] += timedelta(seconds=3)
     preview = ctl.poll_login_flow(ctx, flow.flow_id, flow.flow_secret)
     assert preview.status == "completed" and preview.account_preview["realm"] == "global"
-    assert preview.save_status == "created" and om.get_account(preview.account_id) is not None
+    assert preview.save_status == "replaced" and om.get_account(preview.account_id) is not None
     assert "fixture-global-at" not in str(preview) and "fixture-global-rt" not in str(preview)
     result = ctl.complete_login_flow(ctx, flow.flow_id, flow.flow_secret, CompleteOAuthLoginCommand(completed=True))
     saved = om.get_account(result.account_id)
@@ -159,33 +164,33 @@ def test_global_api_selects_profile_and_keeps_secrets_private(api, monkeypatch):
     calls = []
     def start(**kwargs):
         calls.append(kwargs)
-        return {"realm": "global", "workbuddy_client_profile": "ide", "state": "fixture-state",
-                "status": "pending", "auth_url": "https://www.codebuddy.ai/login"}
+        return {"realm": "global", "workbuddy_client_profile": "workbuddy-cli", "state": "fixture-state",
+                "status": "pending", "auth_url": "https://www.workbuddy.ai/login"}
     monkeypatch.setattr(ctl.backend, "workbuddy_start_login", start)
-    response = call("POST", "/oauth/login-flows", {"provider": "workbuddy", "realm": "global", "clientProfile": "ide"})
+    response = call("POST", "/oauth/login-flows", {"provider": "workbuddy", "realm": "global", "clientProfile": "workbuddy-cli"})
     assert response.status_code == 201, response.text
-    assert calls == [{"realm": "global", "client_profile": "ide"}]
+    assert calls == [{"realm": "global", "client_profile": "workbuddy-cli"}]
     flow = response.json()["data"]
-    entry = dict(om.get_account(key), realm="global", domain="www.codebuddy.ai", workbuddy_client_profile="ide")
+    entry = dict(om.get_account(key), realm="global", domain="www.workbuddy.ai", workbuddy_client_profile="workbuddy-cli")
     monkeypatch.setattr(ctl.backend, "workbuddy_poll_login", lambda p: p.update(status="ready", entry=entry))
     path = "/oauth/login-flows/" + flow["flowId"]
     ready = call("POST", path + "/poll", {"flowSecret": flow["flowSecret"]})
     assert ready.status_code == 200 and "fixture-at" not in ready.text and "fixture-rt" not in ready.text
     assert call("POST", path + "/complete", {"flowSecret": flow["flowSecret"], "completed": True}).status_code == 200
-    assert any(a.get("realm") == "global" and a.get("workbuddy_client_profile") == "ide" for a in om.list_accounts())
+    assert any(a.get("realm") == "global" and a.get("workbuddy_client_profile") == "workbuddy-cli" for a in om.list_accounts())
 
 
 def test_global_tg_automatic_login_and_saved_identity_use_international_region(tg, monkeypatch):
     key, ctl, _, output, _, _, _ = tg
     monkeypatch.setattr(ctl.backend, "workbuddy_start_login", lambda **kwargs: {
         "realm": kwargs["realm"], "workbuddy_client_profile": kwargs["client_profile"],
-        "auth_url": "https://www.codebuddy.ai/login", "state": "fixture-state", "status": "pending"})
+        "auth_url": "https://www.workbuddy.ai/login", "state": "fixture-state", "status": "pending"})
     oauth_menu.handle_callback(42, 900, "cb", "oa:add")
     click(tg, "WorkBuddy")
     assert any(b.get("callback_data") == "oa:wb:login:global" for b in buttons(output[-1][1]))
-    click(tg, "CodeBuddy IDE")
+    click(tg, "国际区")
     assert "国际区登录" in output[-1][0] and "Google / GitHub" in output[-1][0]
-    entry = dict(om.get_account(key), realm="global", domain="www.codebuddy.ai", workbuddy_client_profile="ide")
+    entry = dict(om.get_account(key), realm="global", domain="www.workbuddy.ai", workbuddy_client_profile="workbuddy-cli")
     monkeypatch.setattr(ctl.backend, "workbuddy_poll_login", lambda p: p.update(status="ready", entry=entry))
     tg[2]["login_workers"].pop(0)()  # Authorization finishes without another click.
     assert "授权已保存" in output[-1][0]

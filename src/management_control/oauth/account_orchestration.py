@@ -58,6 +58,8 @@ class OAuthAccountOrchestrationControlMixin:
                 from ...oauth.workbuddy.common import login_profile
                 try:
                     client_profile = login_profile(realm, client_profile)
+                    if relogin is None and client_profile == "ide":
+                        raise ValueError("Legacy profile is only available for existing accounts")
                 except ValueError:
                     raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE,
                         fields=[ErrorField("clientProfile", "REGION_PROFILE_MISMATCH", "Unsupported WorkBuddy login region/profile")])

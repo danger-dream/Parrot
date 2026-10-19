@@ -37,6 +37,16 @@ def quota_code(result):
 
 UNAPPROVED_CHANNEL_CODE = "11128"
 UNAPPROVED_CHANNEL_MESSAGE = "Illegal API invocation from an unapproved channel"
+CHANNEL_REJECTION_MESSAGES = frozenset({
+    UNAPPROVED_CHANNEL_MESSAGE,
+    "conversation id missing",
+    "first message is not system prompt",
+})
+ACCOUNT_RESTRICTED_CODE = "11140"
+ACCOUNT_RESTRICTED_MESSAGE = "WorkBuddy 账号被供应商限制使用，请在官方客户端提交反馈申诉；解除后可清除冷却再试。"
+ACCOUNT_RESTRICTED_COOLDOWN_SECONDS = 2 * 60 * 60
+TOOL_HISTORY_CODE = "11148"
+TOOL_HISTORY_MESSAGE = "tool calls and tool results do not match, please start a new conversation and retry"
 
 
 def unapproved_channel_error_info(payload: object) -> tuple[str, str] | None:
@@ -49,11 +59,28 @@ def unapproved_channel_error_info(payload: object) -> tuple[str, str] | None:
     """
     if not isinstance(payload, dict):
         return None
-    error = payload.get("error") if isinstance(payload.get("error"), dict) else payload
+    error = error_payload(payload)
     code = error.get("code")
     if type(code) not in (int, str) or str(code) != UNAPPROVED_CHANNEL_CODE:
         return None
     message = error.get("msg") or error.get("message")
-    if not isinstance(message, str) or message.strip() != UNAPPROVED_CHANNEL_MESSAGE:
+    if not isinstance(message, str) or message.strip() not in CHANNEL_REJECTION_MESSAGES:
         return None
-    return UNAPPROVED_CHANNEL_CODE, UNAPPROVED_CHANNEL_MESSAGE
+    return UNAPPROVED_CHANNEL_CODE, message.strip()
+
+
+def request_rejection_info(payload: object) -> tuple[str, str] | None:
+    rejection = unapproved_channel_error_info(payload)
+    if rejection is not None:
+        return rejection
+    error = error_payload(payload)
+    code = error.get("code")
+    if type(code) not in (int, str) or str(code) != TOOL_HISTORY_CODE:
+        return None
+    detail = error.get("extError")
+    message = error.get("msg") or error.get("message")
+    if not message and isinstance(detail, dict) and detail.get("type") == "invalid_request_error":
+        message = detail.get("message")
+    if isinstance(message, str) and message.strip() == TOOL_HISTORY_MESSAGE:
+        return TOOL_HISTORY_CODE, TOOL_HISTORY_MESSAGE
+    return None

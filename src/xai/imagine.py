@@ -16,7 +16,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 from fastapi import Request
@@ -45,6 +45,7 @@ from .. import (
 from ..async_owned import await_owned
 from ..channel import registry
 from ..channel.xai_oauth_channel import XAIOAuthChannel
+from ..channel.url_utils import resolve_api_endpoint
 
 
 _IMAGE_MODEL_PREFIX = "grok-imagine-image"
@@ -164,11 +165,8 @@ def _media_url(channel: XAIOAuthChannel, path: str) -> str:
     parsed = urlsplit(str(channel.base_url or "").strip())
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise ValueError("xAI OAuth media base URL must be an absolute HTTP(S) URL")
-    base_path = parsed.path.rstrip("/")
-    if base_path.endswith("/responses"):
-        base_path = base_path[: -len("/responses")]
-    joined_path = f"{base_path}/{path.lstrip('/')}"
-    return urlunsplit((parsed.scheme, parsed.netloc, joined_path, "", ""))
+    url = resolve_api_endpoint(channel.base_url, path, preserve_custom_path=True)
+    return urlsplit(url)._replace(query="", fragment="").geturl()
 
 
 def _safe_response_headers(headers: httpx.Headers) -> dict[str, str]:
@@ -524,14 +522,22 @@ def _permission_error(message: str) -> Response:
     )
 
 
-def _eligible_channels(kind: str, model: str, *, api_key_name: str | None = None) -> list[XAIOAuthChannel]:
+def _media_alias_enabled(channel: XAIOAuthChannel, requested_model: str | None) -> bool:
+    return not requested_model or (
+        model_state.is_global_enabled(requested_model, source_key=channel.key)
+        and model_state.is_source_enabled(channel.key, requested_model)
+    )
+
+
+def _eligible_channels(kind: str, model: str, *, api_key_name: str | None = None,
+                       requested_model: str | None = None) -> list[XAIOAuthChannel]:
     candidates: list[tuple[XAIOAuthChannel, str]] = []
     for channel in registry.all_channels():
         if not auth.channel_allowed(api_key_name, channel.key):
             continue
         if not isinstance(channel, XAIOAuthChannel):
             continue
-        if not channel.supports_media_model(kind, model):
+        if not channel.supports_media_model(kind, model) or not _media_alias_enabled(channel, requested_model):
             continue
         if cooldown.is_blocked(channel.key, model):
             continue
@@ -555,9 +561,10 @@ async def _request_upstream(
     headers: dict[str, str],
     body: bytes | None,
     model: str,
+    requested_model: str | None = None,
 ) -> httpx.Response:
     kind = "video" if "videos/" in path else "image"
-    if not channel.supports_media_model(kind, model):
+    if not channel.supports_media_model(kind, model) or not _media_alias_enabled(channel, requested_model):
         raise ValueError("selected media purpose or account generation is no longer available")
     async with network.async_client(
         timeout=_media_timeout("video" if "videos/" in path else "image"),
@@ -566,6 +573,8 @@ async def _request_upstream(
         proxy_model=model,
         follow_redirects=False,
     ) as client:
+        if not channel.supports_media_model(kind, model) or not _media_alias_enabled(channel, requested_model):
+            raise ValueError("selected media model is no longer enabled")
         return await client.request(
             method,
             _media_url(channel, path),
@@ -588,9 +597,10 @@ async def _post_with_safe_failover(
     path: str,
     payload: dict[str, Any],
     api_key_name: str | None = None,
+    requested_model: str | None = None,
 ) -> _PostResult | Response:
     """POST once per explicitly rejecting account; never retry ambiguous I/O."""
-    candidates = _eligible_channels(kind, model, api_key_name=api_key_name)
+    candidates = _eligible_channels(kind, model, api_key_name=api_key_name, requested_model=requested_model)
     if not candidates:
         return errors.json_error_openai(
             503,
@@ -603,6 +613,8 @@ async def _post_with_safe_failover(
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     for channel in candidates:
+        if not channel.supports_media_model(kind, model) or not _media_alias_enabled(channel, requested_model):
+            continue
         effect_key = channel_state.effect_key(channel)
         if not await concurrency.try_acquire(effect_key):
             continue
@@ -629,6 +641,7 @@ async def _post_with_safe_failover(
                     headers=headers,
                     body=body,
                     model=model,
+                    **({'requested_model': requested_model} if requested_model and requested_model != model else {}),
                 )
             except httpx.TimeoutException:
                 # The server may already have accepted and billed the POST.  Do not
@@ -909,7 +922,10 @@ async def handle_video_create(request: Request, *, action: str) -> Response:
         return _bad_request(f"unsupported xAI video model {model!r}", param="model")
     if not (_model_allowed(model, allowed_models) or _model_allowed(requested_model, allowed_models)):
         return _permission_error("model is not allowed for this API key")
-    if not model_state.is_global_enabled(model) or not model_state.is_global_enabled(requested_model):
+    if not all(model_state.is_global_enabled(name) for name in {model, requested_model}) and not any(
+        all(model_state.is_global_enabled(name, source_key=channel.key) for name in {model, requested_model})
+        for channel in registry.all_channels() if isinstance(channel, XAIOAuthChannel)
+    ):
         return _permission_error("video model is disabled")
 
     try:
@@ -951,6 +967,7 @@ async def handle_video_create(request: Request, *, action: str) -> Response:
             kind="video",
             api_key_name=key_name,
             model=model,
+            **({'requested_model': requested_model} if requested_model != model else {}),
             path=path,
             payload=payload,
         )

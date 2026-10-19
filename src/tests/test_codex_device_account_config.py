@@ -10,6 +10,10 @@ from src.channel.api_channel import ApiChannel
 from src.channel.openai_oauth_channel import OpenAIOAuthChannel
 from src.openai.channel.api_channel import OpenAIApiChannel
 from src.openai.responses_ws_runtime import prepare_oauth_responses_ws_request_parts
+from src.tests.test_codex_identity import _import_modules, identity_store
+
+
+pytestmark = pytest.mark.usefixtures("identity_store")
 
 
 DEVICE_A = "123e4567-e89b-42d3-a456-426614174000"

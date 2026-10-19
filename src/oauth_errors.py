@@ -147,12 +147,21 @@ def describe_oauth_error(
 
     prov = _norm_provider(provider)
     op = _norm_operation(operation)
+    if op == "fetch_usage" and getattr(exc, "oauth_refresh_observation", None) is not None:
+        op = "refresh_token"
     status = _http_status(exc)
     body_code = _response_error_code(exc)
     diagnostic = safe_diagnostics.capture(exc, provider=prov, operation=op, stage=op)
     technical = json.dumps(diagnostic.fields(), ensure_ascii=False, sort_keys=True)
 
     if isinstance(exc, OAuthRefreshStateError):
+        if exc.kind == "refresh_disabled":
+            return OAuthDisplayError(
+                code="oauth_refresh_disabled", title="保护模式已阻止刷新 Token",
+                reason="当前实例禁止刷新凭据，未发出刷新请求。",
+                action="请在允许刷新凭据的实例执行；现有账户状态未改变。",
+                retryable=False, auth_error=False, provider=prov, operation=op, technical=technical,
+            )
         if exc.kind == "account_unavailable":
             return OAuthDisplayError(
                 code="oauth_refresh_account_unavailable", title="账户已暂停",
@@ -264,6 +273,18 @@ def describe_oauth_error(
 
     # OpenAI / Codex OAuth.
     if prov == "openai":
+        if op == "fetch_usage" and status == 401:
+            return OAuthDisplayError(
+                code="openai_usage_401",
+                title="OpenAI 登录状态已失效",
+                reason="用量接口拒绝了当前登录凭据，未取得新的用量数据。",
+                action="重新登录这个 OpenAI 账号。",
+                auth_error=True,
+                status=status,
+                provider=prov,
+                operation=op,
+                technical=technical,
+            )
         if op == "exchange_code" and _is_invalid_token(status, body_code):
             return OAuthDisplayError(
                 code="openai_code_exchange_401" if status == 401 else "openai_code_exchange_invalid",

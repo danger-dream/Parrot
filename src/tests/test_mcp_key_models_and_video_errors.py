@@ -9,7 +9,7 @@ import pytest
 from starlette.responses import JSONResponse
 
 from src.tests.test_mcp_regressions import reset, context
-from src import config, log_db
+from src import config, image_catalog, log_db, model_state
 from src.mcp import catalog, server as ms
 
 
@@ -105,15 +105,51 @@ def test_catalog_and_auto_follow_live_grants_without_changing_priority(monkeypat
 
 @pytest.mark.parametrize("kind", ["image", "video"])
 def test_granted_alias_is_preserved_and_disabled_alias_is_excluded(monkeypatch, kind):
-    monkeypatch.setattr(catalog, kind + "_sources", lambda: ["real-model"])
+    source = image_catalog.ImageSource("real-model", "real-model", "xai",
+        "oauth:xai:fixture", "fixture", True, True)
+    media_kind = kind
+    monkeypatch.setattr(image_catalog, "sources",
+        lambda *, kind="image": [source] if kind == media_kind else [])
     config.update(lambda c: (
         c.update(modelMapping={"global": {"granted-alias": "real-model"}}),
+        c.update({kind + "_models": {"xai": ["real-model"]}}),
         c["apiKeys"]["audit"].update(allowedModels=["granted-alias"]),
     ))
     assert catalog.media_sources(kind, "audit") == ["granted-alias"]
     assert ms._requested_model({}, kind=kind, key_name="audit") == "granted-alias"
     config.update(lambda c: c.setdefault("modelCenter", {}).update(disabledModels=["granted-alias"]))
     assert catalog.media_sources(kind, "audit") == []
+
+
+def test_video_alias_requires_one_permitted_source_for_alias_and_target(monkeypatch):
+    # Image HTTP/MCP parity is covered by test_source_enable_media; keep the
+    # video catalog's same-source and channel-ACL boundary explicit here too.
+    rows = [image_catalog.ImageSource("real-model", "real-model", "xai",
+            "oauth:xai:" + name, name, True, True) for name in ("one", "two")]
+    monkeypatch.setattr(image_catalog, "sources", lambda *, kind="image": rows if kind == "video" else [])
+    config.update(lambda c: (
+        c.update(video_models={"xai": ["real-model"]},
+                 modelMapping={"global": {"granted-alias": "real-model"}}),
+        c["apiKeys"]["audit"].update(allowedModels=["granted-alias"]),
+        model_state.set_global_enabled_in_config(c, ["real-model", "granted-alias"], False),
+        model_state.set_source_enable_override_in_config(c, rows[0].key, ["real-model"], True),
+        model_state.set_source_enable_override_in_config(c, rows[1].key, ["granted-alias"], True),
+    ))
+    assert catalog.media_sources("video", "audit") == []  # Cannot combine two sources' grants.
+    config.update(lambda c: (
+        model_state.set_source_enable_override_in_config(c, rows[0].key, ["granted-alias"], True),
+        model_state.set_source_enable_override_in_config(c, rows[1].key, ["granted-alias"], False),
+        model_state.set_source_enable_override_in_config(c, rows[1].key, ["real-model"], True),
+        c["apiKeys"]["audit"].update(allowedChannels=[rows[1].key]),
+    ))
+    assert catalog.video_sources() == ["real-model"]
+    assert rows[0].visible_for("granted-alias")
+    assert catalog.media_sources("video", "audit") == []  # Eligible alias source is outside this key's ACL.
+    config.update(lambda c: c["apiKeys"]["audit"].update(allowedChannels=[rows[0].key]))
+    assert catalog.media_sources("video", "audit") == ["granted-alias"]
+    config.update(lambda c: model_state.set_visible_in_config(c, ["granted-alias"], False))
+    assert catalog.media_sources("video", "audit") == []
+    assert rows[0].available_for("granted-alias")  # Hidden is not disabled for execution.
 
 
 @pytest.mark.asyncio

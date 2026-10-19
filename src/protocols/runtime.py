@@ -25,7 +25,7 @@ import httpx
 from .. import blacklist, errors
 from ..providers import registry as provider_registry
 from ..providers.antigravity_errors import parse_antigravity_429
-from ..providers.workbuddy_errors import unapproved_channel_error_info
+from ..providers.workbuddy_errors import request_rejection_info
 from .commit_gate import (
     is_responses_dispatch_commit_event_type,
     is_responses_visible_event_type,
@@ -471,6 +471,7 @@ OUTCOMES_NO_COOLDOWN = frozenset({
     "candidate_guard",
     "request_invalid",
     "request_rejected",
+    "account_restricted",
     "response_incomplete",
     "client_disconnected",
     "connection_lifecycle",
@@ -484,7 +485,7 @@ def should_cooldown(outcome: str) -> bool:
 def should_record_failure(outcome: str) -> bool:
     """Whether an unsuccessful attempt should affect channel health scoring."""
     return outcome not in {
-        "candidate_guard", "request_invalid", "request_rejected",
+        "candidate_guard", "request_invalid", "request_rejected", "account_restricted",
         "response_incomplete", "client_disconnected", "connection_lifecycle",
     }
 
@@ -1199,7 +1200,7 @@ def workbuddy_request_rejection(
     response_text: str | None = None,
     translator_ctx: dict | None = None,
 ) -> tuple[str, str] | None:
-    """Require provider identity and explicit rejection, never code 11128 alone.
+    """Require provider identity and an explicit request rejection.
 
     HTTP rejection is scoped to 400. For a successful SSE transport, trust only
     the WorkBuddy decoder's per-attempt observation of that exact error frame.
@@ -1212,14 +1213,37 @@ def workbuddy_request_rejection(
             payload = json.loads(response_text or "")
         except (ValueError, TypeError):
             return None
-        return unapproved_channel_error_info(payload)
+        return request_rejection_info(payload)
     if http_status is None or http_status == 200:
         decoder = (translator_ctx or {}).get("workbuddy_stream")
         return getattr(decoder, "request_rejection", None)
     return None
 
 
+def workbuddy_account_restricted(result, channel) -> bool:
+    if getattr(channel, "provider", None) != "workbuddy" or result.success:
+        return False
+    from ..providers.workbuddy_errors import ACCOUNT_RESTRICTED_CODE, error_payload
+    if result.http_status == 403:
+        try:
+            code = error_payload(json.loads(result.full_response_text or "")).get("code")
+        except (ValueError, TypeError):
+            return False
+        return type(code) in (int, str) and str(code) == ACCOUNT_RESTRICTED_CODE
+    if result.http_status in (None, 200):
+        decoder = (result.translator_ctx or {}).get("workbuddy_stream")
+        return getattr(decoder, "account_restricted", False) is True
+    return False
+
+
 def request_invalid_result_if_needed(result: AttemptResult, *, channel=None) -> AttemptResult:
+    if workbuddy_account_restricted(result, channel):
+        from ..providers.workbuddy_errors import ACCOUNT_RESTRICTED_CODE, ACCOUNT_RESTRICTED_MESSAGE
+        result.outcome = "account_restricted"
+        result.http_status = 403
+        result.error_code = ACCOUNT_RESTRICTED_CODE
+        result.error_detail = ACCOUNT_RESTRICTED_MESSAGE
+        return result
     if not result.success and not result.stream_started:
         rejection = workbuddy_request_rejection(
             channel, http_status=result.http_status,
@@ -1283,58 +1307,69 @@ def request_invalid_result_if_needed(result: AttemptResult, *, channel=None) -> 
     return result
 
 
-def _strip_encrypted_content_value(value: Any, *, preserve_anthropic: bool = False) -> tuple[Any, int]:
-    if isinstance(value, dict):
-        if preserve_anthropic and value.get("type") == "reasoning":
-            from ..openai.anthropic_reasoning_replay import is_native_carrier
-            if is_native_carrier(value.get("encrypted_content")):
-                return value, 0
-        out: dict[str, Any] = {}
-        removed = 0
-        for k, v in value.items():
-            if k == "encrypted_content":
+def _strip_encrypted_content_items(items: list, *, preserve_anthropic: bool) -> tuple[list, int]:
+    """Clean Responses input-like items in an already deep-copied request.
+
+    Only protocol item/content slots are traversed. Tool arguments, schemas,
+    provider metadata and arbitrary JSON may use the same keys and type values
+    as the protocol; their shape alone does not make them replay state.
+    """
+    from ..providers.workbuddy_replay import is_carrier
+    from ..openai.anthropic_reasoning_replay import is_native_carrier
+
+    out, removed = [], 0
+    for item in items:
+        if not isinstance(item, dict):
+            out.append(item)
+            continue
+        kind = item.get("type")
+        if kind == "encrypted_content":
+            removed += 1
+            continue
+        content_key = None
+        if kind == "reasoning":
+            carrier = item.get("encrypted_content")
+            # Provider-tagged replay is indivisible, including any extensions.
+            if is_carrier(carrier) or (preserve_anthropic and is_native_carrier(carrier)):
+                out.append(item)
+                continue
+            if "encrypted_content" in item:
+                item.pop("encrypted_content")
                 removed += 1
-                continue
-            if isinstance(v, list):
-                new_list: list[Any] = []
-                for item in v:
-                    if isinstance(item, dict) and item.get("type") == "encrypted_content":
-                        removed += 1
-                        continue
-                    new_item, n = _strip_encrypted_content_value(item, preserve_anthropic=preserve_anthropic)
-                    removed += n
-                    new_list.append(new_item)
-                out[k] = new_list
-                continue
-            new_v, n = _strip_encrypted_content_value(v, preserve_anthropic=preserve_anthropic)
-            removed += n
-            out[k] = new_v
-        return out, removed
-    if isinstance(value, list):
-        out = []
-        removed = 0
-        for item in value:
-            if isinstance(item, dict) and item.get("type") == "encrypted_content":
-                removed += 1
-                continue
-            new_item, n = _strip_encrypted_content_value(item, preserve_anthropic=preserve_anthropic)
-            removed += n
-            out.append(new_item)
-        return out, removed
-    return value, 0
+            content_key = "content"
+        elif kind == "message" or (kind is None and item.get("role") in ("user", "assistant", "system", "developer")):
+            content_key = "content"
+        elif kind in ("function_call_output", "custom_tool_call_output"):
+            content_key = "output"
+        parts = item.get(content_key) if content_key else None
+        if isinstance(parts, list):
+            kept = [part for part in parts if not (
+                isinstance(part, dict) and part.get("type") == "encrypted_content"
+            )]
+            removed += len(parts) - len(kept)
+            item[content_key] = kept
+        out.append(item)
+    return out, removed
 
 
 def retry_body_without_encrypted_content(body: dict, *, preserve_anthropic: bool = False) -> tuple[dict, int]:
-    """Deep-copy a request and recursively remove only encrypted content.
+    """Deep-copy a request and remove ciphertext only at protocol locations.
 
-    Reasoning items themselves are portable once their opaque EC field is gone;
-    summary/content/id and adjacent message/tool items must remain available to a
-    failover candidate. Routing preserves tagged Anthropic carriers; target
-    protocol boundaries decide whether they can be replayed.
+    Responses input/instructions contain reasoning items and typed content
+    blocks. Other request data (including Chat/Anthropic messages, tool inputs
+    and schemas) is not a Responses replay container. Reasoning summaries and
+    adjacent message/tool items remain portable. WorkBuddy carriers always
+    survive; tagged Anthropic carriers survive when requested by routing.
     """
     copied = copy.deepcopy(body)
-    stripped, removed = _strip_encrypted_content_value(copied, preserve_anthropic=preserve_anthropic)
-    return (stripped if isinstance(stripped, dict) else copied), removed
+    removed = 0
+    for field in ("input", "instructions"):
+        if isinstance(copied.get(field), list):
+            copied[field], count = _strip_encrypted_content_items(
+                copied[field], preserve_anthropic=preserve_anthropic,
+            )
+            removed += count
+    return copied, removed
 
 
 def is_context_1m_credit_error(result: AttemptResult, resolved_model: str, body: dict) -> bool:

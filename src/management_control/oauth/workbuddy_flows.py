@@ -104,7 +104,7 @@ class WorkBuddyFlows:
         entry = payload.get("entry")
         if not entry:
             return None
-        return {key: entry.get(key) for key in ("realm", "uid", "enterprise_id", "nickname", "label", "expired", "workbuddy_client_profile")}
+        return {key: entry.get(key) for key in ("realm", "uid", "enterprise_id", "nickname", "label", "expired", "workbuddy_client_profile", "workbuddy_account_type")}
 
     @diagnose('workbuddy', 'login_poll', 'token_poll')
     def poll(self, actor: str, flow_id: str, secret: str) -> OAuthLoginPoll:

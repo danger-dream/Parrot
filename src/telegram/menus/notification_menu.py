@@ -207,7 +207,9 @@ def handle_callback(cb):
                 return
             elif action == "close":
                 # Panel close refs are not generated: close always targets this delivery.
-                _answer(cb, delivery.close(row["id"]))
+                feedback = delivery.close(row["id"])
+                if feedback:
+                    _answer(cb, feedback)
                 return
             if action in {"mute1", "mute24"}:
                 until = time.time() + (3600 if action == "mute1" else 86400)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import gzip
 import json
 import uuid
 
@@ -99,14 +100,17 @@ async def test_alias_six_inference_paths_keep_raw_upstream_and_public_response(e
     snapshot = copy.deepcopy(entry)
     router = fake.MockRouter()
     def wire(req):
-        payload = json.loads(req.content)
+        encoding = req.headers.get("content-encoding", "")
+        # CN CLI and the retained Global IDE profile use gzip on the real wire.
+        assert encoding == ("gzip" if provider == "workbuddy" else "")
+        payload = json.loads(gzip.decompress(req.content) if encoding == "gzip" else req.content)
         assert payload["model"] == raw
         assert "reasoning_effort" not in payload
         if provider == "workbuddy":
             assert req.url.host == ("www.codebuddy.ai" if realm == "global" else "copilot.tencent.com")
             assert req.headers["authorization"] == "Bearer fixture-access"
             if realm == "global":
-                assert req.headers["x-ide-name"] == "IDE"
+                assert req.headers["x-ide-name"] == "CodeBuddyIDE"
         else:
             assert req.url.host == "cursor-alias.fixture"
         if payload["stream"]:

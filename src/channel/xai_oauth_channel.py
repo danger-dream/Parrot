@@ -17,7 +17,7 @@ from typing import Optional
 
 from .. import cache_hints, config, local_web_tools, oauth_manager, search_tool_wire
 from ..search_xai import normalize_x_search_tool_dates
-from ..channel.url_utils import resolve_upstream_url
+from ..channel.url_utils import resolve_api_endpoint, resolve_upstream_url
 from ..oauth import xai as xai_provider
 from ..providers import registry as provider_registry
 from ..openai.transform import (
@@ -163,7 +163,7 @@ class XAIOAuthChannel(Channel):
         return (oauth_manager.account_state_key(account) == self.state_key
                 and media_config.oauth_state(account, kind)['enabled']
                 and requested_model in media_config.account_models(account, kind)
-                and model_state.is_global_enabled(requested_model)
+                and model_state.is_global_enabled(requested_model, source_key=self.key)
                 and model_state.is_source_enabled(self.key, requested_model))
 
     async def build_media_headers(self) -> dict[str, str]:
@@ -250,7 +250,10 @@ class XAIOAuthChannel(Channel):
             headers["x-grok-conv-id"] = conv_id
 
         return UpstreamRequest(
-            url=resolve_upstream_url(self.base_url, self.api_path, "/responses"),
+            url=(resolve_upstream_url(self.base_url, self.api_path, "/responses")
+                 if self.api_path else resolve_api_endpoint(
+                     self.base_url, "/responses", preserve_custom_path=True,
+                 )),
             headers=headers,
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=dynamic_map,

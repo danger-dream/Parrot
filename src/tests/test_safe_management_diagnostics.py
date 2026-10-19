@@ -52,7 +52,7 @@ def wire(isolated, monkeypatch, caplog):
     calls = []
     options = {"realm": "global"}
     def respond(request):
-        host = "www.codebuddy.ai" if options["realm"] == "global" else "www.codebuddy.cn"
+        host = "www.workbuddy.ai" if options["realm"] == "global" else "www.codebuddy.cn"
         return httpx.Response(200, json={"code": 0, "data": {
             "state": SECRET, "authUrl": "https://" + host + "/login?state=" + SECRET,
         }}, headers={"Set-Cookie": "flow=" + SECRET + "; Path=/; Secure"})
@@ -183,8 +183,8 @@ def test_successful_start_keeps_region_selection_and_private_flow_data(wire, cap
     assert SECRET in flow.auth_url and not events(caplog)
     assert len(calls) == 1 and calls[0][0] == "misaka-lax"
     request = calls[0][1]
-    assert request.url.host == ("copilot.tencent.com" if realm == "cn" else "www.codebuddy.ai")
-    assert request.url.params["platform"] == ("CLI" if realm == "cn" else "ide")
+    assert request.url.host == ("copilot.tencent.com" if realm == "cn" else "www.workbuddy.ai")
+    assert request.url.params["platform"] == "CLI"  # New Global logins select WorkBuddy CLI, not IDE.
     assert request.method == "POST" and request.content == b"{}"
     assert config.get() == before and not om.list_accounts()
 

@@ -49,13 +49,28 @@ def _time(value, realm: str) -> str | None:
 
 def normalize_package(raw: dict, realm: str) -> dict:
     suffixes = ("Size", "Remain", "Used")
+    cycle_start = _time(raw.get("CycleStartTime"), realm)
+    cycle_end = _time(raw.get("CycleEndTime"), realm)
+    expiry = next((parsed for key in ("PackageEndTime", "EndTime", "DeductionEndTime", "ExpiredTime")
+                   if (parsed := _time(raw.get(key), realm)) is not None), None)
     source = raw
+    cycle_fallback = False
     if common.number(raw.get("CapacityType")) == 4:
         prefix = "SlicePeriodCapacity"
         details = raw.get("SlicePeriodUsageDetails")
-        # Type 4 is the current slice, not the lifetime/cycle allowance. An
-        # absent slice must stay unknown rather than falling back to that pool.
         source = details[0] if isinstance(details, list) and details and isinstance(details[0], dict) else {}
+        # The legacy get-user-resource endpoint can omit slices for type 4.
+        # Official resolveResourceCapacity then uses CycleCapacity, NOT the
+        # lifetime Capacity pool (which may still say 500 when this cycle is 0).
+        # Only an absent slice with explicit, current precise cycle values is
+        # eligible; malformed slice data must not be hidden by this fallback.
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if ((details is None or details == []) and cycle_start and cycle_end
+                and cycle_start <= now <= cycle_end and (expiry is None or now <= expiry)
+                and common.number(raw.get("Status")) not in (1, 2)
+                and all(common.number(raw.get("CycleCapacity" + suffix + "Precise")) is not None
+                        for suffix in ("Size", "Remain"))):
+            prefix, source, cycle_fallback = "CycleCapacity", raw, True
     else:
         size = common.number(raw.get("CapacitySizePrecise"))
         has_cycle = any("CycleCapacity" + suffix + precision in raw
@@ -71,7 +86,7 @@ def normalize_package(raw: dict, realm: str) -> dict:
     # ABSENT precise field may fall back to the legacy field. Keep precision
     # for reconciliation, aggregation and quota decisions; round only in UI.
     values = [common.number(source.get(prefix + suffix + "Precise")
-                            if prefix + suffix + "Precise" in source or prefix == "SlicePeriodCapacity"
+                            if prefix + suffix + "Precise" in source or prefix == "SlicePeriodCapacity" or cycle_fallback
                             else source.get(prefix + suffix)) for suffix in suffixes]
     capacity, remaining, used = values
     invalid_precise = any(prefix + suffix + "Precise" in source and value is None
@@ -85,14 +100,12 @@ def normalize_package(raw: dict, realm: str) -> dict:
             reliable = False
     if capacity is not None and used is not None and used > capacity:
         reliable = False
-    expiry = next((parsed for key in ("PackageEndTime", "EndTime", "DeductionEndTime", "ExpiredTime")
-                   if (parsed := _time(raw.get(key), realm)) is not None), None)
     return {"id": common.text(str(raw.get("ResourceId") or raw.get("AccountId") or raw.get("PackageId") or ""), "package id"),
             "name": common.text(raw.get("PackageName") or "未命名资源包", "package name", maximum=512),
             "scope": "personal", "unit": "credits", "capacity": capacity, "remaining": remaining,
             "used": used, "reliable": reliable, "basis": prefix,
-            "cycle_start": _time(raw.get("CycleStartTime"), realm),
-            "cycle_end": _time(raw.get("CycleEndTime"), realm),
+            "cycle_start": cycle_start,
+            "cycle_end": cycle_end,
             "expires_at": expiry}
 
 

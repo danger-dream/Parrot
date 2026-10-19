@@ -14,9 +14,10 @@ from src.tests import test_tg_contract_oauth_support as oauth
 ROOT = Path(__file__).parent / 'fixtures/tg_contract'
 # channels_apikey grew from 11 to 24 for the API-key MCP changes, then to 25
 # when the reviewed cold-statistics channel entry was changed from a blocking
-# prompt to an operable empty management page, then to 27 for edit/discovery traces.
-COUNTS = {'channels_apikey': 27, 'main_status': 11, 'oauth': 58,
-          'auxiliary': 18, 'model_routing': 6, 'system': 9, 'core': 22}
+# prompt to an operable empty management page, then to 27 for edit/discovery traces,
+# and to 30 for safe diagnostic reasons in three existing channel-probe traces.
+COUNTS = {'channels_apikey': 30, 'main_status': 11, 'oauth': 58,
+          'auxiliary': 18, 'model_routing': 7, 'system': 9, 'core': 22}
 
 
 def test_current_overlay_case_coverage_is_bidirectional_and_unique():
@@ -35,7 +36,7 @@ def test_current_overlay_case_coverage_is_bidirectional_and_unique():
         extra_ids = list(current.OAUTH_ADDITION_CASE_IDS) if segment == 'oauth' else []
         assert [c['caseId'] for c in loaded] == [c['caseId'] for c in archived] + extra_ids
         assert [c['capabilityId'] for c in loaded] == [c['capabilityId'] for c in archived] + [case_id.split('.', 1)[0] for case_id in extra_ids]
-    assert len(seen) == 151  # includes MCP UI, cold-stat page, notification, discovery and subscription-label traces
+    assert len(seen) == 155  # includes MCP UI, cold-stat page, notification, discovery, subscription-label, safe-diagnostic and mapping-identity traces
 
 
 @pytest.mark.parametrize('mutation', ['duplicate', 'unknown', 'capability'])

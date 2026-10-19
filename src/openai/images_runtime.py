@@ -6,14 +6,14 @@ import copy
 import json
 import time
 import uuid
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 import httpx
 from fastapi.responses import JSONResponse
 from .. import auth, channel_state, concurrency, config, cooldown, image_artifacts, image_catalog, load_balancing, media_cache, network, oauth_manager, scorer
 from ..antigravity import images as antigravity_images
 from ..channel import registry
 from ..async_owned import await_owned
-from ..channel.url_utils import resolve_upstream_url
+from ..channel.url_utils import resolve_api_endpoint
 from ..xai import imagine
 from . import images_simple as legacy
 from .codex_constants import apply_codex_workspace_routing, codex_responses_url
@@ -42,14 +42,9 @@ def _prompt(parsed) -> str:
 
 
 def _api_url(channel, action: str) -> str:
-    base = channel.base_url.rstrip('/')
-    suffix = '/responses' if base.endswith('/v1') else '/v1/responses'
-    endpoint = resolve_upstream_url(base, getattr(channel, 'api_path', None), suffix)
-    parts = urlsplit(endpoint)
-    path = parts.path.rstrip('/')
-    for suffix in ('/chat/completions', '/responses', '/images/generations', '/images/edits'):
-        if path.endswith(suffix): path = path[:-len(suffix)]; break
-    return urlunsplit((parts.scheme, parts.netloc, path+'/images/'+('generations' if action=='generate' else 'edits'), '', ''))
+    endpoint = '/images/' + ('generations' if action == 'generate' else 'edits')
+    url = resolve_api_endpoint(channel.base_url, endpoint, getattr(channel, 'api_path', None))
+    return urlsplit(url)._replace(query='', fragment='').geturl()
 
 
 def _aggregate_usage(usages: list) -> dict:
@@ -115,6 +110,9 @@ async def _prepare_api_edit_files(parsed) -> list:
 
 async def _send(source, parsed, *, action: str, n: int, cfg: dict) -> httpx.Response:
     """One POST. The caller exclusively owns safe rejection failover."""
+    requested_model = getattr(parsed, 'requested_model', None)
+    if not source.available_for(requested_model):
+        raise ValueError('image model/source is disabled; enable it in model center')
     channel = registry.get_channel(source.key)
     if source.key.startswith(('oauth:xai:', 'api:')) and (channel is None or getattr(channel, 'state_key', None) != source.state_key):
         raise ValueError('selected image account generation was deleted')
@@ -169,18 +167,23 @@ async def _send(source, parsed, *, action: str, n: int, cfg: dict) -> httpx.Resp
             files = parsed._api_edit_files
             if files is None:
                 files = await _prepare_api_edit_files(parsed)
+    if not source.available_for(requested_model):
+        raise ValueError('image model/source is disabled; enable it in model center')
     if source.key.startswith('oauth:xai:'):
         return await imagine._request_upstream(channel, method='POST',
             path='/images/'+('generations' if action=='generate' else 'edits'), headers=headers,
-            body=json.dumps(payload).encode(), model=source.upstream)
+            body=json.dumps(payload).encode(), model=source.upstream,
+            **({'requested_model': requested_model} if requested_model and requested_model != source.upstream else {}))
     timeout = httpx.Timeout(float(cfg.get('requestTimeoutSeconds') or 180), connect=15)
     async with network.async_client(timeout=timeout, proxy_purpose=purpose, proxy_channel=source.key,
                                     proxy_model=source.upstream, follow_redirects=False) as client:
+        if not source.available_for(requested_model):
+            raise ValueError('image model/source is disabled; enable it in model center')
         if source.key.startswith('oauth:openai:'):
             image_catalog.current_openai_account(source)
         if source.key.startswith('api:'):
             current = next((row for row in image_catalog.sources() if row.key == source.key and row.model == source.model), None)
-            if current is None or not current.available or current.state_key != source.state_key or current.upstream != source.upstream:
+            if current is None or not current.available_for(requested_model) or current.state_key != source.state_key or current.upstream != source.upstream:
                 raise ValueError('selected image channel or purpose is no longer available')
         if files is not None:
             return await client.post(url, headers=headers, data={k:str(v) for k,v in payload.items()}, files=files)
@@ -188,7 +191,7 @@ async def _send(source, parsed, *, action: str, n: int, cfg: dict) -> httpx.Resp
 
 
 async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> JSONResponse:
-    sources = [s for s in image_catalog.sources() if s.model == parsed.model and s.available
+    sources = [s for s in image_catalog.sources() if s.model == parsed.model and s.available_for(getattr(parsed, 'requested_model', None))
                and auth.channel_allowed(key_name, s.key)
                and not cooldown.is_blocked(channel_state.effect_key(s), s.upstream)]
     if not sources:
@@ -306,6 +309,9 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
         while len(data) < parsed.requested_n:
             response = None
             for source in list(sources):
+                if not source.available_for(getattr(parsed, 'requested_model', None)):
+                    sources.remove(source)
+                    continue
                 if calls >= max_calls: raise ValueError('image upstream attempt budget exhausted; not regenerated')
                 effect_key = channel_state.effect_key(source)
                 if not await concurrency.try_acquire(effect_key): continue

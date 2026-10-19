@@ -144,16 +144,16 @@ def interrupted(delivery_id):
         store.update_delivery(delivery_id, state="unknown", reason="receipt_persistence_failed")
 
 
-def close(delivery_id):
+def close(delivery_id) -> str | None:
     row = store.get("deliveries", delivery_id)
     if not row or not row.get("message_id"):
         return "未取得消息编号，无法确认删除。"
     if row.get("state") == "closed":
-        return "本条消息已关闭。"
+        return None
     result = request("deleteMessage", {"chat_id": row["chat_id"], "message_id": row["message_id"]})
     if result and result.get("ok"):
         store.update_delivery(delivery_id, state="closed")
-        return "本条消息已关闭；未改变账号状态或其他人的消息。"
+        return None
     store.update_delivery(delivery_id, close_result="failed" if result else "unknown")
     request("editMessageReplyMarkup", {"chat_id": row["chat_id"], "message_id": row["message_id"], "reply_markup": {"inline_keyboard": []}})
     return "Telegram未允许删除或未返回确认；已尝试收起按钮，未标记已删除。"

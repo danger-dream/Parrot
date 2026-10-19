@@ -234,7 +234,7 @@ def video_sources() -> list[str]:
 
     try:
         available = {source.model for source in image_catalog.sources(kind="video")
-                     if source.available and model_state.is_discovery_visible(source.model)}
+                     if source.visible_for()}
         # Filtering must not change the configured fallback priority.
         return [model for model in imagine.video_models() if model in available]
     except Exception:
@@ -247,7 +247,7 @@ def media_sources(kind: str, key_name: str | None = None) -> list[str]:
     No key is used by configuration/catalog callers; actual MCP calls always
     supply their authenticated key. Downstream HTTP authorization remains final.
     """
-    from .. import auth, model_mapping, model_names, model_state
+    from .. import auth, image_catalog, model_mapping, model_names
 
     options = image_sources() if kind == "image" else video_sources()
     if key_name is None:
@@ -258,7 +258,7 @@ def media_sources(kind: str, key_name: str | None = None) -> list[str]:
     if auth.allowed_channels(key_name) is not None:
         from .. import image_catalog
         permitted = {source.model for source in image_catalog.sources(kind=kind)
-                     if source.available and auth.channel_allowed(key_name, source.key)}
+                     if source.visible_for() and auth.channel_allowed(key_name, source.key)}
         options = [model for model in options if model in permitted]
     allowed = set(model_names.expand_legacy_permissions(list(entry.get("allowedModels") or [])))
     if not allowed:
@@ -268,10 +268,10 @@ def media_sources(kind: str, key_name: str | None = None) -> list[str]:
     # rather than replacing it with a real name the key has not been granted.
     options = list(options)
     available = set(options)
+    aliases = image_catalog.available_model_aliases(mapping, api_key_name=key_name, kind=kind)
     options.extend(alias for alias, real in mapping.items()
                    if alias in allowed and alias not in available and real in available
-                   and model_state.is_discovery_visible(alias)
-                   and model_state.is_discovery_visible(real))
+                   and alias in aliases)
     return [model for model in options
             if model in allowed or mapping.get(model, model) in allowed]
 

@@ -421,7 +421,8 @@ def test_view_detail_with_quota_cache(m):
     # 详情按钮
     kb = last["reply_markup"]["inline_keyboard"]
     flat = [b["callback_data"] for row in kb for b in row if "callback_data" in b]
-    assert not any(x.startswith(("oa:refresh_token:", "oa:relogin:")) for x in flat)
+    assert any(x.startswith("oa:refresh_token:") for x in flat)
+    assert not any(x.startswith("oa:relogin:") for x in flat)
     assert any(x.startswith("oa:refresh_usage:") for x in flat)
     assert any(x.startswith("oa:toggle:") for x in flat)
     assert any(x.startswith("oa:delete_ask:") for x in flat)
@@ -1895,25 +1896,25 @@ def test_add_menu_cancel_buttons(m):
     m["oauth_menu"].on_login_start(42, 100, "cb")
     claude_login = rec.last("editMessageText")
     flat = [b["callback_data"] for row in claude_login["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
-    assert "oa:add" in flat
+    assert "oa:add:claude" in flat  # Cancel returns to the provider's method picker.
 
     rec.clear()
     m["oauth_menu"].on_set_json_start(42, 100, "cb")
     claude_json = rec.last("editMessageText")
     flat = [b["callback_data"] for row in claude_json["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
-    assert "oa:add" in flat
+    assert "oa:add:claude" in flat
 
     rec.clear()
     m["oauth_menu"].on_login_openai_start(42, 100, "cb")
     openai_login = rec.last("editMessageText")
     flat = [b["callback_data"] for row in openai_login["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
-    assert "oa:add" in flat
+    assert "oa:add:openai" in flat
 
     rec.clear()
     m["oauth_menu"].on_set_rt_openai_start(42, 100, "cb")
     openai_rt = rec.last("editMessageText")
     flat = [b["callback_data"] for row in openai_rt["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
-    assert "oa:add" in flat
+    assert "oa:add:openai" in flat
     print("  [PASS] add menu/cancel buttons")
 
 

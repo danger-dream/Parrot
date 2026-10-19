@@ -28,7 +28,7 @@ def test_policy_describes_real_login_regions_and_accepted_profiles(api, monkeypa
     assert policy["importRealms"] == []
     assert policy["clientProfile"] == "cli"
     assert policy["clientProfilesByRealm"] == {"cn": "cli", "global": "workbuddy-cli"}
-    assert policy["supportedClientProfilesByRealm"]["global"] == ["workbuddy-cli", "ide"]
+    assert policy["supportedClientProfilesByRealm"] == {"cn": ["cli"], "global": ["workbuddy-cli"]}
     calls = []
     def start(*, realm="cn", client_profile="cli"):
         calls.append((realm, client_profile))
@@ -41,6 +41,10 @@ def test_policy_describes_real_login_regions_and_accepted_profiles(api, monkeypa
         data = response.json()["data"]
         assert call("POST", "/oauth/login-flows/" + data["flowId"] + "/cancel",
                     {"flowSecret": data["flowSecret"]}).status_code == 204
+    # Legacy IDE accounts retain relogin support, but cannot be newly added.
+    rejected = call("POST", "/oauth/login-flows", {"provider": "workbuddy", "realm": "global",
+                    "clientProfile": "ide"})
+    assert rejected.status_code == 422, rejected.text
     assert calls == [("cn", "cli"), ("global", "workbuddy-cli")]
     assert ledger["calls"] == 0
     assert not policy["autoCheckinDefault"] and not policy["autoTrial"]

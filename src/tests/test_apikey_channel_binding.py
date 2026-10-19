@@ -118,7 +118,8 @@ def test_models_http_intersects_source_binding_and_model_grants(pool, monkeypatc
 
 def test_image_discovery_and_execution_use_the_same_scope(pool, monkeypatch):
     from src.openai import images_runtime
-    rows = [SimpleNamespace(model='image', key='oauth:openai:c', available=True, upstream='image')]
+    rows = [image_catalog.ImageSource(model='image', upstream='image', provider='openai',
+            key='oauth:openai:c', label='fixture', enabled=True, source_enabled=True)]
     monkeypatch.setattr(image_catalog, 'sources', lambda **_: rows)
     assert image_catalog.available_models(api_key_name='claude') == []
     assert image_catalog.available_models(api_key_name='shared') == ['image']

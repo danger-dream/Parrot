@@ -3,8 +3,9 @@ from . import oauth_errors, oauth_manager
 from .notifications.events import Effect
 
 
-def apply(account_key, exc, *, expected_state_key=None, provider=None, observation=None):
-    error = oauth_errors.describe_oauth_error(exc, provider=provider or oauth_manager.provider_of(account_key), operation="refresh_token")
+def apply(account_key, exc, *, expected_state_key=None, provider=None, observation=None,
+          operation="refresh_token"):
+    error = oauth_errors.describe_oauth_error(exc, provider=provider or oauth_manager.provider_of(account_key), operation=operation)
     effect = Effect("unchanged", "not_disabled")
     # Prefer the lock owner's actual refresh input over a request's older 401.
     observation = getattr(exc, "oauth_refresh_observation", None) or observation

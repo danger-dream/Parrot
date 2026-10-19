@@ -353,15 +353,19 @@ def test_management_api_selects_actual_route(api, monkeypatch, profile):
     if profile:
         body["clientProfile"] = profile
     response = call("POST", "/oauth/login-flows", body)
+    if profile == "ide":
+        assert response.status_code == 422, response.text
+        assert response.json()["error"]["code"] == "UNSUPPORTED_VALUE"
+        assert calls == []
+        return
     assert response.status_code == 201, response.text
     assert calls == [("global", profile or PROFILE)]
-    assert ("CodeBuddy IDE" if profile == "ide" else "WorkBuddy 国际 CLI") in response.text
+    assert "WorkBuddy 国际 CLI" in response.text
     data = response.json()["data"]
     call("POST", "/oauth/login-flows/" + data["flowId"] + "/cancel", {"flowSecret": data["flowSecret"]})
 
 
-@pytest.mark.parametrize("profile", [PROFILE, "ide"])
-def test_tg_routes_are_selectable_and_visible(tg, monkeypatch, profile):
+def test_tg_only_offers_workbuddy_international_and_rejects_stale_ide_button(tg, monkeypatch):
     calls = []
     def start(**kwargs):
         calls.append(kwargs)
@@ -370,11 +374,27 @@ def test_tg_routes_are_selectable_and_visible(tg, monkeypatch, profile):
     monkeypatch.setattr(tg[1].backend, "workbuddy_start_login", start)
     oauth_menu.on_add_workbuddy(42, 900, "cb")
     callbacks = {b.get("callback_data") for b in buttons(tg[3][-1][1])}
-    assert {"oa:wb:login:global", "oa:wb:login:global:ide"} <= callbacks
-    click(tg, "CodeBuddy IDE" if profile == "ide" else "WorkBuddy 国际区 CLI")
-    assert calls == [{"realm": "global", "client_profile": profile}]
-    assert ("CodeBuddy IDE · codebuddy.ai" if profile == "ide" else "WorkBuddy 国际 CLI · workbuddy.ai") in tg[3][-1][0]
+    assert {"oa:wb:login", "oa:wb:login:global", "oa:add"} == callbacks
+    assert menu.handle_callback(42, 900, "cb", "oa:wb:login:global:ide")
+    assert calls == [] and "旧 CodeBuddy IDE 新增入口已停用" in tg[3][-1][0]
+    oauth_menu.on_add_workbuddy(42, 900, "cb")
+    click(tg, "国际区")
+    assert calls == [{"realm": "global", "client_profile": PROFILE}]
+    assert "WorkBuddy 国际 CLI · workbuddy.ai" in tg[3][-1][0]
     menu.discard_state(42)
+
+
+def test_policy_advertises_one_international_route():
+    policy = OAuthControl().workbuddy_policy(context())
+    assert policy["supported_client_profiles_by_realm"] == {"cn": ["cli"], "global": [PROFILE]}
+    assert list(policy["client_routes"]) == [PROFILE]
+
+
+def test_account_list_shows_region_without_client_protocol(tg):
+    account = {"provider": "workbuddy", "realm": "global", "workbuddy_client_profile": PROFILE,
+               "uid": "fixture", "models": ["hy3"]}
+    assert menu.provider_line(account) == "🏷️ 账户: 个人 · 国际区 · 模型 1"
+    assert "WorkBuddy 国际 CLI · workbuddy.ai" in menu.provider_line(account, detail=True)
 
 
 @pytest.mark.parametrize("profile", [PROFILE, "ide", "cli"])

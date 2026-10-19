@@ -375,11 +375,13 @@ async def request(
     channel = registry.get_channel(source.key)
     if channel is None or getattr(channel, "state_key", None) != source.state_key:
         raise ValueError("selected Antigravity image account generation was deleted")
-    if not channel.supports_media_model("image", source.upstream):
+    if not channel.supports_media_model("image", source.upstream) or not source.available_for(getattr(parsed, 'requested_model', None)):
         raise ValueError("selected Antigravity image source is no longer available")
     headers = await channel.build_media_headers()
     # A refresh may replace the persisted account generation. Revalidate before I/O.
     current_id, _account = image_catalog.current_oauth_account(source)
+    if not source.available_for(getattr(parsed, 'requested_model', None)):
+        raise ValueError("selected Antigravity image model is no longer enabled")
     if current_id != account_id:
         raise ValueError("selected Antigravity image account changed during token refresh")
     gemini = build_request(parsed, prompt=prompt, n=n, action=action)

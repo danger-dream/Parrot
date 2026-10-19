@@ -68,8 +68,9 @@ def test_slow_detail_cannot_retimestamp_old_null_past_new_refusal(m, monkeypatch
     start = clock[0]
     m["config"].get().setdefault("quotaMonitor", {}).update(enabled=False, accessRefreshThrottleSeconds=0)
 
-    async def token(_key):
-        return "synthetic-only"
+    async def token(_key, *, expected_state_key=None):
+        assert expected_state_key == manager.account_state_key(manager.get_account(_key))
+        return manager.get_account(_key)["access_token"]
 
     async def wham(*args, **kwargs):
         payload = m["openai_provider"]._mock_wham_payload()

@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import copy
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 from src.tests import _isolation
 _isolation.isolate()
@@ -82,10 +83,16 @@ def rows(key):
 def test_detail_only_auth_failure_has_relogin(provider, reason):
     key, old = account(provider, reason)
     keyboard = rows(key)
-    assert [b['text'] for b in keyboard[0]] == (['🔐 重新登录', '📊 刷新额度'] if reason == 'auth_error' else ['📊 刷新额度'])
+    credential_label = '🔐 重新登录' if reason == 'auth_error' else ('🔄 更新凭据' if provider == 'zhipu' else '🔄 刷新 Token')
+    assert [b['text'] for b in keyboard[0]] == [credential_label, '📊 刷新额度']
+    expected_callback = 'oa:relogin:' if reason == 'auth_error' else ('oa:zh:refresh:' if provider == 'zhipu' else 'oa:refresh_token:')
+    assert keyboard[0][0]['callback_data'].startswith(expected_callback)
     assert [b['text'] for b in keyboard[1]] == ['管理模型', '🚦 并发上限']
     assert [b['text'] for b in keyboard[2]] == ['🧹 清模型故障', '🔗 清亲和绑定']
-    assert all('刷新 Token' not in b['text'] for r in keyboard for b in r)
+    if reason == 'auth_error':
+        assert all('刷新 Token' not in b['text'] for r in keyboard for b in r)
+    else:
+        assert all('重新登录' not in b['text'] for r in keyboard for b in r)
     assert om.get_account(key) == old
 
 
@@ -98,7 +105,7 @@ def test_zhipu_management_auth_is_explicit_not_network(status, needed):
 @pytest.mark.parametrize('reason', [None, 'auth_error'])
 def test_api_key_never_offers_browser_login(reason):
     key, _ = account('zhipu', reason, **credential('api_key'))
-    assert [b['text'] for b in rows(key)[0]] == (['🔄 刷新连接', '📊 刷新额度'] if reason else ['📊 刷新额度'])
+    assert [b['text'] for b in rows(key)[0]] == ['🔄 刷新连接', '📊 刷新额度']
     menu.on_relogin(42, 100, 'cb', ui.register_code(key))
     assert states.get_state(42) is None
 
@@ -294,33 +301,147 @@ def test_zhipu_management_login_recovers_without_enabling_manual_pause(isolated_
     assert saved['disabled_reason'] == reason
 
 
-@pytest.mark.parametrize('realm', ['cn', 'global'])
-def test_workbuddy_relogin_uses_original_region(isolated_accounts, monkeypatch, realm):
+@pytest.mark.parametrize('realm,profile', [('cn', 'cli'), ('global', 'ide'), ('global', 'workbuddy-cli')])
+def test_workbuddy_relogin_uses_original_region(isolated_accounts, monkeypatch, realm, profile):
     ctl = isolated_accounts
-    key, _ = account('workbuddy', realm=realm, client_profile='ide' if realm == 'global' else 'cli')
-    start = Mock(return_value=dict(status='pending', auth_url='https://example.test/login'))
+    key, original = account('workbuddy', realm=realm, workbuddy_client_profile=profile)
+    # Real start_login_sync returns the selected region/profile with the URL.
+    start = Mock(return_value=dict(status='pending', auth_url='https://example.test/login',
+                                  realm=realm, workbuddy_client_profile=profile))
     monkeypatch.setattr(ctl.backend, 'workbuddy_start_login', start)
-    ctl.start_login_flow(context(), OAuthProvider.WORKBUDDY, relogin_account_id=key, realm='global' if realm == 'cn' else 'cn')
+    ctl.start_login_flow(context(), OAuthProvider.WORKBUDDY, relogin_account_id=key,
+                         realm='global' if realm == 'cn' else 'cn',
+                         client_profile='workbuddy-cli' if profile != 'workbuddy-cli' else 'ide')
     if realm == 'cn':
         start.assert_called_once_with()
     else:
-        start.assert_called_once_with(realm='global', client_profile='ide')
+        start.assert_called_once_with(realm='global', client_profile=profile)
+    assert om.get_account(key) == original
 
 
-def test_notification_and_stale_refresh_use_same_relogin_gate(isolated_accounts, monkeypatch):
+@pytest.mark.parametrize('provider', GENERIC + ['workbuddy'])
+def test_healthy_refresh_callback_performs_refresh_not_login(isolated_accounts, monkeypatch, provider):
+    key, old = account(provider, None)
+    monkeypatch.delenv('PARROT_NO_REFRESH', raising=False)
+    refresh = AsyncMock(return_value='refreshed-token')
+    monkeypatch.setattr(isolated_accounts, 'force_refresh_raw', refresh)
+    monkeypatch.setattr(isolated_accounts, 'refresh_cursor_models_raw', AsyncMock(return_value={'action': 'not_modified'}))
+    usage = Mock()
+    monkeypatch.setattr(menu, '_fetch_and_save_usage_sync', usage)
+    monkeypatch.setattr(menu, '_edit_cached_detail', Mock())
+    start = Mock()
+    monkeypatch.setattr(menu, 'on_relogin', start)
+    payload = menu._callback_payload(ui.register_code(key), 3, 'all')
+    assert menu.handle_callback(42, 100, 'cb', 'oa:refresh_token:' + payload)
+    refresh.assert_awaited_once_with(key)
+    usage.assert_called_once()
+    start.assert_not_called()
+    assert 'Token 已刷新' in menu._edit_cached_detail.call_args.kwargs['prefix']
+    assert menu._edit_cached_detail.call_args.args[3:] == (3, 'all')
+    assert states.get_state(42) is None
+
+
+@pytest.mark.parametrize('provider', GENERIC + ['workbuddy'])
+def test_stale_refresh_button_rechecks_authentication_before_dispatch(isolated_accounts, monkeypatch, provider):
+    key, old = account(provider)
+    refresh = AsyncMock(side_effect=AssertionError('invalid credentials must not be refreshed'))
+    monkeypatch.setattr(isolated_accounts, 'force_refresh_raw', refresh)
+    start = Mock()
+    monkeypatch.setattr(menu, 'on_relogin', start)
+    short = ui.register_code(key)
+    payload = menu._callback_payload(short, 3, 'invalid')
+    assert menu.handle_callback(42, 100, 'cb', 'oa:refresh_token:' + payload)
+    refresh.assert_not_called()
+    start.assert_called_once_with(42, 100, 'cb', short, 3, 'invalid')
+
+
+def test_notification_relogin_remains_limited_to_authentication_failure(monkeypatch):
     from src.notifications import providers
     key, old = account('claude', None)
-    refresh = Mock(side_effect=AssertionError('no manual refresh'))
-    monkeypatch.setattr(isolated_accounts, 'force_refresh_raw', refresh)
-    assert menu.handle_callback(42, 100, 'cb', 'oa:refresh_token:' + ui.register_code(key) + ':1')
-    refresh.assert_not_called()
-    assert states.get_state(42) is None
     start = Mock()
     monkeypatch.setattr(menu, 'on_relogin', start)
     providers.REGISTRY['claude'].login(42, 100, 'cb', old)
     start.assert_called_once_with(42, 100, 'cb', ui.register_code(key))
     assert 'reauthorize' not in providers.capabilities(old)
     assert 'reauthorize' in providers.capabilities(dict(old, disabled_reason='auth_error'))
+
+
+@pytest.mark.parametrize('provider', GENERIC + ['workbuddy'])
+@pytest.mark.parametrize('invalid', [False, True])
+def test_manual_refresh_failure_redraws_matching_credential_button(isolated_accounts, monkeypatch, provider, invalid):
+    key, old = account(provider, None)
+    monkeypatch.delenv('PARROT_NO_REFRESH', raising=False)
+    request = httpx.Request('POST', 'https://fixture.test/oauth/token')
+    error = httpx.HTTPStatusError('fixture rejected', request=request,
+        response=httpx.Response(401, request=request, json={'error': 'invalid_grant'})) if invalid else httpx.ReadTimeout('fixture timeout')
+    if invalid and provider == 'workbuddy':
+        from src.oauth.workbuddy.common import WorkBuddyError
+        error = WorkBuddyError('refresh', status=401)
+    refresh = AsyncMock(side_effect=error)
+    monkeypatch.setattr(isolated_accounts.backend, 'force_refresh', refresh)
+    for name in ['_schedule_openai_metadata_for_ui', '_schedule_oauth_detail_stats']:
+        monkeypatch.setattr(menu, name, Mock())
+    menu.on_refresh_token(42, 100, 'cb', ui.register_code(key))
+    refresh.assert_awaited_once_with(key)
+    saved = om.get_account(key)
+    assert saved['enabled'] is (not invalid)
+    assert saved.get('disabled_reason') == ('auth_error' if invalid else None)
+    keyboard = ui.edit.call_args.kwargs['reply_markup']['inline_keyboard']
+    assert keyboard[0][0]['text'] == ('🔐 重新登录' if invalid else '🔄 刷新 Token')
+    assert saved['access_token'] == old['access_token'] and saved['refresh_token'] == old['refresh_token']
+    ui.send.assert_not_called()
+
+
+@pytest.mark.parametrize('provider', GENERIC + ['workbuddy'])
+def test_manual_refresh_protection_does_not_claim_success(isolated_accounts, monkeypatch, provider):
+    key, old = account(provider, None)
+    monkeypatch.setenv('PARROT_NO_REFRESH', '1')
+    refresh = AsyncMock(side_effect=AssertionError('protected instance must not refresh'))
+    monkeypatch.setattr(isolated_accounts.backend, 'force_refresh', refresh)
+    for name in ['_schedule_openai_metadata_for_ui', '_schedule_oauth_detail_stats']:
+        monkeypatch.setattr(menu, name, Mock())
+    menu.on_refresh_token(42, 100, 'cb', ui.register_code(key))
+    refresh.assert_not_called()
+    assert om.get_account(key) == old
+    text = ui.edit.call_args.args[2]
+    assert '已阻止刷新 Token' in text and 'Token 已刷新' not in text
+
+
+def test_manual_refresh_late_failure_keeps_new_login(isolated_accounts, monkeypatch):
+    key, old = account('claude', None)
+    request = httpx.Request('POST', 'https://fixture.test/oauth/token')
+
+    async def failure(account_id):
+        om.replace_exact_identity(key, dict(old, access_token='new-login-at', refresh_token='new-login-rt'))
+        raise httpx.HTTPStatusError('fixture rejected', request=request, response=httpx.Response(401, request=request))
+
+    monkeypatch.setattr(isolated_accounts.backend, 'force_refresh', failure)
+    monkeypatch.setattr(menu, '_schedule_oauth_detail_stats', Mock())
+    menu.on_refresh_token(42, 100, 'cb', ui.register_code(key))
+    assert om.get_account(key)['enabled'] is True
+    assert om.get_account(key)['access_token'] == 'new-login-at'
+    assert '凭据已更新' in ui.edit.call_args.args[2]
+    assert ui.edit.call_args.kwargs['reply_markup']['inline_keyboard'][0][0]['text'] == '🔄 刷新 Token'
+
+
+@pytest.mark.parametrize('mode', ['oauth', 'api_key'])
+@pytest.mark.parametrize('invalid', [False, True])
+def test_zhipu_refresh_preserves_provider_action_and_relogin_gate(isolated_accounts, monkeypatch, mode, invalid):
+    key, old = account('zhipu', 'auth_error' if invalid else None, **credential(mode))
+    refresh = Mock()
+    start = Mock()
+    monkeypatch.setattr(isolated_accounts, 'refresh_token', refresh)
+    monkeypatch.setattr(menu, 'on_relogin', start)
+    short = ui.register_code(key)
+    assert zh.handle_callback(42, 100, 'cb', 'oa:zh:refresh:' + short)
+    if mode == 'oauth' and invalid:
+        refresh.assert_not_called()
+        start.assert_called_once_with(42, 100, '', short)
+    else:
+        refresh.assert_called_once()
+        assert refresh.call_args.args[1] == key
+        start.assert_not_called()
+        assert '签名缓存已失效' in ui.edit.call_args.args[2]
 
 
 @pytest.mark.parametrize('provider', GENERIC)

@@ -765,7 +765,14 @@ async def run(body: dict, protocol: str, invoke, *, request_id=None, api_key_nam
     try:
         response = await complete()
     except asyncio.CancelledError:
-        finish_request(status="cancelled", http_status=499, message="managed search cancelled")
+        observed = getattr(_stream, "workbuddy_stream_error", None)
+        if observed:
+            # A disconnect after the provider's terminal was observed cannot
+            # overwrite the already-settled request/account rejection with 499.
+            finish_request(JSONResponse({"error": dict(observed["error"])},
+                                        status_code=observed["http_status"]))
+        else:
+            finish_request(status="cancelled", http_status=499, message="managed search cancelled")
         raise
     except Exception:
         finish_request(message="managed search failed")

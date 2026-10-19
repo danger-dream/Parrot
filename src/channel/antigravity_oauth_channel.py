@@ -208,7 +208,7 @@ class AntigravityOAuthChannel(Channel):
             oauth_manager.account_state_key(account) == self.state_key
             and media_config.oauth_state(account, 'image')['enabled']
             and requested_model in media_config.account_models(account, 'image')
-            and model_state.is_global_enabled(requested_model)
+            and model_state.is_global_enabled(requested_model, source_key=self.key)
             and model_state.is_source_enabled(self.key, requested_model)
         )
 

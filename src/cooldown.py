@@ -20,6 +20,7 @@ from typing import Optional
 from . import channel_state, config, model_names, notifier, quota_errors, state_db
 
 
+ACCOUNT_SCOPE = "__account__"
 _INF = -1  # StateStore snapshots 中用 -1 表示永久
 
 _lock = channel_state.mutation_lock
@@ -171,6 +172,10 @@ def _entry_key(channel_key: str, model: str) -> tuple[str, str]:
 def get_state(channel_key: str, model: str) -> Optional[dict]:
     """返回当前冷却状态。不判断是否过期，仅按内存结构返回。"""
     with _lock:
+        channel_key = channel_state.resolve(channel_key)
+        account = _entries.get((channel_key, ACCOUNT_SCOPE))
+        if account and _was_actively_blocked(account, _now_ms()):
+            return dict(account)
         v = _entries.get(_entry_key(channel_key, model))
         return dict(v) if v else None
 
@@ -323,6 +328,14 @@ def record_error(channel_key: str, model: str, message: str | None = None,
         ek = notifier.escape_html
         notifications.channel_event("channel.model.frozen", channel_key, {"model": model, "count": new_count, "error_code": "repeated_upstream_failure"}, Effect("confirmed", "model_paused"), source="cooldown", scope_ref=model, subject=notification_subject)
     return result
+
+
+def record_account_pause(channel_key: str, message: str, *, cooldown_until: int) -> dict:
+    with _lock:
+        current = get_state(channel_key, ACCOUNT_SCOPE)
+        if current and _was_actively_blocked(current, _now_ms()):
+            return current
+        return record_quota_pause(channel_key, ACCOUNT_SCOPE, message, cooldown_until=cooldown_until)
 
 
 def record_quota_pause(channel_key: str, model: str, message: str,

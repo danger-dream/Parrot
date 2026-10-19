@@ -21,6 +21,7 @@ import re
 import time
 import traceback
 import uuid
+from contextlib import asynccontextmanager
 from typing import Optional, Any
 
 import httpx
@@ -32,7 +33,7 @@ import threading
 
 from . import (
     affinity, blacklist, channel_state, compact_rescue, concurrency, config, cooldown, errors, fingerprint,
-    local_web_tools, log_db, model_metadata, model_pricing, model_reroute, model_state, notifier, oauth_errors, oauth_manager, quota_errors, scorer, state_db,
+    local_web_tools, log_db, model_mapping, model_metadata, model_pricing, model_reroute, model_state, notifier, oauth_errors, oauth_manager, quota_errors, scorer, state_db,
     token_counter, upstream,
 )
 from .channel.base import Channel, UpstreamDispatchMetadata
@@ -711,11 +712,41 @@ def _mark_request_invalid(result: AttemptResult, status: int) -> AttemptResult:
     return result
 
 
+def _workbuddy_account_pause_result(channel) -> AttemptResult | None:
+    """Recheck a selected candidate without extending or penalizing its pause.
+
+    The state lock is held only by is_blocked(), never across build/transport I/O.
+    Already-dispatched requests remain owned by their existing finalizers.
+    """
+    if getattr(channel, "provider", None) != "workbuddy" or not cooldown.is_blocked(
+        channel_state.effect_key(channel), cooldown.ACCOUNT_SCOPE,
+    ):
+        return None
+    from .providers.workbuddy_errors import ACCOUNT_RESTRICTED_CODE, ACCOUNT_RESTRICTED_MESSAGE
+    result = AttemptResult(
+        outcome="account_restricted", http_status=403,
+        error_code=ACCOUNT_RESTRICTED_CODE, error_detail=ACCOUNT_RESTRICTED_MESSAGE,
+    )
+    result._workbuddy_restriction_applied = True
+    result._workbuddy_pause_guard = True
+    return result
+
+
 def _request_invalid_result_if_needed(result: AttemptResult, channel=None) -> AttemptResult:
     if isinstance(channel, OpenAIOAuthChannel) and result.error_code in WS_RESET_CODES:
         result.outcome = "connection_lifecycle"
         return result
-    return request_invalid_result_if_needed(result, channel=channel)
+    result = request_invalid_result_if_needed(result, channel=channel)
+    if result.outcome == "account_restricted" and not getattr(result, "_workbuddy_restriction_applied", False):
+        from .providers.workbuddy_errors import ACCOUNT_RESTRICTED_COOLDOWN_SECONDS
+        with oauth_manager.account_generation_guard(getattr(channel, "state_key", None)) as current:
+            if current:
+                cooldown.record_account_pause(
+                    channel_state.effect_key(channel), result.error_detail,
+                    cooldown_until=int((time.time() + ACCOUNT_RESTRICTED_COOLDOWN_SECONDS) * 1000),
+                )
+        result._workbuddy_restriction_applied = True
+    return result
 
 
 def _maybe_cache_codex_reasoning_replay(translator_ctx: Optional[dict], response_obj: Any) -> None:
@@ -749,11 +780,6 @@ def _maybe_clear_codex_reasoning_replay(translator_ctx: Optional[dict]) -> bool:
     except Exception as exc:
         print(f"[failover] codex reasoning replay clear failed: {exc}")
     return False
-
-
-def _strip_encrypted_content_value(value: Any) -> tuple[Any, int]:
-    from .protocols.runtime import _strip_encrypted_content_value as _strip
-    return _strip(value)
 
 
 def _retry_body_without_encrypted_content(body: dict, *, preserve_anthropic: bool = False) -> tuple[dict, int]:
@@ -856,7 +882,8 @@ def _candidate_budget_body(ch: Channel, resolved_model: str, body: dict) -> dict
     whatever could not be clamped here (missing/invalid output fields).
     """
     client_model = str(body.get("_client_visible_model") or body.get("model") or resolved_model).strip()
-    _validate_candidate_model_enabled(ch, client_model)
+    for model in model_mapping.request_model_names(body, resolved_model):
+        _validate_candidate_model_enabled(ch, model)
     limit = model_metadata.max_output_tokens(
         client_model,
         scope_key=str(ch.key),
@@ -921,10 +948,11 @@ def _validate_wire_payload_budget(
 ) -> model_metadata.EffectiveRequestBudget | None:
     """Check final input and output independently before candidate transport."""
 
-    _validate_candidate_model_enabled(ch, str(
-        requested_body.get("_client_visible_model")
-        or requested_body.get("model") or resolved_model
-    ).strip())
+    for model in model_mapping.request_model_names(requested_body, resolved_model):
+        _validate_candidate_model_enabled(ch, model)
+    outbound_model = str(getattr(dispatch_metadata, "outbound_model_id", "") or "").strip()
+    if outbound_model:
+        _validate_candidate_model_enabled(ch, outbound_model)
     if getattr(ch, "provider", "") == "workbuddy" and isinstance(wire_body, bytes) and wire_body.startswith(b"\x1f\x8b"):
         import gzip
         wire_body = gzip.decompress(wire_body)
@@ -2197,6 +2225,7 @@ async def run_failover(
     queued_candidates = list(schedule_result.saturated)
     while True:
         slot_reserved = False
+        reserved_alternates = []
         if idx >= len(pending):
             # Waiting only acquires capacity. Once admitted, a queued candidate
             # uses the same attempt, recovery, settlement and release path below.
@@ -2237,6 +2266,8 @@ async def run_failover(
                     ingress_protocol, 429, "rate_limit_error", queue_err_msg,
                 )
             _reserved_key, candidate = reserved
+            reserved_alternates = [pair for pair in waiting
+                                   if (pair[0].key, pair[1]) != (candidate[0].key, candidate[1])]
             pending.append(candidate)
             slot_reserved = True
 
@@ -2261,6 +2292,9 @@ async def run_failover(
             idx += 1
             continue
 
+        # Selection/queue admission is only a capacity reservation. A different
+        # request may have paused this account while this candidate was waiting.
+        paused_result = _workbuddy_account_pause_result(ch)
         release_done = False
         slot_phase_complete = False
         pending_stream_result: AttemptResult | None = None
@@ -2311,7 +2345,9 @@ async def run_failover(
                 attempt_body = {**attempt_body, "_client_visible_model": resolved_model}
             attempt_body["_codex_turn_serialization_required"] = True
             attempt_handed_off = True
-            if use_responses_ws:
+            if paused_result is not None:
+                result = paused_result
+            elif use_responses_ws:
                 result = await _try_openai_oauth_responses_ws_channel(
                     ch, resolved_model, attempt_body, effective_is_stream, deadline_ts, start_time,
                     fp_query, attempt_body.get("messages") or [], api_key_name, client_ip,
@@ -2437,6 +2473,15 @@ async def run_failover(
                 raise
         # 非成功：立即释放 slot，进入下一候选
         _release_once()
+
+        if getattr(result, "_workbuddy_pause_guard", False):
+            # No upstream attempt was dispatched. Do not refresh, retry this
+            # candidate, or execute any health effect for an existing pause.
+            # Queue admission selected only one slot, not the whole wait set.
+            queued_candidates.extend(reserved_alternates)
+            retry_count += 1
+            idx += 1
+            continue
 
         # Accepted Zhipu bodies cannot be replayed, even before downstream
         # output. Still pass through the normal terminal request-error mapping;
@@ -4485,6 +4530,10 @@ async def _try_channel(
     idle_timeout = int(timeouts.get("idle", 30))
     total_timeout = int(timeouts.get("total", 600))
 
+    paused_result = _workbuddy_account_pause_result(ch)
+    if paused_result is not None:
+        return paused_result
+
     # 1. 构造上游请求；Parrot-owned compact output is clamped per
     # candidate, then the final structured wire payload is checked before any
     # transport or dispatch-price freeze.
@@ -4537,6 +4586,33 @@ async def _try_channel(
             error_detail=f"transform error: {exc}",
             http_status=None,
         )
+
+    # Build/token lookup and its logging await can outlive another request's
+    # restriction observation. Check again before entering the transport owner.
+    paused_result = _workbuddy_account_pause_result(ch)
+    if paused_result is not None:
+        return paused_result
+
+    if getattr(ch, "provider", None) == "workbuddy":
+        original_hook = getattr(upstream_req, "stream_context_hook", None)
+
+        @asynccontextmanager
+        async def guarded_context(request, physical_context):
+            nonlocal paused_result
+            # Route selection and route-log persistence may also await. The
+            # existing raw-context seam runs after them, immediately before the
+            # physical request starts; it also covers a later proxy-route retry.
+            paused_result = _workbuddy_account_pause_result(ch)
+            if paused_result is not None:
+                from .antigravity import DispatchGuardError
+                raise DispatchGuardError(403, errors.ErrType.PERMISSION,
+                                         paused_result.error_detail, scope="candidate")
+            context = (original_hook(request, physical_context) if original_hook
+                       else physical_context(request))
+            async with context as response:
+                yield response
+
+        upstream_req.stream_context_hook = guarded_context
 
     # 与本次请求一一对应的工具名映射；不再依赖 channel 实例属性，避免并发覆盖
     dynamic_map = upstream_req.dynamic_tool_map
@@ -4681,6 +4757,13 @@ async def _try_channel(
             traceback.print_exc()
         raise
     if opened.error is not None:
+        if paused_result is not None:
+            # Keep the transport owner's round/timing/cleanup facts, but retain
+            # the account-local guard identity instead of a generic 403 guard.
+            opened.error.outcome = paused_result.outcome
+            opened.error.error_code = paused_result.error_code
+            opened.error._workbuddy_pause_guard = True
+            opened.error._workbuddy_restriction_applied = True
         return observed_result(opened.error)
 
     ctx = opened.ctx
@@ -5262,6 +5345,9 @@ async def _consume_stream(
 
     # 3. 通过检查 → 开始向下游发 ★
     state: dict = {"finalized": False}
+    # In-process trusted classification for managed-search projection. Never
+    # infer a vendor/status from an arbitrary provider's numeric error code.
+    workbuddy_stream_error: dict = {}
     stream_resources_closed = False
     terminal_slot_released = False
 
@@ -5529,6 +5615,33 @@ async def _consume_stream(
             ch, http_status=upstream_status, translator_ctx=translator_ctx,
         )
 
+    def _workbuddy_responses_error(chunks):
+        if ingress_protocol != "responses" or not workbuddy_stream_error:
+            return chunks
+        error = workbuddy_stream_error["error"]
+        canonical = _sse_error_for_ingress(
+            ingress_protocol, error["type"], error["message"], code=error["code"],
+        )
+        # Preserve visible output/item closures, but replace the FIRST mapped
+        # terminal. Consumers may stop there; an extra error after response.failed
+        # is too late to preserve the vendor's request/account classification.
+        tail, blocks = upstream.split_sse_events(b"".join(chunks))
+        prefix = []
+        for block in blocks:
+            event, data = upstream.parse_sse_event_bytes(block)
+            kind = (data or {}).get("type") or event
+            if kind == "response.failed" and isinstance((data or {}).get("response"), dict):
+                # Keep partial output/usage and the original sequence number.
+                # This provider-local trusted error bypasses only the generic
+                # business-code mapping, not other vendors' Responses mapping.
+                data = {**data, "response": {**data["response"], "error": dict(error)}}
+                return [*prefix, b"event: response.failed\ndata: " +
+                        json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode() + b"\n\n"]
+            if kind in {"error", "response.incomplete", "response.completed"}:
+                return [*prefix, canonical]
+            prefix.append(block + b"\n\n")
+        return [*prefix, *([tail] if tail else []), canonical]
+
     async def _emit_error_and_finalize(err_type: str, message: str, outcome: str):
         if state["finalized"]:
             return
@@ -5544,14 +5657,25 @@ async def _consume_stream(
         # request_invalid 语义处理，避免误伤渠道评分/冷却。
         failure_policy = "runtime" if outcome == "request_invalid" else "post_commit_stream"
         quota_result = AttemptResult(outcome=outcome, error_detail=message,
-                                     http_status=upstream_status, full_response_text=tracker.get_full_response())
+                                     http_status=upstream_status, full_response_text=tracker.get_full_response(),
+                                     translator_ctx=translator_ctx)
+        quota_result = _request_invalid_result_if_needed(quota_result, ch)
+        if quota_result.outcome == "account_restricted":
+            outcome, message, failure_policy = quota_result.outcome, quota_result.error_detail, "runtime"
+        if rejection is not None or quota_result.outcome == "account_restricted":
+            workbuddy_stream_error.update(
+                http_status=400 if rejection is not None else 403,
+                error={"type": errors.ErrType.INVALID_REQUEST if rejection is not None else errors.ErrType.PERMISSION,
+                       "code": rejection[0] if rejection is not None else quota_result.error_code,
+                       "message": message},
+            )
         capture_error_advice(quota_result, headers=getattr(upstream_resp, "headers", None),
                              codex=isinstance(ch, OpenAIOAuthChannel))
         codex_handled = _apply_codex_error_policy(ch, resolved_model, quota_result)
         plan = finalize_policy.error_plan(
             "connection_lifecycle" if codex_handled else outcome,
             failure_policy=failure_policy,
-            http_status=(400 if outcome == "request_invalid" else upstream_status),
+            http_status=(400 if outcome == "request_invalid" else 403 if outcome == "account_restricted" else upstream_status),
         )
         finalize_policy.apply_error_health_effects(
             plan,
@@ -5573,7 +5697,7 @@ async def _consume_stream(
             total_ms=(timing_snapshot.total_ms if timing_snapshot is not None else None),
             final_round_id=(timing_snapshot.round_id if timing_snapshot is not None else None),
             request_elapsed_ms=request_elapsed_ms,
-            http_status=(400 if outcome == "request_invalid" else upstream_status),
+            http_status=(400 if outcome == "request_invalid" else 403 if outcome == "account_restricted" else upstream_status),
             affinity_hit=affinity_hit,
             http_header_model=model_reroute.header_model(getattr(upstream_resp, "headers", None)),
             response_body=tracker.get_full_response(),
@@ -5703,17 +5827,8 @@ async def _consume_stream(
                 await _finalize_terminal_error(
                     "api_error", msg, outcome="stream_upstream_error",
                 )
-                for out in first_downstream_chunks:
+                for out in _workbuddy_responses_error(first_downstream_chunks):
                     yield out
-                rejection = _workbuddy_stream_rejection()
-                if rejection is not None and ingress_protocol == "responses":
-                    # Chat→Responses buffers error chunks until close(), which
-                    # is deliberately not a success boundary here. Emit an error
-                    # event directly, preserving the original vendor code.
-                    yield _sse_error_for_ingress(
-                        ingress_protocol, errors.ErrType.INVALID_REQUEST,
-                        rejection[1], code=rejection[0],
-                    )
                 return
 
             # Every explicit terminal frame is a valid client stop boundary,
@@ -5797,14 +5912,8 @@ async def _consume_stream(
                     await _finalize_terminal_error(
                         "api_error", msg, outcome="stream_upstream_error",
                     )
-                    for out in step.downstream_chunks:
+                    for out in _workbuddy_responses_error(step.downstream_chunks):
                         yield out
-                    rejection = _workbuddy_stream_rejection()
-                    if rejection is not None and ingress_protocol == "responses":
-                        yield _sse_error_for_ingress(
-                            ingress_protocol, errors.ErrType.INVALID_REQUEST,
-                            rejection[1], code=rejection[0],
-                        )
                     return
 
                 if _explicit_terminal_received():
@@ -5868,6 +5977,9 @@ async def _consume_stream(
         headers=resp_headers,
         media_type=upstream_resp.headers.get("content-type", "text/event-stream"),
     )
+
+    if getattr(ch, "provider", None) == "workbuddy":
+        sresp._parrot_workbuddy_stream_error = workbuddy_stream_error
 
     result = AttemptResult(
         outcome="success", success=True, stream_started=True,

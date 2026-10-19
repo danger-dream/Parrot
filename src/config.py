@@ -394,12 +394,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "scoped": {},
     },
     # Persistent model-center state. OAuth source disablement remains in each
-    # account; this root owns only global and API-channel state.
+    # account; this root owns global defaults, source enable overrides and API state.
     "modelCenter": {
         "schemaVersion": 1,
         "disabledModels": [],
         "hiddenModels": [],
         "apiSourceDisabledModels": {},
+        "sourceEnabledModels": {},
     },
     # Independent compact-rescue model. Legacy modelMetadata[*].compressionModel
     # is migrated after the bundled/cache models.dev catalog is initialized.

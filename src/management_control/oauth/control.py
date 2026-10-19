@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable
 
 from src import model_names
+from src.cooldown import ACCOUNT_SCOPE
 from src.model_pricing import TICKS_PER_USD
 from src.management_auth.policy import CapabilityDenied, authorize
 from src.management_auth.principal import AuthMethod, Capability
@@ -265,6 +266,12 @@ class OAuthControl(
         disabled = self.backend.account_disabled_models(account)
         models = self.backend.account_model_selection(account).get("models") or []
         reason = account.get("disabled_reason")
+        disabled_until = utc_datetime(account.get("disabled_until"))
+        if provider is OAuthProvider.WORKBUDDY and not reason:
+            pause = self.backend.cooldown_state(f"oauth:{account_id}", ACCOUNT_SCOPE) or {}
+            until = utc_datetime(pause.get("cooldown_until"))
+            if until is not None and until > self._clock():
+                reason, disabled_until = "供应商限制", until
         return OAuthAccountSummary(
             account_id=account_id,
             provider=provider,
@@ -272,7 +279,7 @@ class OAuthControl(
             identity=sanitize_text(account.get("email") or account_id.partition(":")[2]),
             enabled=bool(account.get("enabled", True)),
             disabled_reason=sanitize_text(reason) if reason else None,
-            disabled_until=utc_datetime(account.get("disabled_until")),
+            disabled_until=disabled_until,
             max_concurrent=max(0, int(account.get("maxConcurrent") or 0)),
             available=bool(account.get("enabled", True)) and not reason and (provider is not OAuthProvider.ZHIPU or bool((account.get("model_key") or account.get("project_key_id"))) and (account.get("credential_mode") == "api_key" or account.get("entitlement") == "available")),
             quota_limited=reason == "quota",
@@ -356,7 +363,7 @@ class OAuthControl(
             until = entry.get("cooldown_until")
             runtime_errors.append(
                 OAuthRuntimeError(
-                    model_id=str(entry.get("model")) if entry.get("model") else None,
+                    model_id=None if entry.get("model") == ACCOUNT_SCOPE else str(entry.get("model")) if entry.get("model") else None,
                     message=(
                         sanitize_text(entry.get("last_error_message"))
                         if entry.get("last_error_message")

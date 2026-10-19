@@ -648,6 +648,8 @@ def _rename_priority_orders_in_config(cfg: dict, old_channel_key: str,
     load_balancing.mutate_channel_renamed(
         cfg, old_channel_key, new_channel_key, family,
     )
+    from . import model_state
+    model_state.rename_source_enable_overrides_in_config(cfg, old_channel_key, new_channel_key)
 
 
 def _rename_runtime_oauth_identity(old_account_key: str, new_account_key: str, *,
@@ -986,7 +988,8 @@ def _do_refresh_mock(refresh_token: str) -> dict:
 
 
 @diagnose(operation="refresh", stage="token_refresh")
-def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: str | None = None, observation: dict | None = None) -> str:
+def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: str | None = None,
+                         observation: dict | None = None, allow_quota_disabled: bool = False) -> str:
     """同步刷新（持 threading.Lock，跨线程跨 loop 串行）。
 
     force=False 时进入锁后做一次"双重检查"：若另一并发刷新已完成且 token 仍有效则跳过实际请求。
@@ -1037,7 +1040,11 @@ def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: s
                 raise ValueError(f"unknown OAuth account: {account_key}")
             expected_state_key = account_state_key(acc)
 
-        if observation is not None and (not acc.get("enabled", True) or acc.get("disabled_reason") in {"user", "auth_error"}):
+        quota_recovery = allow_quota_disabled and acc.get("disabled_reason") == "quota"
+        if observation is not None and (
+            acc.get("disabled_reason") in {"user", "auth_error"}
+            or (not acc.get("enabled", True) and not quota_recovery)
+        ):
             raise oauth_errors.OAuthRefreshStateError("account_unavailable")
         superseded = observation is not None and not refresh_observation_matches(acc, observation)
 
@@ -1290,11 +1297,13 @@ async def ensure_valid_token(account_key: str, *, expected_state_key: str | None
     return await asyncio.to_thread(_refresh_sync_locked, account_key, False, expected_state_key=expected_state_key)
 
 
-async def force_refresh(account_key: str, *, expected_state_key: str | None = None, observation: dict | None = None) -> str:
+async def force_refresh(account_key: str, *, expected_state_key: str | None = None,
+                        observation: dict | None = None, allow_quota_disabled: bool = False) -> str:
     """Explicit force by default; an observed 401/background snapshot coalesces."""
     if observation is not None:
         return await asyncio.to_thread(_refresh_sync_locked, account_key, True,
-                                       expected_state_key=expected_state_key, observation=observation)
+                                       expected_state_key=expected_state_key, observation=observation,
+                                       allow_quota_disabled=allow_quota_disabled)
     if expected_state_key is None:
         return await asyncio.to_thread(_refresh_sync_locked, account_key, True)
     return await asyncio.to_thread(_refresh_sync_locked, account_key, True, expected_state_key=expected_state_key)
@@ -1499,18 +1508,41 @@ def _record_openai_usage_failure(account_key: str, expected_state_key: str,
 
 
 async def _fetch_openai_usage(account_key: str, *, access_token: str | None = None) -> dict:
-    expected_state_key = account_state_key(get_account(account_key) or {})
+    import httpx
+    from . import channel_state, oauth_refresh_failure
+
+    account = get_account(account_key) or {}
+    expected_state_key = account_state_key(account)
+    observation = refresh_observation(account, access_token=access_token)
     started_at = state_db.now_ms()
+    operation = "refresh_token"
     try:
         if access_token is None:
-            access_token = await ensure_valid_token(account_key)
-        acc = get_account(account_key) or {}
-        kwargs = _compatible_kwargs(
-            openai_provider.fetch_wham_usage,
-            account_id=_openai_workspace_id(acc) or None, account_key=account_key,
-        )
-        _bind_usage_request(account_key, access_token, account=acc)
-        usage = await openai_provider.fetch_wham_usage(access_token, **kwargs)
+            access_token = await ensure_valid_token(account_key, expected_state_key=expected_state_key)
+        for attempt in range(2):
+            with account_generation_guard(expected_state_key) as current:
+                if not current:
+                    raise ValueError("OAuth account generation was deleted")
+                account_key = channel_state.resolve(expected_state_key).removeprefix("oauth:")
+                acc = copy.deepcopy(get_account(account_key) or {})
+                observation = refresh_observation(acc, access_token=access_token)
+                _bind_usage_request(account_key, access_token, account=acc)
+            kwargs = _compatible_kwargs(
+                openai_provider.fetch_wham_usage,
+                account_id=_openai_workspace_id(acc) or None, account_key=account_key,
+            )
+            operation = "fetch_usage"
+            try:
+                usage = await openai_provider.fetch_wham_usage(access_token, **kwargs)
+                break
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code != 401 or attempt:
+                    raise
+                operation = "refresh_token"
+                access_token = await force_refresh(
+                    account_key, expected_state_key=expected_state_key, observation=observation,
+                    allow_quota_disabled=True,
+                )
         codex = usage.get("openai") if isinstance(usage, dict) else None
         if isinstance(codex, dict):
             # Use the request's conservative observation boundary, not the later
@@ -1526,8 +1558,14 @@ async def _fetch_openai_usage(account_key: str, *, access_token: str | None = No
                 },
             }}
         return usage
-    except Exception:
+    except Exception as exc:
         _record_openai_usage_failure(account_key, expected_state_key, started_at)
+        error, effect = oauth_refresh_failure.apply(
+            account_key, exc, expected_state_key=expected_state_key,
+            provider="openai", observation=observation, operation=operation,
+        )
+        if error.auth_error and effect is None:
+            raise oauth_errors.OAuthRefreshStateError("credentials_changed") from None
         raise
 
 
@@ -4746,6 +4784,8 @@ def delete_invalid_accounts_batch_if_unchanged(
             for account_key in account_keys:
                 _remove_exact_account_from_config(cfg, account_key)
             load_balancing.mutate_channels_removed(cfg, channel_keys)
+            from . import model_state
+            model_state.remove_source_enable_overrides_in_config(cfg, channel_keys)
             result.update(status="deleted", count=len(account_keys))
 
         try:
@@ -4879,6 +4919,8 @@ def _delete_account_serialized(account_key: str) -> None:
         accounts = cfg.get("oauthAccounts", [])
         cfg["oauthAccounts"] = [account for account in accounts if not matches(account)]
         load_balancing.mutate_channels_removed(cfg, channel_keys)
+        from . import model_state
+        model_state.remove_source_enable_overrides_in_config(cfg, channel_keys)
 
     # Remove config + priority entries atomically, then keep every removed
     # generation tombstoned until restart. Late in-flight responses must not

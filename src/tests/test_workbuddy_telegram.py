@@ -101,7 +101,7 @@ def test_list_and_detail_keep_baseline_order_stats_and_fixed_buttons(tg, monkeyp
     assert "按模型:" in detail and "glm-fixture" in detail and "缓存" in detail and "峰值" in detail and "累计金额" in detail
     assert "📦 资源包: 1 个" in detail and "🎁 签到: 今日未签到" in detail
     assert [[b["text"] for b in row] for row in kb["inline_keyboard"]][:6] == [
-        ["📊 刷新额度"], ["管理模型", "🚦 并发上限"],
+        ["🔄 刷新 Token", "📊 刷新额度"], ["管理模型", "🚦 并发上限"],
         ["🧹 清模型故障", "🔗 清亲和绑定"], ["⏸ 停用账户", "🗑 删除账户"],
         ["🎁 签到/领额度"], ["🏠 主菜单", "◀ 返回列表"]]
     manage = kb["inline_keyboard"][1][0]
@@ -317,7 +317,7 @@ def test_add_menu_only_offers_workbuddy_browser_login_and_keeps_other_imports(tg
     assert "oa:add:workbuddy" in callbacks and "oa:add:openai" in callbacks
     menu.handle_callback(42, 900, "cb", "oa:add:workbuddy")
     callbacks = [b.get("callback_data") for b in buttons(tg[3][-1][1])]
-    assert [v for v in callbacks if v and v.startswith("oa:wb:")] == ["oa:wb:login", "oa:wb:login:global", "oa:wb:login:global:ide"]
+    assert [v for v in callbacks if v and v.startswith("oa:wb:")] == ["oa:wb:login", "oa:wb:login:global"]
     menu.handle_callback(42, 900, "cb", "oa:add:openai")
     callbacks = [b.get("callback_data") for b in buttons(tg[3][-1][1])]
     assert "oa:import:cpa" in callbacks and "oa:import:sub2api" in callbacks
@@ -342,29 +342,81 @@ def test_package_cycle_boundary_and_expiry_are_distinct_in_detail(tg):
     assert "资源包到期: 2030-09-30 23:59:59" in text
 
 
-def test_global_trial_requires_terms_then_confirmation_not_auto(tg, monkeypatch):
-    oldkey, _, ledger, output, _, _, _ = tg
-    entry = dict(om.get_account(oldkey), realm="global", domain="www.workbuddy.ai")
+@pytest.mark.parametrize("profile", ["cli", "ide", "workbuddy-cli"])
+def test_global_has_no_credit_ui_and_stale_buttons_do_not_query_or_claim(tg, monkeypatch, profile):
+    oldkey, ctl, ledger, output, _, _, _ = tg
+    entry = dict(om.get_account(oldkey), realm="global", workbuddy_client_profile=profile,
+                 domain="www.codebuddy.ai" if profile == "ide" else "www.workbuddy.ai")
     config.update(lambda c: c.update(oauthAccounts=[entry]))
     key = om.get_account_key(entry)
-    # Callback IDs may contain reward-like digits; they are not visible promises.
-    short = "9ccf2501"
-    monkeypatch.setitem(ui._code_to_name, short, key)
-    nav = (short, 1, "all")
-    menu.handle_callback(42, 900, "cb", wb._cb("activity", nav))
-    assert "申请试用额度" in output[-1][0] and "自动签到" not in output[-1][0]
-    click(tg, "申请试用额度")
-    assert "免费" in output[-1][0] and ledger["calls"] == 0
-    click(tg, "已核实免费条件")
+    nav = (ui.register_code(key), 1, "all")
+    blocked = Mock(side_effect=AssertionError("International activity must not run"))
+    for name in ("plan_workbuddy_action", "execute_workbuddy_action_now", "update_workbuddy_settings", "refresh_workbuddy_status_now"):
+        monkeypatch.setattr(ctl, name, blocked)
+    text, kb = menu._detail_text_and_kb(key, refresh_quota=False)
+    assert not any(b["text"] == "📊 刷新额度" for b in buttons(kb))
+    assert not any(b["callback_data"].startswith("oa:wb:activity:") for b in buttons(kb))
+    for kind in ("credits", "refresh_credits", "activity", "plan", "auto", "records", "refresh_activity"):
+        assert menu.handle_callback(42, 900, "cb", wb._cb(kind, nav))
+    for action, callback in (("oa_wb_terms", "terms"), ("oa_wb_unknown", "unknown"), ("oa_wb_confirm", "confirm")):
+        states.set_state(42, action, {"nonce": "stale", "key": key, "nav": nav,
+                                     "kind": "claim_trial", "plan_token": "must-not-execute"})
+        assert menu.handle_callback(42, 900, "cb", "oa:wb:" + callback + ":stale")
+        assert states.get_state(42) is None
+    assert menu.handle_callback(42, 900, "cb", "oa:refresh_usage:" + menu._callback_payload(*nav))
+    wb.start_status_query(42, 900, key, lambda feedback: wb.render_credits(key, nav))
+    blocked.assert_not_called()
     assert ledger["calls"] == 0
-    click(tg, "确认执行")
-    assert ledger["calls"] == 1
-    visible = "\n".join(
-        text + "\n" + "\n".join(button["text"] for button in buttons(kb))
-        for text, kb in output
-    )
-    assert any(short in button["callback_data"] for _, kb in output for button in buttons(kb))
-    assert "250" not in visible and "14 天" not in visible
+    for text, kb in [*output, wb.render_activity(key, nav)]:
+        visible = text + "\n" + "\n".join(b["text"] for b in buttons(kb))
+        for word in ("签到", "试用", "领额度", "刷新额度", "积分", "资源包", "查询中", "使用量", "尚未获取"):
+            assert word not in visible
+        assert "管理模型" in visible and "返回列表" in visible
+    config.update(lambda c: c["oauthAccounts"][0].update(enabled=False, disabled_reason="auth_error"))
+    text, kb = menu._detail_text_and_kb(key, refresh_quota=False)
+    assert any(b["text"] == "🔐 重新登录" for b in buttons(kb))
+    assert all(row for row in kb["inline_keyboard"])
+
+
+@pytest.mark.parametrize("status", ["unfetched", "empty", "known", "stale", "error"])
+def test_global_list_and_detail_hide_credit_snapshots_but_keep_local_stats(tg, monkeypatch, status):
+    oldkey, ctl, _, _, snap, _, _ = tg
+    entry = dict(om.get_account(oldkey), realm="global", workbuddy_client_profile="workbuddy-cli",
+                 domain="www.workbuddy.ai", label="global@example.test")
+    config.update(lambda c: c.update(oauthAccounts=[entry]))
+    key = om.get_account_key(entry)
+    snap.update(realm="global", checkin={"supported": False}, payment_type="free")
+    snap["packages"] = [dict(snap["packages"][0], name=f"package {i}") for i in range(9)]
+    if status == "unfetched":
+        snap = {}
+    elif status == "empty":
+        snap.update(status="empty", credits={}, packages=[])
+    elif status == "stale":
+        snap["fetched_at"] -= 3600000
+    elif status == "error":
+        snap.update(complete=False, last_success_credits=snap["credits"], last_success_packages=snap["packages"],
+                    errors={"credits": {"kind": "network", "http_status": 503}})
+    state_db.quota_save(key, {"raw_data": json.dumps({"workbuddy": snap})})
+    stats = dict(total=123, success_count=120, error_count=3, input=300000, output=80000,
+                 cache_creation=0, cache_read=900000, avg_tps=58.2, max_tps=86.4, min_tps=31.7,
+                 costed_success=120, unpriced_success=0, cost_ticks=1240000000)
+    monkeypatch.setattr(menu, "_account_period_stats", lambda *a, **k: stats)
+    assert wb.usage_block(key) == wb.usage_block(key, detail=True) == ""
+    assert menu._format_usage_block(key) == ""
+    assert wb.package_page_buttons(key, (ui.register_code(key), 1, "all")) == []
+    listing, _ = menu._list_text_and_kb()
+    detail, kb = menu._detail_text_and_kb(key, refresh_quota=False, actor_chat_id=42,
+                                       model_stats=[dict(stats, final_model="glm-fixture")])
+    for text in (listing, detail):
+        assert "global@example.test" in text and "国际区" in text
+        for word in ("积分", "资源包", "计费类型", "签到", "旧快照", "尚未获取", "📊 使用量"):
+            assert word not in text
+    assert "本地自然月" in listing and "⚡ TPS" in listing and "💵" in listing
+    assert "总体: 123 次 · ✅ 120 · ❌ 3" in detail and "glm-fixture" in detail
+    assert "累计金额" in detail and "缓存" in detail and "峰值" in detail
+    assert [[b["text"] for b in row] for row in kb["inline_keyboard"]] == [
+        ["🔄 刷新 Token"], ["管理模型", "🚦 并发上限"], ["🧹 清模型故障", "🔗 清亲和绑定"],
+        ["⏸ 停用账户", "🗑 删除账户"], ["🏠 主菜单", "◀ 返回列表"]]
 
 
 def test_removed_import_callback_does_not_cancel_a_new_login(tg, monkeypatch):

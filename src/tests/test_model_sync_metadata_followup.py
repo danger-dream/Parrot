@@ -16,9 +16,14 @@ from src.tests.test_oauth_model_sync_loop import sync_config, _account, _iso
 from src.tests.test_model_center_upstream_sync import env, _api, _oauth, _install, _payload, _start, _wait
 
 
+@pytest.mark.parametrize("realm,profile,version", [
+    ("cn", "cli", "2.164.0"),
+    ("global", "workbuddy-cli", "2.168.2"),
+])
 @pytest.mark.asyncio
-async def test_workbuddy_uses_real_discovery_and_six_hour_cadence(monkeypatch, sync_config):
-    account = _account("workbuddy", 1, disabledModels=["m"])
+async def test_workbuddy_uses_real_discovery_and_six_hour_cadence(monkeypatch, sync_config, realm, profile, version):
+    account = _account("workbuddy", 1, disabledModels=["m"], realm=realm,
+                       workbuddy_client_profile=profile)
     config.update(lambda cfg: cfg.update(oauthAccounts=[account]))
     monkeypatch.setattr(oauth_manager, "mock_mode_enabled", lambda: False)
     async def token(key):
@@ -27,9 +32,17 @@ async def test_workbuddy_uses_real_discovery_and_six_hour_cadence(monkeypatch, s
     calls = []
     def request(account, path, **kwargs):
         calls.append(path)
+        assert kwargs["method"] == "GET" and kwargs["kind"] == "models"
         return {"models": [{"id": "m", "name": "Model", "maxInputTokens": 128000}],
                 "agents": [{"name": "cli", "models": ["m"]}]}
     monkeypatch.setattr(workbuddy_common, "request", request)
+    discoveries = []
+    discovery = oauth_manager.oauth_model_discovery
+    def discover(*args, **kwargs):
+        result = discovery.discover_workbuddy(*args, **kwargs)
+        discoveries.append(result)
+        return result
+    monkeypatch.setitem(discovery.ADAPTERS, "workbuddy", discover)
     metadata_calls = []
     async def metadata():
         saved = oauth_manager.get_account(oauth_manager.get_account_key(account))
@@ -41,11 +54,14 @@ async def test_workbuddy_uses_real_discovery_and_six_hour_cadence(monkeypatch, s
     assert len(result) == 1 and result[0]["catalog_changed"]
     saved = oauth_manager.get_account(oauth_manager.get_account_key(account))
     assert saved["disabledModels"] == ["m"]
+    assert len(discoveries) == 1
+    assert discoveries[0].client_version == version
+    assert discoveries[0].profile_id == profile
     assert saved["account_model_catalog"]["models"][0]["maxInputTokens"] == 128000
     assert not oauth_manager._model_sync_due(saved)
     assert oauth_manager._model_sync_due({**saved, "last_model_sync": _iso(-6 * 3600 - 1)})
     assert await oauth_manager.oauth_model_sync_once(notify_changes=False) == []
-    assert calls == ["/console/enterprises/personal/models"] and len(metadata_calls) == 1
+    assert calls == ["/v3/config"] and len(metadata_calls) == 1
 
 
 @pytest.mark.parametrize("results,expected", [

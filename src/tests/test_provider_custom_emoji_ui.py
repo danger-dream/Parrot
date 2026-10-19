@@ -284,17 +284,15 @@ def test_oauth_and_status_buttons_use_provider_custom_icons(monkeypatch):
     buttons = [
         button for row in captured["reply_markup"]["inline_keyboard"] for button in row
     ]
+    # The add menu now groups multi-method providers behind brand submenus.
     expected = {
-        "oa:login": "claude",
-        "oa:set_json": "claude",
-        "oa:login:openai": "openai",
-        "oa:set_rt:openai": "openai",
-        "oa:login:xai": "xai",
-        "oa:set_rt:xai": "xai",
+        "oa:add:claude": "claude",
+        "oa:add:openai": "openai",
+        "oa:add:xai": "xai",
         "oa:login:cursor": "cursor",
         "oa:login:antigravity": "antigravity",
-        "oa:wb:login": "workbuddy",
-        "oa:wb:login:global": "workbuddy",
+        "oa:add:workbuddy": "workbuddy",
+        "oa:zh:add": "zhipu",
     }
     for callback, provider in expected.items():
         button = next(item for item in buttons if item.get("callback_data") == callback)

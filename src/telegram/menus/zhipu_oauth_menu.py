@@ -813,11 +813,8 @@ def _handle_callback(chat_id, message_id, cb_id, callback):
     elif kind == "projects":
         _projects(chat_id, message_id, key)
     elif kind == "refresh":
-        if account.get("credential_mode") == "oauth":
+        if account.get("credential_mode") == "oauth" and control.account_authentication_failed(account):
             parent().on_relogin(chat_id, message_id, "", parts[1])
-            return True
-        if account.get("disabled_reason") != "auth_error":
-            _result(chat_id, message_id, key, "账户无需更新凭据。")
             return True
         discard_state(chat_id)
         data = _state(chat_id, "oa_zh_work", key=key)

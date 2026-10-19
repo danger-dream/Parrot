@@ -12,7 +12,7 @@ from ...safe_diagnostics import diagnose, report, scope
 ACCOUNT_FIELDS = (
     "realm", "uid", "enterprise_id", "domain", "nickname", "label",
     "workbuddy_client_profile", "workbuddy_identity_source", "workbuddy_auto_checkin",
-    "refresh_expired", "auth_method", "id_source", "department_full_name",
+    "refresh_expired", "auth_method", "id_source", "department_full_name", "workbuddy_account_type",
 )
 
 
@@ -112,6 +112,9 @@ def normalize_credential(value: dict, *, realm: str | None = None, source: str =
         "workbuddy_client_profile": value.get("workbuddy_client_profile") or common.PROFILE,
         "workbuddy_identity_source": source,
     }
+    account_type = value.get("workbuddy_account_type", account.get("type") if account is not value else None)
+    if account_type is not None:
+        entry["workbuddy_account_type"] = common.text(account_type, "account type", maximum=64)
     entry["realm"] = common.realm_of(entry)
     entry["label"] = common.text(value.get("label"), "label") or entry["nickname"] or entry["uid"]
     # Copied files have no acquisition time, even if their source label says login.

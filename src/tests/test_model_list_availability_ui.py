@@ -93,7 +93,7 @@ def test_effective_availability_sort_precedes_pagination_and_agrees_between_api_
     assert seen == expected and len(set(seen)) == 16
     text, _kb = menu.render(42)
     assert "16. 🚫 <code>claude-sonnet-4</code> · 来源停用" in text
-    assert "14. 🚫 <code>a-global-off</code> · 停用" in text
+    assert "14. 🚫 <code>a-global-off</code> · 全局停用" in text
     assert "15. 🚫 <code>c-channel-off</code> · 渠道停用" in text
     assert "当前无可用来源" not in text and "展示开关" not in text
     menu._session(42).page = 1
@@ -118,11 +118,14 @@ def test_source_filtered_sort_uses_that_source_but_preserves_revision_and_disabl
         "type": "chat", "sourceType": "api", "sourceId": "api:A", "status": "disabled",
     })
     assert response.status_code == 200
-    assert [row["modelId"] for row in response.json()["data"]] == ["b-shared"]
-    # Existing status filters describe switches, not silently redefined availability.
+    assert [row["modelId"] for row in response.json()["data"]] == ["a-global-off", "b-shared"]
+    # Source overrides make effective availability authoritative for both the
+    # list and its status filter; raw global/source switches remain in details.
     response = client.get("/api/management/v1/models", headers=admin,
                           params={"type": "chat", "status": "disabled"})
-    assert [row["modelId"] for row in response.json()["data"]] == ["a-global-off"]
+    assert [row["modelId"] for row in response.json()["data"]] == [
+        "a-global-off", "c-channel-off", "claude-sonnet-4",
+    ]
 
 
 @pytest.mark.asyncio
@@ -165,7 +168,7 @@ async def test_disabled_cursor_stays_manageable_but_not_discovered_and_can_be_re
 
 
 @pytest.mark.parametrize("case,expected", [
-    ("live", (True, "")), ("disabled", (False, "停用")),
+    ("live", (True, "")), ("disabled", (False, "全局停用")),
     ("source_off", (False, "来源停用")), ("account_off", (False, "账户停用")),
     ("no_source", (False, "无来源")), ("mixed_off", (False, "不可用")),
 ])

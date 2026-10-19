@@ -1053,8 +1053,7 @@ async def list_models(request: Request):
     known_image_models = image_catalog.models()
     all_models = sorted({
         model for model in text_models + image_models
-        if model_state.is_discovery_visible(model)
-        and (model not in known_image_models or model in image_models)
+        if model not in known_image_models or model in image_models
     })
     if allowed_models:
         allowed_set = set(allowed_models)
@@ -1078,11 +1077,13 @@ async def list_models(request: Request):
     alias_seen: set[str] = set()
     global_map = model_mapping.get_global_map()
     compatible_targets = registry.available_model_spellings(global_map.values(), api_key_name=key_name)
+    text_aliases = registry.available_model_aliases(global_map, api_key_name=key_name)
+    image_aliases = image_catalog.available_model_aliases(global_map, api_key_name=key_name)
     for _alias, _real in global_map.items():
         if _alias in visible_set:
             continue
         if _real in image_models:
-            if model_state.is_discovery_visible(_alias) and (
+            if _alias in image_aliases and (
                 not allowed_models or _alias in allowed_set or _real in allowed_set
             ):
                 alias_seen.add(_alias)
@@ -1090,6 +1091,8 @@ async def list_models(request: Request):
         if _real not in visible_set and not (
             _real in compatible_targets and (not allowed_models or _real in allowed_set)
         ):
+            continue
+        if _alias not in text_aliases:
             continue
         # Key 有白名单时, 别名必须显式授权 (白名单按真名语义, 但下游看到的
         # 是别名, 这里做 strict 检查: 白名单里如果没别名就不暴露)

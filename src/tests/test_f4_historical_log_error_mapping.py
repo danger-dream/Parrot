@@ -86,9 +86,12 @@ def test_strict_corrupt_history_is_retryable_503_for_every_management_log_reader
         for path, response in responses:
             assert response.status_code == 503, (path, response.status_code, response.text)
             assert response.headers["content-type"].startswith("application/json")
-            assert response.json()["error"] == {
+            error = response.json()["error"]
+            message = error.pop("message")
+            assert "未分类异常" in message
+            assert "服务器诊断" in message
+            assert error == {
                 "code": "DEPENDENCY_UNAVAILABLE",
-                "message": "A required dependency is unavailable",
                 "fields": [],
                 "retryable": True,
                 "requestId": "request-p4-test",

@@ -6,8 +6,8 @@
 `/api/coding/paas/v4/chat/completions`，不带 `/v1`，导致拼出来的 URL 永远 404。
 
 解决方案：允许 baseUrl 直接填完整调用路径；代理在保存时按末段白名单识别并拆分
-成 `(baseUrl, apiPath)` 两段存储；运行期若 apiPath 非空，直接 `baseUrl + apiPath`，
-否则走老的"baseUrl + /v1/xxx"拼接。
+成 `(baseUrl, apiPath)` 两段存储。运行期保留显式路径和完整接口，默认路径
+识别已有版本目录，避免重复追加 `/v1`。
 
 末段白名单（按 `/` 分段取末段，大小写不敏感）：
 - `messages`    → anthropic 协议
@@ -17,8 +17,9 @@
 
 from __future__ import annotations
 
+import re
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 
 # 末段 → 对应的协议名
@@ -120,18 +121,59 @@ def validate_api_path_for_protocol(api_path: Optional[str], protocol: str) -> Op
     return None
 
 
+_VERSION_DIRECTORY = re.compile(r"v\d+(?:\.\d+)*(?:(?:alpha|beta)\d*)?\Z")
+
+
+def _version_directory(path: str) -> bool:
+    return bool(_VERSION_DIRECTORY.fullmatch(path.rstrip("/").rsplit("/", 1)[-1]))
+
+
+def _append_url_path(base_url: str, path: str) -> str:
+    parts = urlsplit(base_url)
+    base_path = parts.path.rstrip("/")
+    path = path if path.startswith("/") else "/" + path
+    return urlunsplit(parts._replace(path=base_path + path.rstrip("/")))
+
+
+def resolve_api_endpoint(
+    base_url: str,
+    endpoint: str,
+    api_path: Optional[str] = None,
+    *,
+    preserve_custom_path: bool = False,
+) -> str:
+    """从版本根目录或完整接口定位同目录接口，不改写自定义前缀。"""
+    raw = base_url.strip().rstrip("/")
+    if api_path:
+        raw = _append_url_path(raw, api_path)
+    parts = urlsplit(raw)
+    path = parts.path.rstrip("/")
+    for suffix in (
+        "/chat/completions", "/images/generations", "/images/edits",
+        "/language-models", "/responses", "/messages", "/completions", "/models",
+    ):
+        if path.endswith(suffix):
+            path = path[:-len(suffix)]
+            break
+    else:
+        if not _version_directory(path) and not (preserve_custom_path and path):
+            path += "/v1"
+    return _append_url_path(urlunsplit(parts._replace(path=path)), endpoint)
+
+
 def resolve_upstream_url(
     base_url: str,
     api_path: Optional[str],
     default_suffix: str,
 ) -> str:
-    """拼接真实请求 URL。
-
-    - `api_path` 非空 → `base_url + api_path`（优先）
-    - 否则 → `base_url + default_suffix`（兼容老配置）
-    """
-    base = (base_url or "").rstrip("/")
+    """显式 apiPath 相对整个 Base URL 追加；默认接口复用已有版本目录。"""
+    base = (base_url or "").strip().rstrip("/")
     if api_path:
-        p = api_path if api_path.startswith("/") else "/" + api_path
-        return base + p.rstrip("/")
-    return base + default_suffix
+        return _append_url_path(base, api_path)
+    if detect_suffix_protocol(urlsplit(base).path):
+        return base
+    suffix = "/" + default_suffix.strip("/")
+    prefix, _, endpoint = suffix[1:].partition("/")
+    if _version_directory(urlsplit(base).path) and _version_directory(prefix):
+        suffix = "/" + endpoint
+    return _append_url_path(base, suffix)

@@ -584,10 +584,13 @@ def _handle_frozen(chat_id: int, message_id: int, cb_id: str, action: _FrozenAct
     if name == "clear_error":
         try:
             _CONTROL.clear_model_errors(_ctx(chat_id), source=data["source"], model_id=data["model_id"])
+            view = _CONTROL.get_model(_ctx(chat_id), data["detail_key"])
+            source_view = _source_for_view(view, data["source"])
         except ManagementError as exc:
             _answer_error(cb_id, exc)
             return
-        ui.answer_cb(cb_id, "模型故障已清除")
+        restricted = source_view is not None and source_view.unavailable_reason == "account_restricted"
+        ui.answer_cb(cb_id, "模型故障已清除；账户仍受限，请到账户详情处理" if restricted else "模型故障已清除")
         text, kb = _detail_render(
             chat_id, data["detail_key"],
             back_callback=str(data.get("detail_back") or "mc:list"),

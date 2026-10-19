@@ -163,6 +163,9 @@ class Projection:
         """Read one real stream; closing/cancelling always closes its owner."""
         self.round = Round(self, branch_index)
         current = self.round
+        # Shared only with the real WorkBuddy stream finalizer. It is populated
+        # before terminal output and also survives cancellation during projection.
+        self.workbuddy_stream_error = getattr(response, "_parrot_workbuddy_stream_error", {})
         if hasattr(response, "body_iterator"):
             iterator = response.body_iterator
         else:
@@ -191,6 +194,11 @@ class Projection:
                     if event == "error" or isinstance(data.get("error"), dict) or event in ("response.failed", "response.incomplete"):
                         self.failure_type = event
                         self.failure_response = copy.deepcopy(data.get("response") or {})
+                        if self.workbuddy_stream_error:
+                            return JSONResponse(
+                                {"error": dict(self.workbuddy_stream_error["error"])},
+                                status_code=self.workbuddy_stream_error["http_status"],
+                            )
                         error = data.get("error") or (data.get("response") or {}).get("error") or {
                             "type": "api_error", "message": "upstream response incomplete",
                             "code": "stream_incomplete"}

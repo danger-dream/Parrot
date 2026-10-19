@@ -241,14 +241,25 @@ def available_models_for_families(families: Optional[set[str]], *, api_key_name:
             if fam not in families:
                 continue
         for m in ch.list_client_models():
-            if not m or not model_state.is_global_enabled(m, source_key=ch.key):
-                continue
-            if not model_state.is_source_enabled(ch.key, m):
-                continue
-            if getattr(ch, "provider", "") == "zhipu" and not model_state.is_discovery_visible(m, source_key=ch.key):
-                continue
-            models.add(m)
+            if _model_discovery_visible(ch, m):
+                models.add(m)
     return sorted(models)
+
+
+def _model_discovery_visible(ch: Channel, model: str, alias: str | None = None) -> bool:
+    resolved = ch.supports_model(model)
+    return resolved is not None and all(
+        model_state.is_discovery_visible(name, source_key=ch.key)
+        and model_state.is_source_enabled(ch.key, name)
+        for name in {model, resolved, alias} if name
+    )
+
+
+def available_model_aliases(mapping: dict[str, str], *, api_key_name: Optional[str] = None) -> set[str]:
+    """Aliases with one eligible source enabling both alias and target."""
+    return {alias for ch in all_channels() if ch.enabled and not ch.disabled_reason
+            and auth.channel_allowed(api_key_name, ch.key)
+            for alias, model in mapping.items() if _model_discovery_visible(ch, model, alias)}
 
 
 def available_model_spellings(spellings, *, api_key_name: Optional[str] = None) -> set[str]:
@@ -260,8 +271,7 @@ def available_model_spellings(spellings, *, api_key_name: Optional[str] = None) 
         if not auth.channel_allowed(api_key_name, ch.key):
             continue
         for model in spellings:
-            if (ch.supports_model(model) is not None and model_state.is_discovery_visible(model, source_key=ch.key)
-                    and model_state.is_source_enabled(ch.key, model)):
+            if _model_discovery_visible(ch, model):
                 result.add(model)
     return result
 

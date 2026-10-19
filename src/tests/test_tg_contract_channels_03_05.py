@@ -62,7 +62,8 @@ def test_ch03_existing_failure_does_not_record_error_and_uses_30_seconds():
     assert final["affinity"]["fp-existing"]["model"] == "bad"
     assert final["runtimeEvents"]["deleteDelays"] == [30]
     text = "\n".join(_texts("TG-CH-03.existing-single-failure-does-not-record"))
-    assert "模型测试失败，失败原因: diagnostic failed" in text
+    assert "模型测试失败，失败原因: PROBE_FAILED" in text
+    assert "diagnostic failed" not in text
     assert "本消息将在 30 秒后自动删除" in text
 
 
@@ -85,7 +86,7 @@ def test_ch03_wizard_initial_failure_is_recorded_only_by_save():
         "error_count": 1,
         "cooldown_until": 1700000060000,
         "remaining": "60s",
-        "last_error_message": "initial probe failed: fixed upstream failure",
+        "last_error_message": "initial probe failed: PROBE_FAILED",
     }]
     assert final["runtimeEvents"]["deleteDelays"] == [30]
     pop_steps = [step for step in case["stateSteps"] if step["event"] == "pop"]

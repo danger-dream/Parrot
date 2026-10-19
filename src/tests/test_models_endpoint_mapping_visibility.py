@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 
 from starlette.requests import Request
 
@@ -10,6 +11,7 @@ isolate()
 
 import server as parrot_server  # noqa: E402
 from src import config  # noqa: E402
+from src.channel.api_channel import ApiChannel  # noqa: E402
 
 
 def _request() -> Request:
@@ -27,15 +29,24 @@ def _request() -> Request:
     })
 
 
+def _install_models(monkeypatch, models):
+    # Discovery and alias validation must observe the same real source, rather
+    # than a string-only available_models stub with an empty channel registry.
+    cfg = copy.deepcopy(config.DEFAULT_CONFIG)
+    entry = {"name": "fixture", "protocol": "anthropic", "cc_mimicry": False,
+             "models": [{"alias": model, "real": model} for model in models]}
+    cfg.update(channels=[entry], oauthAccounts=[], apiKeys={})
+    channel = ApiChannel(entry)
+    monkeypatch.setattr(config, "get", lambda: cfg)
+    monkeypatch.setattr(parrot_server.registry, "_channels", {channel.key: channel})
+
+
 def test_models_endpoint_exposes_only_global_mapping_aliases(monkeypatch):
     monkeypatch.setattr(
         parrot_server.auth, "validate",
         lambda headers: ("test-key", None, None),
     )
-    monkeypatch.setattr(
-        parrot_server.registry, "available_models",
-        lambda: ["claude-opus-4-8", "gpt-5.6-sol"],
-    )
+    _install_models(monkeypatch, ["claude-opus-4-8", "gpt-5.6-sol"])
     monkeypatch.setattr(
         parrot_server.model_mapping, "get_global_map",
         lambda: {"gpt": "gpt-5.6-sol"},
@@ -60,10 +71,7 @@ def test_models_endpoint_does_not_expose_global_alias_with_missing_target(monkey
         parrot_server.auth, "validate",
         lambda headers: ("test-key", None, None),
     )
-    monkeypatch.setattr(
-        parrot_server.registry, "available_models",
-        lambda: ["real-present"],
-    )
+    _install_models(monkeypatch, ["real-present"])
     monkeypatch.setattr(
         parrot_server.model_mapping, "get_global_map",
         lambda: {"usable": "real-present", "stale": "real-missing"},

@@ -47,10 +47,16 @@ def test_activity_wire_uses_only_existing_access_token_and_all_refresh_layers_bl
         assert request.headers["authorization"] == "Bearer fixture-at"
         assert "x-refresh-token" not in request.headers
         assert "auth/token/refresh" not in request.url.path
-        return httpx.Response(200, json={"code": 0, "data": {}})
+        # CN checkin acknowledges an award explicitly; an empty object is an
+        # unknown result, unlike the Global trial endpoint's empty success.
+        data = {"credit": 0} if realm == "cn" else {}
+        return httpx.Response(200, json={"code": 0, "data": data})
     monkeypatch.setattr(common.network, "sync_client", lambda **kw: httpx.Client(transport=httpx.MockTransport(wire)))
     action = "checkin" if realm == "cn" else "claim_trial"
-    assert billing.execute_action_sync(current, action)["status"] == "succeeded"
+    result = billing.execute_action_sync(current, action)
+    assert result["status"] == "succeeded"
+    if realm == "cn":
+        assert result["awarded_credits"] == 0
     assert len(seen) == 1
     with pytest.raises(common.WorkBuddyError, match="disabled"):
         auth.refresh_sync("fixture-rt", account=current)

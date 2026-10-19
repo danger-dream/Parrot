@@ -76,7 +76,7 @@ def test_actual_list_detail_share_quota_helpers_and_baseline_layout(display):
     assert listed.index("🏷️ 套餐") < listed.index("📊 5h") < listed.index("📊 7d") < listed.index("🛠 工具/月")
     assert {"5h", "7d"} <= set(window_calls)
     assert [[button["text"] for button in row] for row in kb["inline_keyboard"]] == [
-        ["📊 刷新额度"], ["管理模型", "🚦 并发上限"],
+        ["🔄 刷新连接", "📊 刷新额度"], ["管理模型", "🚦 并发上限"],
         ["🧹 清模型故障", "🔗 清亲和绑定"], ["⏸ 停用账户", "🗑 删除账户"],
         ["✏️ 账户名称"], ["🏠 主菜单", "◀ 返回列表"]]
     assert all(len(button.get("callback_data", "").encode()) <= 64 for row in kb["inline_keyboard"] for button in row)

@@ -18,7 +18,20 @@ class ImageSource:
 
     @property
     def available(self) -> bool:
-        return self.enabled and self.source_enabled and model_state.is_global_enabled(self.model)
+        return self.available_for()
+
+    def available_for(self, requested_model: str | None = None) -> bool:
+        return self.enabled and self.source_enabled and all(
+            model_state.is_global_enabled(model, source_key=self.key)
+            and model_state.is_source_enabled(self.key, model)
+            for model in {self.model, self.upstream, requested_model} if model
+        )
+
+    def visible_for(self, requested_model: str | None = None) -> bool:
+        return self.available_for(requested_model) and all(
+            model_state.is_discovery_visible(model, source_key=self.key)
+            for model in {self.model, self.upstream, requested_model} if model
+        )
 
 
 def is_image_name(name: str) -> bool:
@@ -29,7 +42,7 @@ def is_image_name(name: str) -> bool:
 def openai_account_state(account: dict, cfg: dict) -> dict:
     state = media_config.oauth_state(account, 'image', cfg)
     models = media_config.account_models(account, 'image', cfg)
-    available = any(model_state.is_global_enabled(model, cfg) and model_state.is_source_enabled('oauth:' + account_key(account), model, cfg) for model in models)
+    available = any(model_state.is_global_enabled(model, cfg, source_key='oauth:' + account_key(account)) and model_state.is_source_enabled('oauth:' + account_key(account), model, cfg) for model in models)
     if state['enabled'] and not available:
         state['effective_available'] = False
         state['unavailable_reason'] = '本来源没有启用的图片模型；请通过配置或管理 API 维护。'
@@ -103,7 +116,9 @@ def current_oauth_account(source: ImageSource) -> tuple[str, dict]:
         state = media_config.oauth_state(account, 'image', config.get())
         if not state['enabled']:
             raise ValueError(state['unavailable_reason'])
-        if not model_state.is_global_enabled(source.model) or not model_state.is_source_enabled(key, source.model):
+        if not all(model_state.is_global_enabled(model, source_key=key)
+                   and model_state.is_source_enabled(key, model)
+                   for model in {source.model, source.upstream} if model):
             raise ValueError('image model/source is disabled; enable it in model center')
         return account_id, copy.deepcopy(account)
 
@@ -121,6 +136,12 @@ def models(cfg: dict | None = None, *, kind: str = 'image') -> set[str]:
 
 def available_models(*, api_key_name: str | None = None) -> list[str]:
     from . import auth
-    return sorted({row.model for row in sources() if row.available
-                   and auth.channel_allowed(api_key_name, row.key)
-                   and model_state.is_discovery_visible(row.model)})
+    return sorted({row.model for row in sources() if row.visible_for()
+                   and auth.channel_allowed(api_key_name, row.key)})
+
+
+def available_model_aliases(mapping: dict[str, str], *, api_key_name: str | None = None,
+                            kind: str = 'image') -> set[str]:
+    from . import auth
+    return {alias for row in sources(kind=kind) if auth.channel_allowed(api_key_name, row.key)
+            for alias, model in mapping.items() if model == row.model and row.visible_for(alias)}

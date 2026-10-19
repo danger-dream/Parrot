@@ -242,7 +242,8 @@ def test_workbuddy_candidate_loss_persists_relogin_and_preserves_manual_pause(mo
     upstream.assert_not_called()
     ctl = OAuthControl()
     monkeypatch.setattr(ctl, '_post_save_account_effects', lambda *a, **k: {})
-    monkeypatch.setattr(ctl.backend, 'workbuddy_start_login', lambda: dict(status='pending', auth_url='https://fixture.test/login'))
+    monkeypatch.setattr(ctl.backend, 'workbuddy_start_login', lambda: dict(
+        status='pending', auth_url='https://fixture.test/login', realm='cn', workbuddy_client_profile='cli'))
     flow = ctl.start_login_flow(context(), OAuthProvider.WORKBUDDY, relogin_account_id=key)
     monkeypatch.setattr(ctl.backend, 'workbuddy_poll_login', lambda p: p.update(status='ready', entry=dict(old, access_token='login-at', refresh_token='login-rt')))
     assert ctl.poll_login_flow(context(), flow.flow_id, flow.flow_secret).status == 'completed'

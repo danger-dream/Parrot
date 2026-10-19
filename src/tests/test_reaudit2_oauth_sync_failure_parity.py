@@ -1,4 +1,4 @@
-"""P14 regressions for frozen OAuth post-save synchronous failure semantics."""
+"""P14 post-save failure ordering/state, with current safe public diagnostics."""
 from __future__ import annotations
 
 import concurrent.futures
@@ -240,9 +240,10 @@ def test_cursor_create_sync_launch_failure_uses_frozen_save_failure_flow(
     assert "正在同步模型，请稍候" in trace.events[1][3]
     assert trace.events[2][3] == (
         "❌ 保存 Cursor 账户失败："
-        "<code>injected synchronous launch failure</code>"
+        "<code>management / 账户保存：未分类异常，具体原因尚不确定。</code>"
     )
     rendered = "\n".join(trace.visible_texts())
+    assert "injected synchronous launch failure" not in rendered
     assert "后台将静默重试" not in rendered
     assert "Cursor OAuth 账户已添加" not in rendered
 
@@ -298,9 +299,10 @@ def test_claude_create_sync_launch_failure_uses_frozen_save_failure_flow(
     assert [event[0] for event in trace.events] == ["send", "send"]
     assert "正在同步模型，请稍候" in trace.events[0][2]
     assert trace.events[1][2] == (
-        "❌ 保存失败: <code>injected synchronous launch failure</code>"
+        "❌ 保存失败: <code>management / 账户保存：未分类异常，具体原因尚不确定。</code>"
     )
     rendered = "\n".join(trace.visible_texts())
+    assert "injected synchronous launch failure" not in rendered
     assert "后台将静默重试" not in rendered
     assert "Anthropic OAuth 账户已添加" not in rendered
 
@@ -374,13 +376,15 @@ def test_overwrite_sync_launch_failure_uses_frozen_callback_failure_order(
     assert "正在同步模型，请稍候" in trace.events[1][3]
     assert re.fullmatch(
         r"❌ <b>OAuth账户管理失败</b>\n"
-        r"操作未完成，请将故障编号提供给管理员排查。\n"
+        r"management / operation：未分类异常，具体原因尚不确定。"
+        r"请按时间核对服务器诊断及操作记录。远端操作结果未确认时，不要盲目重复提交。\n"
         r"故障编号：<code>TG-\d{8}-[A-F0-9]{10}</code>\n"
         r"涉及消费或提交时，请先核对结果，不要直接重复操作。",
         trace.events[2][2],
     ) is not None
     assert not any(event[0] == "answer" for event in trace.events)
     rendered = "\n".join(trace.visible_texts())
+    assert "injected synchronous launch failure" not in rendered
     assert "覆盖成功" not in rendered
     assert "OAuth 账户已覆盖" not in rendered
     assert "后台将静默重试" not in rendered

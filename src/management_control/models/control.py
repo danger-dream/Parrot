@@ -16,6 +16,7 @@ from enum import Enum
 from typing import Any, Mapping
 
 from src import config, model_mapping, model_metadata, model_names, model_state
+from src.cooldown import ACCOUNT_SCOPE
 from src.management_control.auxiliary.media import (
     AntigravityMediaControl,
     ImageControl,
@@ -83,6 +84,7 @@ class ModelSourceView:
     value_source: Mapping[str, str]
     constrained_by: Mapping[str, tuple[str, ...]]
     unavailable_reason: str | None = None
+    enabled_override: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,8 +102,8 @@ class ModelView:
 
     def available_in(self, source: ModelSourceRef | None = None) -> bool:
         """Effective availability in this query, independent of discovery visibility."""
-        return self.identity.kind in (ModelKind.CHAT, ModelKind.IMAGE, ModelKind.VIDEO) and self.global_enabled is True and any(
-            row.effective_routable
+        return self.identity.kind in (ModelKind.CHAT, ModelKind.IMAGE, ModelKind.VIDEO) and any(
+            row.effective_routable and (self.global_enabled is True or row.enabled_override)
             for row in self.sources
             if source is None or source.type is ModelSourceType.GLOBAL
             or (row.type is source.type and row.id == source.id)
@@ -297,7 +299,7 @@ class ModelCenterControl(DomainControl):
                 if not model_id or not outbound:
                     continue
                 source_enabled = model_id not in api_disabled.get(source_id, set())
-                global_enabled = model_state.is_global_enabled(model_id, cfg)
+                global_enabled = model_state.is_global_enabled(model_id, cfg, source_key=source_id)
                 metadata, value_source, constrained = self._binding_view(
                     model_id, scope_key=source_id, outbound_model=outbound,
                 )
@@ -306,6 +308,7 @@ class ModelCenterControl(DomainControl):
                     outbound_model=outbound, source_enabled=source_enabled,
                     container_enabled=container_enabled,
                     effective_routable=global_enabled and source_enabled and container_enabled,
+                    enabled_override=model_state.has_source_enable_override(source_id, model_id, cfg),
                     effective_metadata=metadata, value_source=value_source,
                     constrained_by=constrained,
                 ))
@@ -328,6 +331,8 @@ class ModelCenterControl(DomainControl):
             # every catalog row visible, but use the same eligibility as routing.
             zhipu_effective = set(selection.get("effective_models") or ()) if provider == "zhipu" else None
             scope_key = oauth_channel_key_from_account_id(account_id)
+            pause = self._oauth.backend.cooldown_state(scope_key, ACCOUNT_SCOPE) if provider == "workbuddy" else None
+            account_restricted = bool(pause and (pause.get("cooldown_until") or 0) > self._oauth.backend.now_ms())
             for outbound in selection.get("models") or ():
                 outbound = str(outbound or "").strip()
                 if not outbound:
@@ -343,10 +348,11 @@ class ModelCenterControl(DomainControl):
                     outbound_model=outbound, source_enabled=source_enabled,
                     container_enabled=container_enabled,
                     effective_routable=global_enabled and source_enabled and container_enabled
-                        and (zhipu_effective is None or outbound in zhipu_effective),
+                        and not account_restricted and (zhipu_effective is None or outbound in zhipu_effective),
+                    enabled_override=model_state.has_source_enable_override(scope_key, model_id, cfg),
                     effective_metadata=metadata, value_source=value_source,
                     constrained_by=constrained,
-                    unavailable_reason=(
+                    unavailable_reason="account_restricted" if account_restricted else (
                         "model_key_missing" if not (account.get("model_key") or account.get("project_key_id")) else
                         "entitlement_" + str(account.get("entitlement") or "unknown")
                     ) if zhipu_effective is not None and outbound not in zhipu_effective and source_enabled else None,
@@ -396,6 +402,7 @@ class ModelCenterControl(DomainControl):
                 type=source_type, id=source_id, label=row.label, provider=row.provider,
                 outbound_model=row.upstream, source_enabled=row.source_enabled,
                 container_enabled=row.enabled, effective_routable=row.available,
+                enabled_override=model_state.has_source_enable_override(row.key, row.model, cfg),
                 unavailable_reason=row.unavailable_reason or (
                     '图片模型或本来源已停用，请在模型中心启用。' if not row.available else None),
                 effective_metadata=metadata, value_source=value_source, constrained_by=constrained,
@@ -424,6 +431,7 @@ class ModelCenterControl(DomainControl):
                 type=ModelSourceType.OAUTH, id=row.key[6:], label=row.label, provider=row.provider,
                 outbound_model=row.upstream, source_enabled=row.source_enabled, container_enabled=row.enabled,
                 effective_routable=row.available, unavailable_reason=row.unavailable_reason,
+                enabled_override=model_state.has_source_enable_override(row.key, row.model, cfg),
                 effective_metadata={}, value_source={}, constrained_by={}))
         for model, (provider, sources) in videos.items():
             identity = ModelIdentity(ModelKind.VIDEO, model)
@@ -454,6 +462,7 @@ class ModelCenterControl(DomainControl):
                     "label": source.label,
                     "outbound": source.outbound_model,
                     "sourceEnabled": source.source_enabled,
+                    "enabledOverride": source.enabled_override,
                     "containerEnabled": source.container_enabled,
                     "metadata": dict(source.effective_metadata),
                     "valueSource": dict(source.value_source),
@@ -516,14 +525,7 @@ class ModelCenterControl(DomainControl):
             return True
         if item.identity.kind not in (ModelKind.CHAT, ModelKind.IMAGE):
             return False
-        enabled = item.global_enabled is True
-        source = filters.source
-        if source is not None and source.type in {ModelSourceType.OAUTH, ModelSourceType.API}:
-            match = next(
-                (row for row in item.sources if row.type is source.type and row.id == source.id),
-                None,
-            )
-            enabled = bool(match and match.source_enabled)
+        enabled = item.available_in(filters.source)
         checks = {
             ModelStatus.ENABLED: enabled, ModelStatus.DISABLED: not enabled,
             ModelStatus.VISIBLE: item.visible is True, ModelStatus.HIDDEN: item.visible is False,
@@ -657,7 +659,9 @@ class ModelCenterControl(DomainControl):
             for model_id in selected_models:
                 view = chat[model_id]
                 if scope is None:
-                    before = view.visible if target.field is ModelStateField.VISIBLE else view.global_enabled
+                    before = view.visible if target.field is ModelStateField.VISIBLE else (
+                        view.global_enabled or (not target.value and any(row.enabled_override for row in view.sources))
+                    )
                 else:
                     source_view = next(
                         (row for row in view.sources if row.type is scope.type and row.id == scope.id),
@@ -666,9 +670,12 @@ class ModelCenterControl(DomainControl):
                     if source_view is None:
                         raise self._validation("modelIds", "CROSS_SCOPE", "model is not in selected source")
                     before = source_view.source_enabled
+                unchanged = before is target.value
+                if scope is not None:
+                    unchanged = unchanged and source_view.enabled_override is target.value
                 statuses.append(ModelStateItemResult(
                     model_id=model_id,
-                    status="unchanged" if before is target.value else "updated",
+                    status="unchanged" if unchanged else "updated",
                 ))
 
             def mutate(cfg: dict[str, Any]) -> None:
@@ -700,6 +707,9 @@ class ModelCenterControl(DomainControl):
                     disabled.update(upstream_ids)
                 field = "cursor_disabled_models" if provider == "cursor" else "disabledModels"
                 account[field] = sorted(disabled)
+                model_state.set_source_enable_override_in_config(
+                    cfg, oauth_channel_key_from_account_id(scope.id), selected_models, target.value,
+                )
 
             with config.observe_reload_failures() as reload_failures:
                 config.update(mutate, skip_if_unchanged=True)

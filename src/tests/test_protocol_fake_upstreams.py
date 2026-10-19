@@ -1909,16 +1909,48 @@ async def test_anthropic_messages_stream_invalid_image_http_400_short_circuits(m
     assert m["scorer"].get_stats(route.candidates[0][0].key, "gpt-real") is None
 
 
+@pytest.mark.parametrize("fallback_path", ["/v1", "/gateway/v1", "/v1/messages"])
+async def test_native_anthropic_rate_limit_reaches_versioned_fallback(m, fallback_path):
+    _setup(m)
+    router = MockRouter()
+    primary = "https://native-primary.example"
+    fallback = "https://native-fallback.example"
+    router.register(primary, lambda req: httpx.Response(429, json={
+        "type": "error", "error": {"type": "rate_limit_error", "message": "retry later"},
+    }))
+    router.register(fallback, lambda req: _anthropic_sse_response("fallback recovered"))
+    model = "claude-opus-5-5"
+    _install_channels(m, [
+        _make_anthropic_channel(m, "native-primary", primary, alias=model, real=model),
+        _make_anthropic_channel(m, "native-fallback", fallback + fallback_path, alias=model, real=model),
+    ])
+    body = {"model": model, "stream": True, "max_tokens": 32,
+            "messages": [{"role": "user", "content": "ping"}]}
+    resp, client, route = await _call_anthropic_core(m, router, body)
+    try:
+        text = await _consume_streaming_to_string(resp)
+    finally:
+        await client.aclose()
+    assert resp.status_code == 200
+    assert "fallback recovered" in text
+    path = fallback_path if fallback_path.endswith("/messages") else fallback_path + "/messages"
+    assert [str(req.url) for req in router.requests] == [primary + "/v1/messages", fallback + path]
+    assert m["cooldown"].is_blocked(route.candidates[0][0].key, model)
+
+
 @pytest.mark.parametrize("status,error_type", [(429, "rate_limit_error"), (503, "server_error")])
+@pytest.mark.parametrize("fallback_path", ["", "/v1", "/gateway/v1"])
 async def test_anthropic_messages_stream_retryable_http_errors_still_fail_over_and_cool_down(
     m,
     status,
     error_type,
+    fallback_path,
 ):
     _setup(m)
     router = MockRouter()
     bad_base = f"https://retryable-{status}.example"
-    good_base = f"https://retryable-{status}-fallback.example"
+    good_host = f"https://retryable-{status}-fallback.example"
+    good_base = good_host + fallback_path
 
     def bad_handler(req: httpx.Request):
         return httpx.Response(status, json={
@@ -1958,7 +1990,7 @@ async def test_anthropic_messages_stream_retryable_http_errors_still_fail_over_a
     assert "retry succeeded" in text
     assert [str(req.url) for req in router.requests] == [
         f"{bad_base}/v1/responses",
-        f"{good_base}/v1/responses",
+        f"{good_host}{fallback_path or '/v1'}/responses",
     ]
     conn = m["log_db"]._get_conn()
     request_id = conn.execute(
