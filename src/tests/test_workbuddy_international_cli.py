@@ -87,6 +87,9 @@ async def cli(env, monkeypatch):
 
     monkeypatch.setattr(common.network, "sync_client", lambda **kwargs:
         httpx.Client(transport=httpx.MockTransport(wire), cookies=kwargs.get("cookies")))
+    # The real Node probe has its own test; a cold runner start can exceed its 2s budget.
+    monkeypatch.setattr(common.subprocess, "check_output", lambda *a, **k: '["v24.14.1","linux","x64"]')
+    common._workbuddy_cli_sdk_headers.cache_clear()
     ctl = OAuthControl()
     # Execute real discovery below instead of launching a UI background thread.
     monkeypatch.setattr(ctl, "_post_save_account_effects", lambda *a, **k: {})
@@ -108,6 +111,7 @@ async def cli(env, monkeypatch):
     ch = WorkBuddyOAuthChannel(saved)
     fake._install_channels(m, [ch])
     yield SimpleNamespace(m=m, ch=ch, requests=requests, ide_key=ide_key, old=old, ctl=ctl)
+    common._workbuddy_cli_sdk_headers.cache_clear()
     assert om.get_account(ide_key) == old
 
 
