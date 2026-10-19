@@ -4054,7 +4054,7 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         if summary_ok and credits_ok:
             head = "✅ Quota summary 与 Credits 均已更新"
         elif summary_ok:
-            head = "⚠️ Quota summary 已更新；Credits 未返回有效数值（部分成功）"
+            head = "✅ Quota summary 已更新"
         elif credits_ok:
             detail = _ag_quota_error_html(quota_error) if quota_error else "quota summary 无有效数据"
             head = f"⚠️ Credits 已更新；Quota summary 失败（{ui.escape_html(detail)}，部分成功）"

@@ -135,13 +135,14 @@ def test_quota_body_carries_only_known_project(monkeypatch):
     calls = []
 
     def post(url, **kwargs):
-        calls.append(kwargs)
+        calls.append({"url": url, **kwargs})
         return httpx.Response(200, json={}, request=httpx.Request("POST", url))
 
     monkeypatch.setattr(ag.network, "post_sync", post)
     ag.fetch_quota_summary_sync("token", project_id="project-a")
     ag.fetch_quota_summary_sync("token")
     assert [item["json"] for item in calls] == [{"project": "project-a"}, {}]
+    assert all(item["url"] == f"{ag.daily_api_base_url()}/{ag.API_VERSION}:retrieveUserQuotaSummary" for item in calls)
 
 
 def test_control_plane_selects_go_only_for_explicit_profile(monkeypatch):

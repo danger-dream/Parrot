@@ -1239,6 +1239,9 @@ def test_antigravity_telegram_list_and_detail_stay_within_limit(m):
     ({"antigravity": {"known": True, "available": True, "quota_groups": [
         {"display_name": "Gemini", "buckets": [{"window": "5h", "remaining_fraction": .8}]}
     ]}}, "均已更新", "部分成功"),
+    ({"antigravity": {"known": False, "tier": "g1-pro-tier", "quota_groups": [
+        {"display_name": "Gemini", "buckets": [{"window": "5h", "remaining_fraction": .8}]}
+    ]}}, "✅ Quota summary 已更新", "部分成功"),
     ({"antigravity": {"known": True, "available": True,
                        "quota_error": {"kind": "server_error", "http_status": 503}}},
      "部分成功", "均已更新"),

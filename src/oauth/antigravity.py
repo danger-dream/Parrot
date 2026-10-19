@@ -246,12 +246,27 @@ def load_code_assist_url() -> str:
     return f"{api_base_url()}/{API_VERSION}:loadCodeAssist"
 
 
-def retrieve_user_quota_url() -> str:
-    return f"{api_base_url()}/{API_VERSION}:retrieveUserQuota"
+def _quota_account(account_key: str = "", account: dict | None = None) -> dict | None:
+    if isinstance(account, dict):
+        return account
+    if not account_key:
+        return None
+    try:
+        from .. import oauth_manager
+        found = oauth_manager.get_account(account_key)
+        return found if isinstance(found, dict) else None
+    except Exception:
+        return None
 
 
-def retrieve_user_quota_summary_url() -> str:
-    return f"{api_base_url()}/{API_VERSION}:retrieveUserQuotaSummary"
+def retrieve_user_quota_url(account: dict | None = None) -> str:
+    base = effective_request_base_url(account) if isinstance(account, dict) else request_api_base_url()
+    return f"{base}/{API_VERSION}:retrieveUserQuota"
+
+
+def retrieve_user_quota_summary_url(account: dict | None = None) -> str:
+    base = effective_request_base_url(account) if isinstance(account, dict) else request_api_base_url()
+    return f"{base}/{API_VERSION}:retrieveUserQuotaSummary"
 
 
 def onboard_user_url() -> str:
@@ -984,7 +999,7 @@ def fetch_quota_summary_sync(
             ],
         }]
     resp = request_sync("POST",
-        retrieve_user_quota_summary_url(),
+        retrieve_user_quota_summary_url(_quota_account(account_key)),
         json={"project": project_id} if project_id else {},
         headers=_auth_headers(token),
         timeout=_API_HTTP_TIMEOUT,
