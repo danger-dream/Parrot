@@ -201,9 +201,15 @@ def test_correlation_is_account_scoped_retry_stable_and_request_local():
 
 def test_sdk_headers_use_verified_local_node_metadata():
     import subprocess
+    # A cold CI runner can take longer than the production 2s probe budget to
+    # load Node once; the measured probe below still runs with that budget.
     version, system, arch = json.loads(subprocess.check_output(["node", "-p",
-        "JSON.stringify([process.version,process.platform,process.arch])"], text=True, timeout=2))
-    headers = common._workbuddy_cli_sdk_headers()
+        "JSON.stringify([process.version,process.platform,process.arch])"], text=True, timeout=30))
+    common._workbuddy_cli_sdk_headers.cache_clear()
+    try:
+        headers = common._workbuddy_cli_sdk_headers()
+    finally:
+        common._workbuddy_cli_sdk_headers.cache_clear()
     assert headers["x-stainless-runtime-version"] == version
     assert headers["x-stainless-os"] == {"linux": "Linux", "darwin": "MacOS", "win32": "Windows"}[system]
     assert headers["x-stainless-arch"] == {"x64": "x64", "arm64": "arm64"}[arch]
