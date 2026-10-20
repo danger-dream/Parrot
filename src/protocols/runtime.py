@@ -318,6 +318,8 @@ class AttemptResult:
     # Captured at the Anthropic HTTP error boundary before status normalization.
     # A semantic 400 synthesized from a 5xx/SSE error must not enable this recovery.
     anthropic_thinking_history_rejected: bool = False
+    # Digests of the thinking blocks a block-attributed rejection blamed.
+    anthropic_rejected_thinking_keys: frozenset = frozenset()
 
 
 @dataclass

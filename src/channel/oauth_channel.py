@@ -112,8 +112,10 @@ class OAuthChannel(Channel):
             side_query=side_query)
         if drop_thinking_history:
             anthropic_reasoning_replay.drop_thinking_history(payload)
-        elif translator_ctx and translator_ctx.get("response_translator") == "responses_to_anthropic":
-            responses_to_anthropic.repair_tool_thinking(payload, current_input_items)
+        else:
+            anthropic_reasoning_replay.drop_known_rejected_thinking(payload, self.key)
+            if translator_ctx and translator_ctx.get("response_translator") == "responses_to_anthropic":
+                responses_to_anthropic.repair_tool_thinking(payload, current_input_items)
         signed = cc_mimicry.sign_body(payload)
         downstream_betas = body_with_model.get(cc_mimicry.PARROT_DOWNSTREAM_BETAS_KEY)
         original_model = body_with_model.get(cc_mimicry.PARROT_ORIGINAL_MODEL_KEY)

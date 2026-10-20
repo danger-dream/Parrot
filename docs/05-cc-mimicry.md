@@ -59,6 +59,13 @@ output_config, diagnostics, stream
 
 不存在的可选字段不会占位；`tool_choice`、显式 cache 等兼容字段按原有代理能力保留。
 
+### 5.4.1 下游 billing block 与 thinking 历史
+
+- 下游 system 首个 text block 以 `x-anthropic-billing-header: ` 开头时（独立 block、与正文同块或字符串形态），该行原样作为上游 `system[0]`，替换 Parrot 生成的 billing block，其余 system 内容照旧注入 messages。它的 cch 每轮变化，若随 system 进入 `messages[0]` 会让整段会话缓存前缀每轮失效。无下游 billing 时仍按 `cchMode` 生成。
+- assistant 历史中的 thinking / redacted_thinking 原样回放，不再在出站前主动删除。主动删除会让模型丢失前几轮推理、被迫重复长思考，并使上一轮缓存写入在下一轮失配。
+- 上游以 400 明确拒绝 thinking 历史时（签名无效/缺失、不可修改、前缀不匹配，以及工具续接缺首块等结构性错误），同一渠道去掉全部 thinking 重试一次（`recovery.claudeThinkingFallback`，默认开启）。
+- 签名类拒绝会把该次实际发送的 thinking block 摘要按渠道记入进程内表（24 小时、最多 2 万条）；该渠道后续请求只删除这些已被拒绝的块，新产生的 thinking 继续原样保留，避免每轮先撞一次 400。结构性拒绝只重试、不记忆。进程重启后记忆清空，最多再触发一次重试。
+
 ### 模型门控（不是账号授权目录）
 
 `cc_model_profile.py` 根据 v280 内置目录的 `max_output_tokens`、能力表及 `Jyr/vCt/L_` 的门控选默认值；不能把 Fable 抓包画像套到全部模型。模型查表会识别日期后缀及已知别名，但不重写 wire model。

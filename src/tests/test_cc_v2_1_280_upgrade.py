@@ -476,6 +476,58 @@ def test_metadata_session_and_billing_order_are_stable(dynamic_cch):
     assert [full.index(field) for field in fields] == sorted(full.index(field) for field in fields)
 
 
+def _client_billing(cch: str) -> str:
+    return f"x-anthropic-billing-header: cc_version=2.1.280.096; cc_entrypoint=cli; cch={cch};"
+
+
+@pytest.mark.parametrize("cch_mode", ["disabled", "dynamic", "static"])
+@pytest.mark.parametrize("system_shape", ["block", "inline", "string"])
+def test_downstream_billing_passes_through_system_and_keeps_messages_stable(
+    monkeypatch, cch_mode, system_shape,
+):
+    monkeypatch.setattr(
+        m, "load_config", lambda: {"cch_mode": cch_mode, "cch_static_value": "abcde"},
+    )
+    payloads = []
+    for cch in ("313fd", "56373"):
+        billing = _client_billing(cch)
+        if system_shape == "block":
+            system = [
+                {"type": "text", "text": billing},
+                {"type": "text", "text": "stable instructions", "cache_control": {"type": "ephemeral"}},
+            ]
+        elif system_shape == "inline":
+            system = [{"type": "text", "text": billing + "\n\nstable instructions"}]
+        else:
+            system = billing + "\n\nstable instructions"
+        body = _request("claude-opus-5-5", system=system)
+        payload, _ = m.transform_request(
+            body, session_id=body[m.PARROT_CC_SESSION_ID_KEY], auth_mode="oauth",
+        )
+        wire = json.loads(m.sign_body(payload))
+        assert wire["system"][0]["text"] == billing
+        assert sum(
+            str(block.get("text", "")).startswith("x-anthropic-billing-header:")
+            for block in wire["system"]
+        ) == 1
+        assert "x-anthropic-billing-header" not in json.dumps(wire["messages"])
+        assert wire["messages"][0]["content"][0]["text"] == "stable instructions"
+        payloads.append(wire)
+    first, second = payloads
+    assert first["messages"] == second["messages"]
+    assert first["system"][1:] == second["system"][1:]
+
+
+def test_without_downstream_billing_parrot_generates_its_own(dynamic_cch):
+    body = _request("claude-opus-5-5", system=[{"type": "text", "text": "stable instructions"}])
+    payload, _ = m.transform_request(
+        body, session_id=body[m.PARROT_CC_SESSION_ID_KEY], auth_mode="oauth",
+    )
+    assert _billing(payload).startswith("x-anthropic-billing-header: cc_version=2.1.282.")
+    assert "cch=00000" in _billing(payload)
+    assert payload["messages"][0]["content"][0]["text"] == "stable instructions"
+
+
 def test_cc_provider_allowlist_retains_v280_fields_but_standard_does_not():
     payload = {
         "model": "claude-fable-5", "messages": [], "max_tokens": 1,

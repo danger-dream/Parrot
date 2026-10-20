@@ -92,6 +92,10 @@ class ZhipuOAuthChannel(ApiChannel):
                 payload["output_config"] = {**(payload.get("output_config") or {}), "effort": effort}
         if source.get(anthropic_reasoning_replay.DROP_HISTORY_KEY):
             anthropic_reasoning_replay.drop_thinking_history(payload, allow_unsigned_thinking=True)
+        else:
+            anthropic_reasoning_replay.drop_known_rejected_thinking(
+                payload, self.key, allow_unsigned_thinking=True,
+            )
         session = source["_parrot_zcode_session"]
         device_id = await asyncio.to_thread(runtime.ensure_device_id, self.account_key, current)
         request_context.add_metadata(payload, device_id=device_id, session_id=session)

@@ -212,12 +212,13 @@ class ApiChannel(Channel):
 以 docs/05 的 v2.1.280 fixture-backed wire 规则为准：
 1. fingerprint 在注入 downstream `system` 之前从原始 user prompt 计算
 2. `system` 字段 → user+assistant("Understood.") 消息对注入，并保留 Parrot cache 管理
-3. system billing block（version / entrypoint / CCH / request-scoped prompt ID）
-4. `metadata.user_id` 包含稳定 device、空 account UUID、与 header 同值的 session ID
-5. 工具名混淆（映射随 `UpstreamRequest` 返回，不存 Channel 实例）
-6. CCH v280 独立 hash view 签名，不发送规范化副本
-7. 按 ordinary/Fable/Opus-5/side-query 与 auth 选择精确 beta profile
-8. 每个实际 HTTP dispatch 刷新 `x-client-request-id`，逻辑 retry 复用 body/session/prompt
+3. system billing block（version / entrypoint / CCH / request-scoped prompt ID）；下游已带 `x-anthropic-billing-header` 时原样透传到 `system[0]`，不随 system 进入 messages
+4. 签名 thinking 历史原样回放；仅上游明确拒绝时才清理（见 docs/05 §5.4.1）
+5. `metadata.user_id` 包含稳定 device、空 account UUID、与 header 同值的 session ID
+6. 工具名混淆（映射随 `UpstreamRequest` 返回，不存 Channel 实例）
+7. CCH v280 独立 hash view 签名，不发送规范化副本；透传的下游 billing block 不重签
+8. 按 ordinary/Fable/Opus-5/side-query 与 auth 选择精确 beta profile
+9. 每个实际 HTTP dispatch 刷新 `x-client-request-id`，逻辑 retry 复用 body/session/prompt
 
 官方 Anthropic API key 使用 `x-api-key`；已有第三方兼容渠道保留 Bearer 形态。目标 URL 仍由 `base_url` / `apiPath` 决定。
 

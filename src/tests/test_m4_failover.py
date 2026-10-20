@@ -920,6 +920,124 @@ async def test_invalid_thinking_history_retries_once_on_same_channel(m, model, i
     assert [item["outcome"] for item in log["retry_chain"]] == ["request_invalid", "success"]
 
 
+def _signed_turn(sig, call_id):
+    return [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "", "signature": sig},
+                {"type": "tool_use", "id": call_id, "name": "lookup", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call_id, "content": "7"}]}]
+
+
+def _sent_signatures(payload):
+    return [b.get("signature") for msg in payload["messages"] if msg["role"] == "assistant"
+            for b in msg["content"] if isinstance(b, dict) and b.get("type") == "thinking"]
+
+
+@pytest.mark.parametrize("mimicry", [False, True])
+async def test_signed_thinking_history_is_replayed_verbatim_without_rejection(m, mimicry):
+    from src.openai import anthropic_reasoning_replay as replay
+    replay.clear_rejected_history()
+    _setup(m)
+    router = MockRouter()
+    calls = []
+    model = "claude-opus-5-5"
+    channel = _make_channel(m, "chA", "https://cha", real=model, alias=model, cc_mimicry=mimicry)
+    _install_channels(m, [channel])
+    router.register("https://cha", lambda req: (calls.append(json.loads(req.content)), json_ok_response())[1])
+    messages = [{"role": "user", "content": "lookup"}, *_signed_turn("sig-old", "call_1"),
+                *_signed_turn("sig-new", "call_2")]
+    body = {"model": model, "stream": False, "max_tokens": 4096, "thinking": {"type": "adaptive"},
+            "messages": messages}
+    resp, rid, _scheduled, client = await _call_proxy(m, router, body)
+    await client.aclose()
+    assert resp.status_code == 200
+    assert len(calls) == 1
+    assert _sent_signatures(calls[0]) == ["sig-old", "sig-new"]
+    assert calls[0]["thinking"] == {"type": "adaptive"}
+
+
+@pytest.mark.parametrize("mimicry", [False, True])
+async def test_rejected_thinking_is_remembered_and_only_those_blocks_are_dropped_later(m, mimicry):
+    from src.openai import anthropic_reasoning_replay as replay
+    replay.clear_rejected_history()
+    _setup(m)
+    router = MockRouter()
+    calls = []
+    model = "claude-opus-5-5"
+    channel = _make_channel(m, "chA", "https://cha", real=model, alias=model, cc_mimicry=mimicry)
+    _install_channels(m, [channel])
+
+    def handler(req):
+        payload = json.loads(req.content)
+        calls.append(payload)
+        if "sig-foreign" in _sent_signatures(payload):
+            return httpx.Response(400, json={"type": "error", "error": {
+                "type": "invalid_request_error", "message": "Invalid signature in thinking block"}})
+        return json_ok_response()
+
+    router.register("https://cha", handler)
+    first = [{"role": "user", "content": "lookup"}, *_signed_turn("sig-foreign", "call_1")]
+    body = {"model": model, "stream": False, "max_tokens": 4096, "thinking": {"type": "adaptive"},
+            "messages": first}
+    resp, rid, _scheduled, client = await _call_proxy(m, router, body)
+    await client.aclose()
+    assert resp.status_code == 200
+    assert [_sent_signatures(c) for c in calls] == [["sig-foreign"], []]
+
+    # Next turn: the rejected block is dropped up front (no extra 400 round
+    # trip) while thinking produced after the rejection is kept verbatim.
+    calls.clear()
+    body = {**body, "messages": [*first, *_signed_turn("sig-fresh", "call_2")]}
+    resp, rid, _scheduled, client = await _call_proxy(m, router, body)
+    await client.aclose()
+    assert resp.status_code == 200
+    assert len(calls) == 1
+    assert _sent_signatures(calls[0]) == ["sig-fresh"]
+    assert calls[0]["thinking"] == {"type": "adaptive"}
+    log = m["log_db"].log_detail(rid)
+    assert [item["outcome"] for item in log["retry_chain"]] == ["success"]
+
+    # The memory is scoped to the rejecting channel.
+    other = _make_channel(m, "chB", "https://chb", real=model, alias=model, cc_mimicry=mimicry)
+    other_calls = []
+    router.register("https://chb", lambda req: (other_calls.append(json.loads(req.content)), json_ok_response())[1])
+    _install_channels(m, [other])
+    resp, rid, _scheduled, client = await _call_proxy(m, router, body)
+    await client.aclose()
+    assert resp.status_code == 200
+    assert _sent_signatures(other_calls[0]) == ["sig-foreign", "sig-fresh"]
+
+
+async def test_structural_thinking_rejection_retries_without_remembering_blocks(m):
+    from src.openai import anthropic_reasoning_replay as replay
+    replay.clear_rejected_history()
+    _setup(m)
+    router = MockRouter()
+    calls = []
+    model = "claude-opus-5-5"
+    channel = _make_channel(m, "chA", "https://cha", real=model, alias=model, cc_mimicry=True)
+    _install_channels(m, [channel])
+
+    def handler(req):
+        calls.append(json.loads(req.content))
+        if len(calls) == 1:
+            return httpx.Response(400, json={"type": "error", "error": {
+                "type": "invalid_request_error",
+                "message": "messages.3.content.0.type: Expected `thinking` or `redacted_thinking`, but found `tool_use`"}})
+        return json_ok_response()
+
+    router.register("https://cha", handler)
+    body = {"model": model, "stream": False, "max_tokens": 4096, "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "lookup"}, *_signed_turn("sig-ok", "call_1")]}
+    resp, _rid, _scheduled, client = await _call_proxy(m, router, body)
+    await client.aclose()
+    assert resp.status_code == 200 and len(calls) == 2
+    calls.clear()
+    resp, _rid, _scheduled, client = await _call_proxy(m, router, body)
+    await client.aclose()
+    assert resp.status_code == 200
+    assert _sent_signatures(calls[0]) == ["sig-ok"]
+
+
 @pytest.mark.parametrize("error_shape", ["invalid_request_error", "text", "api_error"])
 @pytest.mark.parametrize("ingress_protocol", ["responses", "anthropic"])
 @pytest.mark.parametrize("stream", [False, True])

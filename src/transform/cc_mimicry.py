@@ -292,6 +292,35 @@ def build_system_blocks(
     return blocks
 
 
+def split_downstream_billing_block(system):
+    """Split a leading client attribution from the downstream system prompt.
+
+    Returns ``(billing_block, remaining_system)``.  Only the first system text
+    block is considered, matching where Claude Code emits the attribution.
+    """
+    if isinstance(system, str):
+        rest = cache_hints.strip_leading_anthropic_billing_header(system)
+        if rest == system:
+            return None, system
+        return {"type": "text", "text": re.split(r"\r\n|\r|\n", system, maxsplit=1)[0]}, rest
+    if not isinstance(system, list) or not system:
+        return None, system
+    first = system[0]
+    if not (isinstance(first, dict) and first.get("type") == "text"
+            and isinstance(first.get("text"), str)):
+        return None, system
+    rest = cache_hints.strip_leading_anthropic_billing_header(first["text"])
+    if rest == first["text"]:
+        return None, system
+    remaining = list(system[1:])
+    if rest:
+        billing = {"type": "text", "text": re.split(r"\r\n|\r|\n", first["text"], maxsplit=1)[0]}
+        remaining.insert(0, {**first, "text": rest})
+    else:
+        billing = dict(first)
+    return billing, remaining
+
+
 def inject_user_system_to_messages(messages, user_system):
     if not user_system:
         if messages and messages[0].get("role") != "user":
@@ -556,56 +585,6 @@ def add_cache_breakpoints(messages):
                     break
 
     return messages
-
-
-_THINKING_BLOCK_TYPES = {"thinking", "redacted_thinking"}
-
-
-def _strip_assistant_thinking_blocks(messages):
-    """清理旧轮思考块，但工具续接的最新 assistant 必须原样保留。"""
-    protected = None
-    for index in range(len(messages or []) - 1, -1, -1):
-        msg = messages[index]
-        if not isinstance(msg, dict) or msg.get("role") != "assistant":
-            continue
-        blocks = msg.get("content")
-        calls = {b.get("id") for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"} if isinstance(blocks, list) else set()
-        results = {b.get("tool_use_id") for following in messages[index + 1:] if isinstance(following, dict)
-                   for b in (following.get("content") if isinstance(following.get("content"), list) else [])
-                   if isinstance(b, dict) and b.get("type") == "tool_result"}
-        if calls & results:
-            protected = index
-        break
-    result = []
-    for index, msg in enumerate(messages or []):
-        if index == protected:
-            result.append(msg)
-            continue
-        if not (isinstance(msg, dict) and msg.get("role") == "assistant"):
-            result.append(msg)
-            continue
-        content = msg.get("content")
-        if not isinstance(content, list):
-            result.append(msg)
-            continue
-        new_content = []
-        changed = False
-        for block in content:
-            if isinstance(block, dict) and block.get("type") in _THINKING_BLOCK_TYPES:
-                changed = True
-                continue
-            new_content.append(block)
-        if not changed:
-            result.append(msg)
-            continue
-        if not new_content:
-            # This turn contained only removed thinking. Do not invent ordinary
-            # assistant text; pre-existing empty messages/text remain untouched.
-            continue
-        new_msg = dict(msg)
-        new_msg["content"] = new_content
-        result.append(new_msg)
-    return result
 
 
 # ─── Metadata ──────────────────────────────────────────────────────
@@ -880,9 +859,9 @@ def transform_request(body, email="", session_id=None, *, auth_mode="api_key", s
         prompt_id = str(uuid.uuid4())
 
     import copy
-    messages = copy.deepcopy(inject_user_system_to_messages(original_messages, body.get("system")))
+    downstream_billing, user_system = split_downstream_billing_block(body.get("system"))
+    messages = copy.deepcopy(inject_user_system_to_messages(original_messages, user_system))
     messages = _normalize_messages_for_api(messages)
-    messages = _strip_assistant_thinking_blocks(messages)
     if not explicit_cache_control:
         messages = _strip_message_cache_control(messages)
     system_blocks = build_system_blocks(
@@ -891,6 +870,12 @@ def transform_request(body, email="", session_id=None, *, auth_mode="api_key", s
         fingerprint_value=fingerprint_value,
         prompt_id=prompt_id,
     )
+    if downstream_billing is not None:
+        # The client's attribution stays in system verbatim; relocated into
+        # messages[0], its per-request cch would break the cache prefix.
+        if _generated_billing_block({"system": system_blocks}) is not None:
+            system_blocks = system_blocks[1:]
+        system_blocks = [copy.deepcopy(downstream_billing), *system_blocks]
 
     tool_names = [t.get("name") for t in body.get("tools") or []
                   if isinstance(t, dict) and t.get("name") and not _is_anthropic_server_tool(t)]

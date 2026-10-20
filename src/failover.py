@@ -2528,11 +2528,15 @@ async def run_failover(
             and result.anthropic_thinking_history_rejected
         ):
             retried_without_anthropic_thinking = True
+            remembered = anthropic_reasoning_replay.remember_rejected_history(
+                ch.key, result.anthropic_rejected_thinking_keys,
+            )
             body = anthropic_reasoning_replay.retry_request(body)
             if portable_body is not None:
                 portable_body = anthropic_reasoning_replay.retry_request(portable_body)
             retry_count += 1
-            print(f"[failover] thinking history rejected for {ch.key}/{resolved_model}; retrying once without thinking history")
+            print(f"[failover] thinking history rejected for {ch.key}/{resolved_model}; retrying once without thinking history"
+                  + (f", {remembered} rejected block(s) dropped on later requests" if remembered else ""))
             continue
 
         # 请求级 guard 错误：所有 openai 候选语义一致，切也无用，直接短路 4xx
@@ -4815,6 +4819,16 @@ async def _try_channel(
                     upstream_resp.status_code, result.error_detail or "",
                 )
             )
+            if (result.anthropic_thinking_history_rejected
+                    and anthropic_reasoning_replay.is_block_rejection(
+                        upstream_resp.status_code, result.error_detail or "")):
+                try:
+                    sent = json.loads(upstream_req.body)
+                except (TypeError, ValueError):
+                    sent = None
+                result.anthropic_rejected_thinking_keys = (
+                    anthropic_reasoning_replay.thinking_block_keys(sent)
+                )
             result = _attach_retry_after_from_response(result, upstream_resp, ch)
             result.openai_oauth_html_403 = (
                 isinstance(ch, OpenAIOAuthChannel)

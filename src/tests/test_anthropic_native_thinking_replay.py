@@ -195,15 +195,23 @@ async def test_mimicry_default_adaptive_thinking_survives_missing_history():
     assert json.loads(up.body)["thinking"]["type"] == "adaptive"
 
 
-def test_mimicry_only_strips_older_thinking_not_active_tool_turn():
+@pytest.mark.parametrize("active_tool_turn", [True, False])
+def test_mimicry_replays_all_signed_thinking_verbatim(active_tool_turn):
     old = {"role": "assistant", "content": [{"type": "thinking", "thinking": "old", "signature": "old-sig"}, {"type": "text", "text": "old answer"}]}
     active = {"role": "assistant", "content": message()["content"]}
-    messages = [USER, old, USER, active, {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "7"}]}]
-    original = copy.deepcopy(messages)
-    sent = cc_mimicry._strip_assistant_thinking_blocks(messages)
-    assert sent[1]["content"] == [{"type": "text", "text": "old answer"}]
-    assert sent[3] == active
-    assert messages == original
+    tail = ({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "7"}]}
+            if active_tool_turn else {"role": "user", "content": [{"type": "text", "text": "next"}]})
+    messages = [USER, old, USER, active, tail]
+    if not active_tool_turn:
+        active = {**active, "content": active["content"][:4]}
+        messages[3] = active
+    body = {"model": "claude-opus-5-5", "messages": copy.deepcopy(messages), "stream": True}
+    payload, _ = cc_mimicry.transform_request(cc_mimicry.ensure_request_context(body), session_id="s")
+    def blocks(msg):
+        return [{k: v for k, v in b.items() if k != "cache_control"} for b in msg["content"]]
+    assistants = [m for m in payload["messages"] if m["role"] == "assistant"]
+    assert blocks(assistants[-2]) == old["content"]
+    assert blocks(assistants[-1]) == active["content"]
 
 
 def test_routing_preserves_tagged_carriers_but_openai_boundary_removes_them():
@@ -373,17 +381,74 @@ async def test_default_thinking_explicit_and_stored_histories_are_equivalent(mod
         assert replay.DROP_HISTORY_KEY not in payload
 
 
-def test_cc_omits_only_assistants_emptied_by_thinking_removal():
+def test_cc_retry_omits_only_assistants_emptied_by_thinking_removal():
     only = {"role": "assistant", "content": message()["content"][:3]}
     real = {"role": "assistant", "content": [{"type": "text", "text": "[Thinking removed]"}]}
     empty = {"role": "assistant", "content": []}
     empty_text = {"role": "assistant", "content": [{"type": "text", "text": ""}]}
     active = {"role": "assistant", "content": message()["content"]}
     result = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "7"}]}
-    messages = [USER, only, USER, real, empty, empty_text, USER, active, result]
-    original = copy.deepcopy(messages)
-    assert cc_mimicry._strip_assistant_thinking_blocks(messages) == [USER, USER, real, empty, empty_text, USER, active, result]
-    assert messages == original
+    payload = {"messages": [USER, only, USER, real, empty, empty_text, USER, active, result]}
+    original = copy.deepcopy(payload)
+    replay.drop_thinking_history(payload)
+    assert payload["messages"] == [USER, USER, real, empty, empty_text, USER,
+                                   {**active, "content": active["content"][3:]}, result]
+    assert original["messages"][7] == active
+
+
+def _tool_turn(sig, call_id):
+    return [{"role": "assistant", "content": [{"type": "thinking", "thinking": "", "signature": sig},
+                                              {"type": "tool_use", "id": call_id, "name": "lookup", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call_id, "content": "7"}]}]
+
+
+@pytest.mark.parametrize("thinking", [{"type": "adaptive"}, {"type": "enabled", "budget_tokens": 1024}])
+def test_known_rejected_drop_keeps_fresh_thinking_and_thinking_mode(thinking):
+    rejected = {"messages": [USER, *_tool_turn("sig-bad", "call_1")]}
+    assert replay.remember_rejected_history("ch", replay.thinking_block_keys(rejected)) == 1
+    payload = {"thinking": dict(thinking), "context_management": {"edits": [{"type": "clear_thinking_20251015"}]},
+               "messages": [USER, *_tool_turn("sig-bad", "call_1"), *_tool_turn("sig-fresh", "call_2")]}
+    assert replay.drop_known_rejected_thinking(payload, "ch") == 1
+    assert [b["type"] for b in payload["messages"][1]["content"]] == ["tool_use"]
+    assert payload["messages"][3]["content"][0]["signature"] == "sig-fresh"
+    # The active tool turn still starts with thinking, so manual thinking stays valid.
+    assert payload["thinking"] == thinking
+    assert "context_management" in payload
+
+
+def test_known_rejected_drop_on_active_tool_turn_omits_manual_thinking():
+    replay.remember_rejected_history("ch", replay.thinking_block_keys({"messages": [USER, *_tool_turn("sig-bad", "call_1")]}))
+    legacy = {"thinking": {"type": "enabled", "budget_tokens": 1024}, "messages": [USER, *_tool_turn("sig-bad", "call_1")]}
+    assert replay.drop_known_rejected_thinking(legacy, "ch") == 1
+    assert "thinking" not in legacy
+    adaptive = {"thinking": {"type": "adaptive"}, "messages": [USER, *_tool_turn("sig-bad", "call_1")]}
+    assert replay.drop_known_rejected_thinking(adaptive, "ch") == 1
+    assert adaptive["thinking"] == {"type": "adaptive"}
+
+
+def test_known_rejected_memory_is_channel_scoped_and_expires(monkeypatch):
+    keys = replay.thinking_block_keys({"messages": [USER, *_tool_turn("sig-bad", "call_1")]})
+    replay.remember_rejected_history("ch-a", keys)
+    untouched = {"messages": [USER, *_tool_turn("sig-bad", "call_1")]}
+    assert replay.drop_known_rejected_thinking(untouched, "ch-b") == 0
+    assert replay.drop_known_rejected_thinking(copy.deepcopy(untouched), "") == 0
+    assert untouched["messages"][1]["content"][0]["signature"] == "sig-bad"
+    now = replay.time.monotonic()
+    monkeypatch.setattr(replay.time, "monotonic", lambda: now + replay._REJECTED_TTL_S + 1)
+    assert replay.drop_known_rejected_thinking(copy.deepcopy(untouched), "ch-a") == 0
+
+
+@pytest.mark.parametrize("message,remember", [
+    ("Invalid signature in thinking block", True),
+    ("thinking blocks cannot be modified", True),
+    ("thinking prefix does not match", True),
+    ("Expected `thinking` or `redacted_thinking`, but found `tool_use`", False),
+    ("messages.1: assistant message must start with a thinking block", False),
+])
+def test_only_block_attributed_rejections_are_remembered(message, remember):
+    assert replay.is_thinking_rejection(400, message)
+    assert replay.is_block_rejection(400, message) is remember
+    assert not replay.is_block_rejection(500, message)
 
 
 @pytest.mark.parametrize("kind", ["api", "oauth"])

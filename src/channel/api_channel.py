@@ -242,8 +242,10 @@ class ApiChannel(Channel):
                         payload.pop("context_management", None)
             if drop_thinking_history:
                 anthropic_reasoning_replay.drop_thinking_history(payload)
-            elif translator_ctx and translator_ctx.get("response_translator") == "responses_to_anthropic":
-                responses_to_anthropic.repair_tool_thinking(payload, current_input_items)
+            else:
+                anthropic_reasoning_replay.drop_known_rejected_thinking(payload, self.key)
+                if translator_ctx and translator_ctx.get("response_translator") == "responses_to_anthropic":
+                    responses_to_anthropic.repair_tool_thinking(payload, current_input_items)
             signed = cc_mimicry.sign_body(payload)
             # omit_thinking 时过滤 thinking 类 beta；build_upstream_headers 内部还会
             # 再剔除 oauth-2025-04-20（messages 不带）。§7.5：复用统一 header 构造，
@@ -269,8 +271,10 @@ class ApiChannel(Channel):
                 payload.pop("thinking", None)
             if drop_thinking_history:
                 anthropic_reasoning_replay.drop_thinking_history(payload)
-            elif translator_ctx and translator_ctx.get("response_translator") == "responses_to_anthropic":
-                responses_to_anthropic.repair_tool_thinking(payload, current_input_items)
+            else:
+                anthropic_reasoning_replay.drop_known_rejected_thinking(payload, self.key)
+                if translator_ctx and translator_ctx.get("response_translator") == "responses_to_anthropic":
+                    responses_to_anthropic.repair_tool_thinking(payload, current_input_items)
             signed = standard.serialize(payload)
             headers = {
                 "Content-Type": "application/json",

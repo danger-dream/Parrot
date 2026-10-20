@@ -334,6 +334,18 @@ def _isolate_channel_generation_globals():
         reset()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_rejected_thinking_history():
+    """Remembered thinking rejections are process-wide; keep them per test."""
+    from src.openai import anthropic_reasoning_replay
+
+    anthropic_reasoning_replay.clear_rejected_history()
+    try:
+        yield
+    finally:
+        anthropic_reasoning_replay.clear_rejected_history()
+
+
 async def _traced_httpx_mock_handle(self, request):
     """Make MockTransport emulate HTTPcore's authoritative upload trace.
 
