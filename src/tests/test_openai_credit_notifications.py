@@ -239,11 +239,14 @@ def test_tg_notification_has_independent_toggle(m, account, monkeypatch):
     system_menu._show_notif(42, 100, "show")
     page = recorder.last("editMessageText")
     buttons = [button for row in page["reply_markup"]["inline_keyboard"] for button in row]
-    assert any(button["callback_data"] == "sys:notif_toggle:openai_credits_started"
-               and "套餐额度耗尽，将使用积分" in button["text"] for button in buttons)
-    system_menu._on_notif_toggle_event(42, 100, "toggle", "openai_credits_started")
+    assert [button["callback_data"] for button in buttons if "套餐额度耗尽，将使用积分" in button["text"]] == ["sys:notif_toggle:account.credits.started"]
+    toggles = [button["text"][2:] for button in buttons if button["callback_data"].startswith("sys:notif_toggle:")]
+    assert len(toggles) == len(set(toggles))
+    assert not any(button["callback_data"] == "sys:notif_toggle:openai_credits_started" for button in buttons)
+    system_menu._on_notif_toggle_event(42, 100, "toggle", "account.credits.started")
     events = m["config"].get()["notifications"]["events"]
-    assert events["openai_credits_started"] is False
+    assert events["account.credits.started"] is False
+    assert events.get("openai_credits_started", True) is True
     assert events.get("quota_disabled", True) is True
 
 from src.tests.notification_helpers import capture

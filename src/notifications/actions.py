@@ -11,11 +11,11 @@ _lock = threading.RLock()
 _active = {}
 _plans = {}
 _listeners = {}
-LABELS = {"quota": "📊 查看额度快照", "auth": "🔐 查看授权状态", "models": "📋 查看指定模型/目录", "records": "📒 查看操作记录", "event": "📋 查看当时事件",
+LABELS = {"auth": "🔐 查看授权状态", "models": "📋 查看指定模型/目录", "records": "📒 查看操作记录", "event": "📋 查看当时事件",
           "request": "📋 查看请求证据", "routes": "📋 查看筛选详情", "storage": "💾 查看存储状态", "benefits": "🎁 查看重置方式",
           "refresh_usage": "🔄 更新额度并检查", "sync_models": "🔄 重试模型同步", "refresh_token": "🔄 重试授权续期", "reauthorize": "🔐 重新授权",
           "stop_credits": "⏸ 暂停积分续用", "clear_cooldown": "🧹 清指定模型冷却"}
-READ = {"event", "view", "quota", "auth", "models", "records", "request", "routes", "storage", "benefits"}
+READ = {"event", "view", "auth", "models", "records", "request", "routes", "storage", "benefits"}
 CONFIRM = {"stop_credits", "clear_cooldown"}
 
 

@@ -285,7 +285,7 @@ def test_review_account_local_views_are_read_only(env, real_control, monkeypatch
     sample['incident_id'] = ''
     states.set_state(11, 'other-input', {'keep': True})
     text = []
-    for page in ('view', 'quota', 'auth', 'models', 'records', 'benefits', 'event'):
+    for page in ('view', 'auth', 'models', 'records', 'benefits', 'event'):
         text.append(notification_menu._details(sample, page, 11))
     assert env[0] == before
     assert states.get_state(11)['action'] == 'other-input'
@@ -351,21 +351,30 @@ def test_review_refresh_protection_rechecked_after_queue(env, real_control, monk
 def test_review_api_channel_generation_and_local_view(env, real_control, monkeypatch):
     from src.notifications import views
     from src import channel_state
+    from src.telegram.menus import channel_menu
+    opened = []
+    monkeypatch.setattr(channel_menu, 'open_detail', lambda chat, mid, name: opened.append(name) or True)
     env[0]['channels'] = [{'name': 'review-api', 'generationId': 'review-api-generation',
                            'apiKey': 'fixture-api-private', 'models': [{'alias': 'm', 'real': 'upstream-m'}]}]
     old = subjects.channel('api:review-api')
-    sample = NotificationEvent('channel.model.frozen', old, Effect('confirmed', 'model_paused'),
-        {'model': 'm', 'error_code': 'upstream'}, scope='model', scope_ref='m').record()
+    notice = NotificationEvent('channel.model.frozen', old, Effect('confirmed', 'model_paused'),
+        {'model': 'm', 'error_code': 'upstream'}, scope='model', scope_ref='m')
+    sample = notice.record()
     assert 'clear_cooldown' not in dict(actions.available(sample))
+    rows = delivered(notice, env)
     env[0]['channels'][0]['name'] = 'renamed-api'
     channel_state._install_alias('api:review-api', 'api:renamed-api')
     current = subjects.current(old)
     assert current['key'] == 'api:renamed-api'
-    text = '\n'.join(views.object_lines(sample) + views.model_lines(sample))
-    assert 'renamed-api' in text and 'fixture-api-private' not in text
+    click(rows[0], 'view')
+    assert opened == ['renamed-api']
+    assert 'fixture-api-private' not in '\n'.join(views.model_lines(sample))
     env[0]['channels'][0]['generationId'] = 'review-api-rebuilt'
     assert subjects.current(old) is None
-    assert '原对象已删除' in '\n'.join(views.object_lines(sample))
+    click(rows[1], 'view')
+    assert opened == ['renamed-api']
+    assert '原对象已删除' in '\n'.join(views.model_lines(sample))
+    assert 'fixture-api-private' not in str(env[3])
 
 
 def test_review_same_value_confirmation_is_one_shot(env, real_control):

@@ -1402,18 +1402,25 @@ def on_view(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
         ui.answer_cb(cb_id, "短码已失效")
         show(chat_id, message_id, page=page)
         return
-    ch = _get_channel(name)
-    if ch is None:
+    if _get_channel(name) is None:
         ui.answer_cb(cb_id, "渠道不存在")
         return
     ui.answer_cb(cb_id)
-    if _edit_cached_detail(
+    open_detail(chat_id, message_id, name, page)
+
+
+def open_detail(chat_id: int, message_id: int, name: str, page: int = 1) -> bool:
+    """把指定消息替换为渠道详情页（通知等外部入口复用）。"""
+    ch = _get_channel(name)
+    if ch is None or not _edit_cached_detail(
         chat_id, message_id, name, page, start_view=True,
     ):
-        try:
-            _CONTROL.schedule_provider_usage_hint(_ctx(chat_id), ch.id)
-        except ManagementError:
-            pass
+        return False
+    try:
+        _CONTROL.schedule_provider_usage_hint(_ctx(chat_id), ch.id)
+    except ManagementError:
+        pass
+    return True
 
 
 def on_usage_refresh(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:

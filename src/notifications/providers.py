@@ -9,7 +9,7 @@ class Provider:
     name: str
     scopes: tuple[tuple[str, str], ...] = ()
     identity_fields: tuple[str, ...] = ("email", "nickname", "subject", "uid")
-    capabilities: tuple[str, ...] = ("quota", "models", "auth", "records", "refresh_usage", "sync_models", "refresh_token", "reauthorize", "clear_cooldown")
+    capabilities: tuple[str, ...] = ("models", "auth", "records", "refresh_usage", "sync_models", "refresh_token", "reauthorize", "clear_cooldown")
     variant: Callable | None = None
     plan: Callable | None = None
     available: Callable | None = None
@@ -40,7 +40,7 @@ def _claude_plan(a):
 
 def _zhipu_available(a):
     # API-key accounts have no renewable OAuth credential or benefits.
-    result = {"quota", "models", "records", "refresh_usage", "sync_models", "clear_cooldown"}
+    result = {"models", "records", "refresh_usage", "sync_models", "clear_cooldown"}
     if a.get("credential_mode") == "oauth":
         result |= {"benefits", "reauthorize", "zhipu_use", "zhipu_claim"}
         if not (a.get("model_key") or a.get("project_key_id")) and a.get("organization_id") and a.get("project_id"):
@@ -49,7 +49,7 @@ def _zhipu_available(a):
 
 
 def _workbuddy_available(a):
-    result = {"quota", "models", "auth", "records", "refresh_usage", "sync_models", "reauthorize", "benefits", "clear_cooldown"}
+    result = {"models", "auth", "records", "refresh_usage", "sync_models", "reauthorize", "benefits", "clear_cooldown"}
     if os.environ.get("PARROT_NO_REFRESH") != "1":
         result.add("refresh_token")
     if a.get("realm", "cn") == "cn" and a.get("disabled_reason") in {None, "", "quota"} and (a.get("enabled", True) or a.get("disabled_reason") == "quota"):

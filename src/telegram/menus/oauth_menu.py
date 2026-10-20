@@ -3827,16 +3827,22 @@ def _edit_cached_detail(
     return True
 
 
+def open_detail(chat_id: int, message_id: int, account_key: str,
+                page: int = 1, filter_key: str = _FILTER_ALL) -> bool:
+    """把指定消息替换为账户详情页（通知等外部入口复用）。"""
+    return _edit_cached_detail(
+        chat_id, message_id, account_key, page, filter_key, refresh_quota=False,
+        start_view=True,
+    )
+
+
 def on_view(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     ak = _account_key_from_short(short)
     if ak is None or oauth_control.account_snapshot(ak) is None:
         ui.answer_cb(cb_id, "账户已不存在，请返回重试")
         return
     ui.answer_cb(cb_id)
-    _edit_cached_detail(
-        chat_id, message_id, ak, page, filter_key, refresh_quota=False,
-        start_view=True,
-    )
+    open_detail(chat_id, message_id, ak, page, filter_key)
 
 
 # ─── 刷新 Token ──────────────────────────────────────────────────

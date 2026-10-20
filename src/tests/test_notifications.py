@@ -42,7 +42,11 @@ def callback(row, data, actor=None):
             "message": {"chat": {"id": row["chat_id"]}, "message_id": row["message_id"]}}
 
 
-def test_vertical_delivery_view_close_per_recipient(env):
+def test_vertical_delivery_view_close_per_recipient(env, monkeypatch):
+    from src import oauth_ids
+    from src.telegram.menus import oauth_menu
+    opened = []
+    monkeypatch.setattr(oauth_menu, "open_detail", lambda chat, mid, key: opened.append((chat, mid, key)) or True)
     cfg, db, queue, calls = env
     assert emit(event())
     assert len(queue) == 2
@@ -56,11 +60,17 @@ def test_vertical_delivery_view_close_per_recipient(env):
     assert "Team" in send["text"] and "oauth:" not in send["text"]
     data = send["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
     notification_menu.handle_callback(callback(rows[0], data))
-    assert store.get("deliveries", rows[0]["id"])["panel_id"]
-    close = next("nt:v1:" + k for k,r in store.items("refs").items() if r["delivery_id"] == rows[0]["id"] and r["action"] == "close")
-    notification_menu.handle_callback(callback(rows[0], close))
-    assert store.get("deliveries", rows[0]["id"])["state"] == "closed"
-    assert store.get("deliveries", rows[1]["id"])["state"] == "sent"
+    assert opened == [(rows[0]["chat_id"], rows[0]["message_id"], oauth_ids.account_key(cfg["oauthAccounts"][0]))]
+    viewed = store.get("deliveries", rows[0]["id"])
+    assert viewed["message_owner"] == "management" and not viewed.get("panel_id")
+    deletes = lambda: [p for m, p in calls if m == "deleteMessage"]
+    # The notification became the account page: auto-delete/close must not remove it.
+    assert delivery.close(rows[0]["id"]) and not deletes()
+    assert store.get("deliveries", rows[0]["id"])["state"] == "sent"
+    close = next("nt:v1:" + k for k,r in store.items("refs").items() if r["delivery_id"] == rows[1]["id"] and r["action"] == "close")
+    notification_menu.handle_callback(callback(rows[1], close))
+    assert store.get("deliveries", rows[1]["id"])["state"] == "closed"
+    assert [p["message_id"] for p in deletes()] == [rows[1]["message_id"]]
     assert cfg["oauthAccounts"][0]["enabled"] is True
 
 
@@ -275,24 +285,42 @@ def test_restart_and_expired_confirmation_never_execute(env, controlled, monkeyp
     assert store.get('policy', 'operation:lost')['status'] == 'unknown'
 
 
-def test_local_view_precise_current_details_preserves_input(env):
+def test_view_opens_oauth_account_detail_and_preserves_input(env, monkeypatch):
     from src.telegram import states
+    from src.telegram.menus import oauth_menu
+    rendered = []
+    monkeypatch.setattr(oauth_menu, "_edit_cached_detail", lambda *args, **kwargs: rendered.append((args, kwargs)) or True)
     emit(event())
     delivery.deliver(env[2][0])
     row = store.get('deliveries', env[2][0])
     data = next('nt:v1:'+key for key, v in store.items('refs').items() if v['action'] == 'view')
     states.set_state(11, 'unrelated_input', {'keep': 'original'})
     before = copy.deepcopy(states.get_state(11))
-    notification_menu.handle_callback(callback(row, data))
-    panels = [p for m, p in env[3] if m == 'editMessageText']
-    assert '当前精确对象管理详情' in panels[-1]['text']
-    assert '调用开关：启用' in panels[-1]['text'] and 'Team' in panels[-1]['text']
-    assert states.get_state(11) == before
     sends = [p for m,p in env[3] if m == 'sendMessage']
     assert sends[0]['reply_markup']['inline_keyboard'][0][0]['text'] == '👤 查看账户'
     notification_menu.handle_callback(callback(row, data))
+    key = event().subject.exact_id
+    assert rendered == [((row['chat_id'], row['message_id'], key, 1, oauth_menu._FILTER_ALL), {'refresh_quota': False, 'start_view': True})]
+    assert states.get_state(11) == before
+    notification_menu.handle_callback(callback(row, data))
+    notification_menu.handle_callback(callback(row, store.action_ref(row['id'], 'quota')))
+    assert len(rendered) == 3 and rendered[1] == rendered[2] == rendered[0]
     assert len([p for m,p in env[3] if m == 'sendMessage']) == len(sends)
     states.clear_all()
+
+
+def test_view_of_deleted_account_keeps_event_history_panel(env, monkeypatch):
+    from src.telegram.menus import oauth_menu
+    monkeypatch.setattr(oauth_menu, "open_detail", lambda *args: pytest.fail('deleted account must not open a same-name page'))
+    emit(event())
+    delivery.deliver(env[2][0])
+    row = store.get('deliveries', env[2][0])
+    data = next('nt:v1:'+key for key, v in store.items('refs').items() if v['action'] == 'view')
+    env[0]['oauthAccounts'][0]['generationId'] = 'nt-g2'
+    notification_menu.handle_callback(callback(row, data))
+    current = store.get('deliveries', row['id'])
+    assert current['panel_id'] and current.get('message_owner') is None
+    assert '原账户已删除' in [p for m, p in env[3] if m == 'editMessageText'][-1]['text']
 
 
 def test_real_operation_ledger_not_notification_list(env, controlled):

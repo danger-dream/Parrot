@@ -150,6 +150,8 @@ def close(delivery_id) -> str | None:
         return "未取得消息编号，无法确认删除。"
     if row.get("state") == "closed":
         return None
+    if row.get("message_owner") == "management":
+        return "此消息已转为管理详情页，未删除。"
     result = request("deleteMessage", {"chat_id": row["chat_id"], "message_id": row["message_id"]})
     if result and result.get("ok"):
         store.update_delivery(delivery_id, state="closed")

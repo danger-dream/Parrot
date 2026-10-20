@@ -123,7 +123,7 @@ def test_actual_disk_restart_dedup_receipts_refs_and_confirmation(env, controlle
     delivery.deliver(first)
     store.update_delivery(second, state='sending')
     row = store.get('deliveries', first)
-    ref = next('nt:v1:'+k for k,v in store.items('refs').items() if v['action']=='view')
+    ref = next('nt:v1:'+k for k,v in store.items('refs').items() if v['action']=='more')
     paths = dict(db._paths)
     db.close()
     restarted = StateStore(paths['runtime'], paths['durable']); restarted.start()
@@ -211,9 +211,11 @@ def test_api_channel_exact_view_and_stale_generation(env):
     assert subjects.current(subjects.channel(subject.generation)) is None
 
 
-def test_routing_exact_candidate_navigation_alias_and_input_preserved(env, controlled):
-    from src.notifications import views
+def test_routing_exact_candidate_navigation_alias_and_input_preserved(env, controlled, monkeypatch):
     from src.telegram import states
+    from src.telegram.menus import channel_menu
+    opened = []
+    monkeypatch.setattr(channel_menu, 'open_detail', lambda chat, mid, name: opened.append((chat, mid, name)) or True)
     cfg=env[0]
     cfg['channels']=[{'name':'Route API','generationId':'nt-route-api','models':[{'alias':'m','real':'upstream'}]}]
     sample=scene('routing.unavailable')
@@ -226,10 +228,11 @@ def test_routing_exact_candidate_navigation_alias_and_input_preserved(env, contr
         markup=[p for m,p in env[3] if m=='editMessageText'][-1]['reply_markup']
         button=markup['inline_keyboard'][0][0]
         assert 'Route API' in button['text']
-        row['message_id']=store.get('deliveries',row['id'])['panel_id']
+        panel=store.get('deliveries',row['id'])['panel_id']
+        row['message_id']=panel
         notification_menu.handle_callback(callback(row,button['callback_data']))
-        text=[p for m,p in env[3] if m=='editMessageText'][-1]['text']
-        assert 'Route API' in text and '当前精确对象管理详情' in text
+        assert opened==[(row['chat_id'],panel,'Route API')]
+        assert store.get('deliveries',row['id'])['panel_owner']=='management'
         assert states.get_state(11)['data']=={'value':'keep'}
     finally:
         states.clear_all()
@@ -348,7 +351,7 @@ def test_shared_task_returns_terminal_receipt_to_each_actor(env, controlled):
 
 def test_panel_edit_unknown_not_reported_opened(env):
     emit(event());delivery.deliver(env[2][0]);row=store.get('deliveries',env[2][0])
-    ref=store.action_ref(row['id'],'view')
+    ref=store.action_ref(row['id'],'event')
     delivery.install(lambda method,payload: {'ok':True,'result':{'message_id':700}} if method=='sendMessage' else None,recover=False)
     notification_menu.handle_callback(callback(row,ref))
     latest=store.get('deliveries',row['id'])

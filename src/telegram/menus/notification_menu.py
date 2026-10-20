@@ -60,7 +60,7 @@ def _validate(cb):
     if ref.get("message_id") and ref["message_id"] not in {row.get("message_id"), row.get("panel_id")}:
         raise ValueError("详情面板已更新，请从原通知重新打开")
     if ref.get("message_id") == row.get("panel_id") and row.get("panel_owner", "notification") != "notification":
-        raise ValueError("此面板已转交登录流程，请从原通知重新打开")
+        raise ValueError("此面板已转交登录流程或管理详情页，请从原通知重新打开")
     event = store.get("events", row["event_id"])
     if not event:
         raise ValueError("事件记录已过期")
@@ -101,6 +101,26 @@ def _panel(row, event, text, choices=(), *, force_new=False, _recreate=True):
     return True
 
 
+def _hand_off(cb, row, event):
+    """Replace the clicked notification/panel with the real management detail page."""
+    target = subjects.current(event["subject"])
+    if not target or not target.get("account"):
+        return False
+    mid = (cb.get("message") or {}).get("message_id")
+    if event["subject"]["kind"] == "account":
+        from . import oauth_menu
+        opened = oauth_menu.open_detail(row["chat_id"], mid, target["key"])
+    else:
+        from . import channel_menu
+        opened = channel_menu.open_detail(row["chat_id"], mid, str(target["account"].get("name") or ""))
+    if not opened:
+        return False
+    # The message now carries management buttons: later panels must not edit it,
+    # and auto-delete must not remove the page the admin is reading.
+    store.update_delivery(row["id"], **{"panel_owner" if mid == row.get("panel_id") else "message_owner": "management"})
+    return True
+
+
 def _details(event, page, actor=None):
     from ...notifications import views
     target = subjects.current(event["subject"])
@@ -110,7 +130,9 @@ def _details(event, page, actor=None):
         a = target["account"]
         status += "；账号" + ("启用" if a.get("enabled", True) and not a.get("disabled_reason") else "仍暂停")
     if page == "view" and target and target.get("account"):
-        return "\n".join(views.object_lines(event)) + "\n\n" + "历史通知：" + content.text(CATALOG[event["event_type"]].title) + "\n" + content.text(status)
+        s = event["subject"]
+        return "\n".join([f'<b>{content.text(s["service"])} · {content.text(CATALOG[event["event_type"]].title)}</b>',
+                          *content.identity(s), "当前状态：" + content.text(status)])
     if page == "models":
         return "\n".join(views.model_lines(event))
     if page == "records":
@@ -128,14 +150,6 @@ def _details(event, page, actor=None):
         extra = []
         if page == "auth":
             extra = ["当前到期：" + content.text(a.get("expired") or "未取得")]
-        elif page == "quota":
-            from ...notifications.providers import quota_metrics
-            from ... import oauth_manager
-            usage = oauth_manager.usage_from_quota_row(state_db.quota_load(target["key"]) or {})
-            from ...notifications.providers import REGISTRY
-            provider = REGISTRY.get(event["subject"]["provider"])
-            metrics = provider.facts(usage) if provider and provider.facts else quota_metrics(usage)
-            extra = content.fact_lines({"metrics": metrics}, detail=True) or ["未取得已知额度数值；未发起网络查询。"]
         elif page == "benefits":
             extra = ["仅查看本地快照；查询/使用权益需要明确发起操作并按现有控制层确认。"]
             from ...notifications.providers import REGISTRY
@@ -251,6 +265,9 @@ def handle_callback(cb):
                 if not value or value[0] < time.time():
                     raise ValueError("权益查询页面已过期，请重新查询")
                 _benefit_panel(row, event, value[1], value[2], int(ref["payload"].get("page", 0)))
+            # "quota" refs remain on notifications sent before the snapshot page was removed.
+            elif action in {"view", "quota"} and _hand_off(cb, row, event):
+                pass
             elif action in actions.READ:
                 if action != "view" and action not in dict(actions.available(event)):
                     raise ValueError("此对象/能力已不可用")

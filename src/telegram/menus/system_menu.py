@@ -1380,8 +1380,10 @@ def _on_quota_threshold_input(chat_id: int, text: str) -> None:
 # ─── 通知设置 ────────────────────────────────────────────────────
 
 # 事件 key → 显示名（顺序即菜单按钮顺序）
-from ...notifications.catalog import CATALOG as _NOTIFICATION_CATALOG, public_key as _notification_public_key, enabled as _notification_enabled, LEGACY_LABELS
-_NOTIF_EVENTS = [(key, spec.title) for key, spec in _NOTIFICATION_CATALOG.items()] + list(LEGACY_LABELS.items())
+from ...notifications.catalog import CATALOG as _NOTIFICATION_CATALOG, public_key as _notification_public_key, enabled as _notification_enabled, LEGACY_SYSTEM
+# Pre-catalog keys stay in config only as fallbacks for unset events; listing them
+# would duplicate titles and toggle several events at once.
+_NOTIF_EVENTS = [(key, spec.title) for key, spec in _NOTIFICATION_CATALOG.items()] + list(LEGACY_SYSTEM.items())
 
 
 def _show_notif(chat_id: int, message_id: int, cb_id: str) -> None:

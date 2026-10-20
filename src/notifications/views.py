@@ -1,44 +1,7 @@
 """Exact local management details. No upstream refresh and no legacy chat-state mutation."""
 from . import subjects, content, actions, store
-from .providers import REGISTRY, quota_metrics
+from .providers import REGISTRY
 from .catalog import CATALOG
-
-
-def object_lines(event):
-    from .. import state_db, oauth_manager, cooldown
-    target = subjects.current(event["subject"])
-    if target is None:
-        return ["原对象已删除或世代已改变；不会定位同名新对象。"]
-    a = target.get("account")
-    if a is None:
-        return []
-    subject = subjects.account(a) if event["subject"]["kind"] == "account" else subjects.channel(target["key"])
-    lines = ["<b>当前精确对象管理详情（本地快照）</b>", *content.identity(subject.__dict__)]
-    enabled = a.get("enabled", True)
-    lines += ["调用开关：" + ("启用" if enabled else "暂停"),
-              "暂停原因：" + content.text(a.get("disabled_reason") or "无"),
-              "并发上限：" + content.text(a.get("maxConcurrent", a.get("max_concurrent", "使用服务默认"))),
-              "凭据：" + ("已配置" if any(a.get(k) for k in ("access_token", "model_key", "project_key_id", "apiKey", "api_key")) else "未取得配置状态")]
-    if a.get("disabled_until"):
-        lines.append("上游重置/暂停截止：" + content.text(a["disabled_until"]))
-    if a.get("expired"):
-        lines.append("授权到期：" + content.text(a["expired"]))
-    if event["subject"]["kind"] == "account":
-        selection = oauth_manager.account_model_selection(a)
-        models = list(selection.get("models") or [])
-        effective = list(selection.get("effective_models") or [])
-        lines.append(f"模型目录：{len(models)}；按当前模型开关可路由：{len(effective)}（不保证上游可用）")
-        if a.get("provider") == "openai":
-            lines.append("允许积分续用：" + ("是" if a.get("allowCredits") is True else "否"))
-        row = state_db.quota_load(target["key"]) or {}
-        usage = oauth_manager.usage_from_quota_row(row)
-        lines += content.fact_lines({"metrics": quota_metrics(usage)}, detail=True)[:4]
-        if not row:
-            lines.append("额度快照：尚未取得；查看未发起网络查询。")
-    else:
-        lines += ["协议：" + content.text(a.get("type", a.get("protocol", "未取得"))),
-                  "已配置模型：" + content.text(" / ".join(str(m) for m in a.get("models", [])), 600)]
-    return lines
 
 
 def records(event, actor):

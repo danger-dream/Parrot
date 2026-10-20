@@ -86,7 +86,7 @@ def protocol(env, monkeypatch):
         yield peer
 
 
-@pytest.mark.parametrize('action', ['view', 'quota', 'more'])
+@pytest.mark.parametrize('action', ['event', 'records', 'more'])
 def test_existing_panel_fields_round_trip_real_json(env, protocol, action):
     row = delivered(event(), env)[0]
     click(row, action)
@@ -102,7 +102,7 @@ def test_existing_panel_fields_round_trip_real_json(env, protocol, action):
 def test_rejected_update_is_diagnosable_without_payload_or_bot_token(env, protocol, capsys):
     row = delivered(event(), env)[0]
     protocol.reject['editMessageText'] = {'ok': False, 'error_code': 400, 'description': 'Bad Request: BUTTON_DATA_INVALID'}
-    click(row, 'view')
+    click(row, 'event')
     assert store.get('deliveries', row['id'])['panel_state'] == 'failed'
     output = capsys.readouterr().out
     records = [json.loads(line.split('[tg-notification] ', 1)[1]) for line in output.splitlines() if '[tg-notification] ' in line]
@@ -137,12 +137,12 @@ def test_error_echo_cannot_leak_credentials_into_diagnostics(env, protocol, caps
     assert 'description_sha256' in output
 
 
-@pytest.mark.parametrize('action', ['view', 'quota', 'more'])
+@pytest.mark.parametrize('action', ['event', 'records', 'more'])
 def test_missing_existing_panel_recreated_once_and_old_refs_fail_closed(env, protocol, action):
     from src.telegram import bot
     from src.tests.test_notifications import callback
     row = delivered(event(), env)[0]
-    click(row, 'view')
+    click(row, 'event')
     old_mid = store.get('deliveries', row['id'])['panel_id']
     old_ref = next('nt:v1:' + k for k, r in store.items('refs').items() if r['message_id'] == old_mid)
     del protocol.messages[(row['chat_id'], old_mid)]
@@ -219,7 +219,7 @@ def test_ack_precedes_panel_io_and_never_claims_success(env, protocol):
     (400, "Bad Request: can't parse entities"), (403, 'Forbidden: bot was blocked by the user'),
     (429, 'Too Many Requests: retry after 1'), (None, None)])
 def test_other_rejections_and_unknown_never_recreate_or_retry_panel(env, protocol, monkeypatch, code, description):
-    row = delivered(event(), env)[0]; click(row, 'view')
+    row = delivered(event(), env)[0]; click(row, 'event')
     mid = store.get('deliveries', row['id'])['panel_id']
     original = ui.notification_api
     attempts = []
@@ -230,7 +230,7 @@ def test_other_rejections_and_unknown_never_recreate_or_retry_panel(env, protoco
         return original(method, payload)
     delivery.install(fault, recover=False)
     before = len(protocol.calls)
-    click(row, 'quota')
+    click(row, 'records')
     current = store.get('deliveries', row['id'])
     assert current['panel_id'] == mid and current['panel_state'] == ('unknown' if code is None else 'failed')
     assert len(attempts) == 1
@@ -240,7 +240,7 @@ def test_other_rejections_and_unknown_never_recreate_or_retry_panel(env, protoco
 
 
 def test_uneditable_existing_panel_is_replaced_once_only(env, protocol):
-    row = delivered(event(), env)[0]; click(row, 'view')
+    row = delivered(event(), env)[0]; click(row, 'event')
     old = store.get('deliveries', row['id'])['panel_id']
     original = ui.notification_api
     attempts = []
@@ -250,7 +250,7 @@ def test_uneditable_existing_panel_is_replaced_once_only(env, protocol):
             return {'ok': False, 'error_code': 400, 'description': "Bad Request: message can't be edited"}
         return original(method, payload)
     delivery.install(fault, recover=False)
-    click(row, 'quota')
+    click(row, 'records')
     current = store.get('deliveries', row['id'])
     assert current['panel_state'] == 'sent' and current['panel_id'] != old and len(attempts) == 1
     assert (row['chat_id'], old) in protocol.messages  # never delete the old message
@@ -258,7 +258,7 @@ def test_uneditable_existing_panel_is_replaced_once_only(env, protocol):
 
 @pytest.mark.parametrize('unknown', [False, True])
 def test_rebuild_send_failure_retains_failure_and_never_retries(env, protocol, unknown):
-    row = delivered(event(), env)[0]; click(row, 'view')
+    row = delivered(event(), env)[0]; click(row, 'event')
     old = store.get('deliveries', row['id'])['panel_id']
     del protocol.messages[(row['chat_id'], old)]
     original = ui.notification_api
@@ -269,10 +269,10 @@ def test_rebuild_send_failure_retains_failure_and_never_retries(env, protocol, u
             return None if unknown else {'ok': False, 'error_code': 403}
         return original(method, payload)
     delivery.install(fault, recover=False)
-    click(row, 'view')
+    click(row, 'event')
     current = store.get('deliveries', row['id'])
     assert current['panel_id'] is None and current['panel_state'] == ('unknown' if unknown else 'failed')
-    assert sum('当前精确对象管理详情' in p['text'] for p in attempts) == 1
+    assert sum('额度达到暂停条件' in p['text'] for p in attempts) == 1
     assert (row['chat_id'], row['message_id']) in protocol.messages
 
 
@@ -363,7 +363,7 @@ def test_ack_does_not_wait_for_another_callback_panel_lock(env, protocol):
     from src.telegram import bot
     from src.tests.test_notifications import callback
     row = delivered(event(), env)[0]
-    ref = store.action_ref(row['id'], 'view')
+    ref = store.action_ref(row['id'], 'event')
     ack = threading.Event()
     original = ui.notification_api
     def observed(method, payload):
