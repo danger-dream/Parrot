@@ -48,10 +48,30 @@ def read_version(repo):
     return match[1]
 
 
-def validate_notes(notes, old, new):
+def previous_release(github, new):
+    """Highest public release below ``new``; GitHub compares generated notes against it."""
+    if not VERSION_RE.fullmatch(new):
+        raise ReleaseError("candidate", f"Invalid release version: {new}")
+    target, earlier, page, releases = tuple(map(int, new.split("."))), [], 0, None
+    while releases is None or len(releases) == 100:
+        page += 1
+        try:
+            releases = github.request(f"releases?per_page=100&page={page}") or []
+        except ReleaseError as exc:
+            raise ReleaseError("candidate", f"Cannot list published releases: {exc}", details=exc.details) from exc
+        tags = [str(item.get("tag_name") or "") for item in releases if not item.get("draft") and not item.get("prerelease")]
+        versions = [tuple(map(int, tag[1:].split("."))) for tag in tags if tag.startswith("v") and VERSION_RE.fullmatch(tag[1:])]
+        earlier += [value for value in versions if value < target]
+    if not earlier:
+        raise ReleaseError("candidate", "No published release precedes this version")
+    return ".".join(map(str, max(earlier)))
+
+
+def validate_notes(notes, old, new, *, base=None):
     if not VERSION_RE.fullmatch(new) or tuple(map(int, new.split('.'))) <= tuple(map(int, old.split('.'))):
         raise ReleaseError("candidate", f"Version must advance from {old}: {new}")
-    if len(notes.splitlines()) < 5 or f"v{old}" not in notes or f"v{new}" not in notes:
+    base = base or old
+    if len(notes.splitlines()) < 5 or f"v{base}" not in notes or f"v{new}" not in notes:
         raise ReleaseError("candidate", "Notes must explain user value, version span, and grouped changes")
     if "Full Changelog" in notes:
         raise ReleaseError("candidate", "Do not handwrite Full Changelog; GitHub generates it")

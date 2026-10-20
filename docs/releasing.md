@@ -18,7 +18,7 @@
 
 使用实际线上解释器、已经安装的运行和测试依赖、Git及GitHub token。token只通过 `GH_TOKEN` 或 `GITHUB_TOKEN` 环境变量传入，不写入状态文件、命令行或提交。本机token需具有仓库推送、workflow和Actions恢复权限；GHCR上传与演练清理由Actions使用仓库自身的包权限执行，不要求扩大本机token的权限。
 
-说明文件开头讲清用户价值，写明旧版本到新版本跨度，按新功能/优化修复/质量分组。不要手写Full Changelog，由GitHub生成。
+说明文件开头讲清用户价值，写明旧版本到新版本跨度，按新功能/优化修复/质量分组。旧版本取 GitHub 上最近一个已公开的正式 Release（跳过草稿、预发布和未发布的本地版本号），与 GitHub 自动生成的对比链接一致。不要手写Full Changelog，由GitHub生成。
 
 ```bash
 ./venv/bin/python scripts/release.py start 0.34.6 \

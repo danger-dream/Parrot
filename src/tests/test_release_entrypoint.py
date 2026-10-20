@@ -99,6 +99,22 @@ def test_notes_and_repository_contract():
         r.validate_notes(NOTES + "Full Changelog", "0.34.4", "0.34.5")
 
 
+def test_notes_span_starts_at_previous_published_release():
+    gh = FakeGitHub()
+    pages = {1: [{"tag_name": f"v0.33.{n}"} for n in range(100)],
+             2: [{"tag_name": "v0.34.12"}, {"tag_name": "v0.34.13", "draft": True},
+                 {"tag_name": "v0.34.13-rc1"}, {"tag_name": "v0.34.15"}, {"tag_name": "v0.34.11"}]}
+    gh.request = lambda path, **kw: pages[int(path.rsplit("=", 1)[1])]
+    assert r.previous_release(gh, "0.34.14") == "0.34.12"
+    notes = NOTES.replace("v0.34.4", "v0.34.12").replace("v0.34.5", "v0.34.14")
+    r.validate_notes(notes, "0.34.13", "0.34.14", base="0.34.12")
+    with pytest.raises(r.ReleaseError):
+        r.validate_notes(notes, "0.34.14", "0.34.14", base="0.34.12")
+    gh.request = lambda path, **kw: []
+    with pytest.raises(r.ReleaseError, match="No published release"):
+        r.previous_release(gh, "0.34.14")
+
+
 def test_atomic_state_does_not_store_credentials(runner):
     runner.save()
     path = runner.directory / "state.json"

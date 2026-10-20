@@ -15,6 +15,7 @@ import uuid
 def main(argv=None, *, api):
     ReleaseError, ReleaseRun, GitHub = api.ReleaseError, api.ReleaseRun, api.GitHub
     release_workers, read_version, validate_notes = api.release_workers, api.read_version, api.validate_notes
+    previous_release = api.previous_release
     github_repository, write_json = api.github_repository, api.write_json
     ci_info, ci_verify, ci_record, ci_publish = api.ci_info, api.ci_verify, api.ci_record, api.ci_publish
     CANDIDATE_PREFIX, SHA_RE = api.CANDIDATE_PREFIX, api.SHA_RE
@@ -92,12 +93,16 @@ def main(argv=None, *, api):
                 is_rehearsal = args.command == "rehearse"
                 notes = "" if is_rehearsal else Path(args.notes).read_text().rstrip() + "\n"
                 version = old if is_rehearsal else args.version
+                repository = github_repository(subprocess.check_output(["git", "remote", "get-url", "origin"], cwd=repo, text=True))
                 if not is_rehearsal:
-                    validate_notes(notes, old, version)
+                    # A bumped but unpublished local version is not the span GitHub links to.
+                    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+                    base = previous_release(GitHub(repository, token), version)
+                    validate_notes(notes, old, version, base=base)
+                    old = base
                 if args.workers < 1 or args.timeout < 1:
                     raise ReleaseError("candidate", "Worker count and timeout must be positive")
                 run_id = f'{"rehearsal" if is_rehearsal else version}-{uuid.uuid4().hex[:12]}'
-                repository = github_repository(subprocess.check_output(["git", "remote", "get-url", "origin"], cwd=repo, text=True))
                 python = args.python or str(repo / "venv/bin/python")
                 if not Path(python).is_file():raise ReleaseError("candidate", "Use the actual online Python interpreter via --python")
                 health_url = getattr(args, "health_url", None)
