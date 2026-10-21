@@ -84,6 +84,7 @@ getMediaLog
 getModel
 getModelChannelOrder
 getModelMetadata
+getModelRegistry
 getModelStats
 getNetworkMonitor
 getNetworkSettings
@@ -164,6 +165,7 @@ probeChannelDraft
 probeExistingChannel
 putCompressionModel
 putIngressDefaultModel
+putModelDefaultEffort
 putModelMapping
 putModelMetadataBinding
 refreshAllOAuthUsage
@@ -183,6 +185,7 @@ reorderOAuthAccounts
 replaceApiKeySecret
 replaceChannelOrder
 replaceModelChannelOrder
+replaceModelRegistryRules
 resetApiKeyLimiter
 resetOAuthQuota
 revokeCurrentManagementSession

@@ -160,7 +160,7 @@ def compare(cfg, *, rules=(), extra_names: Iterable[str] = ()) -> Comparison:
     return result
 
 
-def _source_label(source: str, cfg) -> str:
+def source_label(source: str, cfg) -> str:
     if source.startswith("api:"):
         return source
     provider = source.split(":")[1] if source.count(":") >= 1 else source
@@ -177,7 +177,7 @@ def _source_label(source: str, cfg) -> str:
 def render(result: Comparison, cfg, *, live=None, title: str = "影子运行差异报告", notes: Iterable[str] = ()) -> str:
     reg = result.registry
     live = live or offer_live
-    label = lambda source: _source_label(source, cfg)
+    label = lambda source: source_label(source, cfg)
     lines = [f"# 统一模型管理：{title}", ""]
     notes = list(notes)
     if notes:
@@ -235,7 +235,7 @@ def render(result: Comparison, cfg, *, live=None, title: str = "影子运行差�
 
     lines += ["## 3. 待确认", ""]
     lines += [f"- {label(p.offer.source)} `{p.offer.wire}`（暂按 `{model}`）：{p.reason}" for model, p in pending] or ["无。"]
-    lines += ["", "## 4. 合并建议", ""] + ([f"- {item}" for item in reg.suggestions] or ["无。"])
+    lines += ["", "## 4. 合并建议", ""] + ([f"- {item.text}" for item in reg.suggestions] or ["无。"])
     lines += ["", "## 5. 别名冲突", ""] + ([f"- {item}" for item in reg.conflicts] or ["无。"])
     lines += ["", "## 6. 多来源或多写法的模型", "", "| 模型 | 显示名 | 来源 → 上游 ID |", "|---|---|---|"]
     for model in sorted(multi, key=lambda m: m.id):

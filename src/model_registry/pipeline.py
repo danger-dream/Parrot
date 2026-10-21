@@ -24,6 +24,17 @@ class Placement:
     spelling: str
     status: str          # auto | product | pending | manual
     reason: str = ""
+    options: tuple[str, ...] = ()   # pending only: the names the evidence points at
+
+
+@dataclass(frozen=True)
+class Suggestion:
+    """A possible merge the evidence cannot settle alone; ``key`` stays stable for dismissal."""
+    key: str
+    model: str
+    into: str
+    text: str
+    pin: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -48,7 +59,8 @@ class Registry:
     models: dict[str, Model]
     aliases: dict[str, tuple[str, Mapping[str, str]]] = field(default_factory=dict)
     conflicts: list[str] = field(default_factory=list)
-    suggestions: list[str] = field(default_factory=list)
+    suggestions: list[Suggestion] = field(default_factory=list)
+    catalog_names: Mapping[str, str] = field(default_factory=dict)
 
     def lookup(self, name: str) -> tuple[str, Mapping[str, str]] | None:
         if name in self.models:
@@ -91,7 +103,8 @@ def place(offer: Offer, catalog: CatalogIndex) -> Placement:
     split = bool(in_id and in_name and not in_id & in_name)
     if offer.basis == "name":
         if split:
-            return _pending(offer, f"ID `{offer.wire}` 是目录里的 {id_base}，显示名 “{offer.name}” 却是 {name_base}")
+            return _pending(offer, f"ID `{offer.wire}` 是目录里的 {id_base}，显示名 “{offer.name}” 却是 {name_base}",
+                            (name_base, id_base))
         return Placement(offer, by_name, name_base, "auto")
     if in_id and not in_name:
         return Placement(offer, by_id, id_base, "auto", "ID 在目录中")
@@ -99,10 +112,11 @@ def place(offer: Offer, catalog: CatalogIndex) -> Placement:
         return Placement(offer, by_name, name_base, "auto", "显示名在目录中")
     if in_id and in_name and not split:
         return Placement(offer, by_id, id_base, "auto")
-    return _pending(offer, f"ID `{offer.wire}` 与显示名 “{offer.name}” 不一致，目录也无法判断")
+    return _pending(offer, f"ID `{offer.wire}` 与显示名 “{offer.name}” 不一致，目录也无法判断",
+                    (name_base, id_base))
 
 
-def _pending(offer: Offer, reason: str) -> Placement:
+def _pending(offer: Offer, reason: str, options: tuple[str, ...] = ()) -> Placement:
     if offer.legacy:
         current = offer.legacy
     elif offer.basis == "name":
@@ -111,7 +125,8 @@ def _pending(offer: Offer, reason: str) -> Placement:
         current = f"{offer.provider}-{slug(offer.wire)}"
     else:
         current = offer.wire
-    return Placement(offer, compare_key(current), fold(current), "pending", reason)
+    return Placement(offer, compare_key(current), fold(current), "pending", reason,
+                     tuple(dict.fromkeys(item for item in options if item and compare_key(item) != compare_key(current))))
 
 
 def _same_source_duplicates(placements: list[Placement]) -> list[Placement]:
@@ -134,7 +149,7 @@ def _same_source_duplicates(placements: list[Placement]) -> list[Placement]:
             p = placements[i]
             if p.offer.wire not in named:
                 others = "、".join(f"`{wire}`" for wire in sorted(wires - {p.offer.wire}))
-                result[i] = _pending(p.offer, f"同一来源的 {others} 也叫 “{p.offer.name}”")
+                result[i] = _pending(p.offer, f"同一来源的 {others} 也叫 “{p.offer.name}”", (p.spelling,))
     return result
 
 
@@ -197,7 +212,7 @@ def build(offers: Iterable[Offer], *, rules: Iterable[Mapping[str, Any]] = (),
     groups: dict[str, list[Placement]] = defaultdict(list)
     for placement in placements:
         groups[placement.key].append(placement)
-    registry = Registry(models={})
+    registry = Registry(models={}, catalog_names=catalog.names)
     for key, members in groups.items():
         model_id = _spelling(key, members, known_ids)
         kind = "product" if any(p.status == "product" for p in members) else "vendor"
@@ -248,11 +263,11 @@ def _suggest(registry: Registry, catalog: CatalogIndex) -> None:
     keys = {compare_key(model_id): model_id for model_id in registry.models}
     seen: set[frozenset[str]] = set()
 
-    def hint(first: str, second: str, text: str) -> None:
-        pair = frozenset((first, second))
+    def hint(model: str, into: str, text: str, pin: Mapping[str, str] | None = None) -> None:
+        pair = frozenset((model, into))
         if pair not in seen:
             seen.add(pair)
-            registry.suggestions.append(text)
+            registry.suggestions.append(Suggestion(f"{model}>{into}", model, into, text, dict(pin or {})))
 
     for model in sorted(registry.models.values(), key=lambda item: item.id):
         dated = re.match(r"^(.*)-(20\d{6})$", model.id)
@@ -268,4 +283,5 @@ def _suggest(registry: Registry, catalog: CatalogIndex) -> None:
             example = next(ref for ref in model.catalog
                            if compare_key(_DATE_TAIL.sub("", display_traits(catalog.names.get(ref, ""))[0])) == base)
             hint(model.id, other, f"`{model.id}` 在目录中名为 “{catalog.names[example]}”（{count}/{len(model.catalog)} 条一致），"
-                                  f"可能与 `{other}` 是同一模型")
+                                  f"可能与 `{other}` 是同一模型",
+                 {"catalog": example, "name": catalog.names[example]})

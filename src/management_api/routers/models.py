@@ -43,6 +43,16 @@ from ..schemas.models import (
     ModelStateEnvelope,
     ModelStateItemData,
     ModelStateRequest,
+    ModelDefaultEffortRequest,
+    ModelRegistryData,
+    ModelRegistryEnvelope,
+    ModelRegistryRevisionData,
+    ModelRegistryRevisionEnvelope,
+    ModelRegistryRulesRequest,
+    RegistryPendingData,
+    RegistryPinData,
+    RegistryRuleData,
+    RegistrySuggestionData,
 )
 from ._strict_query import reject_unknown_query_parameters
 
@@ -246,6 +256,97 @@ def set_model_state(
         ),
         meta=_meta(request),
     )
+
+
+def _rule_data(rule) -> RegistryRuleData:
+    pin = rule.get("pin")
+    pin_data = RegistryPinData(catalog=pin["catalog"], name=pin.get("name") or "") if pin else None
+    if rule["type"] == "merge":
+        return RegistryRuleData(type="merge", model=rule["from"], into=rule["into"], pin=pin_data)
+    return RegistryRuleData(type="assign", model=rule["model"], source=rule["source"],
+                            upstreamModel=rule["wire"], pin=pin_data)
+
+
+def _stored_rule(rule: RegistryRuleData) -> dict:
+    stored = ({"type": "merge", "from": rule.model, "into": rule.into} if rule.type == "merge"
+              else {"type": "assign", "source": rule.source, "wire": rule.upstreamModel, "model": rule.model})
+    if rule.pin is not None:
+        stored["pin"] = {"catalog": rule.pin.catalog, "name": rule.pin.name}
+    return stored
+
+
+@router.get(
+    "/models/registry",
+    operation_id="getModelRegistry",
+    response_model=ModelRegistryEnvelope,
+    responses={**_success(200, {"enabled": True, "revision": "rev_example", "pending": [], "suggestions": [],
+                                "conflicts": [], "rules": [], "dismissed": [], "defaultEfforts": {}}),
+               **management_error_responses(*_COMMON_ERRORS)},
+)
+def get_model_registry(
+    request: Request,
+    context: ReadContext,
+    control: Annotated[ModelCenterControl, Depends(get_model_control)],
+) -> ModelRegistryEnvelope:
+    reject_unknown_query_parameters(request)
+    overview, revision = control.registry_overview(context)
+    return ModelRegistryEnvelope(
+        data=ModelRegistryData(
+            enabled=overview.enabled,
+            revision=revision,
+            pending=[RegistryPendingData(source=item.source, upstreamModel=item.wire, name=item.name,
+                                         modelId=item.model, reason=item.reason, options=list(item.options))
+                     for item in overview.pending],
+            suggestions=[RegistrySuggestionData(
+                key=item.key, modelId=item.model, intoModelId=item.into, text=item.text,
+                pin=RegistryPinData(**item.pin) if item.pin else None) for item in overview.suggestions],
+            conflicts=list(overview.conflicts),
+            rules=[_rule_data(rule) for rule in overview.rules],
+            dismissed=list(overview.dismissed),
+            defaultEfforts=dict(overview.defaults),
+        ),
+        meta=_meta(request),
+    )
+
+
+@router.put(
+    "/models/registry/rules",
+    operation_id="replaceModelRegistryRules",
+    response_model=ModelRegistryRevisionEnvelope,
+    responses={**_success(200, {"revision": "rev_example"}), **management_error_responses(*_MUTATION_ERRORS)},
+)
+def replace_model_registry_rules(
+    body: ModelRegistryRulesRequest,
+    request: Request,
+    context: WriteContext,
+    control: Annotated[ModelCenterControl, Depends(get_model_control)],
+    if_match: IfMatch = None,
+) -> ModelRegistryRevisionEnvelope:
+    reject_unknown_query_parameters(request)
+    revision = control.replace_registry_rules(
+        context, rules=[_stored_rule(rule) for rule in body.rules], dismissed=list(body.dismissed),
+        expected_revision=if_match,
+    )
+    return ModelRegistryRevisionEnvelope(data=ModelRegistryRevisionData(revision=revision), meta=_meta(request))
+
+
+@router.put(
+    "/models/registry/models/{model_id}/default-effort",
+    operation_id="putModelDefaultEffort",
+    response_model=ModelRegistryRevisionEnvelope,
+    responses={**_success(200, {"revision": "rev_example"}), **management_error_responses(*_MUTATION_ERRORS)},
+)
+def put_model_default_effort(
+    model_id: Annotated[str, Path(min_length=1, max_length=300)],
+    body: ModelDefaultEffortRequest,
+    request: Request,
+    context: WriteContext,
+    control: Annotated[ModelCenterControl, Depends(get_model_control)],
+    if_match: IfMatch = None,
+) -> ModelRegistryRevisionEnvelope:
+    reject_unknown_query_parameters(request)
+    revision = control.set_default_effort(context, model_id=model_id, effort=body.effort, expected_revision=if_match)
+    return ModelRegistryRevisionEnvelope(data=ModelRegistryRevisionData(revision=revision), meta=_meta(request))
 
 
 @router.get(

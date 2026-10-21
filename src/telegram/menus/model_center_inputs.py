@@ -32,6 +32,10 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
             menu._alias_drafts.pop(chat_id, None)
         ui.send(chat_id, "已取消，本次输入未应用。", reply_markup=inline_kb([[ui.btn("返回", data.get("cancel_callback") or "mc:list")]]))
         return True
+    if action == "mc_registry_name":
+        from .model_center_registry import handle_name_input
+        handle_name_input(chat_id, data, raw)
+        return True
     if action == "mc_query":
         s.text = "" if raw == "-" else raw
         s.page = 1

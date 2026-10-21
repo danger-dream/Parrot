@@ -115,7 +115,8 @@ for _recovery, _opening in {
     CATALOG[_recovery] = replace(CATALOG[_recovery], recovery_from=_opening)
 
 # Retained system events are deliberately not routed through the new core.
-LEGACY_SYSTEM = {"status_alert": "上游官网状态", "app_update": "应用更新", "network_monitor": "网络健康"}
+LEGACY_SYSTEM = {"status_alert": "上游官网状态", "app_update": "应用更新", "network_monitor": "网络健康",
+                 "model_registry": "模型命名变化"}
 LEGACY_LABELS = {}
 for spec in CATALOG.values():
     if spec.legacy:

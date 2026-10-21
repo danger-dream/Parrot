@@ -1,0 +1,174 @@
+"""Unified naming administration: management API and the Telegram model-center page."""
+from __future__ import annotations
+
+import pytest
+
+from src import config, state_db
+from src.channel import registry
+from src.model_registry import runtime as model_registry
+from src.model_registry.offers import Offer
+from src.telegram import ui
+from src.telegram.menus import model_center_menu as menu
+from src.tests.test_management_mapping_support import domain_client  # noqa: F401  (fixture)
+
+BASE = "/api/management/v1/models/registry"
+
+
+def _api(name, models):
+    return {"name": name, "type": "api", "enabled": True, "protocol": "openai-chat",
+            "baseUrl": "https://upstream.invalid", "apiKey": "isolated-test",
+            "models": [{"real": model, "alias": model} for model in models]}
+
+
+@pytest.fixture
+def enabled(domain_client, request):  # noqa: F811
+    from src.openai.channel.registration import register_factories
+    state_db.init()
+    request.addfinalizer(state_db.close)
+    register_factories()
+
+    def seed(cfg):
+        cfg["channels"] = [_api("Official", ["MiniMax-M2.7"]), _api("Reseller", ["minimax-m2.7", "glm-5.3"])]
+        cfg["modelRegistry"] = {"enabled": True}
+        cfg.setdefault("modelCenter", {})["disabledModels"] = ["minimax-m2.7"]
+    config.update(seed)
+    registry.rebuild_from_config()
+    yield domain_client
+    config.update(lambda cfg: cfg.update(modelRegistry={"enabled": False}))
+    registry.rebuild_from_config()
+
+
+def test_registry_api_reads_and_writes_rules_under_revision(enabled):
+    client, _runtime, admin, read_only, denied = enabled
+    assert client.get(BASE, headers=denied).status_code == 403
+    read = client.get(BASE, headers=read_only)
+    assert read.status_code == 200, read.text
+    data = read.json()["data"]
+    assert (data["enabled"], data["rules"], data["defaultEfforts"]) == (True, [], {})
+    body = {"rules": [{"type": "merge", "model": "MiniMax-M2.7", "into": "minimax-m2.7-legacy"}]}
+    assert client.put(BASE + "/rules", headers=read_only, json=body).status_code == 403
+    missing = client.put(BASE + "/rules", headers=admin, json=body)
+    assert missing.json()["error"]["code"] == "CONFIRMATION_REQUIRED"
+    stale = client.put(BASE + "/rules", headers={**admin, "If-Match": "rev_stale"}, json=body)
+    assert stale.json()["error"]["code"] == "REVISION_CONFLICT"
+    bad = client.put(BASE + "/rules", headers={**admin, "If-Match": data["revision"]},
+                     json={"rules": [{"type": "merge", "model": "x"}]})
+    assert bad.status_code == 422
+    saved = client.put(BASE + "/rules", headers={**admin, "If-Match": data["revision"]}, json=body)
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["data"]["revision"] != data["revision"]
+    after = client.get(BASE, headers=admin).json()["data"]
+    assert after["rules"] == [{"type": "merge", "model": "minimax-m2.7", "into": "minimax-m2.7-legacy",
+                               "source": None, "upstreamModel": None, "pin": None}]
+    assert after["revision"] == saved.json()["data"]["revision"]
+    # A rename keeps the model's global switch.
+    assert config.get()["modelCenter"]["disabledModels"] == ["minimax-m2.7-legacy"]
+
+
+def test_default_effort_api_validates_model_and_level(enabled):
+    client, _runtime, admin, _read_only, _denied = enabled
+    revision = client.get(BASE, headers=admin).json()["data"]["revision"]
+    url = BASE + "/models/{}/default-effort"
+    assert client.put(url.format("glm-5.3"), headers={**admin, "If-Match": revision},
+                      json={"effort": "huge"}).status_code == 422
+    unknown = client.put(url.format("no-such-model"), headers={**admin, "If-Match": revision}, json={"effort": "low"})
+    assert unknown.status_code == 404
+    saved = client.put(url.format("glm-5.3"), headers={**admin, "If-Match": revision}, json={"effort": "low"})
+    assert saved.status_code == 200, saved.text
+    assert client.get(BASE, headers=admin).json()["data"]["defaultEfforts"] == {"glm-5.3": "low"}
+    cleared = client.put(url.format("glm-5.3"), headers={**admin, "If-Match": saved.json()["data"]["revision"]},
+                         json={"effort": None})
+    assert cleared.status_code == 200
+    assert client.get(BASE, headers=admin).json()["data"]["defaultEfforts"] == {}
+
+
+def test_registry_writes_are_refused_while_the_registry_is_off(domain_client):  # noqa: F811
+    client, _runtime, admin, _read_only, _denied = domain_client
+    data = client.get(BASE, headers=admin).json()["data"]
+    assert data["enabled"] is False
+    refused = client.put(BASE + "/rules", headers={**admin, "If-Match": data["revision"]}, json={"rules": []})
+    assert refused.json()["error"]["code"] == "UNSUPPORTED_VALUE"
+
+
+def _buttons(keyboard):
+    return [button for row in keyboard["inline_keyboard"] for button in row]
+
+
+def _press(text_part, keyboard):
+    button = next(item for item in _buttons(keyboard) if text_part in item["text"])
+    calls.clear()
+    assert menu.handle_callback(42, 100, "cb", button["callback_data"])
+    edit = next(data for method, data in calls if method == "editMessageText")
+    return edit["text"], edit["reply_markup"]
+
+
+calls: list = []
+
+
+def test_telegram_page_settles_a_pending_id_with_an_assign_rule(enabled, monkeypatch):
+    _client, runtime, _admin, _read_only, _denied = enabled
+    monkeypatch.setattr(menu, "_CONTROL", runtime.control_owner().models)
+    monkeypatch.setattr(ui, "is_admin", lambda chat_id: int(chat_id) == 42)
+    monkeypatch.setattr(ui, "api", lambda method, data=None: calls.append((method, dict(data or {}))) or {
+        "ok": True, "result": {"message_id": 100}})
+    monkeypatch.setattr(model_registry, "collect", lambda cfg: [
+        Offer("oauth:wb", "workbuddy", "hy3", "Hy3", basis="name"),
+        Offer("oauth:wb", "workbuddy", "hy3-x", "Hy3", basis="name")])
+    registry.rebuild_from_config()
+    menu.reset_for_tests()
+    text, keyboard = menu.render(42)
+    entry = next(item for item in _buttons(keyboard) if "统一命名" in item["text"])
+    assert entry["text"].endswith("（待处理 1）")
+    text, keyboard = _press("统一命名", keyboard)
+    assert "hy3-x" in text and "workbuddy-hy3-x" in text
+    text, keyboard = _press("待确认 1", keyboard)
+    assert {"归入 hy3", "保持 workbuddy-hy3-x", "自定义名称"} <= {item["text"] for item in _buttons(keyboard)}
+    text, keyboard = _press("归入 hy3", keyboard)
+    assert config.get()["modelRegistry"]["rules"] == [
+        {"type": "assign", "source": "oauth:wb", "wire": "hy3-x", "model": "hy3"}]
+    registry.rebuild_from_config()
+    hy3 = model_registry.current().models["hy3"]
+    assert sorted(offer.wire for offer in hy3.offers) == ["hy3", "hy3-x"] and not hy3.pending
+    text, keyboard = menu.render(42)
+    assert next(item for item in _buttons(keyboard) if "统一命名" in item["text"])["text"] == "🧩 统一命名"
+
+
+def test_telegram_detail_page_sets_a_models_default_effort(enabled, monkeypatch):
+    from src.telegram.menus import model_center_catalog as catalog
+    _client, runtime, _admin, _read_only, _denied = enabled
+    monkeypatch.setattr(menu, "_CONTROL", runtime.control_owner().models)
+    monkeypatch.setattr(ui, "is_admin", lambda chat_id: int(chat_id) == 42)
+    monkeypatch.setattr(ui, "api", lambda method, data=None: calls.append((method, dict(data or {}))) or {
+        "ok": True, "result": {"message_id": 100}})
+    monkeypatch.setattr(model_registry, "collect", lambda cfg: [
+        Offer("api:Reseller", "api", "glm-5.3", "glm-5.3", efforts=("low", "high", "max"))])
+    registry.rebuild_from_config()
+    menu.reset_for_tests()
+    view = next(item for item in menu._CONTROL.list_models(menu._ctx(42)).items if item.model_id == "glm-5.3")
+    _text, keyboard = catalog._detail_render(42, view.resource_key)
+    text, keyboard = _press("默认强度：跟随全局（high）", keyboard)
+    assert {"low", "high", "max"} <= {item["text"] for item in _buttons(keyboard)}
+    text, keyboard = _press("low", keyboard)
+    assert config.get()["modelRegistry"]["models"]["glm-5.3"] == {"defaultEffort": "low"}
+    assert "✓ low" in {item["text"] for item in _buttons(keyboard)}
+
+
+def test_telegram_page_decides_one_upstream_id_for_every_account_of_a_provider(enabled, monkeypatch):
+    _client, runtime, _admin, _read_only, _denied = enabled
+    monkeypatch.setattr(menu, "_CONTROL", runtime.control_owner().models)
+    monkeypatch.setattr(ui, "is_admin", lambda chat_id: int(chat_id) == 42)
+    monkeypatch.setattr(ui, "api", lambda method, data=None: calls.append((method, dict(data or {}))) or {
+        "ok": True, "result": {"message_id": 100}})
+    monkeypatch.setattr(model_registry, "collect", lambda cfg: [
+        Offer(source, "workbuddy", wire, "Hy3", basis="name")
+        for source in ("oauth:wb-a", "oauth:wb-b") for wire in ("hy3", "hy3-x")])
+    registry.rebuild_from_config()
+    menu.reset_for_tests()
+    _text, keyboard = menu.render(42)
+    text, keyboard = _press("统一命名", keyboard)
+    assert "<b>待确认 1</b>" in text and "workbuddy（2 个账号）" in text
+    text, keyboard = _press("待确认 1", keyboard)
+    _press("保持 workbuddy-hy3-x", keyboard)
+    assert config.get()["modelRegistry"]["rules"] == [
+        {"type": "assign", "source": source, "wire": "hy3-x", "model": "workbuddy-hy3-x"}
+        for source in ("oauth:wb-a", "oauth:wb-b")]

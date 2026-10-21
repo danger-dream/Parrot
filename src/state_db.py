@@ -934,6 +934,11 @@ def status_muted_cleanup(live_ids_by_provider:dict[str,set[str]])->int:
     return _mut("status_muted_incidents",op,strict=True)
 
 
+# The last published model grouping, compared on each rebuild to report drift.
+def model_registry_snapshot_load() -> dict | None:
+    return _get("model_registry", "snapshot")
+def model_registry_snapshot_save(row: dict) -> None:
+    _mut("model_registry", lambda data: data.__setitem__("snapshot", row), strict=True)
 def qoder_refresh_load(key: str):
     return _get("qoder_refresh", key)
 

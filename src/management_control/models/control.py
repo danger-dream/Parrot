@@ -742,6 +742,69 @@ class ModelCenterControl(DomainControl):
         self._audit(actual, "model_center.state.update", target_name, "succeeded")
         return ModelStateResult(tuple(statuses), new_revision)
 
+    def registry_overview(self, context: ManagementContext | None) -> tuple[model_registry.Overview, str]:
+        """Unified naming: pending ids, merge suggestions, manual rules and per-model default effort."""
+        self._read(context)
+        cfg = config.get()
+        return model_registry.overview(cfg), stable_revision(model_registry.admin_revision(cfg))
+
+    def replace_registry_rules(
+        self,
+        context: ManagementContext | None,
+        *,
+        rules: list[Mapping[str, Any]],
+        dismissed: list[str],
+        expected_revision: str | None,
+    ) -> str:
+        actual = self._write(context)
+        try:
+            clean = model_registry.normalize_rules(rules)
+        except ValueError as exc:
+            raise self._validation(str(exc), "INVALID_RULE", "rule type or field is missing or malformed") from None
+        return self._registry_write(
+            actual, expected_revision, "model_center.registry.rules",
+            lambda cfg: model_registry.write_rules(cfg, clean, dismissed),
+        )
+
+    def set_default_effort(
+        self,
+        context: ManagementContext | None,
+        *,
+        model_id: str,
+        effort: str | None,
+        expected_revision: str | None,
+    ) -> str:
+        actual = self._write(context)
+        registry = model_registry.current()
+        if registry is None or model_id not in registry.models:
+            raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+        from src.model_registry.names import EFFORTS
+        if effort is not None and effort not in EFFORTS:
+            raise self._validation("effort", "UNSUPPORTED_EFFORT", "effort must be one of " + ", ".join(EFFORTS))
+        return self._registry_write(
+            actual, expected_revision, "model_center.registry.default_effort",
+            lambda cfg: model_registry.write_default_effort(cfg, model_id, effort),
+        )
+
+    def _registry_write(self, actual: ManagementContext, expected_revision: str | None, action: str, mutate) -> str:
+        with config.serialized_updates():
+            cfg = config.get()
+            if not model_registry.enabled(cfg):
+                raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE, "统一模型名未开启")
+            self._check_revision(expected_revision, stable_revision(model_registry.admin_revision(cfg)), required=True)
+            with config.observe_reload_failures() as reload_failures:
+                config.update(mutate, skip_if_unchanged=True)
+        if reload_failures:
+            self._audit(actual, action, "registry", "saved_reload_unconfirmed")
+            message = "配置已保存，运行时重载未确认；请刷新状态，勿重放旧操作"
+            raise ManagementError(
+                ManagementErrorCode.DEPENDENCY_UNAVAILABLE, message,
+                fields=(ErrorField(path="runtime", code="SAVED_RELOAD_UNCONFIRMED", message=message),),
+                retryable=False,
+            )
+        self._audit(actual, action, "registry", "succeeded")
+        return stable_revision(model_registry.admin_revision())
+
     def start_upstream_sync(
         self,
         context: ManagementContext | None,

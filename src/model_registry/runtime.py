@@ -64,6 +64,74 @@ def rebuild(cfg: Mapping[str, Any] | None = None) -> None:
         (offer.source, offer.wire): model.id for model in registry.models.values() for offer in model.offers}
     with _lock:
         _registry, _owners = registry, owners
+    if registry is not None:
+        _report_drift(registry, cfg)
+
+
+# ─── drift ──────────────────────────────────────────────────────────────────
+
+def _snapshot(registry: Registry, cfg: Mapping[str, Any]) -> dict:
+    placements, pending, manual = {}, [], []
+    for model in registry.models.values():
+        for placement in model.placements:
+            key = f"{placement.offer.source}|{placement.offer.wire}"
+            placements[key] = model.id
+            if placement.status == "pending":
+                pending.append(key)
+            elif placement.status == "manual":
+                manual.append(key)
+    stale = []
+    for rule in settings(cfg).get("rules") or ():
+        pin = rule.get("pin") if isinstance(rule, Mapping) else None
+        if isinstance(pin, Mapping) and pin.get("catalog"):
+            now = registry.catalog_names.get(pin["catalog"], "")
+            if now != pin.get("name"):
+                stale.append(f"{rule.get('from')}>{rule.get('into')}|{now}")
+    return {"placements": placements, "pending": sorted(pending), "manual": sorted(manual),
+            "stalePins": sorted(stale)}
+
+
+def drift_lines(previous: Mapping[str, Any], current: Mapping[str, Any], label=lambda source: source) -> list[str]:
+    """What an admin must look at: a known id moving model, a new pending id, a manual rule losing its evidence."""
+    lines = []
+    before = previous.get("placements") or {}
+    # A rule an admin added or removed moves ids on purpose.
+    ruled = set(previous.get("manual") or ()) | set(current.get("manual") or ())
+    for key, model_id in sorted(current["placements"].items()):
+        old = before.get(key)
+        if old and old != model_id and key not in ruled:
+            source, wire = key.split("|", 1)
+            lines.append(f"{label(source)} 的 {wire} 从 {old} 改归 {model_id}")
+    for key in sorted(set(current["pending"]) - set(previous.get("pending") or ())):
+        source, wire = key.split("|", 1)
+        lines.append(f"新的待确认：{label(source)} 的 {wire}")
+    for item in sorted(set(current["stalePins"]) - set(previous.get("stalePins") or ())):
+        pair, _, now = item.partition("|")
+        source, _, target = pair.partition(">")
+        lines.append(f"人工合并 {source} → {target} 的依据变了：目录里现在叫 “{now or '已下架'}”")
+    return lines
+
+
+def _report_drift(registry: Registry, cfg: Mapping[str, Any]) -> None:
+    from .. import notifier, state_db
+    from .report import source_label
+    current = _snapshot(registry, cfg)
+    try:
+        previous = state_db.model_registry_snapshot_load()
+        if previous == current:
+            return
+        state_db.model_registry_snapshot_save(current)
+    except Exception as exc:
+        print(f"[model-registry] drift snapshot unavailable: {type(exc).__name__}: {exc}")
+        return
+    if previous is None:
+        return
+    lines = drift_lines(previous, current, lambda source: source_label(source, cfg))
+    if not lines:
+        return
+    shown = lines[:12] + ([f"……另有 {len(lines) - 12} 条"] if len(lines) > 12 else [])
+    notifier.notify_event("model_registry", "🧩 <b>模型命名变化</b>\n\n" + "\n".join(
+        "• " + notifier.escape_html(line) for line in shown) + "\n\n在模型中心「统一命名」里处理。")
 
 
 def current() -> Registry | None:
@@ -182,7 +250,7 @@ def plan(name: str, body: Mapping[str, Any], ingress: str, api_key: str | None) 
     switches = Switches.read()
     model_settings = (settings().get("models") or {}).get(found.model) or {}
     default = (model_settings.get("defaultEffort") if isinstance(model_settings, Mapping) else None) \
-        or reasoning.derived or settings().get("defaultEffort") or DEFAULT_EFFORT
+        or reasoning.derived or global_default_effort()
     choices = choose(registry, found,
                      lambda offer: switches.usable(offer, found.model) and auth.channel_allowed(api_key, offer.source),
                      effort=reasoning.effort, thinking=reasoning.thinking, default_effort=default)
@@ -301,6 +369,10 @@ def visible_models(api_key: str | None, families: set[str] | None = None) -> lis
                 for offer in model.offers))
 
 
+def global_default_effort(cfg: Mapping[str, Any] | None = None) -> str:
+    return settings(cfg).get("defaultEffort") or DEFAULT_EFFORT
+
+
 def same_model(name: str, keys: Iterable[str]) -> str | None:
     """The first of ``keys`` naming the same model as ``name`` (per-model settings keyed by any spelling)."""
     registry = _registry
@@ -320,6 +392,123 @@ def listed(name: str, api_key: str | None) -> bool:
     registry = _registry
     found = resolve(registry, name) if registry else None
     return found is not None and found.model in visible_models(api_key)
+
+
+# ─── administration ──────────────────────────────────────────────────
+
+RULE_FIELDS = {"merge": ("from", "into"), "assign": ("source", "wire", "model")}
+SWITCH_LISTS = ("disabledModels", "hiddenModels")
+
+
+@dataclass(frozen=True)
+class PendingItem:
+    source: str
+    provider: str
+    wire: str
+    name: str
+    model: str
+    reason: str
+    options: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Overview:
+    enabled: bool
+    pending: tuple[PendingItem, ...]
+    suggestions: tuple
+    conflicts: tuple[str, ...]
+    rules: tuple[Mapping[str, Any], ...]
+    dismissed: tuple[str, ...]
+    defaults: Mapping[str, str]
+
+
+def overview(cfg: Mapping[str, Any] | None = None) -> Overview:
+    root = settings(cfg)
+    registry = _registry
+    dismissed = tuple(str(item) for item in root.get("dismissed") or ())
+    defaults = {model_id: item["defaultEffort"] for model_id, item in (root.get("models") or {}).items()
+                if isinstance(item, Mapping) and item.get("defaultEffort")}
+    if registry is None or not enabled(cfg):
+        return Overview(enabled(cfg), (), (), (), tuple(root.get("rules") or ()), dismissed, defaults)
+    pending = tuple(
+        PendingItem(p.offer.source, p.offer.provider, p.offer.wire, p.offer.name, model.id, p.reason, p.options)
+        for model in sorted(registry.models.values(), key=lambda item: item.id) for p in model.pending)
+    suggestions = tuple(item for item in registry.suggestions if item.key not in dismissed)
+    return Overview(True, pending, suggestions, tuple(registry.conflicts),
+                    tuple(root.get("rules") or ()), dismissed, defaults)
+
+
+def normalize_rules(rules: Iterable[Mapping[str, Any]]) -> list[dict]:
+    """Rules as stored; raises ValueError naming the first malformed rule."""
+    result: list[dict] = []
+    for index, rule in enumerate(rules or ()):
+        kind = rule.get("type") if isinstance(rule, Mapping) else None
+        if kind not in RULE_FIELDS:
+            raise ValueError(f"rules[{index}].type")
+        clean = {"type": kind}
+        for name in RULE_FIELDS[kind]:
+            value = str(rule.get(name) or "").strip()
+            if not value or len(value) > 300:
+                raise ValueError(f"rules[{index}].{name}")
+            clean[name] = value
+        if kind == "merge" and compare_key(clean["from"]) == compare_key(clean["into"]):
+            raise ValueError(f"rules[{index}].into")
+        pin = rule.get("pin")
+        if isinstance(pin, Mapping) and pin.get("catalog"):
+            clean["pin"] = {"catalog": str(pin["catalog"]), "name": str(pin.get("name") or "")}
+        if clean not in result:
+            result.append(clean)
+    return result
+
+
+def write_rules(cfg: dict, rules: list[dict], dismissed: Iterable[str]) -> None:
+    """Store rules; a merge into a name no model has yet is a rename and takes the old model's switches."""
+    root = cfg.setdefault("modelRegistry", {})
+    registry = _registry
+    previous = list(root.get("rules") or ())
+    for rule in rules:
+        if rule["type"] != "merge" or rule in previous or registry is None:
+            continue
+        found = registry.lookup(rule["from"])
+        if found is None:
+            continue
+        # Merges act on a model; an old alias names the model it points at.
+        rule["from"] = found[0]
+        if compare_key(rule["into"]) not in {compare_key(model_id) for model_id in registry.models}:
+            _carry_switches(cfg, found[0], rule["into"])
+    root["rules"] = rules
+    root["dismissed"] = sorted(set(str(item) for item in dismissed))
+
+
+def _carry_switches(cfg: dict, old: str, new: str) -> None:
+    key = compare_key(old)
+    center = cfg.setdefault("modelCenter", {})
+    rename = lambda values: sorted({new if compare_key(value) == key else value for value in values or ()})
+    for name in SWITCH_LISTS:
+        center[name] = rename(center.get(name))
+    for name in ("sourceEnabledModels", "apiSourceDisabledModels"):
+        center[name] = {source: rename(values) for source, values in (center.get(name) or {}).items()}
+    models = cfg.setdefault("modelRegistry", {}).setdefault("models", {})
+    for model_id in list(models):
+        if compare_key(model_id) == key:
+            models.setdefault(new, models.pop(model_id))
+
+
+def write_default_effort(cfg: dict, model_id: str, effort: str | None) -> None:
+    models = cfg.setdefault("modelRegistry", {}).setdefault("models", {})
+    entry = dict(models.get(model_id) or {})
+    if effort:
+        entry["defaultEffort"] = effort
+    else:
+        entry.pop("defaultEffort", None)
+    models[model_id] = entry
+
+
+def admin_revision(cfg: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+    """What the registry's admin revision covers: rules, dismissals and per-model defaults."""
+    root = settings(cfg)
+    return {"rules": root.get("rules") or [], "dismissed": root.get("dismissed") or [],
+            "defaults": overview(cfg).defaults}
 
 
 # ─── one-time switch migration ───────────────────────────────────────

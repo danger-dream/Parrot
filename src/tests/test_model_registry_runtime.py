@@ -181,3 +181,49 @@ def test_default_level_leaves_short_outputs_alone_but_named_levels_still_apply()
     assert runtime.apply({"max_tokens": 4096}, default, "chat")["reasoning_effort"] == "high"
     named = Choice(offer, "high", None, explicit=True)
     assert runtime.apply({"max_tokens": 64}, named, "chat")["reasoning_effort"] == "high"
+
+
+def _hy3_registry(rules=()):
+    from src.model_registry import pipeline
+    from src.model_registry.offers import Offer
+    offers = [Offer("oauth:wb", "workbuddy", "hy3", "Hy3", basis="name"),
+              Offer("oauth:wb", "workbuddy", "hy3-x", "Hy3", basis="name")]
+    return pipeline.build(offers, rules=rules, catalog=pipeline.CatalogIndex([]))
+
+
+def test_pending_offers_carry_choices_and_an_assign_rule_settles_them(monkeypatch):
+    from src.model_registry import runtime
+    registry = _hy3_registry()
+    monkeypatch.setattr(runtime, "_registry", registry)
+    item = runtime.overview({"modelRegistry": {"enabled": True}}).pending[0]
+    assert (item.wire, item.model, item.options) == ("hy3-x", "workbuddy-hy3-x", ("hy3",))
+    settled = _hy3_registry([{"type": "assign", "source": "oauth:wb", "wire": "hy3-x", "model": "hy3-x"}])
+    assert not any(model.pending for model in settled.models.values())
+    assert settled.lookup("hy3-x")[0] == "hy3-x" and settled.lookup("hy3")[0] == "hy3"
+
+
+def test_drift_reports_moves_new_pending_and_stale_pins_but_not_ruled_moves():
+    from src.model_registry import runtime
+    previous = {"placements": {"api:a|x": "m1", "api:a|y": "m2"}, "pending": [], "manual": [], "stalePins": []}
+    current = {"placements": {"api:a|x": "m9", "api:a|y": "m3", "api:b|z": "m4"}, "pending": ["api:b|z"],
+               "manual": ["api:a|y"], "stalePins": ["deepseek-flash>deepseek-v4.1-flash|DeepSeek V4.2 Flash"]}
+    assert runtime.drift_lines(previous, current) == [
+        "api:a 的 x 从 m1 改归 m9",
+        "新的待确认：api:b 的 z",
+        "人工合并 deepseek-flash → deepseek-v4.1-flash 的依据变了：目录里现在叫 “DeepSeek V4.2 Flash”",
+    ]
+    assert runtime.drift_lines(current, current) == []
+
+
+def test_rename_carries_switches_and_a_merge_named_by_alias_acts_on_its_model(env):
+    runtime = env["runtime"]
+    _switches(env, disabledModels=["minimax-m2.7"], sourceEnabledModels={"api:Reseller": ["minimax-m2.7"]})
+    env["config"].update(lambda cfg: runtime.write_rules(
+        cfg, [{"type": "merge", "from": "MiniMax-M2.7", "into": "minimax-m2.7-legacy"}], []))
+    env["registry"].rebuild_from_config()
+    cfg = env["config"].get()
+    assert cfg["modelRegistry"]["rules"] == [{"type": "merge", "from": "minimax-m2.7", "into": "minimax-m2.7-legacy"}]
+    assert cfg["modelCenter"]["disabledModels"] == ["minimax-m2.7-legacy"]
+    assert cfg["modelCenter"]["sourceEnabledModels"] == {"api:Reseller": ["minimax-m2.7-legacy"]}
+    assert runtime.current().lookup("MiniMax-M2.7")[0] == "minimax-m2.7-legacy"
+    assert _routes(env, "minimax-m2.7")[0] == [("api:Reseller", "minimax-m2.7")]

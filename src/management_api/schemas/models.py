@@ -153,3 +153,77 @@ class ModelStateData(StrictSchema):
 class ModelStateEnvelope(StrictSchema):
     data: ModelStateData
     meta: ResponseMeta
+
+
+class RegistryPinData(StrictSchema):
+    catalog: str = Field(min_length=1, max_length=300)
+    name: str = Field(max_length=300)
+
+
+class RegistryRuleData(StrictSchema):
+    """merge: ``model`` becomes an alias of ``into``. assign: ``source``'s ``upstreamModel`` belongs to ``model``."""
+    type: Literal["merge", "assign"]
+    model: str = Field(min_length=1, max_length=300)
+    into: str | None = Field(default=None, max_length=300)
+    source: str | None = Field(default=None, max_length=300)
+    upstreamModel: str | None = Field(default=None, max_length=300)
+    pin: RegistryPinData | None = None
+
+    @model_validator(mode="after")
+    def _fields_for_type(self):
+        if self.type == "merge" and not self.into:
+            raise ValueError("merge requires into")
+        if self.type == "assign" and not (self.source and self.upstreamModel):
+            raise ValueError("assign requires source and upstreamModel")
+        return self
+
+
+class RegistryPendingData(StrictSchema):
+    source: str
+    upstreamModel: str
+    name: str
+    modelId: str
+    reason: str
+    options: list[str]
+
+
+class RegistrySuggestionData(StrictSchema):
+    key: str
+    modelId: str
+    intoModelId: str
+    text: str
+    pin: RegistryPinData | None = None
+
+
+class ModelRegistryData(StrictSchema):
+    enabled: bool
+    revision: str
+    pending: list[RegistryPendingData]
+    suggestions: list[RegistrySuggestionData]
+    conflicts: list[str]
+    rules: list[RegistryRuleData]
+    dismissed: list[str]
+    defaultEfforts: dict[str, str]
+
+
+class ModelRegistryEnvelope(StrictSchema):
+    data: ModelRegistryData
+    meta: ResponseMeta
+
+
+class ModelRegistryRulesRequest(StrictSchema):
+    rules: list[RegistryRuleData] = Field(max_length=500)
+    dismissed: list[str] = Field(default_factory=list, max_length=500)
+
+
+class ModelDefaultEffortRequest(StrictSchema):
+    effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] | None
+
+
+class ModelRegistryRevisionData(StrictSchema):
+    revision: str
+
+
+class ModelRegistryRevisionEnvelope(StrictSchema):
+    data: ModelRegistryRevisionData
+    meta: ResponseMeta

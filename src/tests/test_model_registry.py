@@ -102,8 +102,8 @@ def test_manual_merge_keeps_the_floating_name_as_an_alias_and_suggestions_stay_h
     )
     hinted = build(*offers)
     assert "deepseek-flash" in hinted.models
-    assert any("deepseek-flash" in s and "deepseek-v4.1-flash" in s for s in hinted.suggestions)
-    assert any("`claude-opus-4-5` 可能是 `claude-opus-4-5-20251101` 的浮动名" == s for s in hinted.suggestions)
+    assert any(s.model == "deepseek-flash" and s.into == "deepseek-v4.1-flash" for s in hinted.suggestions)
+    assert any(s.text == "`claude-opus-4-5` 可能是 `claude-opus-4-5-20251101` 的浮动名" for s in hinted.suggestions)
     merged = build(*offers, rules=[{"type": "merge", "from": "deepseek-flash", "into": "deepseek-v4.1-flash"}])
     assert "deepseek-flash" not in merged.models
     assert {o.source for o in merged.models["deepseek-v4.1-flash"].offers} == {"api:DeepSeek", "oauth:workbuddy:a"}

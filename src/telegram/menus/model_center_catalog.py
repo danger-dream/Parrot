@@ -623,6 +623,11 @@ def _model_list_render(chat_id: int) -> tuple[str, dict]:
             ui.btn("完成", "mc:done"),
         ])
     back = menu._list_back_callback(chat_id, menu._list_context(s))
+    if s.tab == "chat":
+        from .model_center_registry import entry_button
+        entry = entry_button(chat_id)
+        if entry is not None:
+            rows.append([entry])
     rows.append([
         ui.btn("同步元数据", menu._freeze(chat_id, "metadata_sync", back_callback=back)),
         ui.btn("同步上游模型" + (" · 当前来源" if s.source else ""), menu._freeze(
@@ -785,6 +790,9 @@ def _detail_render(
                 back_callback=menu._detail_callback(chat_id, view.resource_key, back_callback),
             )),
         ])
+        if view.identity.kind is ModelKind.CHAT:
+            from .model_center_registry import effort_row
+            rows.extend(effort_row(chat_id, view.model_id, view.resource_key, back_callback))
         if s.source is not None:
             rows.append([
                 ui.btn("清除此模型故障", menu._freeze(
