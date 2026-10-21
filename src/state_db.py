@@ -934,6 +934,21 @@ def status_muted_cleanup(live_ids_by_provider:dict[str,set[str]])->int:
     return _mut("status_muted_incidents",op,strict=True)
 
 
+# Telegram callback payloads (see telegram.callback_store). Saving touches one
+# record; pruning reads every record (each read is a copy), so callers batch it.
+def tg_callback_load(domain: str, key: str):
+    return _get(domain, key)
+def tg_callback_save(domain: str, key: str, row: dict) -> None:
+    _mut(domain, lambda data: data.__setitem__(key, row))
+def tg_callback_prune(domain: str, limit: int, cutoff: float | None = None) -> None:
+    def prune(data):
+        ages = {key: value.get("at", 0) for key, value in data.items()}
+        stale = [key for key, at in ages.items() if cutoff is not None and at < cutoff]
+        rest = sorted((key for key in ages if key not in set(stale)), key=ages.get)
+        stale += rest[:max(0, len(rest) - limit)]
+        for key in stale:
+            data.pop(key, None)
+    _mut(domain, prune)
 # The last published model grouping, compared on each rebuild to report drift.
 def model_registry_snapshot_load() -> dict | None:
     return _get("model_registry", "snapshot")

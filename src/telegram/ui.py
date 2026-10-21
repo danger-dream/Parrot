@@ -778,13 +778,24 @@ def register_code(name: str) -> str:
     """
     short = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
     with _code_lock:
+        known = _code_to_name.get(short) == name
         _code_to_name[short] = name
+    if not known:
+        from . import callback_store
+        callback_store.save_code(short, name)
     return short
 
 
 def resolve_code(short: str) -> Optional[str]:
     with _code_lock:
-        return _code_to_name.get(short)
+        name = _code_to_name.get(short)
+    if name is None:
+        from . import callback_store
+        name = callback_store.load_code(short)
+        if name is not None:
+            with _code_lock:
+                _code_to_name.setdefault(short, name)
+    return name
 
 
 # ─── HTML 工具 ────────────────────────────────────────────────────

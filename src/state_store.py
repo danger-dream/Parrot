@@ -26,7 +26,7 @@ VERSION = 1
 RUNTIME_DOMAINS = (
     "performance_stats", "channel_errors", "cache_affinities",
     "client_affinities", "schema_meta", "oauth_quota_cache",
-    "api_provider_usage_cache", "network_check_status",
+    "api_provider_usage_cache", "network_check_status", "tg_callback_codes", "tg_frozen_actions",
 )
 DURABLE_DOMAINS = (
     "xai_video_jobs", "codex_compaction_owners", "codex_identity_tombstones",

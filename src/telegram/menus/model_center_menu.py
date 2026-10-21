@@ -34,7 +34,7 @@ from ...management_control.models import (
     ModelView,
 )
 from ...management_control.oauth import PageSpec
-from .. import menu_cache, states, ui
+from .. import callback_store, menu_cache, states, ui
 from .model_center_html import paged as _paged, page_render as _html_page_render
 from .model_center_icons import inline_kb
 
@@ -227,12 +227,20 @@ def _freeze(chat_id: int, name: str, **data: Any) -> str:
         while token in _actions:
             token = secrets.token_hex(5)
         _actions[token] = _FrozenAction(int(chat_id), name, dict(data), now)
+    callback_store.save_action(token, chat_id, name, data, now, _ACTION_TTL)
     return f"mc:a:{token}"
 
 
 def _thaw(chat_id: int, token: str) -> _FrozenAction | None:
     with _lock:
         action = _actions.get(token)
+    if action is None:
+        stored = callback_store.load_action(token)
+        if stored is not None:
+            action = _FrozenAction(stored[0], stored[1], stored[2], stored[3])
+            with _lock:
+                _actions.setdefault(token, action)
+    with _lock:
         if action is None or action.chat_id != int(chat_id):
             return None
         if time.time() - action.created > _ACTION_TTL:
