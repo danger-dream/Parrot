@@ -227,7 +227,9 @@ def _freeze(chat_id: int, name: str, **data: Any) -> str:
         while token in _actions:
             token = secrets.token_hex(5)
         _actions[token] = _FrozenAction(int(chat_id), name, dict(data), now)
-    callback_store.save_action(token, chat_id, name, data, now, _ACTION_TTL)
+    # Page turns carry every page of the text; reopening the menu after a restart is cheaper.
+    if name != "content_page":
+        callback_store.save_action(token, chat_id, name, data, now, _ACTION_TTL)
     return f"mc:a:{token}"
 
 

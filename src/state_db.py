@@ -935,14 +935,15 @@ def status_muted_cleanup(live_ids_by_provider:dict[str,set[str]])->int:
 
 
 # Telegram callback payloads (see telegram.callback_store). Saving touches one
-# record; pruning reads every record (each read is a copy), so callers batch it.
+# record; pruning peeks at every record without copying it and only drops keys.
 def tg_callback_load(domain: str, key: str):
     return _get(domain, key)
 def tg_callback_save(domain: str, key: str, row: dict) -> None:
     _mut(domain, lambda data: data.__setitem__(key, row))
 def tg_callback_prune(domain: str, limit: int, cutoff: float | None = None) -> None:
     def prune(data):
-        ages = {key: value.get("at", 0) for key, value in data.items()}
+        items = data.peek_items() if hasattr(data, "peek_items") else data.items()
+        ages = {key: value.get("at", 0) for key, value in items}
         stale = [key for key, at in ages.items() if cutoff is not None and at < cutoff]
         rest = sorted((key for key in ages if key not in set(stale)), key=ages.get)
         stale += rest[:max(0, len(rest) - limit)]

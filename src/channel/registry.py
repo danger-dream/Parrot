@@ -118,7 +118,7 @@ def _rebuild_from_config_locked() -> None:
     try:
         model_registry.rebuild(cfg)
     except Exception as exc:
-        # Routing falls back to per-channel names rather than losing every model.
+        # No registry was ever built: per-channel names rather than losing every model.
         print(f"[registry] model registry rebuild failed: {type(exc).__name__}: {exc}")
         model_registry.rebuild({})
 

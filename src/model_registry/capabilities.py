@@ -7,6 +7,7 @@ count for that field; a field no source declares is left out.
 """
 from __future__ import annotations
 
+import time
 from typing import Any, Iterable, Mapping
 
 from . import runtime
@@ -43,7 +44,29 @@ def _least(values: Iterable[int | None]) -> int | None:
     return min(known) if known else None
 
 
+# Config changes rebuild the registry, which drops this cache; the age limit covers
+# channels failing at runtime without a config change.
+_CACHE_SECONDS = 60
+_cache: tuple[Any, dict[tuple[str, str | None], tuple[float, dict[str, Any]]]] = (None, {})
+
+
 def describe(model_id: str, api_key: str | None) -> dict[str, Any]:
+    global _cache
+    registry = runtime.current()
+    owner, entries = _cache
+    if owner is not registry:
+        entries = {}
+        _cache = (registry, entries)
+    now = time.monotonic()
+    cached = entries.get((model_id, api_key))
+    if cached is not None and now - cached[0] < _CACHE_SECONDS:
+        return dict(cached[1])
+    result = _describe(model_id, api_key)
+    entries[(model_id, api_key)] = (now, result)
+    return dict(result)
+
+
+def _describe(model_id: str, api_key: str | None) -> dict[str, Any]:
     by_source: dict[str, list[Offer]] = {}
     for offer in serving_offers(model_id, api_key):
         by_source.setdefault(offer.source, []).append(offer)

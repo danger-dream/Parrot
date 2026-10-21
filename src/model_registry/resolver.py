@@ -72,15 +72,19 @@ def choose(registry: Registry, resolution: Resolution, usable: Callable[[Offer],
             by_source.setdefault(offer.source, []).append(offer)
     result = []
     for offers in by_source.values():
-        choice = _choose_in_source(offers, wanted, bool(explicit), think)
+        choice = _choose_in_source(offers, wanted, bool(explicit), think, named=bool(resolution.traits.get("thinking")))
         if choice is not None:
             result.append(choice)
     return result
 
 
-def _choose_in_source(offers: list[Offer], wanted: str, explicit: bool, think: str | None) -> Choice | None:
+def _choose_in_source(offers: list[Offer], wanted: str, explicit: bool, think: str | None,
+                      named: bool = False) -> Choice | None:
     if think == "off":
-        offers = [offer for offer in offers if _fixed_thinking(offer) != "on"]
+        can_stop = [offer for offer in offers if _fixed_thinking(offer) != "on"]
+        # A name such as -disabled asks for an id that stops thinking. A body parameter is
+        # served by any source, as before the registry; one that always thinks just keeps thinking.
+        offers, think = (can_stop, think) if can_stop or named else (offers, None)
     else:
         offers = [offer for offer in offers if _fixed_thinking(offer) != "off"]
     fixed = [offer for offer in offers if "effort" in offer.traits]

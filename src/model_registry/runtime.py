@@ -20,6 +20,8 @@ MIGRATION_VERSION = 2   # 1: switches re-keyed by model; 2: metadata also keyed 
 
 _lock = threading.Lock()
 _registry: Registry | None = None
+_failure: str | None = None
+_bad_rules: set[str] = set()
 _owners: dict[tuple[str, str], str] = {}
 _catalog: tuple[str, CatalogIndex] | None = None
 
@@ -43,6 +45,26 @@ def _catalog_index() -> CatalogIndex:
     return _catalog[1]
 
 
+def alert(text: str) -> None:
+    from .. import notifier
+    print(f"[model-registry] {text}")
+    notifier.notify_event("model_registry", "🧩 <b>模型命名</b>\n\n" + notifier.escape_html(text))
+
+
+def _valid_rules(rules: Iterable[Any]) -> list[dict]:
+    """Each malformed rule is skipped on its own (and reported once) instead of failing the whole build."""
+    kept = []
+    for rule in rules or ():
+        try:
+            kept += normalize_rules([rule])
+        except ValueError:
+            text = repr(rule)[:200]
+            if text not in _bad_rules:
+                _bad_rules.add(text)
+                alert(f"忽略一条格式不对的人工规则：{text}")
+    return kept
+
+
 def compute(cfg: Mapping[str, Any], *, legacy: Mapping[tuple[str, str], str] | None = None) -> Registry:
     root = settings(cfg)
     offers = collect(cfg)
@@ -52,21 +74,33 @@ def compute(cfg: Mapping[str, Any], *, legacy: Mapping[tuple[str, str], str] | N
         legacy = {tuple(key.split("|", 1)): name for key, name in saved.items() if "|" in key}
     if legacy:
         offers = with_legacy(offers, legacy)
-    return build(offers, rules=root.get("rules") or (), catalog=_catalog_index(),
+    return build(offers, rules=_valid_rules(root.get("rules")), catalog=_catalog_index(),
                  known=(root.get("models") or {}).keys(), aliases=root.get("aliases") or {})
 
 
 def rebuild(cfg: Mapping[str, Any] | None = None) -> None:
-    global _registry, _owners
+    """Raises only when no registry was ever built; otherwise a failed build keeps the last good one."""
+    global _registry, _owners, _failure
     from .. import config
     cfg = cfg if cfg is not None else config.get()
-    registry = compute(cfg) if enabled(cfg) else None
+    try:
+        registry = compute(cfg) if enabled(cfg) else None
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        if message != _failure:
+            _failure = message
+            alert("统一模型名重建失败，" + ("继续使用上一份可用的注册表" if _registry is not None
+                                        else "暂时退回按渠道命名") + f"：{message}")
+        if _registry is not None:
+            return
+        raise
+    _failure = None
     owners = {} if registry is None else {
         (offer.source, offer.wire): model.id for model in registry.models.values() for offer in model.offers}
     with _lock:
         _registry, _owners = registry, owners
     if registry is not None:
-        _report_drift(registry, cfg)
+        _queue_drift(registry, cfg)
 
 
 # ─── drift ──────────────────────────────────────────────────────────────────
@@ -111,6 +145,36 @@ def drift_lines(previous: Mapping[str, Any], current: Mapping[str, Any], label=l
         source, _, target = pair.partition(">")
         lines.append(f"人工合并 {source} → {target} 的依据变了：目录里现在叫 “{now or '已下架'}”")
     return lines
+
+
+_drift_ready = threading.Condition()
+_drift_next: tuple[Registry, Mapping[str, Any]] | None = None
+_drift_worker: threading.Thread | None = None
+
+
+def _queue_drift(registry: Registry, cfg: Mapping[str, Any]) -> None:
+    """Compare and store drift off the reload path: the durable snapshot rewrites a large file.
+
+    Only the latest build matters; builds queued behind it are coalesced.
+    """
+    global _drift_next, _drift_worker
+    with _drift_ready:
+        _drift_next = (registry, cfg)
+        if _drift_worker is None or not _drift_worker.is_alive():
+            _drift_worker = threading.Thread(target=_drift_loop, name="model-registry-drift", daemon=True)
+            _drift_worker.start()
+        _drift_ready.notify()
+
+
+def _drift_loop() -> None:
+    global _drift_next
+    while True:
+        with _drift_ready:
+            while _drift_next is None:
+                _drift_ready.wait()
+            registry, cfg = _drift_next
+            _drift_next = None
+        _report_drift(registry, cfg)
 
 
 def _report_drift(registry: Registry, cfg: Mapping[str, Any]) -> None:
@@ -175,15 +239,23 @@ class Switches:
         return compare_key(model_id) in self.hidden
 
     def usable(self, offer: Offer, model_id: str) -> bool:
+        return self.blocked(offer, model_id) is None
+
+    def blocked(self, offer: Offer, model_id: str) -> str | None:
+        """Why ``offer`` cannot serve ``model_id``, in the scheduler's exclusion words; None when it can."""
         from ..channel import registry as channels
         channel = channels.get_channel(offer.source)
-        if channel is None or not channel.enabled or channel.disabled_reason or not offer.available:
-            return False
+        if channel is None or not channel.enabled or channel.disabled_reason:
+            return "disabled"
+        if not offer.available:
+            return "source_model_disabled"
         key = compare_key(model_id)
         api_off = self.api_disabled.get(offer.source)
         if api_off and api_off & {key, compare_key(offer.name), compare_key(offer.wire)}:
-            return False
-        return key not in self.disabled or key in self.exceptions.get(offer.source, frozenset())
+            return "source_model_disabled"
+        if key in self.disabled and key not in self.exceptions.get(offer.source, frozenset()):
+            return "global_model_disabled"
+        return None
 
 
 # ─── requests ───────────────────────────────────────────────────────
@@ -231,6 +303,7 @@ class Plan:
     choices: dict[str, Choice] = field(default_factory=dict)
     reasoning: Reasoning = Reasoning()
     error: str | None = None
+    rejected: dict[str, str] = field(default_factory=dict)   # source -> exclusion reason
 
 
 def plan(name: str, body: Mapping[str, Any], ingress: str, api_key: str | None) -> Plan | None:
@@ -252,10 +325,22 @@ def plan(name: str, body: Mapping[str, Any], ingress: str, api_key: str | None) 
     model_settings = (settings().get("models") or {}).get(found.model) or {}
     default = (model_settings.get("defaultEffort") if isinstance(model_settings, Mapping) else None) \
         or reasoning.derived or global_default_effort()
-    choices = choose(registry, found,
-                     lambda offer: switches.usable(offer, found.model) and auth.channel_allowed(api_key, offer.source),
+    rejected: dict[str, str] = {}
+    usable: set[tuple[str, str]] = set()
+    for offer in registry.models[found.model].offers:
+        reason = switches.blocked(offer, found.model)
+        if reason is None and auth.channel_allowed(api_key, offer.source):
+            usable.add((offer.source, offer.wire))
+        elif reason is not None:
+            rejected.setdefault(offer.source, reason)
+    choices = choose(registry, found, lambda offer: (offer.source, offer.wire) in usable,
                      effort=reasoning.effort, thinking=reasoning.thinking, default_effort=default)
-    return Plan(found.model, {choice.offer.source: choice for choice in choices}, reasoning)
+    chosen = {choice.offer.source: choice for choice in choices}
+    for source, _wire in usable:
+        if source not in chosen:
+            # Usable, but none of its ids fits the asked effort (e.g. xhigh on -low/-high ids).
+            rejected[source] = "reasoning_unsupported"
+    return Plan(found.model, chosen, reasoning, rejected={k: v for k, v in rejected.items() if k not in chosen})
 
 
 def serves(channel, name: str) -> str | None:
@@ -366,22 +451,39 @@ def visible_models(api_key: str | None, families: set[str] | None = None) -> lis
     return sorted(
         model.id for model in registry.models.values()
         if not switches.hidden_model(model.id) and (permitted is None or model.id in permitted)
-        and any(switches.usable(offer, model.id) and auth.channel_allowed(api_key, offer.source) and family_ok(offer)
-                for offer in model.offers))
+        and any(offer.listed and switches.usable(offer, model.id) and auth.channel_allowed(api_key, offer.source)
+                and family_ok(offer) for offer in model.offers))
 
 
 def global_default_effort(cfg: Mapping[str, Any] | None = None) -> str:
     return settings(cfg).get("defaultEffort") or DEFAULT_EFFORT
 
 
+_NAME_CACHE_LIMIT = 10_000
+_name_cache: tuple[Registry | None, dict[str, str | None]] = (None, {})
+
+
+def _model_named(registry: Registry, name: str) -> str | None:
+    """``resolve(registry, name).model``, remembered until the registry is rebuilt."""
+    global _name_cache
+    owner, cache = _name_cache
+    if owner is not registry or len(cache) > _NAME_CACHE_LIMIT:
+        cache = {}
+        _name_cache = (registry, cache)
+    if name not in cache:
+        hit = resolve(registry, name)
+        cache[name] = hit.model if hit else None
+    return cache[name]
+
+
 def same_models(name: str, keys: Iterable[Any]) -> list[str]:
     """Those of ``keys`` naming the same model as ``name``, the model's own spelling first."""
     registry = _registry
-    found = resolve(registry, name) if registry else None
-    if found is None:
+    target = _model_named(registry, name) if registry else None
+    if target is None:
         return []
-    hits = [key for key in keys if isinstance(key, str) and (hit := resolve(registry, key)) and hit.model == found.model]
-    return sorted(hits, key=lambda key: (compare_key(key) != compare_key(found.model), key))
+    hits = [key for key in keys if isinstance(key, str) and _model_named(registry, key) == target]
+    return sorted(hits, key=lambda key: (compare_key(key) != compare_key(target), key))
 
 
 def same_model(name: str, keys: Iterable[str]) -> str | None:
@@ -468,22 +570,27 @@ def normalize_rules(rules: Iterable[Mapping[str, Any]]) -> list[dict]:
     return result
 
 
+def _rule_key(rule: Mapping[str, Any]) -> tuple:
+    return (rule.get("type"), *(compare_key(str(rule.get(name) or "")) for name in RULE_FIELDS.get(rule.get("type"), ())))
+
+
 def write_rules(cfg: dict, rules: list[dict], dismissed: Iterable[str]) -> None:
     """Store rules; a merge into a name no model has yet is a rename and takes the old model's switches."""
     root = cfg.setdefault("modelRegistry", {})
     registry = _registry
-    previous = list(root.get("rules") or ())
+    previous = {_rule_key(rule) for rule in root.get("rules") or () if isinstance(rule, Mapping)}
     for rule in rules:
-        if rule["type"] != "merge" or rule in previous or registry is None:
+        if rule["type"] != "merge" or _rule_key(rule) in previous or registry is None:
             continue
         found = registry.lookup(rule["from"])
-        if found is None:
+        # Already merged: the old name resolves to the target itself; keep the rule as written.
+        if found is None or compare_key(found[0]) == compare_key(rule["into"]):
             continue
         # Merges act on a model; an old alias names the model it points at.
         rule["from"] = found[0]
         if compare_key(rule["into"]) not in {compare_key(model_id) for model_id in registry.models}:
             _carry_switches(cfg, found[0], rule["into"])
-    root["rules"] = rules
+    root["rules"] = list({_rule_key(rule): rule for rule in rules}.values())
     root["dismissed"] = sorted(set(str(item) for item in dismissed))
 
 
@@ -529,7 +636,8 @@ def migrate_if_needed() -> list[str] | None:
     from .. import config
     from .report import legacy_names
     cfg = config.get()
-    if not enabled(cfg) or settings(cfg).get("migrated") == MIGRATION_VERSION:
+    done = settings(cfg).get("migrated")
+    if not enabled(cfg) or (isinstance(done, int) and done >= MIGRATION_VERSION):
         return None
     registry = compute(cfg, legacy=legacy_names())
     notes: list[str] = []

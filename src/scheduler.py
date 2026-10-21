@@ -118,6 +118,8 @@ def _filter_candidates(requested_model: str,
             # The registry already applied global, per-source and allowlist switches.
             choice = model_plan.choices.get(ch.key)
             if choice is None:
+                if ch.key in model_plan.rejected:
+                    excluded.append({"channel": ch.key, "reason": model_plan.rejected[ch.key]})
                 continue
             resolved = choice.offer.wire
             if call_choices is not None:

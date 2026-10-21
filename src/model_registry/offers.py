@@ -25,6 +25,7 @@ class Offer:
     product: bool = False
     available: bool = True
     legacy: str = ""
+    listed: bool = True   # False: routable by name, never shown in model lists
 
 
 @dataclass(frozen=True)
@@ -80,11 +81,15 @@ def account_offers(account: dict) -> list[Offer]:
     provider = oauth_manager.provider_of(account)
     adapter = ADAPTERS.get(provider, _DEFAULT)
     selection = oauth_manager.account_model_selection(account)
-    records = {str(item.get("id")): item for item in selection.get("records") or [] if isinstance(item, dict)}
-    effective = set(selection.get("effective_models") or ())
+    records = {str(item.get("id")): item
+               for item in [*(selection.get("records") or ()), *(selection.get("hidden_records") or ())]
+               if isinstance(item, dict)}
+    hidden = list(selection.get("hidden_models") or ())
+    disabled = set(selection.get("disabled_models") or ())
+    effective = set(selection.get("effective_models") or ()) | {wire for wire in hidden if wire not in disabled}
     source = "oauth:" + account_key(account)
     result = []
-    for wire in selection.get("models") or ():
+    for wire in [*(selection.get("models") or ()), *hidden]:
         wire = str(wire or "").strip()
         if not wire or is_image_name(wire):
             continue
@@ -95,7 +100,7 @@ def account_offers(account: dict) -> list[Offer]:
         usable = wire in effective and (adapter.usable is None or adapter.usable(account, wire))
         result.append(Offer(source=source, provider=provider, wire=wire, name=name, basis=adapter.basis,
                             traits=_traits(adapter, wire, name), efforts=efforts, thinking=thinking,
-                            product=product, available=usable))
+                            product=product, available=usable, listed=wire not in hidden))
     return result
 
 

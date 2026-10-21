@@ -319,3 +319,102 @@ def test_models_endpoint_applies_an_unscoped_keys_allowlist(env, monkeypatch):
     body = asyncio.run(server.list_models(Request({"type": "http", "method": "GET", "path": "/v1/models",
                                                     "headers": [], "query_string": b""})))
     assert [item["id"] for item in body["data"]] == ["minimax-m3.1-flash"]
+
+
+def test_a_source_that_always_thinks_still_serves_a_request_asking_thinking_off():
+    from src.model_registry import pipeline, resolver
+    from src.model_registry.offers import Offer
+    always = Offer("oauth:wb", "workbuddy", "glm-5.3", "GLM-5.3", thinking="always", efforts=("low", "high"))
+    registry = pipeline.build([always], catalog=pipeline.CatalogIndex([]))
+    found = resolver.resolve(registry, "glm-5.3")
+    choices = resolver.choose(registry, found, lambda offer: True, thinking="off")
+    assert [(choice.offer.wire, choice.thinking) for choice in choices] == [("glm-5.3", None)]
+
+
+def test_scheduler_records_why_each_source_was_left_out(env):
+    _switches(env, apiSourceDisabledModels={"api:Official": ["minimax-m3.1-flash"]}, disabledModels=["minimax-m2.7"],
+              sourceEnabledModels={})
+    _, result = _routes(env, "minimax-m3.1-flash")
+    assert {(item["channel"], item["reason"]) for item in result.exclusions} >= {("api:Official", "source_model_disabled")}
+    _, result = _routes(env, "minimax-m2.7")
+    assert {(item["channel"], item["reason"]) for item in result.exclusions} >= {
+        ("api:Official", "global_model_disabled"), ("api:Reseller", "global_model_disabled")}
+
+
+def test_plan_names_sources_whose_ids_cannot_take_the_asked_effort(monkeypatch):
+    from src.model_registry import pipeline, runtime
+    from src.model_registry.offers import Offer
+    offers = [Offer("oauth:ag", "antigravity", f"m-1-{level}", f"M 1 ({level.title()})", basis="name",
+                    traits={"effort": level}) for level in ("low", "high")]
+    monkeypatch.setattr(runtime, "_registry", pipeline.build(offers, catalog=pipeline.CatalogIndex([])))
+    monkeypatch.setattr(runtime.Switches, "blocked", lambda self, offer, model_id: None)
+    planned = runtime.plan("m-1", {"reasoning_effort": "xhigh"}, "chat", None)
+    assert planned.choices == {} and planned.rejected == {"oauth:ag": "reasoning_unsupported"}
+
+
+def test_a_failed_rebuild_keeps_the_last_good_registry_and_alerts_once(env, monkeypatch):
+    runtime = env["runtime"]
+    alerts = []
+    monkeypatch.setattr(runtime, "alert", alerts.append)
+    good = runtime.current()
+    monkeypatch.setattr(runtime, "compute", lambda cfg, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
+    env["registry"].rebuild_from_config()
+    env["registry"].rebuild_from_config()
+    assert runtime.current() is good
+    assert len(alerts) == 1 and "上一份可用" in alerts[0] and "boom" in alerts[0]
+    monkeypatch.setattr(runtime, "_registry", None)
+    with pytest.raises(RuntimeError):
+        runtime.rebuild(env["config"].get())
+
+
+def test_a_malformed_rule_is_skipped_on_its_own(env, monkeypatch):
+    runtime = env["runtime"]
+    alerts = []
+    monkeypatch.setattr(runtime, "alert", alerts.append)
+    monkeypatch.setattr(runtime, "_bad_rules", set())
+    env["config"].update(lambda cfg: cfg["modelRegistry"].update(rules=[
+        "oops", {"type": "merge", "from": "minimax-m2.7", "into": "minimax-m2.7-legacy"}]))
+    env["registry"].rebuild_from_config()
+    assert runtime.current().lookup("MiniMax-M2.7")[0] == "minimax-m2.7-legacy"
+    env["registry"].rebuild_from_config()
+    assert alerts == ["忽略一条格式不对的人工规则：'oops'"]
+
+
+def test_resubmitting_a_merge_in_another_spelling_keeps_it(env):
+    runtime = env["runtime"]
+    merge = {"type": "merge", "from": "minimax-m2.7", "into": "minimax-m2.7-legacy"}
+    env["config"].update(lambda cfg: runtime.write_rules(cfg, [dict(merge)], []))
+    env["registry"].rebuild_from_config()
+    env["config"].update(lambda cfg: runtime.write_rules(
+        cfg, [{"type": "merge", "from": "MiniMax-M2.7", "into": "MINIMAX-M2.7-LEGACY"}], []))
+    env["registry"].rebuild_from_config()
+    stored = env["config"].get()["modelRegistry"]["rules"]
+    assert len(stored) == 1 and stored[0]["from"].lower() == "minimax-m2.7"
+    assert runtime.current().lookup("minimax-m2.7")[0] == "minimax-m2.7-legacy"
+
+
+def test_a_newer_migration_marker_is_left_alone(monkeypatch):
+    from src import config
+    from src.model_registry import runtime
+    monkeypatch.setattr(config, "get", lambda: {"modelRegistry": {"enabled": True, "migrated": runtime.MIGRATION_VERSION + 1}})
+    assert runtime.migrate_if_needed() is None
+
+
+def test_drift_is_reported_off_the_reload_path_and_only_for_the_latest_build(monkeypatch):
+    import threading
+    import time
+    from src.model_registry import runtime
+    seen, gate, done = [], threading.Event(), threading.Event()
+
+    def report(registry, cfg):
+        gate.wait(5)
+        seen.append(registry)
+        if registry == "c":
+            done.set()
+    monkeypatch.setattr(runtime, "_report_drift", report)
+    runtime._queue_drift("a", {})
+    time.sleep(0.2)
+    runtime._queue_drift("b", {})
+    runtime._queue_drift("c", {})
+    gate.set()
+    assert done.wait(5) and seen == ["a", "c"]

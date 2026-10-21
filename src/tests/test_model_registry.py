@@ -164,3 +164,8 @@ def test_exact_names_win_over_shortcut_reading():
                 offer("oauth:qoder:a", "qfmodel", "Qwen3.8-Flash", basis="name"))
     assert resolver.resolve(reg, "qwen3.8-max").via == "id"
     assert resolver.resolve(reg, "Qwen3.8-Max").model == "qwen3.8-max"
+
+
+def test_thinking_off_from_the_body_still_reaches_sources_that_always_think():
+    reg = build(*ARGON)
+    assert ("oauth:antigravity:a", "gemini-4-argon-high", "high", None) in picks(reg, "gemini-4-argon", thinking="off")

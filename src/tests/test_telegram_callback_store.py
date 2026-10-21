@@ -115,3 +115,10 @@ def test_stored_payloads_stay_bounded(store, monkeypatch):
     for index in range(callback_store.PRUNE_EVERY_WRITES + 1):
         callback_store.save_code(f"c{index}", "name")
     assert len(calls) == 2
+
+
+def test_page_turn_buttons_stay_in_memory_only(store):
+    token = menu._freeze(42, "content_page", pages=("one", "two"), keyboard={}, page=1).rsplit(":", 1)[1]
+    assert menu._thaw(42, token) is not None
+    _restart()
+    assert menu._thaw(42, token) is None

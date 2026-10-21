@@ -328,3 +328,15 @@ async def test_named_function_and_unknown_tool_are_not_relaxed(env):
     })
     assert payload["tool_choice"] == "required"
     assert payload["input"][0]["tools"][0]["name"] == "lookup"
+
+
+@pytest.mark.asyncio
+async def test_hidden_models_stay_routable_but_unlisted_in_the_unified_registry(env):
+    from src.model_registry.offers import account_offers
+    await sync(env, [record(), record("hidden-account-model", visibility="hide")])
+    account = oauth_manager.get_account(KEY)
+    offers = {offer.wire: offer for offer in account_offers(account)}
+    assert offers["gpt-6-sol"].listed and offers["gpt-6-sol"].available
+    assert not offers["hidden-account-model"].listed and offers["hidden-account-model"].available
+    account["disabledModels"] = ["hidden-account-model"]
+    assert not {offer.wire: offer for offer in account_offers(account)}["hidden-account-model"].available

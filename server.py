@@ -498,10 +498,15 @@ async def lifespan(app: FastAPI):
             registry.install_config_reload_hook()
         from src.model_registry import runtime as model_registry
         with startup_timing.phase("lifespan.model-registry-migration"):
-            registry_notes = model_registry.migrate_if_needed()
+            try:
+                registry_notes = model_registry.migrate_if_needed()
+            except Exception as exc:
+                # Switches stay as they are; routing keeps working, an admin has to look.
+                registry_notes = None
+                model_registry.alert(f"启动时的开关与元数据迁移失败，未做任何改动：{type(exc).__name__}: {exc}")
         if registry_notes is not None:
             registry.rebuild_from_config()
-            print(f"[model-registry] switches re-keyed by model; {len(registry_notes)} per-source changes")
+            print(f"[model-registry] switches and metadata re-keyed by model; {len(registry_notes)} notes")
             for note in registry_notes:
                 print(f"[model-registry]   {note}")
 

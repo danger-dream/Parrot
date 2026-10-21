@@ -5685,10 +5685,14 @@ def account_model_selection(account_or_key: dict | str) -> dict:
         models = [model for model in configured_models if model in native_ids]
     else:
         models = configured_models
+    hidden_models: list[str] = []
+    hidden_records: list[dict] = []
     if provider == "openai":
         # This function feeds the existing model pickers/editors, not routing.
         # Authenticated hidden IDs stay in account.models for explicit requests.
         hidden = {str(item.get("id")) for item in records if item.get("visibility") == "hide"}
+        hidden_models = [model for model in models if model in hidden]
+        hidden_records = [item for item in records if item.get("visibility") == "hide"]
         models = [model for model in models if model not in hidden]
         records = [item for item in records if item.get("visibility") != "hide"]
     if models or (provider == "openai" and configured_models):
@@ -5701,6 +5705,9 @@ def account_model_selection(account_or_key: dict | str) -> dict:
         "models": models,
         "effective_models": [model for model in models if model not in disabled] if route_available else [],
         "disabled_models": disabled,
+        # Routable but never offered in pickers or /v1/models (OpenAI visibility=hide).
+        "hidden_models": hidden_models,
+        "hidden_records": hidden_records,
         "source": source,
         "synced_at": str(account.get("last_model_sync") or ""),
         "attempted_at": str(account.get("last_model_sync_attempt") or ""),
