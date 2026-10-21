@@ -473,10 +473,10 @@ def _approved_add_menu_delta(case):
         brands = [
             [("Anthropic", "oa:add:claude", "6140995813788099525"), ("OpenAI", "oa:add:openai", "6141162084857031383"), ("Grok", "oa:add:xai", "6138882363460952713")],
             [("Cursor", "oa:login:cursor", "6062261319426390107"), ("Antigravity", "oa:login:antigravity", "6077644693984779782"), ("WorkBuddy", "oa:add:workbuddy", "6120617435214132136")],
-            [("智谱", "oa:zh:add", "6140727700454645813")],
+            [("智谱", "oa:zh:add", "6140727700454645813"), ("Qoder", "oa:add:qoder", "6251484272679462431")],
         ]
         payload["reply_markup"]["inline_keyboard"] = [
-            [{"text": text, "callback_data": cb, "icon_custom_emoji_id": icon} for text, cb, icon in row]
+            [{"text": text, "callback_data": cb, **({"icon_custom_emoji_id": icon} if icon else {})} for text, cb, icon in row]
             for row in brands] + [[{"text": "⚙ 设置代理", "callback_data": "oa:add:proxy"},
                                   {"text": "🏠 返回主菜单", "callback_data": "menu:main"},
                                   {"text": "◀ 返回列表", "callback_data": "menu:oauth"}]]

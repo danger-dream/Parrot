@@ -75,6 +75,9 @@ class HttpBodyReadResult:
 
 @dataclass
 class StreamAsNonStreamResult:
+    def __post_init__(self):
+        _qoder_error_result(self.error)
+
     obj: dict | None = None
     response_headers: dict[str, str] = field(default_factory=dict)
     response_body_text: str = ""
@@ -96,6 +99,9 @@ class StreamAsNonStreamResult:
 
 @dataclass
 class HttpStreamStartResult:
+    def __post_init__(self):
+        _qoder_error_result(self.error)
+
     aiter: Any | None = None
     tracker: Any | None = None
     builder: Any | None = None
@@ -264,6 +270,21 @@ async def _read_response_bytes(
             if timing is not None:
                 timing.mark_io_complete()
             return b"".join(parts)
+
+
+def _qoder_error_result(result):
+    """Preserve provider-normalized SSE status before failover classifies it."""
+    if result is None:
+        return
+    decoder = (result.translator_ctx or {}).get("qoder_stream")
+    mapped = getattr(decoder, "error_mapping", None)
+    if mapped is not None:
+        result.http_status = mapped["status"]
+        result.outcome = "http_auth_error" if result.http_status in (401, 403) else "http_error"
+        result.full_response_text = json.dumps({"error": mapped["error"]}, ensure_ascii=False)
+        result.error_detail = f"HTTP {result.http_status}: {result.full_response_text}"
+        result.error_code = mapped["error"].get("code")
+        result.retry_after_seconds = mapped.get("retry_after")
 
 
 def _stream_tracker_error_result(
@@ -1219,7 +1240,14 @@ def _resolve_http_route_chain(
 
     from ..proxy import manager as pm
 
+    if getattr(channel, "provider", "") == "qoder":
+        from ..oauth.qoder import routes
+        try:
+            return [(r.name, r.connector) for r in routes.chain(channel.account_key)], None
+        except Exception:
+            return [], AttemptResult(outcome="proxy_connect_error", error_detail="Qoder route unavailable")
     configured = False
+    strict_qoder = getattr(channel, "provider", "") == "qoder"
     try:
         pm.init()
         configured = pm.is_configured()
@@ -1248,11 +1276,11 @@ def _resolve_http_route_chain(
                 route_chain.append((proxy_name, connector))
 
         if route_chain:
-            if pm.direct_fallback_enabled() and not any(name == "direct" for name, _ in route_chain):
+            if not strict_qoder and pm.direct_fallback_enabled() and not any(name == "direct" for name, _ in route_chain):
                 route_chain.append(("direct", pm.get_connector("direct")))
             return route_chain, None
 
-        if pm.direct_fallback_enabled():
+        if not strict_qoder and pm.direct_fallback_enabled():
             print(f"[proxy] HTTP route has no usable target; using enabled direct fallback: {chain}")
             return [("direct", pm.get_connector("direct"))], None
         return [], AttemptResult(
@@ -1260,7 +1288,7 @@ def _resolve_http_route_chain(
             error_detail=f"proxy route has no valid target: {chain}",
         )
     except Exception as exc:
-        if pm.direct_fallback_enabled():
+        if not strict_qoder and pm.direct_fallback_enabled():
             print(f"[proxy] HTTP route resolution failed; using enabled direct fallback: {exc}")
             return [("direct", pm.get_connector("direct"))], None
         if configured or pm.has_non_direct_routing_rules():
@@ -1816,6 +1844,9 @@ async def open_response_with_proxy_chain(
                 def physical_context(request):
                     return _SharedStreamContext(request) if client is None else open_stream(client, request)
                 ctx = hook(stream_request, physical_context)
+                if getattr(channel, "provider", "") == "qoder":
+                    from ..oauth.qoder.routes import Route
+                    ctx.route = Route(route_name, connector)
             owner.ctx = ctx
         except upstream.ClientUnavailableError:
             # Keep a local client construction failure outside channel scoring

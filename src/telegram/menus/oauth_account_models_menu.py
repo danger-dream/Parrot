@@ -22,6 +22,11 @@ _BULK_ACTION = "oam_bulk_disable"
 
 
 def _model_label(account_key: str, model: str) -> str:
+    account = oauth_control.account_snapshot(account_key)
+    if account and oauth_control.provider_of_snapshot(account) == "qoder":
+        from ...oauth.qoder.catalog import model_aliases
+        records = oauth_control.account_model_selection_snapshot(account).get("records") or []
+        return model_aliases(records).get(model, model)
     return model_names.for_channel(f"oauth:{account_key}", model)
 
 
@@ -136,6 +141,9 @@ def _summary_lines(record: dict | None, *, use_max_context: bool = False) -> lis
     if "ultrafast" in service_tier_ids:
         facts.append("⚡ Ultra")
     lines = [" · ".join(facts)] if facts else []
+    from ...oauth.qoder.catalog import credit_label
+    if credit := credit_label(record):
+        lines.append("💳 积分倍率：" + credit)
     if efforts: lines.append("思考档位：" + "、".join(efforts))
     return lines
 
@@ -525,9 +533,12 @@ def _detail_render(account_key: str, model: str, *, model_page: int,
                           if item.get("id") == model), record)
     icon, status, fault = _status(account_key, model, disabled)
     state = oauth_control.cooldown_state_snapshot(account_key, model) or {}
-    lines = [f"🧬 <b>模型详情</b>", "", f"完整 ID: <code>{ui.escape_html(_model_label(account_key, model))}</code>"]
+    public_id = _model_label(account_key, model)
+    lines = [f"🧬 <b>模型详情</b>", "", f"完整 ID: <code>{ui.escape_html(public_id)}</code>"]
+    from ...oauth.qoder.catalog import credit_label
     detail_fields = [
-        ("显示名称", _model_label(account_key, model) if _model_label(account_key, model) != model else record.get("name")), ("描述", record.get("description") or record.get("tagline")),
+        ("积分倍率", credit_label(native_record)),
+        ("显示名称", None if oauth_control.provider_of_snapshot(account) == "qoder" else record.get("name")), ("描述", record.get("description") or record.get("tagline")),
         ("上下文", _format_tokens(record.get("contextWindow"))), ("Max Context", _format_tokens(record.get("contextWindowMaxMode"))),
         ("最大输入", _format_tokens(record.get("maxInputTokens"))),
         ("最大输出", _format_tokens(record.get("maxOutputTokens"))),

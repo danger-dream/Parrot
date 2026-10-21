@@ -203,6 +203,32 @@ def describe_oauth_error(
                 provider=prov, operation=op, technical=technical,
             )
 
+    if prov == "qoder":
+        from .oauth.qoder.common import QoderError
+        if isinstance(exc, QoderError):
+            protected = exc.kind == "disabled"
+            persistence = exc.kind in {"save_failed_retry_save", "save_candidate_expired_relogin"}
+            title = "保护模式暂停执行" if protected else ("Token 保存未完成" if persistence else "Qoder 请求失败")
+            reason = "当前不会刷新 Token。" if protected else "上游请求或凭据保存未完成；未将未知结果当作成功。"
+            if exc.kind == "save_candidate_expired_relogin":
+                title = "轮换凭据已无法恢复"
+                reason = "上游已返回轮换结果，但本地未能保存且可恢复候选已过期；Qoder 的刷新凭据只能使用一次。"
+            elif exc.kind == "refresh_rejected":
+                title, reason = "Qoder 登录已失效", "Qoder 拒绝了刷新凭据（或 PAT）。"
+            elif exc.kind == "missing_refresh_token":
+                title, reason = "Qoder 登录已失效", "账号没有可用的刷新凭据。"
+            action = ("使用独立账户并解除保护后再执行。" if protected else
+                      "请重新授权此账号。" if exc.auth_error else
+                      "稍后重试；已取得的轮换 Token 会优先重试保存，不重复刷新。" if persistence else
+                      "稍后重试或检查上游服务。")
+            return OAuthDisplayError(
+                code=f"qoder_{exc.kind}" if protected or persistence or exc.auth_error else "qoder_request_failed",
+                title=title, reason=reason, action=action,
+                retryable=exc.retryable or exc.kind == "save_failed_retry_save",
+                auth_error=exc.auth_error, status=exc.status_code or None,
+                provider=prov, operation=op, technical=technical,
+            )
+
     if prov == "zhipu":
         from .oauth.zhipu.common import ZhipuError
         if isinstance(exc, ZhipuError):

@@ -14,6 +14,7 @@ PROVIDER_ROUTES = (
     ("cursor", "Cursor"),
     ("antigravity", "Antigravity"),
     ("workbuddy", "WorkBuddy"),
+    ("qoder", "Qoder"),
     ("zhipu", "z.ai / 智谱"),
     ("claude", "Anthropic"),
 )
@@ -22,13 +23,13 @@ _ALIASES = {"anthropic": "claude", "grok": "xai", "z.ai": "zhipu", "zai": "zhipu
 _PURPOSE_PROVIDERS = {
     "oauth_anthropic": "claude", "oauth_openai": "openai",
     "oauth_xai": "xai", "oauth_cursor": "cursor", "oauth_antigravity": "antigravity",
-    "oauth_workbuddy": "workbuddy", "oauth_zhipu": "zhipu",
+    "oauth_workbuddy": "workbuddy", "oauth_zhipu": "zhipu", "oauth_qoder": "qoder",
     "core_openai": "openai", "core_claude": "claude",
 }
 # These are new purpose names replacing ambiguous ones. Keep their old fallback
 # exactly; older distinct purposes (oauth_xai/cursor/antigravity) stay untouched.
 _LEGACY_PURPOSES = {
-    "oauth_workbuddy": "oauth_openai", "oauth_zhipu": "oauth_openai",
+    "oauth_workbuddy": "oauth_openai", "oauth_zhipu": "oauth_openai", "oauth_qoder": "oauth_openai",
     "core_openai": "core_monitor", "core_claude": "core_monitor",
 }
 

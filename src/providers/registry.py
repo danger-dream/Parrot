@@ -25,6 +25,7 @@ from .base import (
     OpenAICodexAdapter,
     XAIOAuthAdapter,
     WorkBuddyOAuthAdapter,
+    QoderOAuthAdapter,
     ZhipuOAuthAdapter,
     ProviderAdapter,
     ProviderAttemptContext,
@@ -39,6 +40,7 @@ _OPENAI_CODEX = OpenAICodexAdapter()
 _XAI_OAUTH = XAIOAuthAdapter()
 _ANTIGRAVITY_OAUTH = AntigravityOAuthAdapter()
 _WORKBUDDY_OAUTH = WorkBuddyOAuthAdapter()
+_QODER_OAUTH = QoderOAuthAdapter()
 _ZHIPU_OAUTH = ZhipuOAuthAdapter()
 
 
@@ -57,6 +59,8 @@ def adapter_for_channel(channel) -> ProviderAdapter:
                 return _ANTIGRAVITY_OAUTH
             if provider == "workbuddy":
                 return _WORKBUDDY_OAUTH
+            if provider == "qoder":
+                return _QODER_OAUTH
             return _OPENAI_CODEX
         return _OPENAI_API
 

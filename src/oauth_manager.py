@@ -61,6 +61,8 @@ from .oauth import openai as openai_provider
 from .oauth import xai as xai_provider
 from .oauth import workbuddy as workbuddy_provider
 from .oauth.workbuddy import runtime as workbuddy_runtime
+from .oauth import qoder as qoder_provider
+from .oauth.qoder import runtime as qoder_runtime
 from .oauth import zhipu as zhipu_provider
 from .oauth.plan_labels import openai_plan_label
 from .oauth.zhipu import common as zhipu_common, runtime as zhipu_runtime
@@ -173,7 +175,7 @@ def _is_antigravity_acc(acc: dict) -> bool:
 
 
 def _is_openai_family_provider(provider: str) -> bool:
-    return provider in ("openai", "xai", "cursor", "antigravity", "workbuddy")
+    return provider in ("openai", "xai", "cursor", "antigravity", "workbuddy", "qoder")
 
 
 def _canonical_key(acc: dict) -> str:
@@ -430,7 +432,7 @@ def account_key_to_email(account_key: str) -> str:
     except AmbiguousOAuthAccountKey:
         acc = None
     if acc is not None:
-        if _acc_provider(acc) in {"cursor", "workbuddy", "zhipu"}:
+        if _acc_provider(acc) in {"cursor", "workbuddy", "zhipu", "qoder"}:
             return str(acc.get("label") or acc.get("nickname") or acc.get("email") or acc.get("uid") or "")
         return str(acc.get("email") or "")
     provider, identity = _split_ak(account_key)
@@ -1058,6 +1060,12 @@ def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: s
             except Exception as exc:
                 exc.oauth_refresh_observation = refresh_observation(acc)
                 raise
+        if provider_of(acc) == "qoder":
+            try:
+                return qoder_runtime.refresh_locked(copy.deepcopy(acc), account_key, force, reuse_current=superseded)
+            except Exception as exc:
+                exc.oauth_refresh_observation = refresh_observation(acc)
+                raise
 
         with _refresh_lock_for_dict:
             pending = _pending_refreshes.get(expected_state_key)
@@ -1289,7 +1297,7 @@ async def ensure_valid_token(account_key: str, *, expected_state_key: str | None
             raise ValueError(f"unknown OAuth account: {account_key}")
         expected_state_key = account_state_key(acc)
 
-    if provider_of(acc) in {"workbuddy", "zhipu"}:
+    if provider_of(acc) in {"workbuddy", "zhipu", "qoder"}:
         return await asyncio.to_thread(_refresh_sync_locked, account_key, False, expected_state_key=expected_state_key)
     if _token_is_fresh(acc) and not _has_pending_refresh(expected_state_key):
         return acc["access_token"]
@@ -1602,6 +1610,9 @@ async def fetch_usage(account_key: str) -> dict:
                                        account=account, account_key=account_key)
         usage["workbuddy"]["credential_fingerprint"] = workbuddy_runtime.credential_fingerprint(account)
         return workbuddy_runtime.preserve_snapshot(account_key, usage, state_db.quota_load(account_key))
+    if provider == "qoder":
+        account = copy.deepcopy(get_account(account_key) or {})
+        return await asyncio.to_thread(qoder_provider.fetch_usage_sync, account, account_key=account_key)
 
     if provider == "xai":
         return await xai_provider.fetch_cli_billing_usage(
@@ -3406,6 +3417,11 @@ def _evaluate_and_toggle_by_usage_current(account_key: str, usage: dict,
         return workbuddy_runtime.evaluate_credits(
             account_key, acc, usage, fresh=fresh, expected_generation=expected_quota_generation,
         )
+    if provider == "qoder":
+        # Credits alone never pause a Qoder account: its 0× models still serve
+        # with none left. Exhaustion is the per-request quota error's cooldown.
+        return {"action": "noop_unknown", "utils": utils, "any_over": False,
+                "hit_windows": [], "disabled_until": acc.get("disabled_until")}
 
     if provider == "antigravity":
         return _evaluate_antigravity_credits(
@@ -3959,7 +3975,11 @@ def _replace_exact_identity_in_config(
         ))
     if provider == "zhipu":
         incoming = zhipu_provider.normalize_credential(incoming)
-    required = () if provider == "zhipu" else ("uid", "access_token", "refresh_token") if provider == "workbuddy" else ("email", "access_token", "refresh_token")
+    if provider == "qoder":
+        incoming.update(qoder_provider.normalize_credential(
+            incoming, source=str(incoming.get("qoder_identity_source") or "import"),
+        ))
+    required = () if provider == "zhipu" else ("uid", "access_token", "refresh_token") if provider == "workbuddy" else ("uid", "access_token", "machine_id") if provider == "qoder" else ("email", "access_token", "refresh_token")
     missing = [key for key in required if not incoming.get(key)]
     if missing:
         raise ValueError(f"missing required fields: {missing}")
@@ -3992,6 +4012,16 @@ def _replace_exact_identity_in_config(
         result["status"] = "identity_conflict"
         return result
 
+    if provider == "qoder":
+        old_profile = current.get("qoder_device_profile")
+        if (incoming.get("machine_id") != current.get("machine_id")
+                or (old_profile and incoming.get("qoder_device_profile") != old_profile
+                    and not (authenticated_login and qoder_provider.device_profile.is_confirmed_upgrade(
+                        old_profile, incoming.get("qoder_device_profile"))))
+                or (not old_profile and incoming.get("qoder_device_profile") and not authenticated_login)):
+            result["status"] = "identity_conflict"
+            return result
+
     # Preserve every field not supplied by the fresh observation, then
     # explicitly protect user settings from login defaults.  A successful
     # interactive login recovers an account that was auto-disabled only
@@ -4000,19 +4030,23 @@ def _replace_exact_identity_in_config(
     replacement.update(incoming)
     if "maxConcurrent" in current:
         replacement["maxConcurrent"] = copy.deepcopy(current["maxConcurrent"])
-    if provider in {"workbuddy", "zhipu"}:
-        for key in ("label", "workbuddy_auto_checkin", "disabledModels", "account_model_catalog",
+    if provider in {"workbuddy", "zhipu", "qoder"}:
+        for key in ("label", "workbuddy_auto_checkin", "qoder_auto_checkin", "disabledModels", "account_model_catalog",
                     "last_model_sync", "last_model_sync_source", "last_model_sync_error", "last_model_sync_attempt"):
             if key in current:
                 replacement[key] = copy.deepcopy(current[key])
     if provider == "workbuddy" and (authenticated_login or
             _refresh_credential_fingerprint(current) != _refresh_credential_fingerprint(incoming)):
         replacement.pop("workbuddy_relogin_required", None)
+    if provider == "qoder" and (authenticated_login or
+            _refresh_credential_fingerprint(current) != _refresh_credential_fingerprint(incoming)):
+        replacement.pop("qoder_relogin_required", None)
     zhipu_reauthenticated = authenticated_login and provider == "zhipu" and incoming.get("credential_mode") == "oauth"
     if zhipu_reauthenticated and replacement.get("management_status") in {"relogin_required", "model_key_rejected"}:
         replacement["management_status"] = "ready"
     if (current.get("disabled_reason") == "auth_error"
             and not replacement.get("workbuddy_relogin_required")
+            and not replacement.get("qoder_relogin_required")
             and (provider != "zhipu" or incoming.get("model_key") or zhipu_reauthenticated)):
         replacement["enabled"] = True
         replacement["disabled_reason"] = None
@@ -4089,7 +4123,11 @@ def replace_exact_identity(
         ))
     if provider == "zhipu":
         incoming = zhipu_provider.normalize_credential(incoming)
-    required = () if provider == "zhipu" else ("uid", "access_token", "refresh_token") if provider == "workbuddy" else ("email", "access_token", "refresh_token")
+    if provider == "qoder":
+        incoming.update(qoder_provider.normalize_credential(
+            incoming, source=str(incoming.get("qoder_identity_source") or "import"),
+        ))
+    required = () if provider == "zhipu" else ("uid", "access_token", "refresh_token") if provider == "workbuddy" else ("uid", "access_token", "machine_id") if provider == "qoder" else ("email", "access_token", "refresh_token")
     missing = [key for key in required if not incoming.get(key)]
     if missing:
         raise ValueError(f"missing required fields: {missing}")
@@ -4230,7 +4268,11 @@ def _add_account_serialized(
         ))
     if provider == "zhipu":
         entry = zhipu_provider.normalize_credential(entry)
-    required = () if provider == "zhipu" else ("uid", "access_token", "refresh_token") if provider == "workbuddy" else ("email", "access_token", "refresh_token")
+    if provider == "qoder":
+        entry = dict(entry, **qoder_provider.normalize_credential(
+            entry, source=str(entry.get("qoder_identity_source") or "import"),
+        ))
+    required = () if provider == "zhipu" else ("uid", "access_token", "refresh_token") if provider == "workbuddy" else ("uid", "access_token", "machine_id") if provider == "qoder" else ("email", "access_token", "refresh_token")
     missing = [k for k in required if not entry.get(k)]
     if missing:
         raise ValueError(f"missing required fields: {missing}")
@@ -4248,7 +4290,7 @@ def _add_account_serialized(
         "refresh_token": entry.get("refresh_token", ""),
         "expired": entry.get("expired", ""),
         "last_refresh": entry.get("last_refresh", _format_utc(datetime.now(timezone.utc))),
-        "type": entry.get("type", provider if provider in ("openai", "xai", "cursor", "antigravity", "workbuddy", "zhipu") else "claude"),
+        "type": entry.get("type", provider if provider in ("openai", "xai", "cursor", "antigravity", "workbuddy", "zhipu", "qoder") else "claude"),
         "enabled": entry.get("enabled", True),
         "disabled_reason": entry.get("disabled_reason"),
         "disabled_until": entry.get("disabled_until"),
@@ -4307,6 +4349,11 @@ def _add_account_serialized(
             if key in entry:
                 normalized[key] = copy.deepcopy(entry[key])
         normalized.setdefault("workbuddy_auto_checkin", False)
+    elif provider == "qoder":
+        for key in qoder_provider.ACCOUNT_FIELDS:
+            if key in entry:
+                normalized[key] = copy.deepcopy(entry[key])
+        normalized.setdefault("qoder_auto_checkin", False)
     # xAI 专属字段（缺失时保持空串；subject 用于稳定 account_key）
     elif provider == "xai":
         subject = str(entry.get("subject") or entry.get("sub") or "")
@@ -4409,7 +4456,7 @@ def _add_account_serialized(
     added = {"v": False}
     existing_target = None
     for a in active_config.get("oauthAccounts", []):
-        if provider in {"openai", "workbuddy", "zhipu"}:
+        if provider in {"openai", "workbuddy", "zhipu", "qoder"}:
             if _acc_provider(a) == provider and _canonical_key(a) == normalized_key:
                 existing_target = a
                 break
@@ -4477,7 +4524,7 @@ def _add_account_serialized(
     def mutate(cfg):
         accounts = cfg.setdefault("oauthAccounts", [])
         target: dict | None = None
-        if provider in {"openai", "workbuddy", "zhipu"}:
+        if provider in {"openai", "workbuddy", "zhipu", "qoder"}:
             for a in accounts:
                 if _acc_provider(a) != provider:
                     continue
@@ -4506,7 +4553,11 @@ def _add_account_serialized(
                     break
 
         if target is not None:
-            if provider not in ("openai", "xai", "cursor", "antigravity", "workbuddy", "zhipu"):
+            if provider == "qoder" and (
+                    normalized.get("machine_id") != target.get("machine_id")
+                    or normalized.get("qoder_device_profile") != target.get("qoder_device_profile")):
+                raise ValueError("Qoder device binding differs; reauthorize from the existing account")
+            if provider not in ("openai", "xai", "cursor", "antigravity", "workbuddy", "zhipu", "qoder"):
                 raise ValueError(
                     f"account already exists: provider={provider} email={email}"
                 )
@@ -4536,9 +4587,9 @@ def _add_account_serialized(
                     "cursor_profile_id", "cursor_email_verified",
                 )
             }
-            keep_workbuddy = {key: copy.deepcopy(target.get(key)) for key in ("label", "workbuddy_auto_checkin") if key in target}
+            keep_workbuddy = {key: copy.deepcopy(target.get(key)) for key in ("label", "workbuddy_auto_checkin", "qoder_auto_checkin") if key in target}
             target.update(normalized)
-            if provider in {"workbuddy", "zhipu"}:
+            if provider in {"workbuddy", "zhipu", "qoder"}:
                 target.update(keep_workbuddy)
             if keep_models is not None and not entry.get("models"):
                 target["models"] = keep_models
@@ -4547,7 +4598,7 @@ def _add_account_serialized(
                     target[key] = value
             if keep_max is not None and "maxConcurrent" not in entry:
                 target["maxConcurrent"] = keep_max
-            if provider in {"cursor", "workbuddy", "zhipu"} and keep_disabled_reason in {"user", "quota"}:
+            if provider in {"cursor", "workbuddy", "zhipu", "qoder"} and keep_disabled_reason in {"user", "quota"}:
                 target["enabled"] = keep_enabled
                 target["disabled_reason"] = keep_disabled_reason
                 target["disabled_until"] = keep_disabled_until
@@ -4826,6 +4877,7 @@ def delete_invalid_accounts_batch_if_unchanged(
                 pass
             forget_openai_probe(account_key)
             workbuddy_runtime.forget(account_key)
+            qoder_runtime.forget(account_key)
             zhipu_runtime.forget(account_key)
             if account_key.startswith("cursor:"):
                 try:
@@ -4973,6 +5025,7 @@ def _delete_account_serialized(account_key: str) -> None:
             # OpenAI probe 节流桶（fetch_usage 统一路径后新增）
             forget_openai_probe(cleanup_key)
             workbuddy_runtime.forget(cleanup_key)
+            qoder_runtime.forget(cleanup_key)
             zhipu_runtime.forget(cleanup_key)
             if cleanup_key.startswith("cursor:"):
                 try:
@@ -6472,7 +6525,7 @@ async def oauth_model_sync_once(
     accounts = [copy.deepcopy(acc) for acc in list_accounts()]
     selected: list[tuple[str, dict]] = []
     for account in accounts:
-        if provider_of(account) not in {"claude", "openai", "xai", "antigravity", "cursor", "workbuddy", "zhipu"}:
+        if provider_of(account) not in {"claude", "openai", "xai", "antigravity", "cursor", "workbuddy", "zhipu", "qoder"}:
             continue
         key = _account_key(account)
         if requested is not None and key not in requested:
@@ -6921,18 +6974,21 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
         if provider == "zhipu":
             out[_account_key(acc)] = "skipped:no_oauth_renewal"
             continue
-        email = acc.get("email") or (account_key_to_email(_account_key(acc)) if provider == "workbuddy" else "")
+        email = acc.get("email") or (account_key_to_email(_account_key(acc)) if provider in {"workbuddy", "qoder"} else "")
         if not email:
             continue
         ak = _account_key(acc)
         if provider == "workbuddy" and not workbuddy_provider.refresh_allowed():
             out[ak] = "skipped:protected"
             continue
+        if provider == "qoder" and not qoder_provider.refresh_allowed():
+            out[ak] = "skipped:protected"
+            continue
         disp = (
             str(acc.get("label") or email)
-            if provider in {"cursor", "workbuddy", "zhipu"} else email
+            if provider in {"cursor", "workbuddy", "zhipu", "qoder"} else email
         )
-        if provider == "workbuddy":
+        if provider in {"workbuddy", "qoder"}:
             email = ak  # IDs, not nicknames, key the result map for this provider.
         if not acc.get("enabled", True):
             out[email] = "skipped:disabled"
@@ -6962,6 +7018,9 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
 
         remaining = (expired - datetime.now(timezone.utc)).total_seconds() if expired else 0
         if provider == "workbuddy" and not workbuddy_runtime.refresh_due(acc, ak, refresh_threshold_seconds):
+            out[email] = "skipped:backoff_or_healthy"
+            continue
+        if provider == "qoder" and not qoder_runtime.refresh_due(acc, ak, refresh_threshold_seconds):
             out[email] = "skipped:backoff_or_healthy"
             continue
         if remaining >= refresh_threshold_seconds and not pending_save:
@@ -7023,7 +7082,7 @@ async def quota_monitor_once() -> dict:
 
     out: dict[str, str] = {}
     for acc in list_accounts()[:]:
-        email = acc.get("email") or (account_key_to_email(_account_key(acc)) if provider_of(acc) in {"workbuddy", "zhipu"} else "")
+        email = acc.get("email") or (account_key_to_email(_account_key(acc)) if provider_of(acc) in {"workbuddy", "zhipu", "qoder"} else "")
         if not email:
             continue
         ak = _account_key(acc)
@@ -7143,6 +7202,11 @@ async def proactive_refresh_loop() -> None:
         try:
             from .oauth.workbuddy.actions import auto_checkin_once
             await asyncio.to_thread(auto_checkin_once)
+        except Exception as exc:
+            safe_diagnostics.report(exc, operation="proactive_refresh_loop")
+        try:
+            from .oauth.qoder.actions import auto_checkin_once as qoder_auto_checkin_once
+            await asyncio.to_thread(qoder_auto_checkin_once)
         except Exception as exc:
             safe_diagnostics.report(exc, operation="proactive_refresh_loop")
         await asyncio.sleep(60)

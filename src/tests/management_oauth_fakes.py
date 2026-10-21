@@ -127,7 +127,7 @@ class InMemoryOAuthBackend(OAuthBackend):
         if account.get("_id"):
             return str(account["_id"])
         provider = self.provider_of(account)
-        if provider in {"workbuddy", "zhipu"}:
+        if provider in {"workbuddy", "zhipu", "qoder"}:
             from src.oauth_ids import account_key
             return account_key(account)
         identity = str(account.get("subject") or account.get("email") or "")
@@ -639,6 +639,26 @@ class InMemoryOAuthBackend(OAuthBackend):
         from src.oauth.workbuddy.auth import normalize_credential
         payload.update(status="ready", entry=normalize_credential({"realm": "cn", "uid": "fixture-workbuddy",
             "nickname": "WorkBuddy Flow", "access_token": "fixture-workbuddy-at", "refresh_token": "fixture-workbuddy-rt"}))
+
+    def qoder_start_login(self, *, realm="global", profile):
+        return {"realm": realm, "nonce": "fixture-nonce", "verifier": "fixture-verifier", "machine_id": profile["machine_id"],
+                "qoder_device_profile": profile, "status": "pending", "auth_url": "https://qoder.com/device/selectAccounts"}
+
+    def qoder_poll_login(self, payload):
+        from src.oauth.qoder.auth import normalize_credential
+        payload.update(status="ready", entry=normalize_credential({"realm": payload["realm"], "uid": "fixture-qoder",
+            "email": "qoder-flow@example.test", "access_token": "fixture-qoder-jt", "refresh_token": "fixture-qoder-rt",
+            "machine_id": payload["machine_id"], "qoder_device_profile": payload["qoder_device_profile"], "device_token": "fixture-qoder-dt"}, source="login"))
+
+    def qoder_pat_login(self, pat, *, realm="global", profile, pending=None):
+        from src.oauth.qoder.auth import normalize_credential
+        if not pat.startswith("pt-"):
+            raise ValueError("Qoder PAT must start with pt-")
+        return normalize_credential({"realm": realm, "uid": "fixture-qoder-pat", "access_token": "fixture-qoder-jt",
+            "refresh_token": "", "qoder_auth_method": "pat", "qoder_pat": pat, "machine_id": profile["machine_id"], "qoder_device_profile": profile}, source="login")
+
+    def qoder_refresh_enabled(self):
+        return True
 
     def cursor_generate_login(self):
         return CursorLogin()

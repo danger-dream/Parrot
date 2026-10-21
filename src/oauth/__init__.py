@@ -20,9 +20,10 @@ from . import openai as _openai
 from . import xai as _xai
 from . import workbuddy as _workbuddy
 from . import zhipu as _zhipu
+from . import qoder as _qoder
 
 # 常量：有效的 provider 值。新增 provider 时在此登记。
-VALID_PROVIDERS: tuple[str, ...] = ("claude", "openai", "xai", "cursor", "antigravity", "workbuddy", "zhipu")
+VALID_PROVIDERS: tuple[str, ...] = ("claude", "openai", "xai", "cursor", "antigravity", "workbuddy", "zhipu", "qoder")
 
 # 老数据（无 provider 字段）默认当作 claude。
 DEFAULT_PROVIDER: str = "claude"
@@ -46,6 +47,7 @@ _NON_CLAUDE_MODULES = {
     "antigravity": _antigravity,
     "workbuddy": _workbuddy,
     "zhipu": _zhipu,
+    "qoder": _qoder,
 }
 
 

@@ -137,6 +137,27 @@ def _credit_metrics(usage):
     return metrics
 
 
+def _qoder_available(a):
+    result = {"models", "auth", "records", "refresh_usage", "sync_models", "reauthorize", "clear_cooldown"}
+    if os.environ.get("PARROT_NO_REFRESH") != "1":
+        result.add("refresh_token")
+    return result
+
+
+def _qoder_metrics(usage):
+    metrics = quota_metrics(usage)
+    for index, pool in enumerate((usage.get("qoder") or {}).get("pools") or []):
+        if not isinstance(pool, dict):
+            continue
+        metric = {"metric_id": f"qoder_{pool.get('kind') or 'pool'}_{index}", "display_name": str(pool.get("name") or "Credits"),
+                  "kind": "credits", "unit": "积分"}
+        for source, target in (("used", "used"), ("remaining", "remaining"), ("total", "total")):
+            if type(pool.get(source)) in (int, float):
+                metric[target] = pool[source]
+        metrics.append(metric)
+    return metrics
+
+
 def _zhipu_metrics(usage):
     result = quota_metrics(usage)
     block = usage.get("zhipu") or {}
@@ -181,6 +202,8 @@ register("workbuddy", Provider("WorkBuddy", (("realm", "地区"), ("enterprise_n
     login=_login("workbuddy"), records=lambda c, ctx, key, a: c.get_workbuddy_records(ctx, key, page_size=10)["items"], benefit_view=_workbuddy_view, benefit_query=lambda c, ctx, key: c.refresh_workbuddy_status_now(ctx, key),
     benefit_actions=(("workbuddy_checkin", "预览签到（需确认）", lambda c, ctx, key, p: c.plan_workbuddy_action(ctx, key, "checkin"),
         lambda c, ctx, key, token: c.execute_workbuddy_action_now(ctx, key, token)),)))
+register("qoder", Provider("Qoder", (("realm", "地区"),), variant=lambda a: "Qoder CN · qoder.cn" if a.get("realm") == "cn" else "Qoder 国际 · qoder.com",
+    available=_qoder_available, facts=_qoder_metrics, login=_login("qoder")))
 register("zhipu", Provider("智谱 / Z.ai", (("plan_scope", "账户范围"), ("organization_name", "组织"), ("project_name", "项目")),
     variant=lambda a: "智谱 · BigModel 中国站" if a.get("site") == "bigmodel" else "Z.ai 国际站" if a.get("site") == "zai" else "智谱 / Z.ai",
     available=_zhipu_available, facts=_zhipu_metrics, login=_login("zhipu"), records=lambda c, ctx, key, a: c.get_zhipu(ctx, key)["actions"], benefit_view=_card_view, benefit_query=lambda c, ctx, key: c.get_zhipu(ctx, key, reset_status=True),

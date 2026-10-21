@@ -28,6 +28,7 @@ from .models import (
 )
 from .plans import OneShotPlanStore
 from .workbuddy_flows import WorkBuddyFlows
+from .qoder_flows import QoderFlows
 from .zhipu_flows import ZhipuFlows
 
 
@@ -74,10 +75,19 @@ class OAuthFlowService:
         self.backend = backend
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.workbuddy = WorkBuddyFlows(backend, clock=self._clock)
+        self.qoder = QoderFlows(backend, clock=self._clock)
         self.zhipu = ZhipuFlows(backend, clock=self._clock)
         self._flows = flow_store or OneShotPlanStore(
             prefix="oflow", ttl_seconds=1800, clock=self._clock,
         )
+
+    def device_for(self, flow_id: str):
+        """The reusable device-style flow owner a flow ID belongs to."""
+        if flow_id.startswith("zhflow_"):
+            return self.zhipu
+        if flow_id.startswith("qdflow_"):
+            return self.qoder
+        return self.workbuddy
 
     def _now(self) -> datetime:
         value = self._clock()
@@ -356,7 +366,7 @@ class OAuthFlowService:
             except (ValueError, TypeError) as exc:
                 raise ManagementError(ManagementErrorCode.VALIDATION_FAILED,
                     summary(exc, provider="zhipu", operation="import", stage="import_parse")) from None
-        if credential.provider is OAuthProvider.WORKBUDDY:
+        if credential.provider in {OAuthProvider.WORKBUDDY, OAuthProvider.QODER}:
             raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
         now = self._now()
         if isinstance(credential, ManualCredential):

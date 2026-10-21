@@ -80,7 +80,7 @@ def _stack(exc: BaseException) -> list[dict]:
                   and re.fullmatch(r"[A-Za-z0-9_<>]+", frame.name)][-12:]
         name = type(current).__name__
         known = {"RuntimeError", "KeyError", "ValueError", "TypeError", "OSError", "TimeoutError",
-                 "ManagementError", "ZhipuError", "WorkBuddyError", "ReadTimeout", "ConnectTimeout",
+                 "ManagementError", "ZhipuError", "WorkBuddyError", "QoderError", "ReadTimeout", "ConnectTimeout",
                  "WriteTimeout", "PoolTimeout", "HTTPStatusError", "ConnectError", "JSONDecodeError"}
         result.append({"type": name if name in known else "Exception", "frames": frames})
         current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)

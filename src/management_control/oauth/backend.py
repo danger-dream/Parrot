@@ -743,6 +743,54 @@ class OAuthBackend:
         from src.oauth.workbuddy.runtime import credential_fingerprint
         return credential_fingerprint(account)
 
+    def qoder_start_login(self, *, realm="global", profile):
+        from src.oauth.qoder import start_login_sync
+        return start_login_sync(realm=realm, profile=profile)
+
+    def qoder_poll_login(self, payload):
+        from src.oauth.qoder import poll_login_sync
+        return poll_login_sync(payload)
+
+    def qoder_pat_login(self, pat, *, realm="global", profile, pending=None):
+        from src.oauth.qoder import pat_login_sync
+        return pat_login_sync(pat, realm=realm, profile=profile, pending=pending)
+
+    def qoder_refresh_enabled(self):
+        from src.oauth.qoder import refresh_allowed
+        return refresh_allowed()
+
+    def qoder_snapshot(self, account_id: str):
+        """Redacted local view: identity, last usage, last daily claim; never tokens."""
+        from src.oauth.qoder import actions, billing, route_label, device_identity, runtime
+        account = self.get_account_exact(account_id) or {}
+        try:
+            usage = json.loads((self.quota_load(account_id) or {}).get("raw_data") or "{}").get("qoder") or {}
+        except (ValueError, TypeError, AttributeError):
+            usage = {}
+        supported, reason = billing.checkin_supported(account) if account else (False, "account_missing")
+        return {
+            **{key: account.get(key) for key in ("realm", "uid", "email", "nickname", "label")},
+            "route": route_label(account) if account.get("realm") in {"global", "cn"} else "",
+            "auth_method": account.get("qoder_auth_method") or "device",
+            "device_chat": account.get("qoder_device_chat") is True,
+            "relogin_required": account.get("qoder_relogin_required") is True,
+            "auto_checkin": account.get("qoder_auto_checkin") is True,
+            "checkin_supported": supported, "checkin_unsupported_reason": reason or None,
+            "checkin": actions.record(account_id),
+            "device": device_identity.summary(account, account_key=account_id),
+            "refresh_status": {pair: runtime.refresh_status(account, account_id, pair) for pair in ("job", "device")},
+            "proxy": device_identity.route_selection(account_id),
+            "usage": {key: copy.deepcopy(usage.get(key)) for key in ("plan", "until", "pools", "fetched_at", "status") if key in usage},
+        }
+
+    def qoder_checkin(self, account_id):
+        from src.oauth.qoder.actions import checkin_now
+        return checkin_now(account_id, source="manual")
+
+    def qoder_update_settings(self, account_id, current, auto_checkin):
+        return oauth_manager.mutate_account_if_unchanged(account_id, current,
+            lambda account: account.update(qoder_auto_checkin=auto_checkin))
+
     def workbuddy_update_settings(self, account_id, current, auto_checkin):
         return oauth_manager.mutate_account_if_unchanged(account_id, current,
             lambda account: account.update(workbuddy_auto_checkin=auto_checkin))

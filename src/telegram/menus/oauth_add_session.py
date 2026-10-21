@@ -79,10 +79,11 @@ def clear_all():
 
 
 def clear_input(chat_id):
-    from . import workbuddy_oauth_menu, zhipu_oauth_menu
+    from . import qoder_oauth_menu, workbuddy_oauth_menu, zhipu_oauth_menu
     cancel_attempt(chat_id)
     workbuddy_oauth_menu.discard_state(chat_id)
     zhipu_oauth_menu.discard_state(chat_id)
+    qoder_oauth_menu.discard_state(chat_id)
     states.pop_state(chat_id)
 
 
@@ -145,7 +146,7 @@ def nav(provider=""):
     attempt = add_context.current()
     provider = provider or (attempt.provider if attempt else "")
     callback = {"claude": "oa:add:claude", "openai": "oa:add:openai", "xai": "oa:add:xai",
-                "workbuddy": "oa:add:workbuddy", "zhipu": "oa:zh:add"}.get(provider, "oa:add")
+                "workbuddy": "oa:add:workbuddy", "zhipu": "oa:zh:add", "qoder": "oa:add:qoder"}.get(provider, "oa:add")
     return {"back_label": "◀ 返回新增账户" if callback == "oa:add" else "◀ 上一步", "back_callback": callback}
 
 

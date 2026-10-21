@@ -46,6 +46,27 @@ class OAuthQueryControlMixin:
     def workbuddy_refresh_enabled_snapshot(self) -> bool:
         return self.backend.workbuddy_refresh_enabled()
 
+    def qoder_snapshot(self, account_id: str) -> dict:
+        """Redacted local view for Telegram; never refreshes or claims."""
+        return self.backend.qoder_snapshot(account_id)
+
+    def _provider_snapshots(self, provider, account_id: str) -> dict:
+        """The account detail's provider-specific redacted views; None for other providers."""
+        from .models import OAuthProvider
+        return {
+            "workbuddy": self.backend.workbuddy_snapshot(account_id) if provider is OAuthProvider.WORKBUDDY else None,
+            "zhipu": self.backend.zhipu_snapshot(account_id) if provider is OAuthProvider.ZHIPU else None,
+            "qoder": self.backend.qoder_snapshot(account_id) if provider is OAuthProvider.QODER else None,
+        }
+
+    def _refresh_enabled_for(self, provider: str) -> bool:
+        """Whether this instance may rotate the provider's credentials (PARROT_NO_REFRESH)."""
+        if provider == "workbuddy":
+            return self.backend.workbuddy_refresh_enabled()
+        if provider == "qoder":
+            return self.backend.qoder_refresh_enabled()
+        return True
+
     def now_ms(self) -> int:
         return self.backend.now_ms()
 

@@ -61,6 +61,7 @@ from .models import (
 from .plans import OneShotPlanStore
 from .queries import OAuthQueryControlMixin
 from .workbuddy_control import WorkBuddyControlMixin
+from .qoder_control import QoderControlMixin
 from .zhipu_control import ZhipuControlMixin
 from .claude_reset_control import ClaudeResetControlMixin
 
@@ -81,6 +82,7 @@ def _page(items: list, spec: PageSpec) -> tuple[list, PageMeta]:
 class OAuthControl(
     ClaudeResetControlMixin,
     WorkBuddyControlMixin,
+    QoderControlMixin,
     ZhipuControlMixin,
     OAuthAccountOrchestrationControlMixin,
     OAuthAccountMutationControlMixin,
@@ -389,8 +391,7 @@ class OAuthControl(
             runtime_errors=tuple(runtime_errors),
             credential_configured=bool(account.get("refresh_token") or account.get("access_token") or (account.get("model_key") or account.get("project_key_id"))),
             last_model_sync=utc_datetime(account.get("last_model_sync")),
-            workbuddy=self.backend.workbuddy_snapshot(account_id) if summary.provider is OAuthProvider.WORKBUDDY else None,
-            zhipu=self.backend.zhipu_snapshot(account_id) if summary.provider is OAuthProvider.ZHIPU else None,
+            **self._provider_snapshots(summary.provider, account_id),
         )
 
     def reorder_accounts_preserving_unlisted(
@@ -403,31 +404,18 @@ class OAuthControl(
         self._audit(context, "oauth.account.reorder", "oauthAccounts")
 
     @audit_failures("oauth.login.start", target_arg="provider")
-    def start_login_flow(self, context: ManagementContext, provider: OAuthProvider, *, realm=None, client_profile=None, site=None, relogin_account_id=None) -> OAuthLoginFlow:
+    def start_login_flow(self, context: ManagementContext, provider: OAuthProvider, *, realm=None, client_profile=None, site=None, relogin_account_id=None, pat=None, login_method="device", proxy_target=None) -> OAuthLoginFlow:
         self._require(context, Capability.SECRETS_WRITE)
-        relogin, realm, client_profile, site = self._prepare_login_context(
-            provider, realm=realm, client_profile=client_profile, site=site,
-            relogin_account_id=relogin_account_id,
+        return self._start_login_flow_for_provider(
+            context, provider, realm=realm, client_profile=client_profile, site=site,
+            relogin_account_id=relogin_account_id, pat=pat,
+            login_method=login_method, proxy_target=proxy_target,
         )
-        if provider is OAuthProvider.ZHIPU:
-            return self._flows.zhipu.start(context.actor.subject_id, site=site, **({"relogin": relogin} if relogin else {}))
-        try:
-            flow = (self._flows.workbuddy.start(context.actor.subject_id, realm=realm, client_profile=client_profile, relogin=relogin)
-                    if relogin else self._flows.start(context.actor.subject_id, provider, realm=realm, client_profile=client_profile)
-                    if provider is OAuthProvider.WORKBUDDY else self._flows.start(context.actor.subject_id, provider))
-        except ManagementError:
-            raise
-        except Exception as exc:
-            raise ManagementError(
-                ManagementErrorCode.UPSTREAM_ERROR, retryable=True,
-            ) from exc
-        self._audit(context, "oauth.login.start", provider.value)
-        return flow
 
     @audit_failures("oauth.login.poll", target="oauthLogin")
     def poll_login_flow(self, context: ManagementContext, flow_id: str, flow_secret: str, *, on_authorized=None):
         self._require(context, Capability.SECRETS_WRITE)
-        device = self._flows.zhipu if flow_id.startswith("zhflow_") else self._flows.workbuddy
+        device = self._flows.device_for(flow_id)
         poll = device.poll(context.actor.subject_id, flow_id, flow_secret)
         if poll.status == "ready":
             if on_authorized is not None:
@@ -442,7 +430,7 @@ class OAuthControl(
     @audit_failures("oauth.login.cancel", target="oauthLogin")
     def cancel_login_flow(self, context: ManagementContext, flow_id: str, flow_secret: str) -> None:
         self._require(context, Capability.SECRETS_WRITE)
-        device = self._flows.zhipu if flow_id.startswith("zhflow_") else self._flows.workbuddy
+        device = self._flows.device_for(flow_id)
         device.cancel(context.actor.subject_id, flow_id, flow_secret)
         self._audit(context, "oauth.login.cancel", "oauthLogin")
 
@@ -457,7 +445,7 @@ class OAuthControl(
         invalid = [
             self.backend.account_id(account)
             for account in self.backend.list_accounts()
-            if (account.get("email") or self.backend.provider_of(account) in {"workbuddy", "zhipu"}) and account.get("disabled_reason") == "auth_error"
+            if (account.get("email") or self.backend.provider_of(account) in {"workbuddy", "zhipu", "qoder"}) and account.get("disabled_reason") == "auth_error"
         ]
         selected = invalid if account_ids is None else list(account_ids)
         if not selected or len(selected) != len(set(selected)) or not set(selected).issubset(invalid):
@@ -500,7 +488,7 @@ class OAuthControl(
     def refresh_token(self, context: ManagementContext, account_id: str) -> OAuthMutationResult:
         self._require(context, Capability.WRITE)
         account = self._account(account_id)
-        if self.backend.provider_of(account) == "workbuddy" and not self.backend.workbuddy_refresh_enabled():
+        if not self._refresh_enabled_for(self.backend.provider_of(account)):
             raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE,
                 fields=[ErrorField("instance", "REFRESH_DISABLED", "PARROT_NO_REFRESH=1; no refresh was performed")])
         if self.backend.provider_of(account) == "zhipu" and not (account.get("model_key") or account.get("project_key_id")):
@@ -575,7 +563,7 @@ class OAuthControl(
         self._require(context, Capability.DESTRUCTIVE)
         account = self._account(account_id)
         provider = OAuthProvider(self.backend.provider_of(account))
-        if provider in {OAuthProvider.CURSOR, OAuthProvider.XAI, OAuthProvider.ANTIGRAVITY, OAuthProvider.WORKBUDDY, OAuthProvider.ZHIPU}:
+        if provider in {OAuthProvider.CURSOR, OAuthProvider.XAI, OAuthProvider.ANTIGRAVITY, OAuthProvider.WORKBUDDY, OAuthProvider.ZHIPU, OAuthProvider.QODER}:
             raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
         row = copy.deepcopy(self.backend.quota_load(account_id) or {})
         credit_count = row.get("openai_reset_credit_count")

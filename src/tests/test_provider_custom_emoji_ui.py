@@ -31,6 +31,7 @@ EXPECTED_CUSTOM_EMOJI = {
     "cursor": "6062261319426390107",
     "ollama-cloud": "6138524734419116492",
     "workbuddy": "6120617435214132136",
+    "qoder": "6251484272679462431",
     "xai": "6138882363460952713",
     "kimi": "6140905172798284383",
     "deepseek": "6138914554240836667",
@@ -52,7 +53,7 @@ CONFIG_CUSTOM_EMOJI = {
 PROVIDERS = tuple(EXPECTED_CUSTOM_EMOJI)
 API_PROVIDERS = tuple(
     provider for provider in PROVIDERS
-    if provider not in {"claude", "antigravity", "cursor", "workbuddy", "xai"}
+    if provider not in {"claude", "antigravity", "cursor", "workbuddy", "qoder", "xai"}
 )
 
 
@@ -66,7 +67,7 @@ def test_exact_custom_emoji_map_defaults_example_ui_and_notifier_are_consistent(
     assert notifier._PROVIDER_CUSTOM_EMOJI == EXPECTED_CUSTOM_EMOJI
     assert config.DEFAULT_CONFIG["telegramUi"]["providerCustomEmoji"] == CONFIG_CUSTOM_EMOJI
     assert example["telegramUi"]["providerCustomEmoji"] == CONFIG_CUSTOM_EMOJI
-    assert len(CONFIG_CUSTOM_EMOJI) == 19
+    assert len(CONFIG_CUSTOM_EMOJI) == 20
     assert {key: ui.PROVIDER_CUSTOM_EMOJI[key] for key in CONFIG_CUSTOM_EMOJI} == CONFIG_CUSTOM_EMOJI
     assert ui.PROVIDER_CUSTOM_EMOJI["anthropic"] == CONFIG_CUSTOM_EMOJI["claude"]
     assert ui.provider_custom_emoji_id("claude") == EXPECTED_CUSTOM_EMOJI["claude"]
@@ -148,6 +149,21 @@ def test_workbuddy_custom_icon_is_consistent_in_defaults_messages_and_buttons(mo
     assert notifier.provider_tag("workbuddy") == ui.provider_tag("workbuddy")
     assert ui.provider_button("WorkBuddy", "oa:wb:login", "workbuddy")["icon_custom_emoji_id"] == expected
     assert "WorkBuddy" not in ui.family_label("openai")
+
+
+def test_qoder_custom_icon_is_consistent_in_defaults_messages_buttons_and_channels(monkeypatch):
+    expected = "6251484272679462431"
+    assert config.DEFAULT_CONFIG["telegramUi"]["providerCustomEmoji"]["qoder"] == expected
+    monkeypatch.setattr(ui, "_telegram_ui_provider_table", lambda name: {})
+    monkeypatch.setattr(notifier, "_telegram_ui_provider_table", lambda name: {})
+    assert ui.provider_custom_emoji_id("qoder") == expected
+    assert ui.provider_custom_emoji_html("qoder") == f'<tg-emoji emoji-id="{expected}">🧩</tg-emoji>'
+    assert notifier.provider_tag("qoder") == ui.provider_tag("qoder")
+    assert notifier.provider_btn_emoji("qoder") == ui.provider_btn_emoji("qoder") == "🧩"
+    assert ui.provider_button("Qoder", "oa:add:qoder", "qoder")["icon_custom_emoji_id"] == expected
+    assert ui.provider_url_button("打开授权页面", "https://qoder.com/device/test", "qoder")["icon_custom_emoji_id"] == expected
+    for realm in ("global", "cn"):
+        assert ui.channel_provider_custom_emoji_id(f"oauth:qoder:{realm}:fixture") == expected
 
 
 def test_api_channel_provider_helper_uses_exact_registry_provider_without_guessing(monkeypatch):

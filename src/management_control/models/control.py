@@ -272,6 +272,7 @@ class ModelCenterControl(DomainControl):
 
     def _chat_views(self, cfg: Mapping[str, Any]) -> list[ModelView]:
         by_model: dict[str, list[ModelSourceView]] = {}
+        aliases_by_target: dict[str, list[str]] = {}
         state = model_state.state_snapshot(cfg)
         api_disabled = {
             source: set(values)
@@ -324,6 +325,11 @@ class ModelCenterControl(DomainControl):
                 continue
             if not account_id:
                 continue
+            if provider == "qoder":
+                from src.oauth.qoder.catalog import model_aliases
+                for outbound, alias in model_aliases(selection.get("records") or []).items():
+                    if outbound in selection.get("models", ()):
+                        aliases_by_target.setdefault(outbound, []).append(alias)
             label = str(account.get("label") or account_id)
             container_enabled = bool(account.get("enabled", True)) and not bool(account.get("disabled_reason"))
             disabled = set(selection.get("disabled_models") or ())
@@ -358,7 +364,6 @@ class ModelCenterControl(DomainControl):
                     ) if zhipu_effective is not None and outbound not in zhipu_effective and source_enabled else None,
                 ))
 
-        aliases_by_target: dict[str, list[str]] = {}
         for alias, target in model_mapping.get_global_map().items():
             aliases_by_target.setdefault(target, []).append(alias)
         views: list[ModelView] = []
@@ -368,7 +373,7 @@ class ModelCenterControl(DomainControl):
             identity = ModelIdentity(ModelKind.CHAT, model_id)
             views.append(ModelView(
                 resource_key=_resource_key(identity), identity=identity, model_id=model_id,
-                aliases=tuple(sorted(aliases_by_target.get(model_id, ()), key=str.casefold)),
+                aliases=tuple(sorted(set(aliases_by_target.get(model_id, ())), key=str.casefold)),
                 global_enabled=model_id not in disabled, visible=model_id not in hidden,
                 common_metadata=self._common_metadata(model_id),
                 sources=tuple(sorted(sources, key=lambda item: (item.type.value, item.id))),
@@ -553,6 +558,7 @@ class ModelCenterControl(DomainControl):
                 text = " ".join((
                     item.model_id, *item.aliases,
                     *(source.outbound_model for source in item.sources),
+                    *(str(source.effective_metadata.get("name") or "") for source in item.sources),
                     *(source.label for source in item.sources),
                 )).casefold()
                 if needle not in text:

@@ -2645,7 +2645,7 @@ async def run_failover(
             and ch.type == "oauth"
             and getattr(ch, "provider", "") != "zhipu"
             and result.http_status in (401, 403)
-            and (getattr(ch, "provider", "") != "workbuddy" or result.http_status == 401)
+            and (getattr(ch, "provider", "") not in {"workbuddy", "qoder"} or result.http_status == 401)
             and not result.openai_oauth_html_403
             and quota_exhaustion is None
             and getattr(getattr(result, "error_advice", None), "kind", "") not in {
@@ -5634,7 +5634,16 @@ async def _consume_stream(
             ch, http_status=upstream_status, translator_ctx=translator_ctx,
         )
 
+    def _qoder_stream_mapping():
+        if getattr(ch, "provider", "") != "qoder":
+            return None
+        return getattr((translator_ctx or {}).get("qoder_stream"), "error_mapping", None)
+
     def _workbuddy_responses_error(chunks):
+        mapped = _qoder_stream_mapping()
+        if mapped is not None:
+            error = mapped["error"]
+            return [_sse_error_for_ingress(ingress_protocol, error["type"], error["message"], code=error.get("code"))]
         if ingress_protocol != "responses" or not workbuddy_stream_error:
             return chunks
         error = workbuddy_stream_error["error"]
@@ -5669,14 +5678,21 @@ async def _consume_stream(
         rejection = _workbuddy_stream_rejection()
         if rejection is not None:
             outcome, message = "request_invalid", rejection[1]
+        mapped = _qoder_stream_mapping()
+        terminal_status = upstream_status
+        if mapped is not None:
+            terminal_status = mapped["status"]
+            message = mapped["error"]["message"]
+            outcome = ("request_invalid" if terminal_status == 400 else
+                       "quota_exhausted" if terminal_status == 429 else "stream_upstream_error")
         request_elapsed_ms = _elapsed_ms(start_monotonic)
 
         # 已发首包的普通上游错误视为本次渠道失败；但上下文/请求级错误
         # 不是渠道健康问题，即使在流中途才被上游明确揭示，也按 runtime
         # request_invalid 语义处理，避免误伤渠道评分/冷却。
-        failure_policy = "runtime" if outcome == "request_invalid" else "post_commit_stream"
+        failure_policy = "runtime" if outcome == "request_invalid" or mapped is not None else "post_commit_stream"
         quota_result = AttemptResult(outcome=outcome, error_detail=message,
-                                     http_status=upstream_status, full_response_text=tracker.get_full_response(),
+                                     http_status=terminal_status, full_response_text=tracker.get_full_response(),
                                      translator_ctx=translator_ctx)
         quota_result = _request_invalid_result_if_needed(quota_result, ch)
         if quota_result.outcome == "account_restricted":
@@ -5694,7 +5710,7 @@ async def _consume_stream(
         plan = finalize_policy.error_plan(
             "connection_lifecycle" if codex_handled else outcome,
             failure_policy=failure_policy,
-            http_status=(400 if outcome == "request_invalid" else 403 if outcome == "account_restricted" else upstream_status),
+            http_status=(400 if outcome == "request_invalid" else 403 if outcome == "account_restricted" else terminal_status),
         )
         finalize_policy.apply_error_health_effects(
             plan,
@@ -5716,7 +5732,7 @@ async def _consume_stream(
             total_ms=(timing_snapshot.total_ms if timing_snapshot is not None else None),
             final_round_id=(timing_snapshot.round_id if timing_snapshot is not None else None),
             request_elapsed_ms=request_elapsed_ms,
-            http_status=(400 if outcome == "request_invalid" else 403 if outcome == "account_restricted" else upstream_status),
+            http_status=(400 if outcome == "request_invalid" else 403 if outcome == "account_restricted" else terminal_status),
             affinity_hit=affinity_hit,
             http_header_model=model_reroute.header_model(getattr(upstream_resp, "headers", None)),
             response_body=tracker.get_full_response(),

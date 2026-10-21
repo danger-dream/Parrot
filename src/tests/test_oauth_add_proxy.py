@@ -73,15 +73,17 @@ def rows():
 def test_exact_brand_layout_and_every_old_entry_reachable():
     menu.on_add_menu(42, 1, "cb")
     assert [[b["text"] for b in row] for row in rows()] == [
-        ["Anthropic", "OpenAI", "Grok"], ["Cursor", "Antigravity", "WorkBuddy"], ["智谱"],
+        ["Anthropic", "OpenAI", "Grok"], ["Cursor", "Antigravity", "WorkBuddy"], ["智谱", "Qoder"],
         ["⚙ 设置代理", "🏠 返回主菜单", "◀ 返回列表"]]
     assert "本次新增代理：继承现有规则" in ui.edit.call_args.args[2]
     for row in rows()[:3]:
-        assert all(b.get("icon_custom_emoji_id") for b in row)
+        # Qoder has no Telegram custom emoji yet (telegramUi.providerCustomEmoji.qoder).
+        assert all(b.get("icon_custom_emoji_id") for b in row if b["text"] != "Qoder")
     expected = {"claude": {"oa:login", "oa:set_json"},
         "openai": {"oa:login:openai", "oa:set_rt:openai", "oa:import:sub2api", "oa:import:cpa"},
         "xai": {"oa:login:xai", "oa:set_rt:xai"},
-        "workbuddy": {"oa:wb:login", "oa:wb:login:global"}}
+        "workbuddy": {"oa:wb:login", "oa:wb:login:global"},
+        "qoder": {"oa:qd:login:global", "oa:qd:pat", "oa:qd:login:cn", "oa:add:proxy"}}
     for provider, callbacks in expected.items():
         assert menu.handle_callback(42, 1, "cb", "oa:add:" + provider)
         assert {b["callback_data"] for row in rows() for b in row} == callbacks | {"oa:add"}

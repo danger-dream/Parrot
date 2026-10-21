@@ -8,6 +8,7 @@ cancelManagementOperation
 cancelOAuthLoginFlow
 cancelStagedUpdate
 checkForUpdates
+checkinOAuthQoderAccount
 clearAllAffinity
 clearAllChannelAffinity
 clearAllChannelErrors
@@ -24,6 +25,7 @@ commitLogRetentionPlan
 commitOAuthImport
 commitSocks5Settings
 completeOAuthLoginFlow
+confirmOAuthQoderDevice
 createApiKey
 createChannel
 createLogRetentionPlan
@@ -87,6 +89,7 @@ getNetworkMonitor
 getNetworkSettings
 getNotificationSettings
 getOAuthAccount
+getOAuthQoderAccount
 getOAuthSettings
 getOAuthWorkBuddyAccount
 getOAuthWorkBuddyPolicy
@@ -165,11 +168,13 @@ putModelMapping
 putModelMetadataBinding
 refreshAllOAuthUsage
 refreshChannelProviderUsage
+refreshOAuthQoderStatus
 refreshOAuthToken
 refreshOAuthUsage
 refreshOAuthWorkBuddyStatus
 refreshStatusAlerts
 regenerateApiKey
+regenerateOAuthQoderDevice
 removeXaiMediaModel
 renameXaiMediaModel
 reorderApiKeys
@@ -220,6 +225,7 @@ updateNotificationSettings
 updateOAuthAccount
 updateOAuthAccountModelSettings
 updateOAuthAccountModels
+updateOAuthQoderSettings
 updateOAuthSettings
 updateOAuthWorkBuddySettings
 updateOpenAiWebSocketSettings

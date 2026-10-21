@@ -752,12 +752,21 @@ def _configured_proxy_chain_or_none(*, proxy_purpose: str, proxy_channel: str, p
     """
     from .proxy import manager as pm
     from .proxy.connector import ProxyConnectError
+    if proxy_provider == "qoder" or proxy_purpose == "oauth_qoder":
+        from .oauth.qoder import routes
+        pinned = routes.current()
+        if pinned is not None:
+            return [(pinned.name, pinned.connector)]
+        proxy_channel = routes.channel_key(proxy_channel)
 
     from .oauth.add_context import request_target
     # Resolve the attempt before the legacy/default branch, including explicit
     # direct when no new-proxy configuration exists. Expiry must fail closed.
     selected_target = request_target(proxy_purpose, proxy_channel)
     configured = selected_target is not None
+    # Qoder account identity and authorization must share the selected exit.
+    # Other providers retain the global user-selected direct fallback behavior.
+    strict_qoder = proxy_provider == "qoder" or proxy_purpose == "oauth_qoder"
     try:
         pm.init()
         configured = configured or pm.is_configured()
@@ -776,7 +785,7 @@ def _configured_proxy_chain_or_none(*, proxy_purpose: str, proxy_channel: str, p
         is_antigravity = proxy_provider == "antigravity" or (
             not proxy_provider and proxy_purpose == "oauth_antigravity"
         )
-        if is_antigravity and proxy_channel.startswith("oauth:"):
+        if (is_antigravity or strict_qoder) and proxy_channel.startswith("oauth:"):
             route_kwargs["account_key"] = proxy_channel[len("oauth:"):]
         source_chain = (pm.expand_target(selected_target) if selected_target is not None
                         else pm.resolve_proxy_chain(**route_kwargs))
@@ -786,12 +795,12 @@ def _configured_proxy_chain_or_none(*, proxy_purpose: str, proxy_channel: str, p
             if connector is not None:
                 chain.append((name, connector))
         if chain:
-            if pm.direct_fallback_enabled() and not any(name == "direct" for name, _ in chain):
+            if not strict_qoder and pm.direct_fallback_enabled() and not any(name == "direct" for name, _ in chain):
                 direct = pm.get_connector("direct")
                 if direct is not None:
                     chain.append(("direct", direct))
             return chain
-        if pm.direct_fallback_enabled():
+        if not strict_qoder and pm.direct_fallback_enabled():
             direct = pm.get_connector("direct")
             if direct is not None:
                 print("[proxy] network route has no usable target; using enabled direct fallback")
@@ -800,7 +809,7 @@ def _configured_proxy_chain_or_none(*, proxy_purpose: str, proxy_channel: str, p
     except ProxyConnectError:
         raise
     except Exception as exc:
-        if pm.direct_fallback_enabled():
+        if not strict_qoder and pm.direct_fallback_enabled():
             direct = pm.get_connector("direct")
             if direct is not None:
                 from .safe_diagnostics import report
@@ -1016,6 +1025,8 @@ def async_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
 
     # No configured new-proxy route: preserve legacy SOCKS5/default behavior.
     opts = dict(kwargs)
+    if proxy_provider == "qoder" or proxy_purpose == "oauth_qoder":
+        opts["trust_env"] = False
     if timeout is not None:
         opts["timeout"] = timeout
     if limits is not None:
@@ -1077,6 +1088,8 @@ def sync_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
             "configured proxy route has no sync-compatible target"
         ) from last_error
 
+    if proxy_provider == "qoder" or proxy_purpose == "oauth_qoder":
+        opts["trust_env"] = False
     proxy = active_socks5_url()
     if proxy:
         opts["proxy"] = proxy

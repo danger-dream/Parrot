@@ -22,9 +22,44 @@ class OAuthAccountOrchestrationControlMixin:
         return account.get("disabled_reason") == "auth_error" or (
             account.get("provider") == "workbuddy" and account.get("workbuddy_relogin_required") is True
         ) or (
+            account.get("provider") == "qoder" and account.get("qoder_relogin_required") is True
+        ) or (
             account.get("provider") == "zhipu" and account.get("credential_mode") == "oauth"
             and account.get("management_status") == "relogin_required"
         )
+
+    def _start_login_flow_for_provider(
+        self, context, provider, *, realm=None, client_profile=None, site=None,
+        relogin_account_id=None, pat=None, login_method="device", proxy_target=None,
+    ):
+        """Dispatch provider login after the public entry's capability check.
+
+        Qoder owns device preparation/PAT options; other providers retain their
+        existing login routing, error translation and audit ordering.
+        """
+        if provider is OAuthProvider.QODER or pat is not None:
+            return self._start_qoder_login(context, provider, realm=realm, pat=pat, relogin_account_id=relogin_account_id,
+                                           login_method=login_method, proxy_target=proxy_target)
+        if login_method != "device" or proxy_target is not None:
+            raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
+        relogin, realm, client_profile, site = self._prepare_login_context(
+            provider, realm=realm, client_profile=client_profile, site=site,
+            relogin_account_id=relogin_account_id,
+        )
+        if provider is OAuthProvider.ZHIPU:
+            return self._flows.zhipu.start(context.actor.subject_id, site=site, **({"relogin": relogin} if relogin else {}))
+        try:
+            flow = (self._flows.workbuddy.start(context.actor.subject_id, realm=realm, client_profile=client_profile, relogin=relogin)
+                    if relogin else self._flows.start(context.actor.subject_id, provider, realm=realm, client_profile=client_profile)
+                    if provider is OAuthProvider.WORKBUDDY else self._flows.start(context.actor.subject_id, provider))
+        except ManagementError:
+            raise
+        except Exception as exc:
+            raise ManagementError(
+                ManagementErrorCode.UPSTREAM_ERROR, retryable=True,
+            ) from exc
+        self._audit(context, "oauth.login.start", provider.value)
+        return flow
 
     def _prepare_login_context(self, provider: OAuthProvider, *, realm=None, client_profile=None,
                                site=None, relogin_account_id=None):
@@ -37,14 +72,16 @@ class OAuthAccountOrchestrationControlMixin:
         if relogin_account_id is not None:
             account = copy.deepcopy(self._account(relogin_account_id))
             if (self.backend.provider_of(account) != provider.value
-                    or not self.account_authentication_failed(account)
-                    or provider not in {OAuthProvider.WORKBUDDY, OAuthProvider.ZHIPU}
+                    or (provider is not OAuthProvider.QODER and not self.account_authentication_failed(account))
+                    or provider not in {OAuthProvider.WORKBUDDY, OAuthProvider.ZHIPU, OAuthProvider.QODER}
                     or (provider is OAuthProvider.ZHIPU and account.get("credential_mode") != "oauth")):
                 raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
             relogin = {"target_key": relogin_account_id, "account": account}
             if provider is OAuthProvider.WORKBUDDY:
                 realm = account.get("realm") or "cn"
                 client_profile = account.get("workbuddy_client_profile") or "cli"
+            elif provider is OAuthProvider.QODER:
+                realm = account.get("realm") or "global"
             else:
                 site = account["site"]
         if provider is OAuthProvider.ZHIPU:
@@ -63,6 +100,10 @@ class OAuthAccountOrchestrationControlMixin:
                 except ValueError:
                     raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE,
                         fields=[ErrorField("clientProfile", "REGION_PROFILE_MISMATCH", "Unsupported WorkBuddy login region/profile")])
+            elif provider is OAuthProvider.QODER:
+                realm = realm or "global"
+                if realm not in {"global", "cn"} or client_profile is not None:
+                    raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
             elif realm is not None or client_profile is not None:
                 raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
         return relogin, realm, client_profile, site
@@ -323,7 +364,7 @@ class OAuthAccountOrchestrationControlMixin:
         effects = self._start_post_save_model_sync(account_id)
         effects.update(usage=None, usage_error=None, quota_action=None, enrichment_error=None)
 
-        if provider not in {"openai", "cursor", "workbuddy"}:
+        if provider not in {"openai", "cursor", "workbuddy", "qoder"}:
             return effects
         try:
             if usage is None:

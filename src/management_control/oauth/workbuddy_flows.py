@@ -19,23 +19,21 @@ from .plans import OneShotPlanStore
 
 
 class WorkBuddyFlows:
+    kind = "workbuddy-login"
+    prefix = "wbflow"
+    ttl_seconds = 300
+
     def __init__(self, backend, *, clock=None):
         self.backend = backend
         self.clock = clock or (lambda: datetime.now(timezone.utc))
-        self.store = OneShotPlanStore(prefix="wbflow", ttl_seconds=300, clock=self.clock)
+        self.store = OneShotPlanStore(prefix=self.prefix, ttl_seconds=self.ttl_seconds, clock=self.clock)
         self._known = OrderedDict()
         self._known_lock = RLock()
 
-    @diagnose('workbuddy', 'login_init', 'login_init')
-    def start(self, actor: str, *, realm="cn", client_profile=None, relogin=None) -> OAuthLoginFlow:
-        try:
-            payload = (self.backend.workbuddy_start_login() if realm == "cn" and client_profile in (None, "cli")
-                       else self.backend.workbuddy_start_login(realm=realm, client_profile=client_profile))
-        except Exception:
-            raise ManagementError(ManagementErrorCode.UPSTREAM_ERROR, retryable=True) from None
+    def _register(self, actor: str, payload: dict, relogin=None):
         payload = dict(payload, lock=Lock(), last_poll=None, relogin=copy.deepcopy(relogin),
                        add_attempt=None if relogin else add_context.current())
-        flow_id, secret, plan = self.store.create_split(actor_subject_id=actor, kind="workbuddy-login", revision="", payload=payload)
+        flow_id, secret, plan = self.store.create_split(actor_subject_id=actor, kind=self.kind, revision="", payload=payload)
         with self._known_lock:
             for key, value in list(self._known.items()):
                 if self.clock().timestamp() - value["expires_at"].timestamp() > 600:
@@ -44,6 +42,16 @@ class WorkBuddyFlows:
                 self._known.popitem(last=False)
             self._known[flow_id] = {"actor": actor, "verifier": hashlib.sha256(secret.encode()).digest(),
                                     "expires_at": plan.expires_at, "status": "pending"}
+        return flow_id, secret, plan
+
+    @diagnose('workbuddy', 'login_init', 'login_init')
+    def start(self, actor: str, *, realm="cn", client_profile=None, relogin=None) -> OAuthLoginFlow:
+        try:
+            payload = (self.backend.workbuddy_start_login() if realm == "cn" and client_profile in (None, "cli")
+                       else self.backend.workbuddy_start_login(realm=realm, client_profile=client_profile))
+        except Exception:
+            raise ManagementError(ManagementErrorCode.UPSTREAM_ERROR, retryable=True) from None
+        flow_id, secret, plan = self._register(actor, payload, relogin)
         from ...oauth.workbuddy.common import route_label
         region = route_label(payload) + (" · 国际区（Google/GitHub）" if realm == "global" else "")
         return OAuthLoginFlow(flow_id, secret, OAuthProvider.WORKBUDDY, payload["auth_url"],
@@ -58,7 +66,7 @@ class WorkBuddyFlows:
             if record["status"] == "pending" and not record.get("saving") and record["expires_at"] <= self.clock():
                 record["status"] = "expired"
                 try:
-                    self.store.inspect_parts(flow_id, secret, actor_subject_id=actor, kind="workbuddy-login")
+                    self.store.inspect_parts(flow_id, secret, actor_subject_id=actor, kind=self.kind)
                 except ManagementError:
                     pass
             if record["status"] != "pending":
@@ -72,13 +80,13 @@ class WorkBuddyFlows:
 
     @contextmanager
     def lease(self, actor: str, flow_id: str, secret: str):
-        plan = self.store.inspect_parts(flow_id, secret, actor_subject_id=actor, kind="workbuddy-login")
+        plan = self.store.inspect_parts(flow_id, secret, actor_subject_id=actor, kind=self.kind)
         lock = plan.payload["lock"]
         if not lock.acquire(blocking=False):
             raise ManagementError(ManagementErrorCode.STATE_CONFLICT, retryable=True)
         try:
             # Another actor-bound request may have consumed it before lock acquisition.
-            plan = self.store.inspect_parts(flow_id, secret, actor_subject_id=actor, kind="workbuddy-login")
+            plan = self.store.inspect_parts(flow_id, secret, actor_subject_id=actor, kind=self.kind)
             with add_context.bind(plan.payload.get("add_attempt")):
                 yield plan
         finally:
@@ -106,8 +114,14 @@ class WorkBuddyFlows:
             return None
         return {key: entry.get(key) for key in ("realm", "uid", "enterprise_id", "nickname", "label", "expired", "workbuddy_client_profile", "workbuddy_account_type")}
 
+    def _poll_payload(self, payload: dict) -> None:
+        self.backend.workbuddy_poll_login(payload)
+
     @diagnose('workbuddy', 'login_poll', 'token_poll')
     def poll(self, actor: str, flow_id: str, secret: str) -> OAuthLoginPoll:
+        return self._poll(actor, flow_id, secret)
+
+    def _poll(self, actor: str, flow_id: str, secret: str) -> OAuthLoginPoll:
         terminal = self._terminal(actor, flow_id, secret)
         if terminal is not None:
             return terminal
@@ -117,14 +131,14 @@ class WorkBuddyFlows:
             if payload.get("status") != "ready" and (payload.get("last_poll") is None or now - payload["last_poll"] >= 3):
                 payload["last_poll"] = now
                 try:
-                    self.backend.workbuddy_poll_login(payload)
+                    self._poll_payload(payload)
                 except Exception:
                     # Token polling may have succeeded while identity lookup
                     # failed. Preserve that phase and credential candidate for
                     # the next identity-only poll; do not report it as a login.
                     if payload.get("status") != "identity_pending":
                         raise ManagementError(ManagementErrorCode.UPSTREAM_ERROR, retryable=True) from None
-                self.store.inspect_parts(flow_id, secret, actor_subject_id=actor, kind="workbuddy-login")
+                self.store.inspect_parts(flow_id, secret, actor_subject_id=actor, kind=self.kind)
             return OAuthLoginPoll(flow_id, payload.get("status", "pending"), plan.expires_at, self.preview(payload))
 
     def ready(self, plan) -> dict:
@@ -144,7 +158,7 @@ class WorkBuddyFlows:
     def finish(self, actor: str, flow_id: str, secret: str, *, completed: bool = False,
                result=None, preview=None) -> None:
         try:
-            self.store.consume_parts(flow_id, secret, actor_subject_id=actor, kind="workbuddy-login")
+            self.store.consume_parts(flow_id, secret, actor_subject_id=actor, kind=self.kind)
         except ManagementError:
             # A verified save may outlive the flow TTL while post-save metadata
             # synchronizes. Its success must not be reported as a failed login.
@@ -166,7 +180,7 @@ class WorkBuddyFlows:
                 raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
             if self._known[flow_id].get("saving"):
                 raise ManagementError(ManagementErrorCode.STATE_CONFLICT, retryable=True)
-            plan = self.store.consume_parts(flow_id, secret, actor_subject_id=actor, kind="workbuddy-login")
+            plan = self.store.consume_parts(flow_id, secret, actor_subject_id=actor, kind=self.kind)
             self._known[flow_id]["status"] = "cancelled"
         # In-flight polling owns its payload until its post-request inspect fails;
         # consuming the store above prevents that result from ever being saved.

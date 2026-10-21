@@ -32,7 +32,7 @@ DURABLE_DOMAINS = (
     "xai_video_jobs", "codex_compaction_owners", "codex_identity_tombstones",
     "codex_logical_sessions", "app_self_update", "app_update_state",
     "status_seen_updates", "status_muted_incidents", "workbuddy_actions",
-    "model_reroute_mutes", "claude_reset_operations", "zhipu_actions",
+    "model_reroute_mutes", "claude_reset_operations", "zhipu_actions", "qoder_checkins", "qoder_identities", "qoder_refresh",
     "notification_events", "notification_incidents", "notification_deliveries",
     "notification_refs", "notification_policy",
 )

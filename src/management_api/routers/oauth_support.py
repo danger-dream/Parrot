@@ -261,6 +261,7 @@ def detail(value) -> OAuthAccountDetailData:
         lastModelSync=value.last_model_sync,
         workbuddy=public_value(value.workbuddy, camel_case_keys=True) if value.workbuddy is not None else None,
         zhipu=public_value(value.zhipu, camel_case_keys=True) if value.zhipu is not None else None,
+        qoder=public_value(value.qoder, camel_case_keys=True) if value.qoder is not None else None,
     )
 
 

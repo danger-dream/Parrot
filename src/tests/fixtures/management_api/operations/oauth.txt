@@ -20,6 +20,10 @@ startOAuthZhipuProjectSelection
 selectOAuthZhipuProject
 planOAuthZhipuAction
 executeOAuthZhipuAction
+getOAuthQoderAccount
+refreshOAuthQoderStatus
+checkinOAuthQoderAccount
+updateOAuthQoderSettings
 completeOAuthLoginFlow
 previewOAuthImport
 commitOAuthImport
@@ -42,3 +46,5 @@ getOAuthSettings
 updateOAuthSettings
 getTelegramOAuthPreferences
 updateTelegramOAuthPreferences
+regenerateOAuthQoderDevice
+confirmOAuthQoderDevice

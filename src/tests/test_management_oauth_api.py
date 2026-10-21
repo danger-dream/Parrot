@@ -71,6 +71,12 @@ ROUTE_REQUESTS = [
     ("POST", "/oauth/login-flows/zhflow_invalid/zhipu/project", {"flowSecret": "invalid-secret-value", "organizationId": "", "projectId": ""}, {}),
     ("POST", f"/oauth/accounts/{ACCOUNT_ID}/zhipu/action-plans", {"action": "opportunity", "resetType": "TOKENS_LIMIT"}, {}),
     ("POST", f"/oauth/accounts/{ACCOUNT_ID}/zhipu/actions/execute", {"planToken": "zhaction_invalid.invalid"}, {}),
+    ("GET", f"/oauth/accounts/{ACCOUNT_ID}/qoder", None, {}),
+    ("POST", f"/oauth/accounts/{ACCOUNT_ID}/qoder/actions/refresh-status", None, {}),
+    ("POST", f"/oauth/accounts/{ACCOUNT_ID}/qoder/actions/checkin", None, {}),
+    ("PATCH", f"/oauth/accounts/{ACCOUNT_ID}/qoder/settings", {"autoCheckin": False}, {}),
+    ("POST", "/oauth/login-flows/qdflow_invalid/qoder-device/confirm", {"flowSecret": "invalid-secret-value", "revision": "0" * 64}, {}),
+    ("POST", "/oauth/login-flows/qdflow_invalid/qoder-device/regenerate", {"flowSecret": "invalid-secret-value", "revision": "0" * 64}, {}),
     ("POST", "/oauth/login-flows/oflow_invalid/complete", {"flowSecret": "invalid-secret-value", "code": "code", "state": "state"}, {}),
     ("POST", "/oauth/imports/preview", {"format": "openai", "payload": "[]"}, {}),
     ("POST", "/oauth/imports/oimport_invalid/commit", {"importSecret": "invalid-secret-value", "decisions": []}, {}),
@@ -120,7 +126,7 @@ def test_oauth_openapi_matches_owned_manifest_and_declares_security_and_secrets(
         if line
     }
     assert set(operations) == manifested
-    assert len(operations) == len(ROUTE_REQUESTS) == 44
+    assert len(operations) == len(ROUTE_REQUESTS) == 50
     assert all(value.get("tags") == ["management-oauth"] for value in operations.values())
     assert all(value.get("security") == [{"ManagementSession": []}] for value in operations.values())
     no_content = {
@@ -744,7 +750,10 @@ def test_control_login_flows_cover_every_supported_provider(provider):
         assert poll.status == "completed" and poll.save_status == "created"
         assert backend.get_account(poll.account_id) is not None
         command = CompleteOAuthLoginCommand(completed=True)
-    elif provider is OAuthProvider.WORKBUDDY:
+    elif provider in {OAuthProvider.WORKBUDDY, OAuthProvider.QODER}:
+        if provider is OAuthProvider.QODER:
+            assert flow.auth_url is None
+            flow = control.confirm_qoder_device(context, flow.flow_id, flow.flow_secret, flow.device_preview["revision"])
         poll = control.poll_login_flow(context, flow.flow_id, flow.flow_secret)
         assert poll.status == "completed" and poll.save_status == "created"
         assert backend.get_account(poll.account_id) is not None

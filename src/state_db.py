@@ -791,6 +791,41 @@ def zhipu_action_history(owner: str) -> list[dict]:
     return [row for row in _all("zhipu_actions") if row.get("owner") == owner]
 
 
+# The last Qoder daily-credits claim per account; the campaign itself dedupes claims.
+_QODER_CHECKIN_FIELDS = frozenset({
+    "business_date", "status", "credit", "until", "at", "source", "error_kind", "error_status", "realm",
+})
+
+def qoder_identity_load(key: str):
+    return _get("qoder_identities", key)
+
+
+def qoder_identity_save(key: str, row: dict) -> dict:
+    value = {name: row[name] for name in ("token", "type", "code", "expires", "retry_at", "format_version") if name in row}
+    def op(data):
+        data[key] = value
+        # Expired tickets are no longer reusable; bound disk growth as profiles/routes change.
+        now = time.time()
+        for old, record in list(data.items()):
+            if old != key and max(record.get("expires", 0), record.get("retry_at", 0)) < now - 86400:
+                data.pop(old, None)
+        return value
+    return _mut("qoder_identities", op, strict=True)
+
+
+def qoder_checkin_load(key: str):
+    return _get("qoder_checkins", key)
+
+def qoder_checkin_save(key: str, row: dict) -> dict:
+    value = {name: row[name] for name in _QODER_CHECKIN_FIELDS if name in row}
+    def op(data):
+        data[key] = value
+        return value
+    return _mut("qoder_checkins", op, strict=True)
+
+def qoder_checkin_forget(key: str) -> None:
+    _mut("qoder_checkins", lambda data: data.pop(key, None), strict=True)
+
 # WorkBuddy action intents/results are durable, never quota-cache observations.
 _WORKBUDDY_ACTION_FIELDS = frozenset({
     "id", "owner", "action", "business_date", "activity_id", "attempt_id", "attempt",
@@ -897,3 +932,11 @@ def status_muted_cleanup(live_ids_by_provider:dict[str,set[str]])->int:
         for k in keys:d.pop(k,None)
         return len(keys)
     return _mut("status_muted_incidents",op,strict=True)
+
+
+def qoder_refresh_load(key: str):
+    return _get("qoder_refresh", key)
+
+
+def qoder_refresh_save(key: str, row: dict):
+    return _mut("qoder_refresh", lambda data: data.__setitem__(key, row), strict=True)

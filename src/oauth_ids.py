@@ -140,6 +140,9 @@ def account_identity(acc: dict) -> str:
     if provider == "workbuddy":
         from .oauth.workbuddy import identity
         return identity(acc)
+    if provider == "qoder":
+        from .oauth.qoder import identity
+        return identity(acc)
     return email
 
 
@@ -212,5 +215,5 @@ def is_account_key(value: Any) -> bool:
         return False
     prov = value.split(":", 1)[0]
     return _normalize_provider(prov) == prov and prov in (
-        "claude", "openai", "xai", "cursor", "antigravity", "workbuddy", "zhipu",
+        "claude", "openai", "xai", "cursor", "antigravity", "workbuddy", "zhipu", "qoder",
     )

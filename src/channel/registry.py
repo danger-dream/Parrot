@@ -24,6 +24,7 @@ from .openai_oauth_channel import OpenAIOAuthChannel
 from .antigravity_oauth_channel import AntigravityOAuthChannel
 from .xai_oauth_channel import XAIOAuthChannel
 from .workbuddy_oauth_channel import WorkBuddyOAuthChannel
+from .qoder_oauth_channel import QoderOAuthChannel
 from .zhipu_oauth_channel import ZhipuOAuthChannel
 from .url_utils import (
     normalize_api_path,
@@ -74,6 +75,8 @@ def _rebuild_from_config_locked() -> None:
                 ch = ZhipuOAuthChannel(acc)
             elif provider == "workbuddy":
                 ch = WorkBuddyOAuthChannel(acc)
+            elif provider == "qoder":
+                ch = QoderOAuthChannel(acc)
             else:
                 ch = OAuthChannel(acc)
             if channel_state.is_retired_source(ch.key):

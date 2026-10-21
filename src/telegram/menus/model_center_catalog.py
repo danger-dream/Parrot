@@ -103,6 +103,17 @@ def _source_for_view(view: ModelView, source: ModelSourceRef | None):
     )
 
 
+def _model_display_name(view: ModelView, source: ModelSourceRef | None) -> str:
+    selected = _source_for_view(view, source)
+    sources = (selected,) if selected is not None else view.sources
+    if sources and all(item.provider == "qoder" for item in sources):
+        from .oauth_account_models_menu import _model_label
+        names = {_model_label(item.id, item.outbound_model) for item in sources}
+        if len(names) == 1:
+            return names.pop()
+    return view.model_id
+
+
 def _source_label(
     chat_id: int, source: ModelSourceRef | None, view: ModelView | None = None,
 ) -> str:
@@ -479,6 +490,18 @@ def _workbuddy_rate_lines(view: ModelView, source: ModelSourceRef | None) -> lis
     return ["💳 WorkBuddy 倍率：" + " / ".join(rates) + suffix]
 
 
+def _qoder_rate_lines(view: ModelView, source: ModelSourceRef | None) -> list[str]:
+    from ...oauth.qoder.catalog import credit_label
+    selected = _source_for_view(view, source)
+    sources = (selected,) if selected is not None else view.sources if source is None else ()
+    rates = list(dict.fromkeys(label for item in sources if item.provider == "qoder"
+                              if (label := credit_label(item.effective_metadata))))
+    if not rates:
+        return []
+    suffix = "（随账户不同，详见详情）" if len(rates) > 1 else ""
+    return ["💳 Qoder 积分倍率：" + " / ".join(rates) + suffix]
+
+
 def _model_list_render(chat_id: int) -> tuple[str, dict]:
     s = menu._session(chat_id)
     if s.tab == "image": return menu._image_settings_render(chat_id)
@@ -537,7 +560,7 @@ def _model_list_render(chat_id: int) -> tuple[str, dict]:
         if owner is not None and owner.type is ModelSourceType.OAUTH:
             owner_note = " · 账户专属只读" if not view.editable else " · 账户专属"
         lines.append(
-            f"{index}. {marker} <code>{ui.escape_html(view.model_id)}</code>"
+            f"{index}. {marker} <code>{ui.escape_html(_model_display_name(view, s.source))}</code>"
             + (f" · {ui.escape_html(state_text)}" if state_text else "")
             + (
                 hidden_note
@@ -546,6 +569,7 @@ def _model_list_render(chat_id: int) -> tuple[str, dict]:
             )
         )
         lines.extend("      " + line for line in _workbuddy_rate_lines(view, s.source))
+        lines.extend("      " + line for line in _qoder_rate_lines(view, s.source))
         stats_lines = usage.format_lines((cached.value or {}).get(view.model_id))
         if stats_lines:
             lines.extend("      " + line for line in stats_lines)
@@ -618,10 +642,12 @@ def _detail_render(
     if view.identity.kind in (ModelKind.IMAGE, ModelKind.VIDEO):
         return menu._media_view_detail_render(chat_id, view, back_callback=back_callback)
     provider = menu._provider_for_view(view, s.source)
-    title = f"{ui.provider_tag(provider)} <b>{ui.escape_html(view.model_id)}</b>" if provider else f"🧬 <b>{ui.escape_html(view.model_id)}</b>"
+    display_name = _model_display_name(view, s.source)
+    title = f"{ui.provider_tag(provider)} <b>{ui.escape_html(display_name)}</b>" if provider else f"🧬 <b>{ui.escape_html(display_name)}</b>"
     lines = [title, "", f"类型：<code>{ui.escape_html(menu._kind_label(menu._enum_value(view.identity.kind)))}</code>"]
-    if view.aliases:
-        lines.append("别名：" + "、".join(f"<code>{ui.escape_html(item)}</code>" for item in view.aliases))
+    aliases = tuple(item for item in view.aliases if item != display_name)
+    if aliases:
+        lines.append("别名：" + "、".join(f"<code>{ui.escape_html(item)}</code>" for item in aliases))
     rows: list[list[dict]] = []
     if view.identity.kind not in (ModelKind.CHAT, ModelKind.IMAGE):
         return menu._media_view_detail_render(
@@ -664,12 +690,14 @@ def _detail_render(
                 lines.extend([
                     "",
                     f"{brand_prefix}<b>{ui.escape_html(human_source)}</b>",
-                    f"上游名：<code>{ui.escape_html(source_view.outbound_model)}</code>",
+                    *([f"上游名：<code>{ui.escape_html(source_view.outbound_model)}</code>"]
+                      if source_view.provider != "qoder" else []),
                     f"本来源模型开关：<code>{'显式启用' if source_view.enabled_override and source_view.source_enabled else '允许' if source_view.source_enabled else '停用'}</code> · "
                     f"{'图片来源' if view.identity.kind is ModelKind.IMAGE else menu._container_label(source_view.type)}：<code>{'启用' if source_view.container_enabled else '停用'}</code> · "
                     f"当前可用：<code>{'是' if source_view.effective_routable else '否'}</code>",
                     *(["💳 WorkBuddy 倍率：" + _workbuddy_rate(source_view.effective_metadata)]
                       if source_view.provider == "workbuddy" else []),
+                    *_qoder_rate_lines(view, ModelSourceRef(source_view.type, source_view.id)),
                     *menu._metadata_lines(source_view.effective_metadata),
                 ])
                 if source_view.unavailable_reason == "account_restricted":

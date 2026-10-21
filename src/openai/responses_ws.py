@@ -1416,7 +1416,7 @@ async def _run_ws_failover(
             and os.environ.get("PARROT_NO_REFRESH") != "1"
             and ch.type == "oauth"
             and getattr(ch, "provider", "") != "zhipu"
-            and (getattr(ch, "provider", "") != "workbuddy" or result.http_status == 401)
+            and (getattr(ch, "provider", "") not in {"workbuddy", "qoder"} or result.http_status == 401)
             and result.http_status in (401, 403)
             and not result.openai_oauth_html_403
             and getattr(getattr(result, "error_advice", None), "kind", "") not in {

@@ -572,6 +572,13 @@ def discover_workbuddy(account: dict, *, timeout: float = _TIMEOUT, proxy_channe
                            client_version=version, profile_id=profile)
 
 
+def discover_qoder(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str = "") -> DiscoveryResult:
+    from .oauth.qoder import common, fetch_models_sync
+    records = fetch_models_sync(account, account_key=proxy_channel.removeprefix("oauth:"), timeout=timeout)
+    return DiscoveryResult([item["id"] for item in records], _catalog(records), "upstream:qoder",
+                           client_version=common.COSY_VERSION, profile_id="qoder-" + common.realm_of(account))
+
+
 def discover_zhipu(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str = "") -> DiscoveryResult:
     from .oauth.zhipu.catalog import fetch_models
     records = fetch_models(account, account_key=proxy_channel.removeprefix("oauth:"), timeout=timeout)
@@ -587,6 +594,7 @@ ADAPTERS: dict[str, Callable[..., DiscoveryResult]] = {
     "cursor": discover_cursor,
     "workbuddy": discover_workbuddy,
     "zhipu": discover_zhipu,
+    "qoder": discover_qoder,
 }
 
 

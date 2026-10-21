@@ -25,7 +25,7 @@ import httpx
 _logger = logging.getLogger(__name__)
 _context = ContextVar("safe_failure_context", default=("management", "operation", "execute", ""))
 _collector = ContextVar("safe_failure_collector", default=None)
-_PROVIDERS = {"management", "claude", "anthropic", "openai", "xai", "cursor", "antigravity", "workbuddy", "zhipu",
+_PROVIDERS = {"management", "claude", "anthropic", "openai", "xai", "cursor", "antigravity", "workbuddy", "zhipu", "qoder",
               "channels", "models", "proxy", "search", "mcp", "translation", "status", "updates", "telegram"}
 _LABEL = re.compile(r"[a-z][a-z0-9_.]{0,79}\Z")
 # Trusted call-site labels are registered by decorators/scopes, not read from IO.

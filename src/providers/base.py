@@ -21,6 +21,7 @@ from .capabilities import (
     OPENAI_CODEX_CAPABILITIES,
     XAI_OAUTH_CAPABILITIES,
     WORKBUDDY_OAUTH_CAPABILITIES,
+    QODER_OAUTH_CAPABILITIES,
     ZHIPU_OAUTH_CAPABILITIES,
     ProviderCapabilities,
 )
@@ -126,6 +127,21 @@ class WorkBuddyOAuthAdapter(ProviderAdapter):
 
     async def finish_response_bytes(self, ctx: ProviderAttemptContext) -> bytes:
         converter = (ctx.translator_ctx or {}).get("workbuddy_stream")
+        return converter.finish() if converter is not None else b""
+
+
+class QoderOAuthAdapter(ProviderAdapter):
+    name = "qoder-oauth"
+    capabilities = QODER_OAUTH_CAPABILITIES
+
+    async def restore_response_bytes(self, chunk: bytes, ctx: ProviderAttemptContext) -> bytes:
+        converter = (ctx.translator_ctx or {}).get("qoder_stream")
+        if converter is None:
+            raise ValueError("Qoder response requires its per-attempt stream decoder")
+        return converter.feed(chunk)
+
+    async def finish_response_bytes(self, ctx: ProviderAttemptContext) -> bytes:
+        converter = (ctx.translator_ctx or {}).get("qoder_stream")
         return converter.finish() if converter is not None else b""
 
 

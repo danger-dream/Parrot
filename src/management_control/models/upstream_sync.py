@@ -60,7 +60,7 @@ class UpstreamSync:
         # Reuse the OAuth DTO's curated display/identity. Some legacy WorkBuddy
         # entries default label to uid; that is a routing identity, not a name.
         internal = {summary.account_id, summary.account_id.partition(":")[2]}
-        if provider == "workbuddy":
+        if provider in {"workbuddy", "qoder"}:
             internal.add(str(account.get("uid") or ""))
         for field in ("email", "phone"):
             internal.discard(str(account.get(field) or ""))

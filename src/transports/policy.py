@@ -16,11 +16,16 @@ def proxy_route_kwargs(channel, resolved_model: str) -> dict:
     """Build proxy routing context for a channel/model attempt."""
     proto = getattr(channel, "protocol", "anthropic") or "anthropic"
     purpose = "oauth_anthropic" if proto == "anthropic" else "oauth_openai"
+    provider = provider_for_channel(channel)
+    if provider == "qoder":
+        # Account device tickets and chat must use one account/provider route,
+        # not separate exits selected by the served model or ingress protocol.
+        purpose, resolved_model = "oauth_qoder", ""
     return {
         "channel_key": channel.key,
         "model": resolved_model,
         "purpose": purpose,
-        "provider": provider_for_channel(channel),
+        "provider": provider,
         "account_key": getattr(channel, "account_key", "") or "",
     }
 

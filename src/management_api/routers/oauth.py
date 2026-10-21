@@ -245,7 +245,10 @@ async def start_oauth_login_flow(
     control: Control,
 ) -> DataEnvelope[OAuthLoginFlowData]:
     result = await asyncio.to_thread(control.start_login_flow, context, body.provider,
-                                     realm=body.realm, client_profile=body.clientProfile, **({"site": body.site} if body.site is not None else {}))
+                                     realm=body.realm, client_profile=body.clientProfile, **({"site": body.site} if body.site is not None else {}),
+                                     **({"pat": body.pat.get_secret_value()} if body.pat is not None else {}),
+                                     **({"login_method": body.loginMethod, "proxy_target": body.proxyTarget,
+                                         "relogin_account_id": body.reloginAccountId} if body.provider.value == "qoder" else {}))
     return DataEnvelope(
         data=OAuthLoginFlowData(
             flowId=result.flow_id,
@@ -253,6 +256,7 @@ async def start_oauth_login_flow(
             provider=result.provider,
             authUrl=result.auth_url,
             instruction=result.instruction,
+            devicePreview=result.device_preview,
             expiresAt=result.expires_at,
         ),
         meta=meta(request),
@@ -804,3 +808,5 @@ from .oauth_workbuddy import router as workbuddy_router
 router.include_router(workbuddy_router)
 from .oauth_zhipu import router as zhipu_router
 router.include_router(zhipu_router)
+from .oauth_qoder import router as qoder_router
+router.include_router(qoder_router)

@@ -253,7 +253,7 @@ class OAuthAccountMutationControlMixin:
     ) -> OAuthMutationResult:
         if entry.get("provider") == "zhipu":
             entry = self.backend.zhipu_normalize_credential(entry)
-        fields_required = () if entry.get("provider") == "zhipu" else ("uid", "access_token", "refresh_token") if entry.get("provider") == "workbuddy" else ("email", "access_token", "refresh_token")
+        fields_required = () if entry.get("provider") == "zhipu" else ("uid", "access_token", "refresh_token") if entry.get("provider") == "workbuddy" else ("uid", "access_token", "machine_id") if entry.get("provider") == "qoder" else ("email", "access_token", "refresh_token")
         required = [field for field in fields_required if not entry.get(field)]
         if required:
             raise ManagementError(
@@ -261,6 +261,9 @@ class OAuthAccountMutationControlMixin:
                 fields=[ErrorField(field, "REQUIRED", "Field is required") for field in required],
             )
         self._ensure_legacy_identity_safe(entry)
+        if entry.get("provider") == "qoder" and self.backend.find_exact_identity(entry) is not None:
+            raise ManagementError(ManagementErrorCode.IDENTITY_CONFLICT,
+                fields=[ErrorField("qoder", "RELOGIN_REQUIRED", "账户已存在，请从原账户重授权，保留绑定设备")])
         if replace_plan_token:
             return self._commit_replace_plan(context, replace_plan_token, entry)
         existing = self.backend.find_exact_identity(entry)
@@ -278,6 +281,8 @@ class OAuthAccountMutationControlMixin:
             # degrading the explicit-replace contract to an implicit upsert.
             existing = self.backend.find_exact_identity(entry)
             if existing is not None:
+                if entry.get("provider") == "qoder":
+                    raise ManagementError(ManagementErrorCode.IDENTITY_CONFLICT)
                 self._replace_conflict(
                     context,
                     account_id=existing[0],
@@ -326,10 +331,10 @@ class OAuthAccountMutationControlMixin:
     ) -> OAuthMutationResult:
         self._require(context, Capability.SECRETS_WRITE)
         try:
-            if flow_id.startswith(("wbflow_", "zhflow_")):
+            if flow_id.startswith(("wbflow_", "zhflow_", "qdflow_")):
                 if command.completed is not True:
                     raise ManagementError(ManagementErrorCode.INVALID_REQUEST)
-                device = self._flows.zhipu if flow_id.startswith("zhflow_") else self._flows.workbuddy
+                device = self._flows.device_for(flow_id)
                 saved = device.completed_result(context.actor.subject_id, flow_id, flow_secret)
                 if saved is not None:
                     return saved
@@ -350,7 +355,7 @@ class OAuthAccountMutationControlMixin:
                             entry.update({k: old[k] for k in ("organization_id", "project_id", "plan_scope") if k in old})
                         outcome = self.replace_account_entry(
                             context, relogin["target_key"], entry, expected_account=old,
-                            authenticated_login=flow_id.startswith("zhflow_"),
+                            authenticated_login=flow_id.startswith(("zhflow_", "qdflow_")),
                         )
                         self._raise_conditional_status(outcome)
                         if outcome.get("status") != "replaced":

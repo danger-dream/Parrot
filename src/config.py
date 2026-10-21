@@ -187,7 +187,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             # 账号/渠道 > 模型 > 上游类型 > 原有 purpose/OAuth 规则 > default。
             # 类型与模型名、协议无关，未添加账户也能预设；未设置时保留原出口。
             # "providers": {"openai": "us", "workbuddy": "direct"},
-            # 类型键：openai, xai, cursor, antigravity, workbuddy, zhipu, claude
+            # 类型键：openai, xai, cursor, antigravity, workbuddy, qoder, zhipu, claude
             # "oauth": "direct",  # 旧规则仍作为兼容回退，不自动迁移/删除
             # "models": {},
             # "channels": {},
@@ -510,6 +510,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "cursor": "6062261319426390107",
             "ollama-cloud": "6138524734419116492",
             "workbuddy": "6120617435214132136",
+            "qoder": "6251484272679462431",
             "xai": "6138882363460952713",
             "kimi": "6140905172798284383",
             "deepseek": "6138914554240836667",
@@ -530,6 +531,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "xai": "𝕏",
             "cursor": "🖱️",
             "antigravity": "✨",
+            "qoder": "🧩",
         },
     },
     "oauth": {

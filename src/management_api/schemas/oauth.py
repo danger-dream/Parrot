@@ -89,6 +89,7 @@ class OAuthAccountDetailData(StrictSchema):
     lastModelSync: datetime | None = None
     workbuddy: dict | None = None
     zhipu: dict | None = None
+    qoder: dict | None = None
 
 
 # WorkBuddy credentials are acquired only through its browser login flow.
@@ -183,19 +184,31 @@ class StartOAuthLoginFlowRequest(StrictSchema):
     realm: Literal["cn", "global"] | None = None
     clientProfile: Literal["cli", "ide", "workbuddy-cli"] | None = None
     site: Literal["bigmodel", "zai"] | None = None
+    loginMethod: Literal["device", "pat"] = "device"
+    proxyTarget: str | None = Field(default=None, min_length=1, max_length=200)
+    reloginAccountId: str | None = Field(default=None, min_length=1, max_length=1000)
+    # Deprecated for Qoder: submit PAT only to the confirmed device flow.
+    pat: SecretStr | None = Field(default=None, min_length=4, max_length=4096)
 
     @model_validator(mode="after")
     def validate_provider_fields(self):
+        if self.provider is not OAuthProvider.QODER and (self.loginMethod != "device" or self.proxyTarget is not None or self.reloginAccountId is not None):
+            raise ValueError("device preparation options are Qoder-only")
         if self.provider is OAuthProvider.ZHIPU and self.site is None:
             raise ValueError("Zhipu site is required")
         if self.provider is not OAuthProvider.ZHIPU and self.site is not None:
             raise ValueError("site is Zhipu-only")
-        if self.provider is not OAuthProvider.WORKBUDDY and (self.realm is not None or self.clientProfile is not None):
-            raise ValueError("realm/clientProfile are WorkBuddy-only login options")
+        if self.provider not in {OAuthProvider.WORKBUDDY, OAuthProvider.QODER} and self.realm is not None:
+            raise ValueError("realm is a WorkBuddy/Qoder login option")
+        if self.provider is not OAuthProvider.WORKBUDDY and self.clientProfile is not None:
+            raise ValueError("clientProfile is a WorkBuddy-only login option")
+        if self.pat is not None and (self.provider is not OAuthProvider.QODER or self.realm == "cn"):
+            raise ValueError("pat is a Qoder international login option")
         return self
 
 
 class OAuthLoginFlowData(StrictSchema):
+    devicePreview: dict | None = None
     flowId: str
     flowSecret: str
     provider: OAuthProvider
@@ -210,7 +223,7 @@ class PollOAuthLoginFlowRequest(StrictSchema):
 
 class OAuthLoginPollData(StrictSchema):
     flowId: str
-    status: Literal["pending", "identity_pending", "select_project", "ready", "completed", "cancelled", "expired", "failed"]
+    status: Literal["preparing", "confirmed", "pending", "identity_pending", "select_project", "ready", "completed", "cancelled", "expired", "failed"]
     expiresAt: datetime
     accountPreview: dict | None = None
     accountId: str | None = None

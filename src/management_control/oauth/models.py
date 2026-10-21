@@ -16,6 +16,7 @@ class OAuthProvider(str, Enum):
     ANTIGRAVITY = "antigravity"
     WORKBUDDY = "workbuddy"
     ZHIPU = "zhipu"
+    QODER = "qoder"
 
 
 class OAuthAccountFilter(str, Enum):
@@ -126,6 +127,7 @@ class OAuthAccountDetail:
     last_model_sync: datetime | None
     workbuddy: dict | None = None
     zhipu: dict | None = None
+    qoder: dict | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +199,7 @@ class OAuthLoginFlow:
     auth_url: str | None
     instruction: str | None
     expires_at: datetime
+    device_preview: dict | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -35,6 +35,7 @@ Parrot 的核心价值：**一个进程管住所有 AI 家族的上游复用**�
 | 🅰 Anthropic OAuth | Claude Code 官方账户 | 完整 CC 伪装（指纹 / CCH / 工具名混淆 / cache 断点），与 cc-proxy 同源移植 |
 | 🅾 OpenAI OAuth (Codex) | ChatGPT Plus/Pro/Enterprise | 对接 `chatgpt.com/backend-api/codex/responses`，SSE 聚合、rate-limit 头自动解析 |
 | 🖱️ Cursor OAuth | Cursor 个人/团队订阅 | 浏览器 PKCE 登录，自动同步真实邮箱/姓名、套餐额度、canonical 模型与 200+ 原生变体；通过私有 AgentService bridge 同时服务 Chat / Responses / Anthropic 入口 |
+| 🧩 Qoder OAuth | Qoder 国际（qoder.com）/ Qoder CN（qoder.cn） | 桌面客户端设备授权（国际区另支持 PAT）；按客户端 COSY 签名与报文编码调用其 agent 接口，同时服务 Chat / Responses / Anthropic 入口；同步账号模型目录、积分用量，可开启每日积分自动领取（国际区使用账户绑定的设备档案；无需原生 `runtime-info`） |
 | 📡 第三方 API 渠道 | 智谱 / 天翼云 / 京东云 / 讯飞星辰 / 任何 Anthropic 或 OpenAI 兼容服务 | 可开关 CC 伪装；按 `protocol` 决定走哪种请求构造器 |
 
 **家族内互转**：`/v1/chat/completions` 下游请求可以打到 `openai-responses` 上游，反之亦然（SSE 双向状态机 + CapabilityGuard 兜底不兼容字段）。
@@ -869,3 +870,29 @@ Google 要求该账户完成账号验证（`VALIDATION_REQUIRED`），TG 配额�
 ## 📄 License
 
 MIT — 见 [LICENSE](LICENSE)
+
+### Qoder 设备档案与出口
+
+新增账户先选择既有账户代理，再本地生成、预览设备档案；新登录默认 macOS Apple Silicon，平台按钮依次为 macOS / Windows、Linux x86_64 / ARM64，只显示已支持的平台。草稿可选择平台/架构并重生成，确认后才打开设备授权或输入 PAT，已绑定账户的重授权仍沿用原档案。当前可生成 Linux x86_64 / ARM64、macOS Apple Silicon（M 系列）、Windows x64 档案；Intel Mac 与原生 Windows ARM64 仍未适配，不用其他平台模板冒充。国际/CN 设备授权、国际 PAT 均走此流程。档案随账户原子保存，重授权沿用。重复添加已有身份不会覆盖设备，请从原账户「设备档案 / 重授权」进入。旧账户不会自动改 machine_id；先在此入口确认初始化并重授权，原设置和凭据在成功前保留。
+
+最好不要多个账户共用出口，可通过设置代理指定；不同代理名称不等于不同出口。浏览器授权使用浏览器自身网络。Qoder 的已选代理失败不自动直连；保留 legacy SOCKS5 继承与显式 direct 的区别，仅 Qoder 禁用环境代理。一次物理业务请求将同一有效 connector 快照贯穿票据 key、UMID 发送与 HTTP 发送，配置 reload 不改变在途快照；代理组可回退，但必须为新成员重新准备身份。其他 provider 的全局 directFallback 选择不变。设备档案草稿和账户详情不显示出口 IP，也不自动探测公网 IP；保留代理名称及网络使用提示。详情从已保存档案展示型号、系统、架构、已设置容量及完整档案 ID；可选硬件信息仅在有值时显示，未写入的 CPU、主板等字段直接省略，不显示占位文字，也不按平台名称推断。列表只提示已开启的自动签到，不展示签到记录；详情保留签到结果，开关状态只显示在按钮上。套餐的 9999 年占位到期时间不显示。
+
+管理 API：`POST /oauth/login-flows` 的 Qoder 请求用 `loginMethod=device|pat`、可选 `proxyTarget` / `reloginAccountId`，返回 `devicePreview` 和 flow capability，不执行登录。用 flowSecret、预览 revision 调用 `.../{flowId}/qoder-device/regenerate` 或 `.../qoder-device/confirm`；regenerate 可传 `platform=linux-x64|linux-arm64|macos-arm64|windows-x64` 切换平台，省略则保留当前平台，未适配平台会拒绝且不改变草稿。PAT 可在确认后再次向 confirm 提交 pat。之后复用 poll/complete/cancel。旧 start 请求直接带 pat 会被拒绝。所有准备/确认均绑定 actor、过期时间和版本，确认后的档案不能重生成。
+
+Qoder 模型页只展示与下游模型列表一致的名称，如 `qoder-cantus`、`qoder-deepseek-v4-pro`、`qoder-glm-5.3`，不再另列“调用名”或并列内部代号；旧内部 ID 继续可用，出站仍使用原 ID 与原 `model_config`。别名随该账户目录生成，不按内部代号猜测底层厂商。账户模型页和模型中心展示已同步的免费状态、积分倍率及优惠前倍率；倍率不是每次调用固定扣费积分，费用缺失时不补零或标成免费。账户列表、详情的积分池名称统一显示为“积分”，不改变池内数值。
+
+macOS 档案版本 `macos-generated-v1`：独立生成 MAC、序列号、UUID、主机名和辅助随机状态，不复制采样机器数据；SDK `1.1.2`、`os=7`，签发走同一已选代理链上的 HTTPS，校验服务器证书。四块字段数为 `[2,44,5,3]`，辅助状态与 Linux 分别校验。已离线对照官方组件请求验证编解码，尚未做真实账户在线签发、模型或签到验证。
+
+Windows 档案版本 `windows-generated-v1`：100 字段按 Windows SDK 布局独立生成 MAC、序列号、UUID、主机名等，可选软硬件库存保持空集合，不复制采样机器数据。SDK `1.0.0`、`os=6`，四块字段数 `[2,100,5,3]`；`e=1005` 与档案字段一致，通过同一已选代理链使用明文 HTTP over 443。完整合成档案已在默认入口获得 `ec=200` 并解出 88 字符票据，同一不可变档案再次签发也已验证；无需复用 SDK 的本地 fallback Token 或机器缓存。此验证只覆盖 UMID 签发，不等于真实 Qoder 账户登录、模型或签到接受性验证。
+
+新 Linux 档案版本 `linux-generated-v2`：独立 machine_id、生成的本地管理 MAC/UUID/主机名与中性 Parrot 配置，不包含采样机器私密模板，不承诺防关联或绕过领取限制。结构校验不等于硬件真实性或服务接受性：四块字段数为 `[1,43,5,3]`，block3 的空辅助状态为 `['', '####', '']`，block0 保持原有正确密文常量。旧 v1 标记为需迁移，禁止自动换身份；必须预览确认并成功重授权后，仅修 block3/版本，保留原 machine_id、block1 身份、其余块与原设置，保存成功前原账户不变。UMID 配置 `runtime-info-1.5.0-default-v1` 默认 `pum.m.alibaba.com`；可用 `QODER_UMID_REGION=default|sg|us` 明确选择入口。仅默认入口有既有签发证据，SG/US 和生成档案的 IDE 业务接受性仍待真实账号联调，不做自动在线探测。传输沿用组件的明文 HTTP over 443，经 Parrot 原始字节流代理，不是 HTTPS。
+
+票据与档案分离，按账户、档案及实际 connector 配置绑定到私有 durable state，锁内复用一小时（本地策略）、失败退避。Type/Code 使用 XXHash64 确定性 mark，未检测分支为 90/0，不宣称检测为物理机；票据格式 v2 不复用旧随机三元组。UMID 保存失败时进程内复用同一候选；重启只保留已落盘票据或退避 intent，不保证恢复未落盘票据。普通模型 GET 不带 Encode 参数；对话保持已验证 codec/COSY 路线，设备头来自同一身份 provider；campaigns/usage 账户页继续保留原协议（包括 ClientType=10），不混用 IDE activity；桌面 ClientType=0/Version=1.24.2 用于已验证的普通 COSY 路线。国际 campaigns 仅从统一身份源取原有的 Token/Type 两头，CN campaigns 保留不带设备头行为。新容器不下载或运行 UMID SDK；已有 qoder-device 数据及可选 `scripts/qoder_runtime_info.py` 工具保留。
+
+一次性 job/device refresh 独立记录：消费 RT 前先写私有 durable intent，收到新 pair 后先落 durable candidate 再发布配置。保存失败、进程重启后有候选时仅重试保存；intent/unknown 缺候选时禁止 auto/force 重放旧 RT，管理 API `refreshStatus` / TG 显示结果不明、需重授权，不将其称为已吊销。安全存储失败不消费 RT。PAT 的可重复 exchange 与一次性 RT 区分；登录交换成功后保留 candidate，userinfo 失败只重查身份。准备、确认、identity_pending 均可 poll；10 分钟有效期从准备开始，TG 显示真实截止时间。
+
+SSE 保留 event:error / event:finish 和结构化业务码，三入口流/非流统一分类。官方兼容的干净 EOF（合法完整帧、正常输出）允许完成；损坏残余帧、显式错误、不完整工具、读异常/超时及 forceFinish 不当成功。finish_reason 后继续读取 usage；引用代码中的工具示例保持文本，并行 native tools 按 index 跟踪。105 仅在尚无下游输出时恢复一次，提交后绝不重放。明确 temperature 映射到 `parameters.temperature`；未确认本接口语义的 top_p、stop、schema、required/named tool choice 等候选请求明确拒绝，不以提示词冒充硬约束。
+
+CN jobToken 失败本身不再标 ready：429/明确认证拒绝保留候选与错误；其他兼容情形只有同档案/路由的 device-token 模型 GET 独立成功后才可保存 deviceChat。此代码内正向校验不等于已完成线上 CN 验证。PAT 签到先 ensure token，105 至多恢复一次；campaigns 必须是合法列表，缺字段/业务错误不当 inactive。
+
+以上是离线验证的实现事实，不是上线或生成身份业务接受结论。`./venv/bin/python -I -B scripts/qoder_umid_probe.py` 默认只生成并检查临时档案、绝不联网、不读账户配置。经控制者批准目的地及出口后才可用 `--execute --direct` 单次申请；也可由隔离调用者向 `probe(execute=True, open_stream=...)` 明确提供已批准 connector。无自动重试，仅输出签发状态/长度，不输出票据或设备块。即使单次签发成功，也不证明模型、聊天、签到、长期时间戳或风控接受。

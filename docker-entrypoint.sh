@@ -23,6 +23,9 @@ if [ "$(id -u)" = "0" ]; then
         chown app:app "$DATA_DIR/logs"
     fi
 
+    # Qoder profiles now belong to accounts in config, with tickets in durable state.
+    # Leave existing qoder-device directories and ~/.config links untouched.
+
     # The response Store contains complete request/output history. Repair the
     # default DB files before dropping privileges, but reject symlinks or
     # non-files instead of following them as root. Custom absolute dbPath

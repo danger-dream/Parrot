@@ -39,7 +39,7 @@ def escape_html(s) -> str:
                   .replace(">", "&gt;"))
 
 
-_PROVIDER_BTN_EMOJI = {"claude": "🅰️", "anthropic": "🅰️", "openai": "🅾️", "xai": "𝕏", "cursor": "🖱️", "antigravity": "✨"}
+_PROVIDER_BTN_EMOJI = {"claude": "🅰️", "anthropic": "🅰️", "openai": "🅾️", "xai": "𝕏", "cursor": "🖱️", "antigravity": "✨", "qoder": "🧩"}
 _PROVIDER_CUSTOM_EMOJI = {
     "openai": "6141162084857031383",
     "claude": "6140995813788099525",
@@ -48,6 +48,7 @@ _PROVIDER_CUSTOM_EMOJI = {
     "cursor": "6062261319426390107",
     "ollama-cloud": "6138524734419116492",
     "workbuddy": "6120617435214132136",
+    "qoder": "6251484272679462431",
     "xai": "6138882363460952713",
     "kimi": "6140905172798284383",
     "deepseek": "6138914554240836667",
@@ -63,7 +64,7 @@ _PROVIDER_CUSTOM_EMOJI = {
     "openrouter": "6140767025175209650",
 }
 _PROVIDER_CUSTOM_FALLBACK = {"claude": "🤖", "anthropic": "🤖", "openai": "🤖", "xai": "🐦", "cursor": "🖱️", "antigravity": "✨"}
-_PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok", "cursor": "Cursor", "antigravity": "Antigravity", "workbuddy": "WorkBuddy", "zhipu": "智谱 / Z.ai"}
+_PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok", "cursor": "Cursor", "antigravity": "Antigravity", "workbuddy": "WorkBuddy", "zhipu": "智谱 / Z.ai", "qoder": "Qoder"}
 
 
 def _provider_key(provider: str | None) -> str:

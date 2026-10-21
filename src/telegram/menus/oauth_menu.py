@@ -66,6 +66,7 @@ from . import oauth_add_session as add_session
 from . import main as main_menu
 from . import workbuddy_oauth_menu as workbuddy_menu
 from . import zhipu_oauth_menu as zhipu_menu
+from . import qoder_oauth_menu as qoder_menu
 from .sort_primitives import (
     move_bottom as _move_bottom,
     move_down as _move_down,
@@ -704,7 +705,7 @@ def _quota_cache_has_usage_signal(row: dict | None) -> bool:
 
 
 def _should_refresh_account_for_ui(acc: dict | None) -> bool:
-    if acc and oauth_control.provider_of_snapshot(acc) in {"workbuddy", "zhipu"}:
+    if acc and oauth_control.provider_of_snapshot(acc) in {"workbuddy", "zhipu", "qoder"}:
         # WorkBuddy pages read local snapshots only, even when email is present.
         return False
     if not acc or not acc.get("email"):
@@ -716,7 +717,7 @@ def _should_refresh_account_for_ui(acc: dict | None) -> bool:
 
 def _refreshable_account_keys_for_ui(accounts: list[dict], *, explicit: bool = False) -> list[str]:
     return [_account_key(a) for a in accounts if _should_refresh_account_for_ui(a) or (
-        explicit and oauth_control.provider_of_snapshot(a) in {"workbuddy", "zhipu"}
+        explicit and oauth_control.provider_of_snapshot(a) in {"workbuddy", "zhipu", "qoder"}
         and a.get("disabled_reason") not in ("user", "auth_error")
         and (a.get("enabled", True) or a.get("disabled_reason") == "quota")
     )]
@@ -1891,7 +1892,7 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
         tag = " [用户禁用]"
     elif reason == "quota":
         du = acc.get("disabled_until")
-        tag = " [配额禁用]" if prov in {"workbuddy", "zhipu"} and not du else f" [配额禁用 · 预计 {_format_bjt(du)}]"
+        tag = " [配额禁用]" if prov in {"workbuddy", "zhipu", "qoder"} and not du else f" [配额禁用 · 预计 {_format_bjt(du)}]"
     elif reason == "auth_error":
         tag = " [认证失败]"
     elif _account_restriction(acc):
@@ -1911,6 +1912,8 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
         lines.append(zhipu_menu.provider_line(acc))
     elif prov == "workbuddy":
         lines.append(workbuddy_menu.provider_line(acc))
+    elif prov == "qoder":
+        lines.append(qoder_menu.provider_line(acc))
     elif prov == "openai":
         plan = openai_plan_label(acc.get("plan_type"))
         workspace = _openai_workspace_label(acc)
@@ -1958,6 +1961,8 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
     _now_ts = time.time()
     if prov == "workbuddy":
         lines.extend(workbuddy_menu.usage_block(ak).splitlines())
+    elif prov == "qoder":
+        lines.extend(qoder_menu.usage_block(ak).splitlines())
     elif prov == "cursor":
         lines.extend(_format_cursor_usage_block(ak, detail=False).splitlines())
     elif prov == "xai":
@@ -2118,6 +2123,8 @@ def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
     )
     if provider == "workbuddy":
         return workbuddy_menu.usage_block(account_key, detail=True)
+    if provider == "qoder":
+        return qoder_menu.usage_block(account_key, detail=True)
     if provider == "cursor":
         return _format_cursor_usage_block(account_key, detail=True)
     if provider == "antigravity":
@@ -3400,6 +3407,8 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         provider_line = zhipu_menu.provider_line(acc, detail=True) + "\n"
     elif prov == "workbuddy":
         provider_line = workbuddy_menu.provider_line(acc, detail=True) + "\n"
+    elif prov == "qoder":
+        provider_line = qoder_menu.provider_line(acc, detail=True) + "\n"
     elif prov == "openai":
         plan = openai_plan_label(acc.get("plan_type")) or "?"
         workspace = _openai_workspace_label(acc, force=True)
@@ -3582,6 +3591,8 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         rows.extend(workbuddy_menu.package_page_buttons(account_key, nav, workbuddy_package_page))
         if workbuddy_menu.supports_credit_ui(acc):
             rows.append([ui.btn("🎁 签到/领额度", workbuddy_menu._cb("activity", nav))])
+    if prov == "qoder" and not oauth_control.account_authentication_failed(acc):
+        rows.extend(qoder_menu.detail_buttons(acc, short, max(1, int(page or 1)), filter_key))
     if prov == "claude":
         rows.append([ui.btn("♻️ 官方额度重置/状态", f"oa:claude_reset_ask:{payload}")])
     if prov == "openai":
@@ -4906,7 +4917,7 @@ def on_delete_ask(chat_id: int, message_id: int, cb_id: str, short: str, page: i
     acc = oauth_control.account_snapshot(ak)
     email = (acc or {}).get("email") or _account_email(ak)
     prov = oauth_control.provider_of_snapshot(ak)
-    if prov in {"workbuddy", "zhipu"} and acc:
+    if prov in {"workbuddy", "zhipu", "qoder"} and acc:
         email = _account_display(acc)
     prov_tag = _provider_tag(prov)
     ui.answer_cb(cb_id)
@@ -5410,7 +5421,8 @@ def on_add_menu(chat_id: int, message_id: int, cb_id: str) -> None:
             [ui.provider_button("Cursor", "oa:login:cursor", "cursor"),
              ui.provider_button("Antigravity", "oa:login:antigravity", "antigravity"),
              ui.provider_button("WorkBuddy", "oa:add:workbuddy", "workbuddy")],
-            [ui.provider_button("智谱", "oa:zh:add", "zhipu")],
+            [ui.provider_button("智谱", "oa:zh:add", "zhipu"),
+             ui.provider_button("Qoder", "oa:add:qoder", "qoder")],
             [ui.btn("⚙ 设置代理", "oa:add:proxy"),
              ui.btn("🏠 返回主菜单", "menu:main"),
              ui.btn("◀ 返回列表", "menu:oauth")],
@@ -5497,6 +5509,7 @@ def _login_hint(relogin=None):
 def _return_from_relogin(chat_id, message_id, cb_id, payload):
     workbuddy_menu.discard_state(chat_id)
     zhipu_menu.discard_state(chat_id)
+    qoder_menu.discard_state(chat_id)
     states.pop_state(chat_id)
     short, page, filter_key = _split_short_page_filter(payload)
     on_view(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
@@ -5518,10 +5531,14 @@ def on_relogin(chat_id, message_id, cb_id, short, page=1, filter_key=_FILTER_ALL
                "payload": _callback_payload(short, page, filter_key)}
     workbuddy_menu.discard_state(chat_id)
     zhipu_menu.discard_state(chat_id)
+    qoder_menu.discard_state(chat_id)
     states.pop_state(chat_id)
     if provider == "workbuddy":
         ui.answer_cb(cb_id)
         return workbuddy_menu._login_start(chat_id, message_id, realm=account.get("realm") or "cn", relogin=relogin)
+    if provider == "qoder":
+        ui.answer_cb(cb_id)
+        return qoder_menu.start_relogin(chat_id, message_id, account, relogin)
     if provider == "zhipu":
         ui.answer_cb(cb_id)
         return zhipu_menu._login(chat_id, message_id, account["site"], relogin=relogin)
@@ -7031,7 +7048,7 @@ def on_import_openai_overwrite(chat_id: int, message_id: int, cb_id: str, nonce:
 def _invalid_accounts() -> list[dict]:
     return [
         a for a in oauth_control.account_entries_snapshot()
-        if (a.get("email") or oauth_control.provider_of_snapshot(a) in {"workbuddy", "zhipu"}) and a.get("disabled_reason") == "auth_error"
+        if (a.get("email") or oauth_control.provider_of_snapshot(a) in {"workbuddy", "zhipu", "qoder"}) and a.get("disabled_reason") == "auth_error"
     ]
 
 
@@ -7060,7 +7077,7 @@ def _render_invalid_remove(chat_id: int, message_id: int, *, selected: set[str] 
     else:
         for idx, acc in enumerate(invalid, 1):
             ak = _account_key(acc)
-            email = _account_display(acc) if oauth_control.provider_of_snapshot(acc) == "workbuddy" else acc.get("email") or "?"
+            email = _account_display(acc) if oauth_control.provider_of_snapshot(acc) in {"workbuddy", "qoder"} else acc.get("email") or "?"
             mark = "✅ " if ak in selected else "☐ "
             lines.append(f"{idx}. <code>{ui.escape_html(email)}</code>")
             rows.append([ui.btn(f"{mark}{email}", f"oa:invalid:toggle:{_invalid_select_token(ak)}")])
@@ -7208,6 +7225,8 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if zhipu_menu.handle_callback(chat_id, message_id, cb_id, data):
         return True
     if workbuddy_menu.handle_callback(chat_id, message_id, cb_id, data):
+        return True
+    if qoder_menu.handle_callback(chat_id, message_id, cb_id, data):
         return True
     if data == "menu:oauth":
         show(chat_id, message_id, cb_id)
@@ -7467,6 +7486,8 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
 
 def handle_text_state(chat_id: int, action: str, text: str) -> bool:
     if zhipu_menu.handle_text(chat_id, action, text):
+        return True
+    if qoder_menu.handle_text(chat_id, action, text):
         return True
     if action in {"oa_wb_import", "oa_wb_import_preview"}:
         workbuddy_menu.reject_removed_import(chat_id)

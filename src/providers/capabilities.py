@@ -210,6 +210,15 @@ WORKBUDDY_OAUTH_CAPABILITIES = ProviderCapabilities(
 )
 
 
+QODER_OAUTH_CAPABILITIES = ProviderCapabilities(
+    adapter_name="qoder-oauth", family="openai",
+    protocols=frozenset({"openai-chat"}), transports=frozenset({"sse"}),
+    passthrough_request_fields={"openai-chat": CHAT_REQ_ALLOWED},
+    native_state=frozenset({"reasoning_content"}),
+    notes=("Qoder OAuth writes Chat as its signed agent protocol; non-stream clients aggregate Chat SSE",),
+)
+
+
 OPENAI_CODEX_CAPABILITIES = ProviderCapabilities(
     adapter_name="openai-codex",
     family="openai",
