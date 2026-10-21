@@ -255,8 +255,14 @@ def _default_model_panel(chat_id: int, kind: str, page: int = 0,
     return '\n'.join(lines), ui.inline_kb(rows)
 
 
+_LEGACY_ACTIONS = {'image_patch', 'image_account', 'image_independent', 'gpt_media_detail', 'image_input', 'xai_duration',
+                   'media_manager', 'media_detail', 'media_input', 'media_remove_ask', 'media_remove'}
+
+
 def handle_action(chat_id: int, message_id: int, cb_id: str, action) -> bool:
     name, data = action.name, action.data
+    if not (name.startswith('media_') or name in _LEGACY_ACTIONS):
+        return False
     if data.get('provider') == 'antigravity':
         ui.answer_cb(cb_id, 'AG 生图支持已移除', show_alert=True)
         return True
@@ -324,9 +330,7 @@ def handle_action(chat_id: int, message_id: int, cb_id: str, action) -> bool:
             return True
         menu._show_rendered(chat_id, message_id, cb_id, lambda: _panel(chat_id, kind, back))
         return True
-    legacy = {'image_patch', 'image_account', 'image_independent', 'gpt_media_detail', 'image_input', 'xai_duration',
-              'media_manager', 'media_detail', 'media_input', 'media_remove_ask', 'media_remove'}
-    if name in legacy:
+    if name in _LEGACY_ACTIONS:
         kind = data.get('kind') or ('video' if name == 'xai_duration' else 'image')
         menu._show_rendered(chat_id, message_id, cb_id, lambda: _panel(chat_id, kind, 'menu:main'))
         return True

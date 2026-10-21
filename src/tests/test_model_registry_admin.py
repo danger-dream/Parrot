@@ -172,3 +172,21 @@ def test_telegram_page_decides_one_upstream_id_for_every_account_of_a_provider(e
     assert config.get()["modelRegistry"]["rules"] == [
         {"type": "assign", "source": source, "wire": "hy3-x", "model": "workbuddy-hy3-x"}
         for source in ("oauth:wb-a", "oauth:wb-b")]
+
+
+def test_telegram_pending_page_opens_for_antigravity_ids(enabled, monkeypatch):
+    _client, runtime, _admin, _read_only, _denied = enabled
+    monkeypatch.setattr(menu, "_CONTROL", runtime.control_owner().models)
+    monkeypatch.setattr(ui, "is_admin", lambda chat_id: int(chat_id) == 42)
+    monkeypatch.setattr(ui, "api", lambda method, data=None: calls.append((method, dict(data or {}))) or {
+        "ok": True, "result": {"message_id": 100}})
+    monkeypatch.setattr(model_registry, "collect", lambda cfg: [
+        Offer("oauth:ag", "antigravity", wire, "Gemini 3.5 Flash Lite", basis="name")
+        for wire in ("gemini-2.5-flash", "gemini-2.5-flash-lite")])
+    registry.rebuild_from_config()
+    menu.reset_for_tests()
+    _text, keyboard = menu.render(42)
+    _text, keyboard = _press("统一命名", keyboard)
+    text, keyboard = _press("待确认 1", keyboard)
+    assert "上游 ID：<code>gemini-2.5-flash</code>" in text
+    assert not any(method == "answerCallbackQuery" and data.get("show_alert") for method, data in calls)
