@@ -20,6 +20,54 @@ from . import model_center_menu as menu
 from .model_center_icons import inline_kb
 
 
+def _wire_efforts(model_id: str) -> dict[str, str]:
+    """Upstream ids fixed to one effort level (Antigravity's -low/-high ids), by id."""
+    from ...model_registry import runtime as model_registry
+    from ...model_registry.names import EFFORTS
+    registry = model_registry.current()
+    model = registry.models.get(model_id) if registry else None
+    return {offer.wire: offer.traits["effort"] for offer in (model.offers if model else ())
+            if offer.traits.get("effort") in EFFORTS}
+
+
+def _fold_source_ids(
+    model_id: str, blocks: list[tuple[str, str, list[str]]], wires: list[str | None],
+    refs: list[tuple], ranks: list[int | None],
+) -> tuple[list[tuple[str, str, list[str]]], list[int | None]]:
+    """One block per source, prefixed with its upstream ids.
+
+    A source serving the model under several ids (one per effort, as Antigravity
+    does) lists them in one block when everything else reads the same.
+    """
+    from ...model_registry.names import EFFORTS
+    fixed = _wire_efforts(model_id)
+    effort = {wire: EFFORTS.index(level) for wire, level in fixed.items()}
+    members: dict[tuple, list[int]] = {}
+    for position, ref in enumerate(refs):
+        members.setdefault(ref, []).append(position)
+
+    def upstream(ids) -> list[str]:
+        ids = sorted(dict.fromkeys(item for item in ids if item), key=lambda item: effort.get(item, len(effort)))
+        return ["上游名：" + " / ".join(f"<code>{ui.escape_html(item)}</code>" for item in ids)] if ids else []
+
+    folded, folded_ranks = [], []
+    for ref, positions in members.items():
+        if len({tuple(blocks[position][2]) for position in positions}) == 1:
+            groups = [positions]
+        else:
+            groups = [[position] for position in positions]
+        for group in groups:
+            brand, label, body = blocks[group[0]]
+            levels = sorted({fixed[wires[position]] for position in group if wires[position] in fixed}, key=EFFORTS.index)
+            if len(group) > 1 and levels:
+                # Each level is its own id here; the catalog's list would overstate what can be asked for.
+                line = f"思考档位：<code>{ui.escape_html(' / '.join(levels))}</code>（每档一个上游 ID）"
+                body = [line if item.startswith("思考档位：") else item for item in body]
+            folded.append((brand, label, upstream(wires[position] for position in group) + list(body)))
+            folded_ranks.append(ranks[group[0]] if ranks else None)
+    return folded, folded_ranks if ranks else []
+
+
 def _merged_source_blocks(blocks: list[tuple[str, str, list[str]]], ranks: list[int | None] | None = None) -> list[str]:
     """One block per provider and identical content, naming every account it covers.
 
@@ -97,6 +145,15 @@ def _source_states_render(chat_id: int, resource_key: str, detail_back: str) -> 
         "",
     ]
     rows: list[list[dict]] = []
+    # A source serving the model under several ids is one switch: it covers all of them.
+    seen: set[tuple] = set()
+    unique: list[tuple] = []
+    for item, rank in zip(sources, ranks or [None] * len(sources)):
+        if (item.type, item.id) not in seen:
+            seen.add((item.type, item.id))
+            unique.append((item, rank))
+    sources = [item for item, _rank in unique]
+    ranks = [rank for _item, rank in unique] if ranks else []
     for number, source_view in enumerate(sources, 1):
         ref = ModelSourceRef(source_view.type, source_view.id)
         enabled, state_text = menu._model_state(view, ref)

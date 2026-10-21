@@ -170,7 +170,8 @@ def _to_bool(value: Any) -> bool | None:
 
 
 def _to_effort_list(value: Any) -> list[str]:
-    if value is None:
+    # "reasoning"/"thinking" flags alias this field; a yes/no is not a level.
+    if value is None or isinstance(value, bool):
         return []
     items = (
         [str(item) for item in value]
@@ -180,7 +181,7 @@ def _to_effort_list(value: Any) -> list[str]:
     result: list[str] = []
     for item in items:
         normalized = re.sub(r"\s+", "", item).lower()
-        if normalized and normalized not in result:
+        if normalized and normalized not in result and normalized not in {"true", "false"}:
             result.append(normalized)
     return result
 

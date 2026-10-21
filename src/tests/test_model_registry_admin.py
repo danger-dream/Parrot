@@ -267,3 +267,25 @@ def test_detail_follows_priority_order_and_manages_sources_and_priority(enabled,
     assert [button["text"] for row in saved["reply_markup"]["inline_keyboard"] for button in row] == ["返回模型详情"]
     orders = config.get()["loadBalancing"]["modelPriorityOrders"]
     assert orders == {"minimax-m2.7": ["api:Reseller", "api:Official"]}
+
+
+def test_one_source_serving_a_model_per_effort_is_one_block():
+    from src.telegram.menus.model_center_sources import _fold_source_ids
+    body = ["本来源模型开关：停用", "上下文：1,000,000 tokens"]
+    blocks = [("", "Antigravity · a", list(body)), ("", "Antigravity · a", list(body)),
+              ("", "Antigravity · a", list(body)), ("", "Claude · c", ["x"])]
+    wires = ["claude-opus-5-5-medium", "claude-opus-5-5-low", "claude-opus-5-5-high", "claude-opus-5-5"]
+    refs = [("oauth", "ag:a")] * 3 + [("oauth", "claude:c")]
+    folded, ranks = _fold_source_ids("no-such-model", blocks, wires, refs, [2, 2, 2, 3])
+    assert ranks == [2, 3] and len(folded) == 2
+    assert folded[0][2][0] == ("上游名：<code>claude-opus-5-5-medium</code> / <code>claude-opus-5-5-low</code>"
+                               " / <code>claude-opus-5-5-high</code>")
+    different = [("", "Antigravity · a", ["x"]), ("", "Antigravity · a", ["y"])]
+    folded, _ = _fold_source_ids("m", different, ["a-low", "a-high"], [("oauth", "ag:a")] * 2, [])
+    assert [block[2][0] for block in folded] == ["上游名：<code>a-low</code>", "上游名：<code>a-high</code>"]
+
+
+def test_reasoning_flags_are_not_effort_levels():
+    from src import model_metadata
+    assert model_metadata.normalize_metadata({"reasoning": True, "thinking": "true"}) == {}
+    assert model_metadata.normalize_metadata({"reasoning": ["low", "High"]}) == {"reasoningEfforts": ["low", "high"]}

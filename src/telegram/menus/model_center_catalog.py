@@ -27,7 +27,7 @@ from .. import ui
 from . import model_center_usage as usage
 from . import model_center_menu as menu
 from .model_center_icons import inline_kb
-from .model_center_sources import _merged_source_blocks, _ordered_sources, _schedule
+from .model_center_sources import _fold_source_ids, _merged_source_blocks, _ordered_sources, _schedule
 
 
 def _enum_value(value: Any) -> str:
@@ -677,8 +677,10 @@ def _detail_render(
                           "OpenAI 单图接口：n 张最多 n 次生成，模糊超时不重试。", ""])
         selected_source = menu._source_for_view(view, s.source)
         ordered, ranks = _ordered_sources(view, schedule_order)
-        metadata_sources = (selected_source,) if selected_source is not None else ordered
+        metadata_sources = ordered
         if selected_source is not None:
+            metadata_sources = [item for item in view.sources
+                                if item.type is selected_source.type and item.id == selected_source.id]
             ranks = []
         if metadata_sources:
             source_options = {
@@ -686,6 +688,7 @@ def _detail_render(
                 for item in menu._source_options(chat_id)
             }
             blocks: list[tuple[str, str, list[str]]] = []
+            wires: list[str | None] = []
             for source_view in metadata_sources:
                 source_option = source_options.get((source_view.type, source_view.id))
                 human_source = (
@@ -701,9 +704,8 @@ def _detail_render(
                 brand_prefix = f"{brand_icon} " if brand_icon else ""
                 body: list[str] = []
                 blocks.append((brand_prefix, human_source, body))
+                wires.append(source_view.outbound_model if source_view.provider != "qoder" else None)
                 body.extend([
-                    *([f"上游名：<code>{ui.escape_html(source_view.outbound_model)}</code>"]
-                      if source_view.provider != "qoder" else []),
                     f"本来源模型开关：<code>{'显式启用' if source_view.enabled_override and source_view.source_enabled else '允许' if source_view.source_enabled else '停用'}</code> · "
                     f"{'图片来源' if view.identity.kind is ModelKind.IMAGE else menu._container_label(source_view.type)}：<code>{'启用' if source_view.container_enabled else '停用'}</code> · "
                     f"当前可用：<code>{'是' if source_view.effective_routable else '否'}</code>",
@@ -741,6 +743,8 @@ def _detail_render(
                             target=True, revision=account.revision,
                             detail_key=view.resource_key, detail_back=back_callback,
                         ))])
+            blocks, ranks = _fold_source_ids(
+                view.model_id, blocks, wires, [(item.type, item.id) for item in metadata_sources], ranks)
             lines.extend(_merged_source_blocks(blocks, ranks))
         else:
             lines.extend(menu._metadata_lines(view.common_metadata))
