@@ -245,6 +245,26 @@ def describe_oauth_error(
                 retryable=exc.retryable, auth_error=exc.auth_error, status=exc.status_code or None,
                 provider=prov, operation=op, technical=technical)
 
+    if prov == "cursor":
+        from .cursor_bridge.errors import CursorAuthError
+        # Cursor raises its own errors carrying the upstream status rather than
+        # httpx.HTTPStatusError; an auth error without a status is a rejected session.
+        status = status or getattr(exc, "response_status", None) or (401 if isinstance(exc, CursorAuthError) else None)
+        if status == 401:
+            refresh = op == "refresh_token"
+            return OAuthDisplayError(
+                code="cursor_token_401" if refresh else "cursor_auth_401",
+                title="Cursor 登录已失效",
+                reason=("Cursor 拒绝了刷新凭据，登录会话可能已过期或已被注销。" if refresh
+                        else "Cursor 拒绝了当前登录凭据，未取得新的额度或资料。"),
+                action="重新登录这个 Cursor 账号。",
+                auth_error=True,
+                status=status,
+                provider=prov,
+                operation=op,
+                technical=technical,
+            )
+
     # Non-HTTP transport failures first.
     if isinstance(exc, httpx.TimeoutException) or (isinstance(exc, str) and "timeout" in exc.lower()):
         return OAuthDisplayError(
