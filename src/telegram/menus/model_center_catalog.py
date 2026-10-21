@@ -106,7 +106,8 @@ def _source_for_view(view: ModelView, source: ModelSourceRef | None):
 def _model_display_name(view: ModelView, source: ModelSourceRef | None) -> str:
     selected = _source_for_view(view, source)
     sources = (selected,) if selected is not None else view.sources
-    if sources and all(item.provider == "qoder" for item in sources):
+    from ...model_registry import runtime as model_registry
+    if model_registry.current() is None and sources and all(item.provider == "qoder" for item in sources):
         from .oauth_account_models_menu import _model_label
         names = {_model_label(item.id, item.outbound_model) for item in sources}
         if len(names) == 1:

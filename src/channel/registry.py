@@ -114,6 +114,14 @@ def _rebuild_from_config_locked() -> None:
         global _channels
         _channels = new
 
+    from ..model_registry import runtime as model_registry
+    try:
+        model_registry.rebuild(cfg)
+    except Exception as exc:
+        # Routing falls back to per-channel names rather than losing every model.
+        print(f"[registry] model registry rebuild failed: {type(exc).__name__}: {exc}")
+        model_registry.rebuild({})
+
     _sync_state_db_with_channels()
 
 
@@ -230,6 +238,9 @@ def available_models_for_families(families: Optional[set[str]], *, api_key_name:
     `families=None` 或空集 → 不过滤，返回所有（等价于 available_models()）。
     家族名从 Channel.protocol 推导：`anthropic` → "anthropic"，其他 → "openai"。
     """
+    from ..model_registry import runtime as model_registry
+    if model_registry.current() is not None:
+        return model_registry.visible_models(api_key_name, families or None)
     models: set[str] = set()
     with _lock:
         channels = list(_channels.values())
@@ -260,6 +271,9 @@ def _model_discovery_visible(ch: Channel, model: str, alias: str | None = None) 
 
 def available_model_aliases(mapping: dict[str, str], *, api_key_name: Optional[str] = None) -> set[str]:
     """Aliases with one eligible source enabling both alias and target."""
+    from ..model_registry import runtime as model_registry
+    if model_registry.current() is not None:
+        return {alias for alias, model in mapping.items() if model_registry.listed(model, api_key_name)}
     return {alias for ch in all_channels() if ch.enabled and not ch.disabled_reason
             and auth.channel_allowed(api_key_name, ch.key)
             for alias, model in mapping.items() if _model_discovery_visible(ch, model, alias)}
@@ -267,6 +281,9 @@ def available_model_aliases(mapping: dict[str, str], *, api_key_name: Optional[s
 
 def available_model_spellings(spellings, *, api_key_name: Optional[str] = None) -> set[str]:
     """Resolve explicit legacy names without advertising duplicate identities."""
+    from ..model_registry import runtime as model_registry
+    if model_registry.current() is not None:
+        return set()
     result = set()
     for ch in all_channels():
         if getattr(ch, "provider", "") != "zhipu" or not ch.enabled or ch.disabled_reason:

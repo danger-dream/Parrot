@@ -34,7 +34,8 @@ class ScheduleResult:
                  guard_errors: Optional[list[str]] = None,
                  exclusions: Optional[list[dict]] = None,
                  bound_channel_key: Optional[str] = None,
-                 encrypted_content_count: int = 0):
+                 encrypted_content_count: int = 0,
+                 call_choices: Optional[dict] = None):
         self.candidates = candidates
         self.fp_query = fp_query         # 本次请求计算得到的查询指纹（可用于后续事件记录）
         self.affinity_hit = affinity_hit
@@ -54,6 +55,9 @@ class ScheduleResult:
         # 仅供内部日志/告警使用，不回显给 API 客户端。每项代表一个原本支持
         # requested_model、但在调度筛选中被排除的渠道。
         self.exclusions: list[dict] = exclusions or []
+        # (channel key, upstream id) -> model-registry choice: the effort and
+        # thinking that candidate must be sent with. Empty when the registry is off.
+        self.call_choices: dict = call_choices or {}
 
     def exclusion_summary(self, limit: int = 12) -> str:
         parts: list[str] = []
@@ -83,6 +87,8 @@ def _filter_candidates(requested_model: str,
                        bound_channel_key: Optional[str] = None,
                        portable_body: Optional[dict] = None,
                        api_key_name: Optional[str] = None,
+                       model_plan=None,
+                       call_choices: Optional[dict] = None,
                        ) -> tuple[list[tuple[Channel, str]], list[tuple[Channel, str]], dict[tuple[str, str], RoutePlan], list[str]]:
     """返回 (available, saturated, route_plans)：
        available = 可立即尝试的候选；
@@ -102,34 +108,45 @@ def _filter_candidates(requested_model: str,
     route_plans: dict[tuple[str, str], RoutePlan] = {}
     guard_errors: list[str] = []
     excluded = diagnostics if diagnostics is not None else []
+    if model_plan is not None and model_plan.error and model_plan.model:
+        guard_errors.append(model_plan.error)
     for ch in registry.all_channels():
         if not auth.channel_allowed(api_key_name, ch.key):
             excluded.append({"channel": ch.key, "reason": "api_key_channel_denied"})
             continue
-        try:
-            resolver = getattr(ch, "resolve_request_model", None)
-            resolved = (resolver(requested_model, request_body, ingress_protocol)
-                        if callable(resolver) else ch.supports_model(requested_model))
-        except GuardError as exc:
-            guard_errors.append(exc.message)
-            excluded.append({"channel": ch.key, "reason": "protocol_guard", "detail": exc.message})
-            continue
-        if resolved is None:
-            continue
-        if not model_state.is_global_enabled(requested_model, source_key=ch.key):
-            excluded.append({"channel": ch.key, "reason": "global_model_disabled"})
-            continue
-        if not model_state.is_source_enabled(ch.key, requested_model):
-            excluded.append({"channel": ch.key, "reason": "source_model_disabled"})
-            continue
-        if any(
-            not model_state.is_global_enabled(model, source_key=ch.key)
-            or not model_state.is_source_enabled(ch.key, model)
-            for model in model_mapping.request_model_names(request_body, resolved)
-            if model != requested_model
-        ):
-            excluded.append({"channel": ch.key, "reason": "resolved_model_disabled"})
-            continue
+        if model_plan is not None:
+            # The registry already applied global, per-source and allowlist switches.
+            choice = model_plan.choices.get(ch.key)
+            if choice is None:
+                continue
+            resolved = choice.offer.wire
+            if call_choices is not None:
+                call_choices[(ch.key, resolved)] = choice
+        else:
+            try:
+                resolver = getattr(ch, "resolve_request_model", None)
+                resolved = (resolver(requested_model, request_body, ingress_protocol)
+                            if callable(resolver) else ch.supports_model(requested_model))
+            except GuardError as exc:
+                guard_errors.append(exc.message)
+                excluded.append({"channel": ch.key, "reason": "protocol_guard", "detail": exc.message})
+                continue
+            if resolved is None:
+                continue
+            if not model_state.is_global_enabled(requested_model, source_key=ch.key):
+                excluded.append({"channel": ch.key, "reason": "global_model_disabled"})
+                continue
+            if not model_state.is_source_enabled(ch.key, requested_model):
+                excluded.append({"channel": ch.key, "reason": "source_model_disabled"})
+                continue
+            if any(
+                not model_state.is_global_enabled(model, source_key=ch.key)
+                or not model_state.is_source_enabled(ch.key, model)
+                for model in model_mapping.request_model_names(request_body, resolved)
+                if model != requested_model
+            ):
+                excluded.append({"channel": ch.key, "reason": "resolved_model_disabled"})
+                continue
         if not ch.enabled:
             excluded.append({"channel": ch.key, "reason": "disabled"})
             continue
@@ -260,20 +277,26 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
         )
 
     client_key = affinity.make_client_key(api_key_name, client_ip, requested_model)
+    from .model_registry import runtime as model_registry
+    model_plan = model_registry.plan(requested_model, body, ingress_protocol, api_key_name)
     exact_bound = affinity.get(fp_query) if fp_query else None
     bound_channel_key: Optional[str] = None
     if isinstance(exact_bound, dict):
         candidate_key = str(exact_bound.get("channel_key") or "")
         bound_model = str(exact_bound.get("model") or "")
         owner_channel = registry.get_channel(candidate_key) if candidate_key else None
-        try:
-            resolver = getattr(owner_channel, "resolve_request_model", None)
-            owner_resolved_model = (
-                resolver(requested_model, body, ingress_protocol) if callable(resolver)
-                else owner_channel.supports_model(requested_model) if owner_channel else None
-            )
-        except Exception:
-            owner_resolved_model = None
+        if model_plan is not None:
+            owner_choice = model_plan.choices.get(candidate_key)
+            owner_resolved_model = owner_choice.offer.wire if owner_choice else None
+        else:
+            try:
+                resolver = getattr(owner_channel, "resolve_request_model", None)
+                owner_resolved_model = (
+                    resolver(requested_model, body, ingress_protocol) if callable(resolver)
+                    else owner_channel.supports_model(requested_model) if owner_channel else None
+                )
+            except Exception:
+                owner_resolved_model = None
         if owner_resolved_model and owner_resolved_model == bound_model:
             bound_channel_key = candidate_key
 
@@ -289,6 +312,7 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
             portable_body = None
 
     exclusions: list[dict] = []
+    call_choices: dict = {}
     candidates, saturated, route_plans, guard_errors = _filter_candidates(
         requested_model,
         ingress_protocol,
@@ -297,6 +321,8 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
         bound_channel_key=bound_channel_key,
         portable_body=portable_body,
         api_key_name=api_key_name,
+        model_plan=model_plan,
+        call_choices=call_choices,
     )
     if compaction_refs:
         eligible_channels = [ch for ch, _ in candidates + saturated]
@@ -368,4 +394,5 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
                           route_plans=route_plans, guard_errors=guard_errors,
                           exclusions=exclusions,
                           bound_channel_key=bound_channel_key,
-                          encrypted_content_count=encrypted_content_count)
+                          encrypted_content_count=encrypted_content_count,
+                          call_choices=call_choices)

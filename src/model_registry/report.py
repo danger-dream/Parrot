@@ -84,7 +84,7 @@ def old_route(name: str, key: str) -> set[tuple[str, str]]:
     return result
 
 
-def offer_live(offer: Offer) -> bool:
+def offer_live(offer: Offer, model_id: str | None = None) -> bool:
     from .. import model_state
     from ..channel import registry as channels
     channel = channels.get_channel(offer.source)
@@ -126,6 +126,24 @@ def new_route(registry: Registry, name: str, key: str) -> set[tuple[str, str]]:
     return {(choice.offer.source, choice.offer.wire) for choice in choices}
 
 
+def scheduled_route(name: str, key: str) -> set[tuple[str, str]]:
+    """End to end through the scheduler, as an ingress would call it after mapping and the allowlist."""
+    from .. import scheduler
+    from . import runtime
+    model = _global_map().get(name, name)
+    if not runtime.permits(_allowed_models(key), model):
+        return set()
+    result = scheduler.schedule({"model": model, "messages": [{"role": "user", "content": "hi"}]},
+                                key, "127.0.0.1", ingress_protocol="chat")
+    return {(channel.key, wire) for channel, wire in list(result.candidates) + list(result.saturated)}
+
+
+def snapshot(keys: list[str], names: Iterable[str], route) -> tuple[dict, dict]:
+    visible = {key: old_visible(key) for key in keys}
+    routes = {name: {key: route(name, key) for key in keys} for name in sorted(set(names))}
+    return visible, routes
+
+
 def compare(cfg, *, rules=(), extra_names: Iterable[str] = ()) -> Comparison:
     offers = with_legacy(collect(cfg), legacy_names())
     registry = build(offers, rules=rules)
@@ -156,10 +174,14 @@ def _source_label(source: str, cfg) -> str:
     return source
 
 
-def render(result: Comparison, cfg) -> str:
+def render(result: Comparison, cfg, *, live=None, title: str = "影子运行差异报告", notes: Iterable[str] = ()) -> str:
     reg = result.registry
+    live = live or offer_live
     label = lambda source: _source_label(source, cfg)
-    lines = ["# 统一模型管理：影子运行差异报告", ""]
+    lines = [f"# 统一模型管理：{title}", ""]
+    notes = list(notes)
+    if notes:
+        lines += ["## 0. 迁移改写的开关", ""] + [f"- {note}" for note in notes] + [""]
     multi = [m for m in reg.models.values() if len({o.source for o in m.offers}) > 1 or len({o.wire for o in m.offers}) > 1]
     pending = [(m.id, p) for m in reg.models.values() for p in m.pending]
     lines += [f"- 模型 {len(reg.models)} 个，其中多来源或多写法 {len(multi)} 个；待确认 {len(pending)} 条；"
@@ -221,7 +243,7 @@ def render(result: Comparison, cfg) -> str:
         for offer in model.offers:
             traits = ",".join(f"{k}={v}" for k, v in offer.traits.items())
             parts.append(f"{label(offer.source)} → `{offer.wire}`" + (f"[{traits}]" if traits else "")
-                         + ("" if offer_live(offer) else "（停用）"))
+                         + ("" if live(offer, model.id) else "（停用）"))
         lines.append(f"| `{model.id}` | {model.name} | {'<br>'.join(parts)} |")
     lines.append("")
     return "\n".join(lines)

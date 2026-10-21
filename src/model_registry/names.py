@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 
-EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 _EFFORT_WORDS = {**{name: name for name in EFFORTS}, "extra-high": "xhigh"}
 _THINKING_WORDS = {"thinking": "on", "nothinking": "off", "non-thinking": "off", "disabled": "off"}
 _SPEED_WORDS = {"fast": "fast"}

@@ -22,6 +22,10 @@ _BULK_ACTION = "oam_bulk_disable"
 
 
 def _model_label(account_key: str, model: str) -> str:
+    from ...model_registry import runtime as model_registry
+    unified = model_registry.model_of(f"oauth:{account_key}", model)
+    if unified:
+        return unified
     account = oauth_control.account_snapshot(account_key)
     if account and oauth_control.provider_of_snapshot(account) == "qoder":
         from ...oauth.qoder.catalog import model_aliases

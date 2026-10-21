@@ -229,6 +229,9 @@ def effective_order_for_model(
 
     model_id = str(model or "").strip()
     orders = _model_orders_from_cfg(cfg)
+    if model_id not in orders:
+        from .model_registry import runtime as model_registry
+        model_id = model_registry.same_model(model_id, orders) or model_id
     if model_id not in orders and live_channels and all(getattr(ch, "provider", "") == "zhipu" for ch in live_channels):
         keys = model_names.lookup_keys("zhipu", model_id, orders)
         if keys:

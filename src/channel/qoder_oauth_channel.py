@@ -100,10 +100,9 @@ class QoderOAuthChannel(OpenAIApiChannel):
         request.headers = headers
         request.body = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
         request.stream_context_hook = lambda physical, factory: QoderWire(physical, factory, signer, self.account_key)
-        public = model_names.public_id(self.provider, resolved_model)
-        requested = requested_body.get("model")
-        if self.supports_model(requested) == resolved_model:
-            public = requested
+        # Qoder ids are codes (gmodel); answer with the name the client asked for.
+        public = str(requested_body.get("_client_visible_model") or requested_body.get("model") or "").strip() \
+            or model_names.public_id(self.provider, resolved_model)
         request.translator_ctx = model_names.response_context(self.provider, resolved_model, request.translator_ctx, ingress=ingress_protocol)
         request.translator_ctx = {**(request.translator_ctx or {}), "qoder_stream": QoderStream(public), "model_for_response": public}
         if ingress_protocol == "chat":

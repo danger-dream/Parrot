@@ -641,7 +641,8 @@ def _find_channel_for_model(model_name: str) -> Optional[tuple[Channel, str]]:
     for ch in registry.all_channels():
         if not ch.enabled or ch.disabled_reason:
             continue
-        resolved = ch.supports_model(model_name)
+        from .model_registry import runtime as model_registry
+        resolved = model_registry.serves(ch, model_name)
         if resolved is not None:
             return ch, resolved
     return None

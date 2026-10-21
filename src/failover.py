@@ -2339,6 +2339,10 @@ async def run_failover(
             attempt_body = _attempt_body_for_channel(
                 body, ch.key, bound_channel_key, portable_body,
             )
+            registry_choice = (getattr(schedule_result, "call_choices", None) or {}).get((ch.key, resolved_model))
+            if registry_choice is not None:
+                from .model_registry import runtime as model_registry
+                attempt_body = model_registry.apply(attempt_body, registry_choice, ingress_protocol)
             if argon_tier_selection:
                 # Keep the trusted scheduling model for AG's late permission
                 # checks. Wire/response/billing still use the resolved tier.

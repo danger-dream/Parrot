@@ -5,7 +5,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, Mapping
 
-from .names import fold, nearest_effort, suffix_traits
+from .names import EFFORTS, fold, nearest_effort, suffix_traits
 from .offers import Offer
 from .pipeline import Registry
 
@@ -91,6 +91,8 @@ def _choose_in_source(offers: list[Offer], wanted: str, explicit: bool, think: s
         offer = free[0]
         if think == "off":
             level = None
+        elif explicit and wanted not in EFFORTS:
+            level = wanted
         elif offer.efforts:
             level = nearest_effort(wanted, offer.efforts)
         else:

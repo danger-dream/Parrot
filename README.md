@@ -357,6 +357,18 @@ JSON 请求体：
 返回当前所有启用渠道聚合的可用模型（按 API Key 白名单过滤），Anthropic 标准格式。
 **配置了模型映射的别名也会在这里一同列出**（条件：别名所在入口的家族对该 Key 放行，且别名指向的真实模型本身对该 Key 可见），这样下游客户端直接拉列表就能看到最新别名。
 
+### 统一模型名（`modelRegistry.enabled`）
+
+开启后，同一个模型不论来自哪个渠道、上游怎么写，对下游只有一个小写名字，所有来源按负载均衡的顺序和策略分流，发给每个来源的仍是它自己的 ID。
+
+- **同一模型合并**：`MiniMax-M3.1-Flash`（MiniMax API）、`minimax-m3.1-flash`（WorkBuddy）、Qoder 的 `mmodel` 都是 `minimax-m3.1-flash`；Cursor 的 `glm-5p3`、Qoder 的 `gmodel` 并入 `glm-5.3`。依据只有官方 ID、官方显示名和 models.dev 目录，不按名字相似猜；判断不了的保持原名。
+- **任意写法都能调用**：大小写、版本号写法（`4.6`/`4-6`）不同视为同一个；旧对外名（如 `qoder-glm-5.3`、`kimi-k3-1`、`primary-model`）保留为别名，不再列出。
+- **名字只表示模型**：思考强度、思考开关走请求参数；`gemini-4-argon-high`、`claude-opus-5-5-low`、`-thinking`、`-nothinking` 等后缀作为快捷写法始终可用。没传强度时默认 `high`（可用 `modelRegistry.models.<模型>.defaultEffort` 单独设），并按各来源支持的档位就近取；请求自己带了思考设置的照旧。
+- **渠道自有产品**统一叫“渠道名-名称”：`qoder-ultimate`、`qoder-sonus`、`workbuddy-primary`、`cursor-auto`、`cursor-composer-2.5`。
+- **开关按模型生效**：全局禁用覆盖该模型的所有来源（含以后新加入的）；按来源开关和“全局禁用但某来源例外”照旧。API Key 白名单也按模型匹配，写 `GLM-5.3` 等于写 `glm-5.3`。
+- **首次开启**时自动把现有开关改写为按模型记录，只做一次（`modelRegistry.migrated`）。开启前可用 `./venv/bin/python -I scripts/model_registry_report.py --runtime --out report.md` 在配置副本上预览列表和分流的变化，线上数据只读。把 `enabled` 改回 `false` 即退回按渠道命名。
+- 人工规则写在 `modelRegistry.rules`，如 `{"type": "merge", "from": "deepseek-flash", "into": "deepseek-v4.1-flash"}`。
+
 ### `GET /health`
 运维健康检查（无鉴权）：
 ```json
@@ -879,7 +891,7 @@ MIT — 见 [LICENSE](LICENSE)
 
 管理 API：`POST /oauth/login-flows` 的 Qoder 请求用 `loginMethod=device|pat`、可选 `proxyTarget` / `reloginAccountId`，返回 `devicePreview` 和 flow capability，不执行登录。用 flowSecret、预览 revision 调用 `.../{flowId}/qoder-device/regenerate` 或 `.../qoder-device/confirm`；regenerate 可传 `platform=linux-x64|linux-arm64|macos-arm64|windows-x64` 切换平台，省略则保留当前平台，未适配平台会拒绝且不改变草稿。PAT 可在确认后再次向 confirm 提交 pat。之后复用 poll/complete/cancel。旧 start 请求直接带 pat 会被拒绝。所有准备/确认均绑定 actor、过期时间和版本，确认后的档案不能重生成。
 
-Qoder 模型页只展示与下游模型列表一致的名称，如 `qoder-cantus`、`qoder-deepseek-v4-pro`、`qoder-glm-5.3`，不再另列“调用名”或并列内部代号；旧内部 ID 继续可用，出站仍使用原 ID 与原 `model_config`。别名随该账户目录生成，不按内部代号猜测底层厂商。账户模型页和模型中心展示已同步的免费状态、积分倍率及优惠前倍率；倍率不是每次调用固定扣费积分，费用缺失时不补零或标成免费。账户列表、详情的积分池名称统一显示为“积分”，不改变池内数值。
+Qoder 模型页只展示与下游模型列表一致的名称，不另列“调用名”或内部代号；出站始终使用原 ID 与原 `model_config`，响应里的模型名回显下游请求时用的名字。开启统一模型名后，Qoder 的厂商模型并入共享名字（如 `glm-5.3`、`qwen3.8-max`），自有档位与代号叫 `qoder-ultimate`、`qoder-cantus` 等，内部 ID 不再接受；未开启时仍是 `qoder-cantus`、`qoder-glm-5.3` 这类账户级别名。账户模型页和模型中心展示已同步的免费状态、积分倍率及优惠前倍率；倍率不是每次调用固定扣费积分，费用缺失时不补零或标成免费。账户列表、详情的积分池名称统一显示为“积分”，不改变池内数值。
 
 macOS 档案版本 `macos-generated-v1`：独立生成 MAC、序列号、UUID、主机名和辅助随机状态，不复制采样机器数据；SDK `1.1.2`、`os=7`，签发走同一已选代理链上的 HTTPS，校验服务器证书。四块字段数为 `[2,44,5,3]`，辅助状态与 Linux 分别校验。已离线对照官方组件请求验证编解码，尚未做真实账户在线签发、模型或签到验证。
 

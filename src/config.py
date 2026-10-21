@@ -402,6 +402,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "apiSourceDisabledModels": {},
         "sourceEnabledModels": {},
     },
+    # One public name per model across every source. Off: each channel lists
+    # and routes its own names.
+    "modelRegistry": {
+        "enabled": False,
+    },
     # Independent compact-rescue model. Legacy modelMetadata[*].compressionModel
     # is migrated after the bundled/cache models.dev catalog is initialized.
     "compressionModel": "",

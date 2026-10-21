@@ -16,6 +16,7 @@ from enum import Enum
 from typing import Any, Mapping
 
 from src import config, model_mapping, model_metadata, model_names, model_state
+from src.model_registry import runtime as model_registry
 from src.cooldown import ACCOUNT_SCOPE
 from src.management_control.auxiliary.media import (
     AntigravityMediaControl,
@@ -299,7 +300,10 @@ class ModelCenterControl(DomainControl):
                     model_id = outbound
                 if not model_id or not outbound:
                     continue
-                source_enabled = model_id not in api_disabled.get(source_id, set())
+                api_names = {model_id}
+                model_id = model_registry.model_of(source_id, outbound) or model_id
+                api_names.add(model_id)
+                source_enabled = not api_names & api_disabled.get(source_id, set())
                 global_enabled = model_state.is_global_enabled(model_id, cfg, source_key=source_id)
                 metadata, value_source, constrained = self._binding_view(
                     model_id, scope_key=source_id, outbound_model=outbound,
@@ -325,7 +329,7 @@ class ModelCenterControl(DomainControl):
                 continue
             if not account_id:
                 continue
-            if provider == "qoder":
+            if provider == "qoder" and model_registry.current() is None:
                 from src.oauth.qoder.catalog import model_aliases
                 for outbound, alias in model_aliases(selection.get("records") or []).items():
                     if outbound in selection.get("models", ()):
@@ -343,7 +347,7 @@ class ModelCenterControl(DomainControl):
                 outbound = str(outbound or "").strip()
                 if not outbound:
                     continue
-                model_id = model_names.public_id(provider, outbound)
+                model_id = model_registry.model_of(scope_key, outbound) or model_names.public_id(provider, outbound)
                 source_enabled = outbound not in disabled
                 global_enabled = model_state.is_global_enabled(model_id, cfg, source_key=scope_key)
                 metadata, value_source, constrained = self._binding_view(
@@ -704,8 +708,11 @@ class ModelCenterControl(DomainControl):
                     raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
                 provider = self._oauth.backend.provider_of(account)
                 disabled = self._oauth.backend.account_disabled_models(account)
+                source_key = oauth_channel_key_from_account_id(scope.id)
                 upstream_ids = {
-                    model_names.upstream_id(provider, model_id) for model_id in selected_models
+                    wire for model_id in selected_models
+                    for wire in (model_registry.wires_of(source_key, model_id)
+                                 or [model_names.upstream_id(provider, model_id)])
                 }
                 if target.value:
                     disabled.difference_update(upstream_ids)

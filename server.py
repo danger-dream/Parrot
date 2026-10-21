@@ -64,6 +64,7 @@ from src.management_auth import (
 from src.management_control import OperationRegistry, OperationStore, StoreAuditSink
 from src.management_control.composition import ManagementControls
 from src import mcp
+from src.model_registry import runtime as model_registry_runtime
 from src.openai.codex_constants import codex_cli_version
 from src.openai.transform.guard import GuardError, guard_collection_fields
 from src.transform.cc_mimicry import (
@@ -495,6 +496,14 @@ async def lifespan(app: FastAPI):
             )
         with startup_timing.phase("lifespan.config-reload-hook"):
             registry.install_config_reload_hook()
+        from src.model_registry import runtime as model_registry
+        with startup_timing.phase("lifespan.model-registry-migration"):
+            registry_notes = model_registry.migrate_if_needed()
+        if registry_notes is not None:
+            registry.rebuild_from_config()
+            print(f"[model-registry] switches re-keyed by model; {len(registry_notes)} per-source changes")
+            for note in registry_notes:
+                print(f"[model-registry]   {note}")
 
         # API Provider 用量在 Telegram 启动前启动唯一 coordinator 并预热一次。
         # 预热只进入共享队列，不等待网络；禁用语义与 OAuth 主动刷新一致。
@@ -951,8 +960,9 @@ app.add_middleware(ManagementOriginMiddleware)
 def _model_never_supported(model: str) -> bool:
     """model 在当前任何渠道（包括已禁用）里都不可能被路由 → True。
     用于把"模型不存在"与"模型存在但全都冷却"区分开。"""
+    from src.model_registry import runtime as model_registry
     for ch in registry.all_channels():
-        if ch.supports_model(model):
+        if model_registry.serves(ch, model):
             return False
     return True
 
@@ -1055,9 +1065,12 @@ async def list_models(request: Request):
         model for model in text_models + image_models
         if model not in known_image_models or model in image_models
     })
+    from src.model_registry import runtime as model_registry
+    registry_models = set(text_models) if model_registry.current() is not None else set()
     if allowed_models:
         allowed_set = set(allowed_models)
-        visible = [m for m in all_models if m in allowed_set]
+        # Registry models were already matched to the allowlist by model, not spelling.
+        visible = [m for m in all_models if m in allowed_set or m in registry_models]
         compatible = registry.available_model_spellings(allowed_models, api_key_name=key_name)
         identities = {model_names.canonical_id("zhipu", model) for model in visible}
         for model in sorted(compatible):
@@ -1108,7 +1121,7 @@ async def list_models(request: Request):
         "%Y-%m-%dT%H:%M:%SZ"
     )
     data = [
-        {"type": "model", "id": m, "display_name": m, "created_at": placeholder_ts}
+        {"type": "model", "id": m, "display_name": model_registry.display_name(m), "created_at": placeholder_ts}
         for m in visible
     ]
     return {
@@ -1374,7 +1387,7 @@ async def proxy_messages(request: Request):
         )
 
     # 模型白名单检查：allowed_models 为空 = 无限制；非空则必须命中
-    if allowed_models and model not in allowed_models:
+    if allowed_models and not model_registry_runtime.permits(allowed_models, model):
         return errors.json_error_response(
             403, errors.ErrType.PERMISSION,
             f"Model '{model}' is not allowed for this API key "

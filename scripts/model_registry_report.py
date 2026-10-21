@@ -6,6 +6,9 @@ channels writes channel state; the live data directory is only read.
 
     ./venv/bin/python -I scripts/model_registry_report.py --out /tmp/registry.md \
         --merge deepseek-flash=deepseek-v4.1-flash
+
+With --runtime the copy is switched over for real: registry enabled, the
+one-time switch migration applied, and both sides routed by the scheduler.
 """
 from __future__ import annotations
 
@@ -34,6 +37,36 @@ def requested_names(log_dir: str, days: int) -> set[str]:
     return names
 
 
+def _runtime_report(cfg, rules, names):
+    from src import config
+    from src.channel import registry
+    from src.model_registry import report, runtime
+    keys = sorted((cfg.get("apiKeys") or {}).keys())
+    names = set(names) | {name for (_source, _wire), name in report.legacy_names().items()}
+    for key in keys:
+        names |= report.old_visible(key)
+    old_visible, old_routes = report.snapshot(keys, names, report.scheduled_route)
+
+    def enable(current):
+        root = current.setdefault("modelRegistry", {})
+        root["enabled"] = True
+        root["rules"] = list(root.get("rules") or []) + [rule for rule in rules if rule not in (root.get("rules") or [])]
+    config.update(enable)
+    registry.rebuild_from_config()
+    notes = runtime.migrate_if_needed() or []
+    registry.rebuild_from_config()
+    for key in keys:
+        names |= report.old_visible(key)
+    new_visible, new_routes = report.snapshot(keys, names, report.scheduled_route)
+    result = report.Comparison(runtime.current(), keys, old_visible, new_visible, {
+        name: {key: (old_routes.get(name, {}).get(key, set()), new_routes[name][key]) for key in keys}
+        for name in new_routes})
+    switches = runtime.Switches.read()
+    text = report.render(result, config.get(), live=lambda offer, model_id: switches.usable(offer, model_id),
+                         title="切换后实测差异报告（真实调度器）", notes=notes)
+    return text, result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--data-dir", default=ROOT, help="live data directory to read (default: repo root)")
@@ -41,6 +74,8 @@ def main() -> int:
     parser.add_argument("--merge", action="append", default=[], metavar="FROM=INTO",
                         help="proposed manual merge rule, repeatable")
     parser.add_argument("--days", type=int, default=30, help="also compare names requested in the last N days")
+    parser.add_argument("--runtime", action="store_true",
+                        help="enable the registry in the copy, migrate, and compare scheduler results")
     args = parser.parse_args()
 
     rules = []
@@ -68,8 +103,11 @@ def main() -> int:
         log_dir = os.path.join(args.data_dir, cfg.get("logDir", "logs"))
         names = requested_names(log_dir, args.days) if args.days > 0 else set()
         rules += list((cfg.get("modelRegistry") or {}).get("rules") or [])
-        result = report.compare(cfg, rules=rules, extra_names=names)
-        text = report.render(result, cfg)
+        if args.runtime:
+            text, result = _runtime_report(cfg, rules, names)
+        else:
+            result = report.compare(cfg, rules=rules, extra_names=names)
+            text = report.render(result, cfg)
     with open(args.out, "w", encoding="utf-8") as handle:
         handle.write(text)
     print(f"wrote {args.out}: {len(result.registry.models)} models, {len(result.routes)} names compared")

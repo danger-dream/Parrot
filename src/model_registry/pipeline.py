@@ -103,7 +103,14 @@ def place(offer: Offer, catalog: CatalogIndex) -> Placement:
 
 
 def _pending(offer: Offer, reason: str) -> Placement:
-    current = offer.legacy or offer.wire
+    if offer.legacy:
+        current = offer.legacy
+    elif offer.basis == "name":
+        # A name-based source's id is never a bare public name; undecided ids
+        # sharing one display name must still stay apart.
+        current = f"{offer.provider}-{slug(offer.wire)}"
+    else:
+        current = offer.wire
     return Placement(offer, compare_key(current), fold(current), "pending", reason)
 
 
@@ -153,10 +160,12 @@ def _apply_rules(placements: list[Placement], rules: Iterable[Mapping[str, Any]]
     return result, aliases
 
 
-def _spelling(key: str, placements: list[Placement]) -> str:
+def _spelling(key: str, placements: list[Placement], known: Mapping[str, str]) -> str:
     forced = [p.spelling for p in placements if p.status in ("manual", "product")]
     if forced:
         return Counter(forced).most_common(1)[0][0]
+    if key in known:
+        return known[key]
     for candidates in (
         [fold(p.offer.legacy) for p in placements if p.offer.legacy and compare_key(p.offer.legacy) == key],
         [fold(p.offer.wire) for p in placements if p.offer.basis != "name" and compare_key(p.offer.wire) == key],
@@ -178,8 +187,11 @@ def _display(model_id: str, key: str, placements: list[Placement]) -> str:
 
 
 def build(offers: Iterable[Offer], *, rules: Iterable[Mapping[str, Any]] = (),
-          catalog: CatalogIndex | None = None) -> Registry:
+          catalog: CatalogIndex | None = None, known: Iterable[str] = (),
+          aliases: Mapping[str, Any] | None = None) -> Registry:
+    """``known`` keeps already published ids stable; ``aliases`` are persisted old names."""
     catalog = catalog if catalog is not None else CatalogIndex()
+    known_ids = {compare_key(model_id): fold(model_id) for model_id in known if str(model_id or "").strip()}
     placements = _same_source_duplicates([place(offer, catalog) for offer in offers])
     placements, rule_aliases = _apply_rules(placements, rules)
     groups: dict[str, list[Placement]] = defaultdict(list)
@@ -187,16 +199,16 @@ def build(offers: Iterable[Offer], *, rules: Iterable[Mapping[str, Any]] = (),
         groups[placement.key].append(placement)
     registry = Registry(models={})
     for key, members in groups.items():
-        model_id = _spelling(key, members)
+        model_id = _spelling(key, members, known_ids)
         kind = "product" if any(p.status == "product" for p in members) else "vendor"
         refs = tuple(sorted(catalog.find(key))) if kind == "vendor" else ()
         registry.models[model_id] = Model(model_id, _display(model_id, key, members), kind, members, refs)
-    _index_aliases(registry, rule_aliases)
+    _index_aliases(registry, rule_aliases, aliases or {})
     _suggest(registry, catalog)
     return registry
 
 
-def _index_aliases(registry: Registry, rule_aliases: list[tuple[str, str]]) -> None:
+def _index_aliases(registry: Registry, rule_aliases: list[tuple[str, str]], persisted: Mapping[str, Any]) -> None:
     ranks: dict[str, int] = {}
 
     def add(name: str, model_id: str, traits: Mapping[str, str], rank: int) -> None:
@@ -221,6 +233,10 @@ def _index_aliases(registry: Registry, rule_aliases: list[tuple[str, str]]) -> N
     for source, target in rule_aliases:
         if target in registry.models:
             add(source, target, {}, 1)
+    for name, target in persisted.items():
+        model_id, traits = (target.get("model"), target.get("traits") or {}) if isinstance(target, Mapping) else (target, {})
+        if model_id in registry.models:
+            add(str(name), model_id, traits, 1)
     for model in registry.models.values():
         for p in model.placements:
             if p.offer.basis != "name" and not p.offer.product:

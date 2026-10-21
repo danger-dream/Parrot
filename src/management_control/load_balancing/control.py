@@ -7,6 +7,7 @@ from typing import Iterable
 
 from src import affinity, config, load_balancing, model_mapping
 from src.channel import registry
+from src.model_registry import runtime as model_registry
 from src.management_auth.principal import Capability
 from src.management_control.context import AuditSink, ManagementContext
 from src.management_control.errors import ErrorField, ManagementError, ManagementErrorCode
@@ -83,7 +84,7 @@ class LoadBalancingControl(DomainControl):
         result = []
         for channel in cls._all_channels():
             try:
-                if channel.supports_model(model_id) is not None:
+                if model_registry.serves(channel, model_id) is not None:
                     result.append(channel)
             except Exception:
                 continue

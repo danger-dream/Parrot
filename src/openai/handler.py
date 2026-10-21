@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 from src import notifications
+from src.model_registry import runtime as model_registry_runtime
 from src.notifications import reporting
 from src.notifications.events import Effect
 
@@ -128,7 +129,7 @@ def _has_xai_oauth_candidate(model: str | None) -> bool:
         if getattr(ch, "type", "") != "oauth" or getattr(ch, "provider", "") != "xai":
             continue
         try:
-            if ch.supports_model(model) is not None:
+            if model_registry_runtime.serves(ch, model) is not None:
                 return True
         except Exception:
             continue
@@ -490,7 +491,7 @@ def _bridge_legacy_openai_affinity(
     if requested_model:
         bound_channel = registry.get_channel(channel_key)
         try:
-            resolved = bound_channel.supports_model(requested_model) if bound_channel else None
+            resolved = model_registry_runtime.serves(bound_channel, requested_model) if bound_channel else None
         except Exception:
             resolved = None
         if resolved != bound_model:
@@ -573,7 +574,7 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         return errors.json_error_openai(
             400, errors.ErrTypeOpenAI.INVALID_REQUEST, "model is required",
         )
-    if allowed_models and model not in allowed_models:
+    if allowed_models and not model_registry_runtime.permits(allowed_models, model):
         return errors.json_error_openai(
             403, errors.ErrTypeOpenAI.PERMISSION,
             f"model '{model}' is not allowed for this API key "
@@ -753,6 +754,6 @@ def _model_never_supported(model: str) -> bool:
     形成循环依赖。任一实现改动应同步。
     """
     for ch in registry.all_channels():
-        if ch.supports_model(model):
+        if model_registry_runtime.serves(ch, model):
             return False
     return True

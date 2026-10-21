@@ -18,6 +18,7 @@ as much as possible while keeping the actual transport as a transparent WS relay
 from __future__ import annotations
 
 from src import notifications
+from src.model_registry import runtime as model_registry_runtime
 from src.notifications import reporting
 from src.notifications.events import Effect
 
@@ -964,7 +965,7 @@ async def _handle_responses_ws_lane(websocket: WebSocket) -> None:
     body["_client_visible_model"] = str(body.get("model") or "").strip()
 
     model = body.get("model")
-    if allowed_models and model not in allowed_models:
+    if allowed_models and not model_registry_runtime.permits(allowed_models, model):
         await websocket.close(
             code=4403,
             reason=_trim_reason(
@@ -2125,7 +2126,13 @@ async def _try_ws_channel(
                             start_time=new_time, start_monotonic=new_mono, allowed_models=allowed_models)
                         return session_result or relay_result
                     requested_model = str(body.get("model") or "")
-                    next_resolved_model = ch.supports_model(requested_model)
+                    registry_choice = None
+                    if model_registry_runtime.current() is not None:
+                        registry_choice = model_registry_runtime.route_on(
+                            ch, requested_model, body, "responses", api_key_name)
+                        next_resolved_model = registry_choice.offer.wire if registry_choice else None
+                    else:
+                        next_resolved_model = ch.supports_model(requested_model)
                     try:
                         route_names = {
                             name for name, _ in _resolve_ws_route_chain(
@@ -2137,12 +2144,15 @@ async def _try_ws_channel(
                     if (
                         next_resolved_model is not None
                         and bool(getattr(ch, "enabled", True))
-                        and all(model_state.is_global_enabled(model, source_key=ch.key)
-                                and model_state.is_source_enabled(ch.key, model)
-                                for model in model_mapping.request_model_names(body, next_resolved_model))
+                        and (registry_choice is not None
+                             or all(model_state.is_global_enabled(model, source_key=ch.key)
+                                    and model_state.is_source_enabled(ch.key, model)
+                                    for model in model_mapping.request_model_names(body, next_resolved_model)))
                         and route_name in route_names
                     ):
                         resolved_model = next_resolved_model
+                        if registry_choice is not None:
+                            body = model_registry_runtime.apply(body, registry_choice, "responses")
                         break
                     await _send_request_invalid_error_frame(
                         websocket,
@@ -2613,11 +2623,20 @@ async def _run_codex_sse_fallback_session(
                 return first_result
             _first, next_body, next_fp = next_turn
             requested_model = str(next_body.get("model") or "")
-            next_model = ch.supports_model(requested_model)
+            registry_choice = None
+            if model_registry_runtime.current() is not None:
+                registry_choice = model_registry_runtime.route_on(
+                    ch, requested_model, next_body, "responses", api_key_name)
+                next_model = registry_choice.offer.wire if registry_choice else None
+                if registry_choice is not None:
+                    next_body = model_registry_runtime.apply(next_body, registry_choice, "responses")
+            else:
+                next_model = ch.supports_model(requested_model)
             if (next_model is None or not ch.enabled
-                    or not all(model_state.is_global_enabled(model, source_key=ch.key)
-                               and model_state.is_source_enabled(ch.key, model)
-                               for model in model_mapping.request_model_names(next_body, next_model))):
+                    or (registry_choice is None
+                        and not all(model_state.is_global_enabled(model, source_key=ch.key)
+                                    and model_state.is_source_enabled(ch.key, model)
+                                    for model in model_mapping.request_model_names(next_body, next_model)))):
                 await _send_request_invalid_error_frame(websocket, "model is not available on the active route", param="model")
                 continue
             full = rebuild_full_request(next_body, api_key_name=api_key_name,
@@ -3520,7 +3539,7 @@ async def _receive_next_response_create(
         model_mapping.apply_mapping(body, "openai-responses")
         body["_client_visible_model"] = str(body.get("model") or "").strip()
         model = body.get("model")
-        if allowed_models and model not in allowed_models:
+        if allowed_models and not model_registry_runtime.permits(allowed_models, model):
             await _send_request_invalid_error_frame(
                 websocket,
                 f"model '{model}' is not allowed for this API key",
