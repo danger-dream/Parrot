@@ -5,6 +5,7 @@ per-channel naming path.
 """
 from __future__ import annotations
 
+import copy
 import threading
 import time
 from dataclasses import dataclass, field
@@ -15,7 +16,7 @@ from .offers import Offer, collect, with_legacy
 from .pipeline import CatalogIndex, Registry, build
 from .resolver import DEFAULT_EFFORT, Choice, choose, resolve
 
-MIGRATION_VERSION = 1
+MIGRATION_VERSION = 2   # 1: switches re-keyed by model; 2: metadata also keyed by model
 
 _lock = threading.Lock()
 _registry: Registry | None = None
@@ -373,13 +374,19 @@ def global_default_effort(cfg: Mapping[str, Any] | None = None) -> str:
     return settings(cfg).get("defaultEffort") or DEFAULT_EFFORT
 
 
-def same_model(name: str, keys: Iterable[str]) -> str | None:
-    """The first of ``keys`` naming the same model as ``name`` (per-model settings keyed by any spelling)."""
+def same_models(name: str, keys: Iterable[Any]) -> list[str]:
+    """Those of ``keys`` naming the same model as ``name``, the model's own spelling first."""
     registry = _registry
     found = resolve(registry, name) if registry else None
     if found is None:
-        return None
-    return next((key for key in keys if (hit := resolve(registry, key)) and hit.model == found.model), None)
+        return []
+    hits = [key for key in keys if isinstance(key, str) and (hit := resolve(registry, key)) and hit.model == found.model]
+    return sorted(hits, key=lambda key: (compare_key(key) != compare_key(found.model), key))
+
+
+def same_model(name: str, keys: Iterable[str]) -> str | None:
+    """The key naming the same model as ``name`` (per-model settings keyed by any spelling)."""
+    return next(iter(same_models(name, keys)), None)
 
 
 def display_name(model_id: str) -> str:
@@ -514,7 +521,7 @@ def admin_revision(cfg: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
 # ─── one-time switch migration ───────────────────────────────────────
 
 def migrate_if_needed() -> list[str] | None:
-    """Re-key today's switches by model, once, when the registry is first enabled.
+    """Re-key today's switches and metadata by model, once per migration version.
 
     Runs in the new code at startup: an old process would read the re-keyed
     switches with per-spelling semantics.
@@ -531,6 +538,40 @@ def migrate_if_needed() -> list[str] | None:
 
 
 def migrate_config(cfg: dict, registry: Registry, notes: list[str]) -> None:
+    root = cfg.setdefault("modelRegistry", {})
+    done = root.get("migrated") or 0
+    if done < 1:
+        _migrate_switches(cfg, registry, notes)
+    if done < 2:
+        _key_metadata_by_model(cfg, registry, notes)
+    root["migrated"] = MIGRATION_VERSION
+    root["migratedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _key_metadata_by_model(cfg: dict, registry: Registry, notes: list[str]) -> None:
+    """Add each model's own key next to metadata saved under other names; the old keys stay for rollback."""
+    for root_name, label in (("modelBindings", "元数据匹配"), ("modelMetadataOverrides", "元数据覆盖")):
+        root = cfg.get(root_name)
+        if not isinstance(root, dict):
+            continue
+        layers = [(None, root.get("defaults"))] + list((root.get("scoped") or {}).items())
+        for scope, values in layers:
+            if not isinstance(values, dict):
+                continue
+            by_model: dict[str, list[str]] = {}
+            for key in values:
+                found = registry.lookup(key) if isinstance(key, str) else None
+                if found is not None and found[0] not in values:
+                    by_model.setdefault(found[0], []).append(key)
+            for model_id, keys in sorted(by_model.items()):
+                keys.sort(key=lambda key: (compare_key(key) != compare_key(model_id), key))
+                values[model_id] = copy.deepcopy(values[keys[0]])
+                if any(values[key] != values[keys[0]] for key in keys[1:]):
+                    where = f"{scope} 的" if scope else ""
+                    notes.append(f"{where}{label}里 {'、'.join(keys)} 都属于 {model_id}，按模型查询时采用 {keys[0]} 的设置")
+
+
+def _migrate_switches(cfg: dict, registry: Registry, notes: list[str]) -> None:
     root = cfg.setdefault("modelRegistry", {})
     models = root.setdefault("models", {})
     for model_id in registry.models:
@@ -571,8 +612,6 @@ def migrate_config(cfg: dict, registry: Registry, notes: list[str]) -> None:
     exceptions = center.get("sourceEnabledModels") or {}
     for source, values in list(exceptions.items()):
         exceptions[source] = sorted({(found[0] if (found := registry.lookup(value)) else value) for value in values})
-    root["migrated"] = MIGRATION_VERSION
-    root["migratedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def _disable_offer(cfg: dict, offer: Offer) -> None:

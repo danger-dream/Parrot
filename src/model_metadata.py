@@ -327,13 +327,13 @@ def get_override_fields(
     defaults, scoped = _override_roots(cfg)
     provider = model_names.channel_provider(scope)
     common: dict[str, Any] = {}
-    for key in reversed(model_names.lookup_keys(provider, name, defaults)):
+    for key in reversed(_model_keys(provider, name, defaults)):
         common.update(_override_entry_fields(defaults[key]))
     source: dict[str, Any] = {}
     if scope:
         values = scoped.get(scope) or {}
         if isinstance(values, Mapping):
-            for key in reversed(model_names.lookup_keys(provider, name, values)):
+            for key in reversed(_model_keys(provider, name, values)):
                 source.update(_override_entry_fields(
                     values[key], known_outbound_model=outbound_model, provider=provider,
                 ))
@@ -822,13 +822,30 @@ def _account_native_binding(
     )
 
 
+def _model_keys(provider: str, model: str, values, *, every: bool = False) -> list[str]:
+    """Keys saved for ``model``: its own spelling, else (or with ``every``, also)
+    the other names of the same unified model."""
+    keys = model_names.lookup_keys(provider, model, values)
+    if keys and not every:
+        return keys
+    from .model_registry import runtime as model_registry
+    return keys + [key for key in model_registry.same_models(model, values) if key not in keys]
+
+
 def _binding_lookup_keys(model, scope, values):
     provider = model_names.channel_provider(scope)
-    keys = model_names.lookup_keys(provider, model, values)
+    keys = _model_keys(provider, model, values)
     def automatic(key):
         fields = _binding_fields(values[key])
         return not fields or fields[1] in {"auto", "legacy"}
     return sorted(keys, key=automatic)
+
+
+def _with_same_model(lookups: list[str], model: str, values) -> list[str]:
+    if not isinstance(values, Mapping) or any(lookup in values for lookup in lookups):
+        return lookups
+    from .model_registry import runtime as model_registry
+    return lookups + model_registry.same_models(model, values)
 
 
 def resolve_binding(
@@ -857,7 +874,8 @@ def resolve_binding(
     if scope:
         scope_bindings = scoped.get(scope) or {}
         scoped_keys = (_binding_lookup_keys(model, scope, scope_bindings)
-                       if provider == "zhipu" and isinstance(scope_bindings, Mapping) else lookup_models)
+                       if provider == "zhipu" and isinstance(scope_bindings, Mapping)
+                       else _with_same_model(lookup_models, model, scope_bindings))
         for lookup in scoped_keys:
             if isinstance(scope_bindings, Mapping) and lookup in scope_bindings:
                 binding = _record_for(
@@ -867,7 +885,8 @@ def resolve_binding(
                 if binding is not None:
                     break
     if binding is None:
-        default_keys = _binding_lookup_keys(model, scope, defaults) if provider == "zhipu" else lookup_models
+        default_keys = (_binding_lookup_keys(model, scope, defaults) if provider == "zhipu"
+                        else _with_same_model(lookup_models, model, defaults))
         for lookup in default_keys:
             if lookup in defaults:
                 binding = _record_for(
@@ -949,7 +968,7 @@ def set_binding(
                 values = {}
                 root["defaults"] = values
         provider = model_names.channel_provider(scope)
-        for key in model_names.matching_keys(provider, model, values):
+        for key in _model_keys(provider, model, values, every=True):
             values.pop(key)
         values[model_names.canonical_id(provider, model)] = entry
 
@@ -969,7 +988,7 @@ def delete_binding(client_visible_model: str, *, scope_key: str | None = None) -
             values = defaults
         if isinstance(values, dict):
             provider = model_names.channel_provider(scope)
-            for key in model_names.matching_keys(provider, model, values):
+            for key in _model_keys(provider, model, values, every=True):
                 del values[key]
                 removed[0] = True
         if scope and isinstance(scoped, dict) and not values:
@@ -1103,7 +1122,7 @@ def patch_override_fields(
                 values = {}
                 root["defaults"] = values
         provider = model_names.channel_provider(scope)
-        keys = model_names.lookup_keys(provider, name, values)
+        keys = _model_keys(provider, name, values, every=True)
         raw = values.get(keys[0]) if keys else None
         existing = {}
         for key in reversed(keys):
@@ -1155,7 +1174,7 @@ def delete_override_layer(model: str, *, scope_key: str | None = None) -> bool:
         values = scoped.get(scope) if scope and isinstance(scoped, dict) else defaults
         if isinstance(values, dict):
             provider = model_names.channel_provider(scope)
-            for key in model_names.matching_keys(provider, name, values):
+            for key in _model_keys(provider, name, values, every=True):
                 values.pop(key)
                 removed[0] = True
         if scope and isinstance(scoped, dict) and not values:
@@ -1180,7 +1199,7 @@ def clear_scoped_metadata_in_config(
         if not isinstance(values, dict):
             continue
         for name in names:
-            for key in model_names.matching_keys(model_names.channel_provider(scope), name, values):
+            for key in _model_keys(model_names.channel_provider(scope), name, values, every=True):
                 values.pop(key, None)
         if not values:
             scopes.pop(scope, None)
@@ -1338,7 +1357,9 @@ def inventory_items() -> list[ModelInventoryItem]:
         for account in config.get().get("oauthAccounts") or ()
         if isinstance(account, dict)
     }
+    from .model_registry import runtime as model_registry
     result: list[ModelInventoryItem] = []
+    listed: set[tuple[str, str]] = set()
     for channel in registry.all_channels():
         scope_key = normalize_model_name(getattr(channel, "key", ""))
         if not scope_key:
@@ -1368,6 +1389,10 @@ def inventory_items() -> list[ModelInventoryItem]:
                 outbound = ""
             if not outbound:
                 outbound = model_names.upstream_for_channel(scope_key, model)
+            model = model_registry.model_of(scope_key, outbound) or model
+            if (scope_key, model) in listed:
+                continue
+            listed.add((scope_key, model))
             result.append(ModelInventoryItem(
                 scope_key=scope_key,
                 scope_type=scope_type,

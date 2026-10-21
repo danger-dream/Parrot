@@ -227,3 +227,40 @@ def test_rename_carries_switches_and_a_merge_named_by_alias_acts_on_its_model(en
     assert cfg["modelCenter"]["sourceEnabledModels"] == {"api:Reseller": ["minimax-m2.7-legacy"]}
     assert runtime.current().lookup("MiniMax-M2.7")[0] == "minimax-m2.7-legacy"
     assert _routes(env, "minimax-m2.7")[0] == [("api:Reseller", "minimax-m2.7")]
+
+
+def test_metadata_saved_under_old_names_is_found_by_model_and_edits_consolidate(env):
+    from src import model_metadata
+    binding = {"provider": "minimax", "target": "MiniMax-M3.1-Flash", "source": "manual"}
+    override = {"fields": {"maxOutputTokens": 4096}}
+    env["config"].update(lambda cfg: cfg.update(
+        modelBindings={"defaults": {"MiniMax-M3.1-Flash": binding}},
+        modelMetadataOverrides={"defaults": {"MiniMax-M3.1-Flash": override}}))
+    assert model_metadata._model_keys("", "minimax-m3.1-flash", {"MiniMax-M3.1-Flash": 1}) == ["MiniMax-M3.1-Flash"]
+    assert model_metadata.get_override_fields("minimax-m3.1-flash")[0] == {"maxOutputTokens": 4096}
+    assert {(item.scope_key, item.client_visible_model) for item in model_metadata.inventory_items()} >= {
+        ("api:Official", "minimax-m3.1-flash"), ("api:Reseller", "minimax-m3.1-flash")}
+    assert model_metadata.delete_override_layer("minimax-m3.1-flash")
+    assert env["config"].get()["modelMetadataOverrides"]["defaults"] == {}
+
+
+def test_second_migration_keys_metadata_by_model_without_touching_switches():
+    from src.model_registry import pipeline, runtime
+    from src.model_registry.offers import Offer
+    offers = [Offer("api:Official", "api", "MiniMax-M2.7", "MiniMax-M2.7", basis="name", legacy="MiniMax-M2.7"),
+              Offer("api:G", "api", "gem-3-high", "Gem 3 (High)", basis="name", traits={"effort": "high"}, legacy="gem-3-high"),
+              Offer("api:G", "api", "gem-3-low", "Gem 3 (Low)", basis="name", traits={"effort": "low"}, legacy="gem-3-low")]
+    registry = pipeline.build(offers, catalog=pipeline.CatalogIndex([]))
+    cfg = {"modelRegistry": {"migrated": 1}, "modelCenter": {"disabledModels": ["MiniMax-M2.7"]},
+           "modelBindings": {"defaults": {"MiniMax-M2.7": {"target": "a"}, "gem-3-high": {"target": "h"},
+                                          "gem-3-low": {"target": "l"}}},
+           "modelMetadataOverrides": {"scoped": {"api:G": {"gem-3-high": {"fields": {"vision": True}}}}}}
+    notes = []
+    runtime.migrate_config(cfg, registry, notes)
+    assert cfg["modelRegistry"]["migrated"] == runtime.MIGRATION_VERSION == 2
+    assert cfg["modelCenter"]["disabledModels"] == ["MiniMax-M2.7"]
+    defaults = cfg["modelBindings"]["defaults"]
+    assert defaults["minimax-m2.7"] == {"target": "a"} and defaults["MiniMax-M2.7"] == {"target": "a"}
+    assert defaults["gem-3"] == {"target": "h"}
+    assert cfg["modelMetadataOverrides"]["scoped"]["api:G"]["gem-3"] == {"fields": {"vision": True}}
+    assert notes == ["元数据匹配里 gem-3-high、gem-3-low 都属于 gem-3，按模型查询时采用 gem-3-high 的设置"]
