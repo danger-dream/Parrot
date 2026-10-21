@@ -207,11 +207,27 @@ def route_on(channel, name: str, body: Mapping[str, Any], ingress: str, api_key:
     return None if routed is None or routed.error else routed.choices.get(channel.key)
 
 
+# Providers refuse or starve thinking below this output cap (Zhipu requires
+# max_tokens > 1024 once thinking is on), so a default level must not turn
+# thinking on for short requests such as titles.
+MIN_DEFAULT_REASONING_OUTPUT = 1024
+
+
+def _output_cap(body: Mapping[str, Any], ingress: str) -> int | None:
+    keys = {"chat": ("max_completion_tokens", "max_tokens"), "responses": ("max_output_tokens",)}.get(ingress, ("max_tokens",))
+    for key in keys:
+        value = body.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
 def apply(body: dict, choice: Choice | None, ingress: str) -> dict:
     """The candidate's own body: the chosen level is written only where the request left it open.
 
     A request that already carries any reasoning control keeps it, except that
-    an id fixed to one level must see that level (Antigravity checks it).
+    an id fixed to one level must see that level (Antigravity checks it). A
+    default level is not written into a request capped to a short output.
     """
     if choice is None:
         return body
@@ -219,9 +235,16 @@ def apply(body: dict, choice: Choice | None, ingress: str) -> dict:
     fixed = "effort" in choice.offer.traits
     if choice.thinking == "off" and reasoning.thinking != "off" and reasoning.effort is None:
         return _write(body, ingress, None, off=True)
-    if choice.effort and reasoning.effort is None and choice.thinking != "off" and (fixed or not reasoning.controlled):
+    if not choice.effort or reasoning.effort is not None or choice.thinking == "off":
+        return body
+    if fixed:
         return _write(body, ingress, choice.effort, off=False)
-    return body
+    if reasoning.controlled:
+        return body
+    cap = _output_cap(body, ingress)
+    if not choice.explicit and cap is not None and cap <= MIN_DEFAULT_REASONING_OUTPUT:
+        return body
+    return _write(body, ingress, choice.effort, off=False)
 
 
 def _write(body: dict, ingress: str, effort: str | None, *, off: bool) -> dict:

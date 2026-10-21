@@ -168,3 +168,16 @@ def test_per_model_priority_follows_the_model_under_any_spelling(env):
     env["registry"].rebuild_from_config()
     assert [key for key, _ in _routes(env, "minimax-m3.1-flash")[0]] == ["api:Reseller", "api:Official"]
     assert [key for key, _ in _routes(env, "minimax-m2.7")[0]] == ["api:Official", "api:Reseller"]
+
+
+def test_default_level_leaves_short_outputs_alone_but_named_levels_still_apply():
+    from src.model_registry import runtime
+    from src.model_registry.offers import Offer
+    from src.model_registry.resolver import Choice
+    offer = Offer("oauth:zhipu:a", "zhipu", "glm-5.3", "GLM-5.3", efforts=("low", "high", "max"))
+    default = Choice(offer, "high", None)
+    assert runtime.apply({"max_tokens": 64}, default, "chat") == {"max_tokens": 64}
+    assert runtime.apply({"max_output_tokens": 1024}, default, "responses") == {"max_output_tokens": 1024}
+    assert runtime.apply({"max_tokens": 4096}, default, "chat")["reasoning_effort"] == "high"
+    named = Choice(offer, "high", None, explicit=True)
+    assert runtime.apply({"max_tokens": 64}, named, "chat")["reasoning_effort"] == "high"

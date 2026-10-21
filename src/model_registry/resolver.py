@@ -24,6 +24,7 @@ class Choice:
     offer: Offer
     effort: str | None
     thinking: str | None
+    explicit: bool = False   # the level came from the name or the body, not a default
 
 
 def resolve(registry: Registry, name: str) -> Resolution | None:
@@ -86,7 +87,7 @@ def _choose_in_source(offers: list[Offer], wanted: str, explicit: bool, think: s
     free = [offer for offer in offers if "effort" not in offer.traits]
     exact = next((offer for offer in fixed if offer.traits["effort"] == wanted), None)
     if exact is not None and think != "off":
-        return Choice(exact, wanted, think)
+        return Choice(exact, wanted, think, explicit)
     if free:
         offer = free[0]
         if think == "off":
@@ -97,7 +98,7 @@ def _choose_in_source(offers: list[Offer], wanted: str, explicit: bool, think: s
             level = nearest_effort(wanted, offer.efforts)
         else:
             level = wanted if explicit else None
-        return Choice(offer, level, think)
+        return Choice(offer, level, think, explicit)
     if fixed and not explicit:
         level = nearest_effort(wanted, [offer.traits["effort"] for offer in fixed])
         return next(Choice(offer, level, think) for offer in fixed if offer.traits["effort"] == level)
