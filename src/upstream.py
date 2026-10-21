@@ -345,15 +345,16 @@ class SSEAssistantBuilder:
 #
 # 注意：与 Anthropic 版并列存在，不复用 / 不覆盖任一 anthropic 函数或类。
 # usage 字段以 anthropic 的 4 键为准（input_tokens / output_tokens /
-# cache_creation / cache_read），保证 log_db 落库无感切换。OpenAI 不区分
-# cache_creation，一律置 0；cache_read 来自 cached_tokens 细节字段。
+# cache_creation / cache_read），保证 log_db 落库无感切换。cache_read 来自
+# cached_tokens 细节字段；cache_creation 来自 GPT-5.6+ 的 cache_write_tokens
+# 细节字段，旧模型不返回该字段时为 0。
 #
 # ⚠️ 语义对齐（v0.8.0 修复）：
-# OpenAI 上游的 `prompt_tokens` 是含缓存命中的**总 prompt**，而 Anthropic
-# 的 `input_tokens` 指的是**未命中缓存的新 token**。为了让 DB 里 4 键的语
-# 义统一（Anthropic 风格），此处在归一时做一次扣减：
-#     input_tokens = max(0, prompt_tokens - cached_tokens)
-# 这样 DB 里的 `input_tokens + cache_read_tokens` 始终等于完整 prompt 总量，
+# OpenAI 上游的 `prompt_tokens` 是含缓存命中与缓存写入的**总 prompt**，而
+# Anthropic 的 `input_tokens` 指的是**未命中缓存的新 token**。为了让 DB 里
+# 4 键的语义统一（Anthropic 风格），此处在归一时做一次扣减：
+#     input_tokens = prompt_tokens - cached_tokens - cache_write_tokens
+# 这样 DB 里的 `input_tokens + cache_creation + cache_read` 始终等于完整 prompt 总量，
 # 展示层的 `↑ = input + cache_creation + cache_read` 公式对 OpenAI / Anthropic
 # 两套协议都能得到正确的总 prompt 大小，缓存命中率 `cache_read / ↑` 也不会
 # 因为重复计数而掉到一半。

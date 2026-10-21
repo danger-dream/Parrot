@@ -126,6 +126,29 @@ def test_legacy_transform_filters_share_provider_allowlists():
     assert bridge == {"model": "claude", "messages": [], "thinking": {"type": "enabled"}}
 
 
+def test_prompt_cache_options_reach_openai_responses_but_not_codex_or_xai():
+    from src.channel.xai_oauth_channel import _sanitize_xai_payload
+    from src.openai.transform import codex_oauth_transform, common
+
+    options = {"mode": "explicit", "ttl": "12h"}
+    responses = common.filter_responses_passthrough({
+        "model": "gpt-6.1-sol", "input": "hi", "prompt_cache_options": options,
+    })
+    assert responses["prompt_cache_options"] == options
+    chat = common.filter_chat_passthrough({
+        "model": "gpt-6.1-sol", "messages": [], "prompt_cache_options": options,
+    })
+    assert "prompt_cache_options" not in chat
+
+    codex = codex_oauth_transform.apply_codex_oauth_transform(
+        {"model": "gpt-5.5", "input": "hi", "prompt_cache_options": dict(options)},
+        resolved_model="gpt-5.5",
+    )
+    assert "prompt_cache_options" not in codex
+    xai = _sanitize_xai_payload({"model": "grok-4", "input": "hi", "prompt_cache_options": options})
+    assert "prompt_cache_options" not in xai
+
+
 def test_cc_v258_bridge_filter_preserves_cc_fields_as_provider_capability():
     anthropic = FakeChannel(protocol="anthropic", type="api", cc_mimicry=True)
     filtered = registry.filter_request_payload(

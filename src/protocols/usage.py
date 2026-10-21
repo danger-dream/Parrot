@@ -130,6 +130,30 @@ def anthropic_cache_creation_split(usage_obj: Any) -> tuple[int, int] | None:
     return five_minute, one_hour
 
 
+def openai_cache_write_split(details: Any) -> tuple[int, int] | None:
+    """Return OpenAI's exact 30m/12h cache-write split when present and valid.
+
+    GPT-5.6+ Responses usage reports ``cache_write_tokens`` inside the input
+    details plus a ``cache_write_tokens_details`` lifetime breakdown.  The pair
+    travels in the same short/long slots as Anthropic's 5m/1h split.
+    """
+    if not isinstance(details, dict):
+        return None
+    split = details.get("cache_write_tokens_details")
+    if not isinstance(split, dict):
+        return None
+    if not {"ttl_30m_tokens", "ttl_12h_tokens"}.issubset(split):
+        return None
+    thirty_minute = _strict_token(split.get("ttl_30m_tokens"))
+    twelve_hour = _strict_token(split.get("ttl_12h_tokens"))
+    aggregate = _strict_token(details.get("cache_write_tokens"))
+    if thirty_minute is None or twelve_hour is None or aggregate is None:
+        return None
+    if thirty_minute + twelve_hour != aggregate:
+        return None
+    return thirty_minute, twelve_hour
+
+
 @dataclass
 class Usage:
     input_tokens: int = 0
@@ -288,6 +312,13 @@ class UsageAccumulator:
                 self._reject()
                 return
             cached = parsed_cached
+        cache_write = 0
+        if "cache_write_tokens" in details:
+            parsed_write = _strict_token(details.get("cache_write_tokens"))
+            if parsed_write is None:
+                self._reject()
+                return
+            cache_write = parsed_write
         reasoning = 0
         if "reasoning_tokens" in output_details:
             parsed_reasoning = _strict_token(output_details.get("reasoning_tokens"))
@@ -301,15 +332,19 @@ class UsageAccumulator:
             self._reject()
             return
         prompt_total = parsed.get(prompt_name, 0)
-        if cached > prompt_total:
+        # OpenAI prompt totals include both cache reads and cache writes.
+        if cached + cache_write > prompt_total:
             self._reject()
             return
+        split = openai_cache_write_split(details)
         self.usage_invalid = False
         self.usage = Usage(
-            input_tokens=prompt_total - cached,
+            input_tokens=prompt_total - cached - cache_write,
             output_tokens=parsed.get(output_name, 0),
             cache_read_tokens=cached,
-            cache_write_tokens=0,
+            cache_write_tokens=cache_write,
+            cache_write_5m_tokens=(split[0] if split is not None else None),
+            cache_write_1h_tokens=(split[1] if split is not None else None),
             reasoning_tokens=reasoning,
             raw=dict(usage_obj),
         )

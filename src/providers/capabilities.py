@@ -36,7 +36,7 @@ RESPONSES_REQ_ALLOWED: frozenset[str] = frozenset({
     "text", "reasoning", "truncation",
     "store", "metadata", "prompt", "background",
     "service_tier", "user", "safety_identifier",
-    "prompt_cache_key", "prompt_cache_retention",
+    "prompt_cache_key", "prompt_cache_retention", "prompt_cache_options",
     "client_metadata", "access_programs",
 })
 

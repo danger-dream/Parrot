@@ -113,6 +113,74 @@ def test_openai_responses_usage_subtracts_cached_input_tokens():
     }
 
 
+def test_openai_responses_usage_splits_cache_writes_out_of_input_tokens():
+    out = legacy_usage_from_openai_responses_json({
+        "usage": {
+            "input_tokens": 12000,
+            "output_tokens": 5,
+            "input_tokens_details": {
+                "cached_tokens": 4000,
+                "cache_write_tokens": 7000,
+                "cache_write_tokens_details": {
+                    "ttl_30m_tokens": 3000,
+                    "ttl_12h_tokens": 4000,
+                },
+            },
+        }
+    })
+
+    assert out == {
+        "input_tokens": 1000,
+        "output_tokens": 5,
+        "cache_creation": 7000,
+        "cache_read": 4000,
+        "cache_creation_5m": 3000,
+        "cache_creation_1h": 4000,
+    }
+
+
+def test_openai_cache_write_without_valid_ttl_split_keeps_aggregate_only():
+    without_split = legacy_usage_from_openai_responses_json({
+        "usage": {
+            "input_tokens": 100,
+            "output_tokens": 1,
+            "input_tokens_details": {"cached_tokens": 30, "cache_write_tokens": 50},
+        }
+    })
+    mismatched_split = legacy_usage_from_openai_responses_json({
+        "usage": {
+            "input_tokens": 100,
+            "output_tokens": 1,
+            "input_tokens_details": {
+                "cached_tokens": 30,
+                "cache_write_tokens": 50,
+                "cache_write_tokens_details": {"ttl_30m_tokens": 10, "ttl_12h_tokens": 10},
+            },
+        }
+    })
+
+    expected = {
+        "input_tokens": 20,
+        "output_tokens": 1,
+        "cache_creation": 50,
+        "cache_read": 30,
+    }
+    assert without_split == expected
+    assert mismatched_split == expected
+
+
+def test_openai_cache_reads_and_writes_exceeding_prompt_total_are_invalid():
+    acc = UsageAccumulator()
+    acc.set_from_openai_responses_usage({
+        "input_tokens": 100,
+        "output_tokens": 1,
+        "input_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 50},
+    })
+
+    assert acc.usage_invalid is True
+    assert acc.usage_observed is False
+
+
 def test_openai_responses_accumulator_preserves_reasoning_tokens_in_ir():
     acc = UsageAccumulator()
     acc.set_from_openai_responses_usage({

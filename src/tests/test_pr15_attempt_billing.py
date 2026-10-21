@@ -275,6 +275,87 @@ def test_claude_oauth_cache_write_ttl_split_is_priced_exactly(m):
     assert snapshot["cache_write_1h_per_token"] == 10 / 1_000_000
 
 
+def _install_openai_cache_test_tariff(m):
+    mp = m["model_pricing"]
+    mp.initialize()
+    target = "openai/gpt-ledger-cache"
+    mp._catalog_models[target] = {
+        "id": "gpt-ledger-cache",
+        "name": "GPT Ledger Cache Test",
+        "limit": {"context": 400000, "output": 10000},
+        "cost": {"input": 1, "output": 2, "cache_write": 1.25, "cache_read": 0.1},
+    }
+    mp._catalog[target] = mp.PricingEntry(
+        input_per_token=1 / 1_000_000,
+        output_per_token=2 / 1_000_000,
+        cache_write_per_token=1.25 / 1_000_000,
+        cache_read_per_token=0.1 / 1_000_000,
+    )
+    m["config"].get()["modelBindings"]["defaults"]["gpt-ledger-cache"] = {
+        "target": target, "source": "test",
+    }
+
+
+def test_openai_cache_write_ttl_split_is_priced_exactly(m):
+    _setup(m)
+    _install_openai_cache_test_tariff(m)
+    ld = m["log_db"]
+    rid = "openai-cache-ttl"
+    _pending(ld, rid, "gpt-ledger-cache")
+    aid = _attempt(ld, rid, 1, "api:openai", "api", "gpt-ledger-cache", 1.0)
+    _dispatch(ld, aid, "gpt-ledger-cache")
+
+    tracker = m["failover"].upstream.ResponsesSSEUsageTracker()
+    tracker.feed(
+        b'event: response.completed\n'
+        b'data: {"type":"response.completed","response":{"id":"r","usage":'
+        b'{"input_tokens":100000,"output_tokens":10000,'
+        b'"input_tokens_details":{"cached_tokens":40000,'
+        b'"cache_write_tokens":50000,"cache_write_tokens_details":'
+        b'{"ttl_30m_tokens":20000,"ttl_12h_tokens":30000}}}}}\n\n'
+    )
+    assert tracker.usage_observed is True
+    assert tracker.usage == {
+        "input_tokens": 10_000,
+        "output_tokens": 10_000,
+        "cache_creation": 50_000,
+        "cache_read": 40_000,
+        "cache_creation_5m": 20_000,
+        "cache_creation_1h": 30_000,
+    }
+
+    ld.finish_success(
+        rid, "api:openai", "api", "gpt-ledger-cache",
+        input_tokens=tracker.usage["input_tokens"],
+        output_tokens=tracker.usage["output_tokens"],
+        cache_creation_tokens=tracker.usage["cache_creation"],
+        cache_read_tokens=tracker.usage["cache_read"],
+        response_body=tracker.get_full_response(),
+        usage_observed=tracker.usage_observed,
+        upstream_protocol="openai-responses",
+    )
+    ld.update_retry_attempt(aid, outcome="success", ended_at=2.0)
+
+    attempt = ld._get_conn().execute(
+        "SELECT * FROM upstream_attempt_usage WHERE retry_attempt_id=?",
+        (aid.row_id,),
+    ).fetchone()
+    assert attempt["binding_provider_id"] == "openai"
+    assert (
+        attempt["input_tokens"],
+        attempt["cache_creation_tokens"],
+        attempt["cache_creation_5m_tokens"],
+        attempt["cache_creation_1h_tokens"],
+        attempt["cache_read_tokens"],
+    ) == (10_000, 50_000, 20_000, 30_000, 40_000)
+    assert attempt["cost_source"] == "estimated"
+    # $0.01 input + $0.02 output + $0.004 read + $0.025 30m write + $0.075 12h write.
+    assert attempt["cost_ticks"] == 1_340_000_000
+    snapshot = json.loads(attempt["pricing_snapshot_json"])
+    assert snapshot["cache_write_5m_per_token"] == 1.25 / 1_000_000
+    assert snapshot["cache_write_1h_per_token"] == pytest.approx(2.5 / 1_000_000)
+
+
 @pytest.mark.parametrize("outcome,status", [("stream_upstream_error", "error"), ("client_disconnected", "cancelled")])
 def test_anthropic_tracker_snapshot_survives_error_and_cancel_settlement(m, outcome, status):
     _setup(m)

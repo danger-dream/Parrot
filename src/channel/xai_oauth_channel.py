@@ -68,6 +68,7 @@ def _sanitize_xai_payload(payload: dict, *, stream: bool = True) -> dict:
     out["stream"] = bool(stream)
     out.pop("previous_response_id", None)
     out.pop("prompt_cache_retention", None)
+    out.pop("prompt_cache_options", None)
     out.pop("safety_identifier", None)
     # xAI 的 Responses 兼容层不接受 OpenAI Responses 的 arbitrary metadata。
     # 下游客户端常带 metadata 做业务追踪；这里丢弃，避免上游 400：

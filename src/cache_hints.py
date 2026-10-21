@@ -505,13 +505,28 @@ def _model_prefers_24h_retention(model: str | None) -> bool:
     return name.startswith("gpt-5.5") or name.startswith("gpt-5.5-pro")
 
 
+_GPT_VERSION_RE = re.compile(r"gpt-(\d+)(?:\.(\d+))?(?![\d.])")
+
+
+def _model_uses_prompt_cache_options(model: str | None) -> bool:
+    """GPT-5.6+ control cache lifetime via ``prompt_cache_options``, not retention."""
+    match = _GPT_VERSION_RE.match(str(model or "").strip().lower())
+    if not match:
+        return False
+    return (int(match.group(1)), int(match.group(2) or 0)) >= (5, 6)
+
+
 def openai_retention_from_anthropic(body: dict[str, Any] | None, *, model: str | None = None) -> str | None:
     """Best-effort Anthropic TTL → OpenAI retention mapping.
 
     OpenAI's prompt cache is automatic; retention is a routing/storage policy.
-    Anthropic 1h is best approximated by OpenAI 24h.  For GPT-5.5+ OpenAI docs
-    say only 24h is supported, so set it explicitly.
+    Anthropic 1h is best approximated by OpenAI 24h.  For GPT-5.5 OpenAI docs
+    say only 24h is supported, so set it explicitly.  GPT-5.6+ control lifetime
+    with ``prompt_cache_options.ttl`` instead; their 30m default is kept rather
+    than buying 12h writes.
     """
+    if _model_uses_prompt_cache_options(model):
+        return None
     ttl = _cache_ttl(body)
     if ttl == "1h" or _model_prefers_24h_retention(model):
         return "24h"

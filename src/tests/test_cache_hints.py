@@ -376,3 +376,32 @@ def test_header_derived_internal_session_hint_is_supported():
     )
 
     assert key.startswith("parrot:cache:v1:a2o-session:")
+
+
+def _anthropic_body_with_1h_system():
+    return {
+        "system": [{
+            "type": "text", "text": "stable instructions",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        }],
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+
+@pytest.mark.parametrize("model", ["gpt-5.6-sol", "gpt-6-astra", "gpt-6.1-sol"])
+def test_gpt_56_plus_keeps_default_cache_lifetime_for_anthropic_1h(model):
+    body = _anthropic_body_with_1h_system()
+    payload: dict = {}
+
+    cache_hints.apply_anthropic_cache_to_openai_payload(body, payload, model=model)
+
+    assert "prompt_cache_retention" not in payload
+    assert "prompt_cache_options" not in payload
+    assert payload["prompt_cache_key"].startswith("parrot:cache:v1:a2o:")
+
+
+@pytest.mark.parametrize("model", ["gpt-5.5", "gpt-5.4", "gpt-5-mini", "gpt-4.1"])
+def test_pre_56_models_keep_24h_retention_for_anthropic_1h(model):
+    body = _anthropic_body_with_1h_system()
+
+    assert cache_hints.openai_retention_from_anthropic(body, model=model) == "24h"

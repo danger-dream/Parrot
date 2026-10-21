@@ -841,6 +841,9 @@ def apply_codex_oauth_transform(
     # the field so Codex-incompatible client limits do not fail the request.
     # Missing policy still fails closed.
     policies = request_field_policies or {}
+    # Official Codex clients never send prompt_cache_options (GPT-5.6+ cache
+    # TTL/breakpoint mode); the audited profiles carry no policy for it.
+    body.pop("prompt_cache_options", None)
     controlled_fields = (
         "max_output_tokens", "max_completion_tokens", "max_tokens",
         "temperature", "top_p", "frequency_penalty", "presence_penalty",

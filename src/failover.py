@@ -3236,10 +3236,15 @@ class _WsResponsesTracker:
         base.setdefault("status", "completed" if self.response_completed else "incomplete")
         base.setdefault("model", fallback_model)
         if self.usage_observed:
+            cache_read = int(self.usage.get("cache_read") or 0)
+            cache_write = int(self.usage.get("cache_creation") or 0)
+            input_details = {"cached_tokens": cache_read}
+            if cache_write:
+                input_details["cache_write_tokens"] = cache_write
             base.setdefault("usage", {
-                "input_tokens": int(self.usage.get("input_tokens") or 0) + int(self.usage.get("cache_read") or 0),
+                "input_tokens": int(self.usage.get("input_tokens") or 0) + cache_write + cache_read,
                 "output_tokens": int(self.usage.get("output_tokens") or 0),
-                "input_tokens_details": {"cached_tokens": int(self.usage.get("cache_read") or 0)},
+                "input_tokens_details": input_details,
             })
         return base
 

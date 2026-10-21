@@ -27,7 +27,8 @@ from typing import Any, Mapping
 
 from . import config
 from .protocols.usage import (
-    UsageAccumulator, anthropic_cache_creation_split, openai_envelope_containers,
+    UsageAccumulator, anthropic_cache_creation_split, openai_cache_write_split,
+    openai_envelope_containers,
 )
 
 TICKS_PER_USD = 10_000_000_000
@@ -1659,7 +1660,8 @@ def estimate_cost_from_binding(
     Anthropic publishes an aggregate cache-write count plus an exact 5m/1h
     split.  The aggregate remains the display/token fact; the split selects the
     two different write tariffs.  Old responses without that split retain the
-    previous unpriced behaviour rather than guessing a TTL.
+    previous unpriced behaviour rather than guessing a TTL.  OpenAI's 30m/12h
+    split uses the same short/long slots.
     """
     if (
         binding.tariff is None
@@ -1749,6 +1751,10 @@ def estimate_cost_from_binding(
             # Anthropic's published rule is 2× the effective input tariff; Fast
             # and long-context modifiers therefore remain attached to this attempt.
             one_hour_price = prices[0] * 2.0
+        elif binding.provider_id == "openai":
+            # OpenAI's published 12-hour write rate is 2.5× the input tariff;
+            # 30-minute writes use the catalog cache_write (1.25×) price.
+            one_hour_price = prices[0] * 2.5
         elif cache_creation_1h > 0:
             return None
 
@@ -2016,6 +2022,16 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                         valid = False
                     else:
                         cached_from_details = parsed
+                written_from_details = 0
+                details_write_present = bool(
+                    isinstance(details_obj, Mapping) and "cache_write_tokens" in details_obj
+                )
+                if details_write_present:
+                    parsed = _strict_nonnegative_int(details_obj.get("cache_write_tokens"))
+                    if parsed is None:
+                        valid = False
+                    else:
+                        written_from_details = parsed
 
                 cache_read_present = bool(
                     "cache_read_input_tokens" in usage
@@ -2048,6 +2064,8 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                     parsed_cache_creation = _strict_nonnegative_int(
                         usage.get("cache_creation_tokens")
                     )
+                elif details_write_present:
+                    parsed_cache_creation = written_from_details
                 else:
                     parsed_cache_creation = next_cache_creation
                 if parsed_cache_creation is None:
@@ -2058,6 +2076,8 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                         if incremental_anthropic else parsed_cache_creation
                     )
                 ttl_split = anthropic_cache_creation_split(usage)
+                if ttl_split is None and isinstance(details_obj, dict):
+                    ttl_split = openai_cache_write_split(details_obj)
                 if ttl_split is not None:
                     next_cache_creation_5m = max(next_cache_creation_5m or 0, ttl_split[0])
                     next_cache_creation_1h = max(next_cache_creation_1h or 0, ttl_split[1])
@@ -2074,11 +2094,13 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                         is_openai_shape = "prompt_tokens" in usage or isinstance(
                             usage.get("input_tokens_details"), Mapping
                         )
-                        if is_openai_shape and next_cache_read > prompt:
+                        # OpenAI totals also include details.cache_write_tokens.
+                        openai_written = written_from_details if is_openai_shape else 0
+                        if is_openai_shape and next_cache_read + openai_written > prompt:
                             valid = False
                         else:
                             if is_openai_shape:
-                                next_input = prompt - next_cache_read
+                                next_input = prompt - next_cache_read - openai_written
                             elif incremental_anthropic:
                                 next_input = max(input_tokens, prompt)
                             else:
