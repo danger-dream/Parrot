@@ -192,3 +192,24 @@ def test_telegram_pending_page_opens_for_antigravity_ids(enabled, monkeypatch):
     text, keyboard = _press("待确认 1", keyboard)
     assert "上游 ID：<code>gemini-2.5-flash</code>" in text
     assert not any(method == "answerCallbackQuery" and data.get("show_alert") for method, data in calls)
+
+
+def test_detail_page_merges_identical_sources_of_one_provider():
+    from src.telegram.menus.model_center_catalog import _merged_source_blocks
+    same = ["上游名：<code>deepseek-v4.1-flash</code>", "💳 WorkBuddy 倍率：×0.11"]
+    free = ["上游名：<code>deepseek-v4.1-flash</code>", "💳 WorkBuddy 倍率：×0.00（免费）"]
+    lines = _merged_source_blocks([
+        ("", "DeepSeek · DeepSeek", ["上游名：<code>deepseek-flash</code>"]),
+        ("", "WorkBuddy · 可乐", list(same)), ("", "WorkBuddy · 小枕头", list(same)),
+        ("", "WorkBuddy · soarsky0204@gmail.com", free), ("", "Kimi · 可乐", list(same)),
+        ("", "已移除的账户", ["x"]), ("", "已移除的账户", ["x"]),
+    ])
+    titles = [line for line in lines if line.startswith("<b>")]
+    assert titles == [
+        "<b>DeepSeek · DeepSeek</b>",
+        "<b>WorkBuddy · 可乐、小枕头（2 个账号）</b>",
+        "<b>WorkBuddy · soarsky0204@gmail.com</b>",
+        "<b>Kimi · 可乐</b>",
+        "<b>已移除的账户（2 个）</b>",
+    ]
+    assert lines.count("💳 WorkBuddy 倍率：×0.11") == 2

@@ -638,6 +638,24 @@ def _model_list_render(chat_id: int) -> tuple[str, dict]:
     return menu._paged(chat_id, "\n".join(lines), inline_kb(rows))
 
 
+def _merged_source_blocks(blocks: list[tuple[str, str, list[str]]]) -> list[str]:
+    """One block per provider and identical content, naming every account it covers."""
+    groups: dict[tuple, list[str]] = {}
+    for brand, label, body in blocks:
+        provider, sep, name = label.partition(" · ")
+        groups.setdefault((brand, provider, bool(sep), tuple(body)), []).append(name)
+    lines: list[str] = []
+    for (brand, provider, named, body), names in groups.items():
+        if not named:
+            title = provider + (f"（{len(names)} 个）" if len(names) > 1 else "")
+        elif len(names) == 1:
+            title = f"{provider} · {names[0]}"
+        else:
+            title = f"{provider} · {'、'.join(names)}（{len(names)} 个账号）"
+        lines.extend(["", f"{brand}<b>{ui.escape_html(title)}</b>", *body])
+    return lines
+
+
 def _detail_render(
     chat_id: int, resource_key: str, *, back_callback: str = "mc:list",
 ) -> tuple[str, dict]:
@@ -680,6 +698,7 @@ def _detail_render(
                 (item.ref.type, item.ref.id): item
                 for item in menu._source_options(chat_id)
             }
+            blocks: list[tuple[str, str, list[str]]] = []
             for source_view in metadata_sources:
                 source_option = source_options.get((source_view.type, source_view.id))
                 human_source = (
@@ -693,9 +712,9 @@ def _detail_render(
                     if ui.provider_custom_emoji_id(brand_provider) else ""
                 )
                 brand_prefix = f"{brand_icon} " if brand_icon else ""
-                lines.extend([
-                    "",
-                    f"{brand_prefix}<b>{ui.escape_html(human_source)}</b>",
+                body: list[str] = []
+                blocks.append((brand_prefix, human_source, body))
+                body.extend([
                     *([f"上游名：<code>{ui.escape_html(source_view.outbound_model)}</code>"]
                       if source_view.provider != "qoder" else []),
                     f"本来源模型开关：<code>{'显式启用' if source_view.enabled_override and source_view.source_enabled else '允许' if source_view.source_enabled else '停用'}</code> · "
@@ -707,21 +726,21 @@ def _detail_render(
                     *menu._metadata_lines(source_view.effective_metadata),
                 ])
                 if source_view.unavailable_reason == "account_restricted":
-                    lines.append("⛔ 供应商限制账户（11140），全部模型暂停；请在账户详情确认解除后清除暂停。")
+                    body.append("⛔ 供应商限制账户（11140），全部模型暂停；请在账户详情确认解除后清除暂停。")
                 if view.identity.kind is ModelKind.IMAGE and (source_view.provider == 'xai' or source_view.outbound_model.startswith('grok-imagine-image')):
-                    lines.extend([
+                    body.extend([
                         "xAI 当前图片适配不支持透明背景：实测返回 JPEG，无 alpha；请用 background=auto/opaque，或选择支持透明的图片来源。",
                         "xAI 编辑最多 3 张参考图；moderation 仅支持默认 auto。已知不兼容参数在生成前拒绝，不付费试错。",
                     ])
                 if view.identity.kind is ModelKind.IMAGE and source_view.type is ModelSourceType.OAUTH and source_view.provider == 'openai':
                     account = menu._CONTROL.images.get_account(ctx, source_view.id)
-                    lines.extend([
+                    body.extend([
                         f"普通对话账户：<code>{'启用' if account.oauth_enabled else '停用'}</code>（图片授权不改变此状态）",
                         f"图片独立启用：<code>{'开' if account.independent_enabled else '关'}</code>",
                         "只覆盖用户手动停用，不绕过认证异常、账户删除或图片模型停用。",
                     ])
                     if account.unavailable_reason:
-                        lines.append(ui.escape_html(account.unavailable_reason))
+                        body.append(ui.escape_html(account.unavailable_reason))
                     if account.independent_allowed or account.independent_enabled:
                         label = '关闭图片独立启用' if account.independent_enabled else '图片独立启用（不启用对话）'
                         rows.append([ui.btn(label + ' · ' + human_source, menu._freeze(
@@ -735,6 +754,7 @@ def _detail_render(
                             target=True, revision=account.revision,
                             detail_key=view.resource_key, detail_back=back_callback,
                         ))])
+            lines.extend(_merged_source_blocks(blocks))
         else:
             lines.extend(menu._metadata_lines(view.common_metadata))
         target_enabled = not bool(enabled)
