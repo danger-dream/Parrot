@@ -307,6 +307,24 @@ def _start_model(
     _show_edit(chat_id, message_id, cb_id)
 
 
+def open_model_editor(chat_id: int, message_id: int, cb_id: str, model: str, return_callback: str) -> None:
+    """The per-model priority editor entered from elsewhere (model center); back and save return there."""
+    draft = _effective_model_keys(model)
+    _store_edit_state(chat_id, {
+        "kind": "model", "models": [model], "draft": draft, "initial": draft, "selected": [],
+        "return_callback": return_callback,
+    })
+    _show_edit(chat_id, message_id, cb_id)
+
+
+def _return_to(chat_id: int, message_id: int, cb_id: str, callback: str) -> None:
+    if callback.startswith("mc:"):
+        from . import model_center_menu
+        model_center_menu.handle_callback(chat_id, message_id, cb_id, callback)
+    else:
+        show(chat_id, message_id, cb_id)
+
+
 def _toggle_select(chat_id: int, message_id: int, cb_id: str, raw_index: str) -> None:
     data = _edit_state(chat_id)
     if not data:
@@ -398,6 +416,11 @@ def _save(chat_id: int, message_id: int, cb_id: str) -> None:
         back = f"lb:models:{max(1, int(data.get('return_page') or 1))}"
     states.pop_state(chat_id)
     ui.answer_cb(cb_id, "已保存")
+    if data.get("return_callback"):
+        ui.edit(chat_id, message_id, success, reply_markup=ui.inline_kb([
+            [ui.btn("返回模型详情", str(data["return_callback"]))],
+        ]))
+        return
     ui.edit(chat_id, message_id, success, reply_markup=ui.inline_kb([
         [ui.btn("继续调整", back), ui.btn("返回负载均衡", "menu:loadbalancing")],
         [ui.btn("🏠 主菜单", "menu:main")],
@@ -409,7 +432,9 @@ def _cancel(chat_id: int, message_id: int, cb_id: str) -> None:
     kind = data.get("kind")
     page = max(1, int(data.get("return_page") or 1))
     states.pop_state(chat_id)
-    if kind in {"model", "models_batch"}:
+    if data.get("return_callback"):
+        _return_to(chat_id, message_id, cb_id, str(data["return_callback"]))
+    elif kind in {"model", "models_batch"}:
         _show_models(chat_id, message_id, cb_id, page)
     else:
         show(chat_id, message_id, cb_id)

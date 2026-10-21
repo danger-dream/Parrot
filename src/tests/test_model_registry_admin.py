@@ -195,7 +195,7 @@ def test_telegram_pending_page_opens_for_antigravity_ids(enabled, monkeypatch):
 
 
 def test_detail_page_merges_identical_sources_of_one_provider():
-    from src.telegram.menus.model_center_catalog import _merged_source_blocks
+    from src.telegram.menus.model_center_sources import _merged_source_blocks
     same = ["上游名：<code>deepseek-v4.1-flash</code>", "💳 WorkBuddy 倍率：×0.11"]
     free = ["上游名：<code>deepseek-v4.1-flash</code>", "💳 WorkBuddy 倍率：×0.00（免费）"]
     lines = _merged_source_blocks([
@@ -213,3 +213,57 @@ def test_detail_page_merges_identical_sources_of_one_provider():
         "<b>已移除的账户（2 个）</b>",
     ]
     assert lines.count("💳 WorkBuddy 倍率：×0.11") == 2
+
+
+def test_ranked_sources_merge_only_with_their_neighbours():
+    from src.telegram.menus.model_center_sources import _merged_source_blocks
+    same = ["x"]
+    lines = _merged_source_blocks([
+        ("", "WorkBuddy · a", list(same)), ("", "WorkBuddy · b", list(same)),
+        ("", "Kimi · k", ["y"]), ("", "WorkBuddy · c", list(same)),
+    ], [1, 2, 3, 4])
+    assert [line for line in lines if line.startswith("<b>")] == [
+        "<b>1–2. WorkBuddy · a、b（2 个账号）</b>", "<b>3. Kimi · k</b>", "<b>4. WorkBuddy · c</b>"]
+
+
+def test_detail_follows_priority_order_and_manages_sources_and_priority(enabled, monkeypatch):
+    from src.telegram.menus import load_balancing_menu
+    from src.telegram.menus import model_center_catalog as catalog
+    _client, runtime, _admin, _read_only, _denied = enabled
+
+    def priority(cfg):
+        cfg["modelCenter"]["disabledModels"] = []
+        cfg["channelSelection"] = "priority"
+        cfg["loadBalancing"] = {"initialized": True, "channelPriorityOrder": ["api:Official", "api:Reseller"],
+                                "modelPriorityOrders": {"MiniMax-M2.7": ["api:Reseller", "api:Official"]}}
+    config.update(priority)
+    registry.rebuild_from_config()
+    monkeypatch.setattr(menu, "_CONTROL", runtime.control_owner().models)
+    monkeypatch.setattr(ui, "is_admin", lambda chat_id: int(chat_id) == 42)
+    monkeypatch.setattr(ui, "api", lambda method, data=None: calls.append((method, dict(data or {}))) or {
+        "ok": True, "result": {"message_id": 100}})
+    menu.reset_for_tests()
+    view = next(item for item in menu._CONTROL.list_models(menu._ctx(42)).items if item.model_id == "minimax-m2.7")
+    text, keyboard = catalog._detail_render(42, view.resource_key)
+    assert "调度：<code>优先级 · 本模型专属顺序</code>" in text
+    assert text.index("<b>1. ") < text.index("Reseller") < text.index("<b>2. ") < text.index("Official")
+
+    text, sources_kb = _press("按账户/渠道启停", keyboard)
+    assert "1. ✅" in text and "调度第 1 位" in text
+    text, _ = _press("停用 1 ·", sources_kb)
+    assert "1. 🚫" in text and "2. ✅" in text
+
+    def lb(callback):
+        calls.clear()
+        assert load_balancing_menu.handle_callback(42, 100, "cb", callback)
+        return next(data for method, data in calls if method == "editMessageText")
+
+    text, keyboard = catalog._detail_render(42, view.resource_key)
+    text, _ = _press("调整调度优先级", keyboard)
+    assert "模型专属优先级" in text
+    assert "调度：" in lb("lb:cancel")["text"]
+    _press("调整调度优先级", keyboard)
+    saved = lb("lb:save")
+    assert [button["text"] for row in saved["reply_markup"]["inline_keyboard"] for button in row] == ["返回模型详情"]
+    orders = config.get()["loadBalancing"]["modelPriorityOrders"]
+    assert orders == {"minimax-m2.7": ["api:Reseller", "api:Official"]}

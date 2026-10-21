@@ -147,8 +147,16 @@ def model_priority_orders(cfg: dict | None = None) -> dict[str, list[str]]:
     return _model_orders_from_cfg(cfg or config.get())
 
 
+def _same_model_keys(model: str, orders: Mapping) -> list[str]:
+    """Other keys saving an order for the same unified model as ``model``."""
+    from .model_registry import runtime as model_registry
+    return [key for key in model_registry.same_models(model, orders) if key != model]
+
+
 def has_model_priority(model: str, cfg: dict | None = None) -> bool:
-    return str(model or "").strip() in _model_orders_from_cfg(cfg or config.get())
+    model = str(model or "").strip()
+    orders = _model_orders_from_cfg(cfg or config.get())
+    return model in orders or bool(_same_model_keys(model, orders))
 
 
 def _legacy_merged_order(channels: list[Channel], cfg: dict) -> list[str]:
@@ -341,6 +349,8 @@ def save_model_orders(orders: Mapping[str, list[str]]) -> None:
         lb["initialized"] = True
         target = lb.setdefault("modelPriorityOrders", {})
         for model, order in clean.items():
+            for key in _same_model_keys(model, target):
+                target.pop(key, None)
             target[model] = order
 
     config.update(mutate)
@@ -355,9 +365,10 @@ def clear_model_orders(models: Iterable[str]) -> int:
     def mutate(cfg: dict) -> None:
         target = cfg.setdefault("loadBalancing", {}).setdefault("modelPriorityOrders", {})
         for model in wanted:
-            if model in target:
-                target.pop(model, None)
-                removed["count"] += 1
+            keys = ([model] if model in target else []) + _same_model_keys(model, target)
+            for key in keys:
+                target.pop(key, None)
+            removed["count"] += bool(keys)
 
     config.update(mutate, skip_if_unchanged=True)
     return removed["count"]

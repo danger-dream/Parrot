@@ -468,6 +468,8 @@ def _handle_frozen(chat_id: int, message_id: int, cb_id: str, action: _FrozenAct
         return
     if _registry_actions.handle_action(chat_id, message_id, cb_id, action):
         return
+    if _sources_actions.handle_action(chat_id, message_id, cb_id, action):
+        return
     if name == "content_page":
         _show_rendered(chat_id, message_id, cb_id, lambda: _html_page_render(
             chat_id, data["pages"], data["keyboard"], data["page"],
@@ -932,3 +934,4 @@ from . import model_center_settings as _settings_actions
 from . import model_center_media as _media_actions
 from . import model_center_sync as _sync_actions
 from . import model_center_registry as _registry_actions
+from . import model_center_sources as _sources_actions

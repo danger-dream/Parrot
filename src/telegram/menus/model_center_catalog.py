@@ -27,6 +27,7 @@ from .. import ui
 from . import model_center_usage as usage
 from . import model_center_menu as menu
 from .model_center_icons import inline_kb
+from .model_center_sources import _merged_source_blocks, _ordered_sources, _schedule
 
 
 def _enum_value(value: Any) -> str:
@@ -572,9 +573,8 @@ def _model_list_render(chat_id: int) -> tuple[str, dict]:
         lines.extend("      " + line for line in _workbuddy_rate_lines(view, s.source))
         lines.extend("      " + line for line in _qoder_rate_lines(view, s.source))
         stats_lines = usage.format_lines((cached.value or {}).get(view.model_id))
-        if stats_lines:
-            lines.extend("      " + line for line in stats_lines)
-            lines.append("")
+        lines.extend("      " + line for line in stats_lines)
+        lines.append("")
         action = "select_model" if s.multiple else "detail"
         callback = menu._freeze(
             chat_id, action, resource_key=view.resource_key, model_id=view.model_id,
@@ -638,24 +638,6 @@ def _model_list_render(chat_id: int) -> tuple[str, dict]:
     return menu._paged(chat_id, "\n".join(lines), inline_kb(rows))
 
 
-def _merged_source_blocks(blocks: list[tuple[str, str, list[str]]]) -> list[str]:
-    """One block per provider and identical content, naming every account it covers."""
-    groups: dict[tuple, list[str]] = {}
-    for brand, label, body in blocks:
-        provider, sep, name = label.partition(" · ")
-        groups.setdefault((brand, provider, bool(sep), tuple(body)), []).append(name)
-    lines: list[str] = []
-    for (brand, provider, named, body), names in groups.items():
-        if not named:
-            title = provider + (f"（{len(names)} 个）" if len(names) > 1 else "")
-        elif len(names) == 1:
-            title = f"{provider} · {names[0]}"
-        else:
-            title = f"{provider} · {'、'.join(names)}（{len(names)} 个账号）"
-        lines.extend(["", f"{brand}<b>{ui.escape_html(title)}</b>", *body])
-    return lines
-
-
 def _detail_render(
     chat_id: int, resource_key: str, *, back_callback: str = "mc:list",
 ) -> tuple[str, dict]:
@@ -684,15 +666,20 @@ def _detail_render(
             f"全局默认：<code>{'启用' if view.global_enabled else '停用'}</code>",
             f"下游展示开关：<code>{'开' if view.visible else '关'}</code>",
             "关闭时不出现在 /v1/models，仍可按名称调用；开启不代表停用模型会出现在列表，只有可用来源才会贡献模型。",
-            "",
-            "<b>容量、能力与价格</b>",
         ])
+        schedule_mode, schedule_text, schedule_order = _schedule(view) if view.identity.kind is ModelKind.CHAT else ("", "", [])
+        if schedule_text:
+            lines.append(f"调度：<code>{ui.escape_html(schedule_text)}</code>")
+        lines.extend(["", "<b>容量、能力与价格</b>"])
         if view.identity.kind is ModelKind.IMAGE:
             lines.extend(["生成 / 编辑：JSON 与 multipart；默认 PNG / base64，URL 有效期 1 小时。",
                           "尺寸按需等比缩放并补边（不裁切）；透明背景校验真实 alpha。",
                           "OpenAI 单图接口：n 张最多 n 次生成，模糊超时不重试。", ""])
         selected_source = menu._source_for_view(view, s.source)
-        metadata_sources = (selected_source,) if selected_source is not None else view.sources
+        ordered, ranks = _ordered_sources(view, schedule_order)
+        metadata_sources = (selected_source,) if selected_source is not None else ordered
+        if selected_source is not None:
+            ranks = []
         if metadata_sources:
             source_options = {
                 (item.ref.type, item.ref.id): item
@@ -754,7 +741,7 @@ def _detail_render(
                             target=True, revision=account.revision,
                             detail_key=view.resource_key, detail_back=back_callback,
                         ))])
-            lines.extend(_merged_source_blocks(blocks))
+            lines.extend(_merged_source_blocks(blocks, ranks))
         else:
             lines.extend(menu._metadata_lines(view.common_metadata))
         target_enabled = not bool(enabled)
@@ -800,6 +787,16 @@ def _detail_render(
                 scope=None, target=ModelStateTarget(ModelStateField.ENABLED, False),
                 revision=view.revision, detail_key=view.resource_key, detail_back=back_callback,
             ))])
+        schedule_row = []
+        if s.source is None and view.sources and view.identity.kind is ModelKind.CHAT:
+            schedule_row.append(ui.btn("按账户/渠道启停", menu._freeze(
+                chat_id, "source_states", resource_key=view.resource_key, detail_back=back_callback)))
+        if schedule_mode == "priority":
+            schedule_row.append(ui.btn("调整调度优先级", menu._freeze(
+                chat_id, "lb_priority", model_id=view.model_id, resource_key=view.resource_key,
+                detail_back=back_callback)))
+        if schedule_row:
+            rows.append(schedule_row)
         rows.append([
             ui.btn("调整元数据", menu._freeze(
                 chat_id, "metadata_targets", resource_key=view.resource_key,

@@ -66,6 +66,11 @@ class LoadBalancingControl(DomainControl):
 
     @classmethod
     def _client_models(cls) -> list[str]:
+        unified = model_registry.current()
+        if unified is not None:
+            live = {channel.key for channel in cls._all_channels()}
+            return sorted((model.id for model in unified.models.values()
+                           if any(offer.source in live for offer in model.offers)), key=str.lower)
         models: set[str] = set()
         mapping = model_mapping.get_ingress_map(model_mapping.GLOBAL_MAPPING_LINE)
         for channel in cls._all_channels():
