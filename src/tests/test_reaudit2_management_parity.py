@@ -180,6 +180,9 @@ def _patch_successful_lifespan(monkeypatch, events: list[str]) -> None:
     )
     monkeypatch.setattr(server, "codex_cli_version", lambda: "test")
     monkeypatch.setattr(server.updater, "resume_after_restart", lambda: None)
+    # Lifespan shutdown stops the update workers process-wide; later tests need them running.
+    monkeypatch.setattr(server.update_checker, "_stopping", False)
+    monkeypatch.setattr(server.updater, "_stopping", threading.Event())
 
     async def wait_forever():
         await asyncio.Event().wait()
