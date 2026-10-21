@@ -219,7 +219,9 @@ def _schema_sql() -> str:
       request_id       TEXT PRIMARY KEY,
       request_headers  TEXT,
       request_body     TEXT,
-      response_body    TEXT
+      response_body    TEXT,
+      -- 正文按 logBodyRetention 清理的时间；NULL = 未清理（含从未保存正文）。
+      purged_at        REAL
     );
 
     CREATE TABLE IF NOT EXISTS retry_chain (
@@ -447,7 +449,8 @@ def _schema_sql() -> str:
     CREATE TABLE IF NOT EXISTS mcp_call_detail (
       call_id          TEXT PRIMARY KEY,
       created_at       REAL NOT NULL,
-      result_body      TEXT
+      result_body      TEXT,
+      purged_at        REAL
     );
     CREATE INDEX IF NOT EXISTS idx_mcp_call_detail_started ON mcp_call_detail(created_at);
     """
@@ -854,6 +857,12 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
                 conn.execute(ddl)
                 changed = True
         conn.execute("CREATE INDEX IF NOT EXISTS idx_local_web_req ON local_web_log(request_id)")
+    # 正文保留策略的清理标记；ADD COLUMN 只改 schema，不重写已有数据页。
+    for table in ("request_detail", "mcp_call_detail"):
+        detail_cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if detail_cols and "purged_at" not in detail_cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN purged_at REAL")
+            changed = True
     if changed:
         conn.commit()
 
@@ -1287,8 +1296,10 @@ def _read_retention_metadata(path: str, cutoff: float) -> dict[str, Any]:
             independent_total += int(counts[0] or 0)
             independent_expired += int(counts[1] or 0)
         page_size = int(conn.execute("PRAGMA page_size").fetchone()[0] or 0)
+        page_count = int(conn.execute("PRAGMA page_count").fetchone()[0] or 0)
         freelist_pages = int(conn.execute("PRAGMA freelist_count").fetchone()[0] or 0)
         return {
+            "live_bytes": page_size * max(0, page_count - freelist_pages),
             "total_requests": int(row["total_requests"] or 0),
             "expired_requests": int(row["expired_requests"] or 0),
             "total_independent_rows": independent_total,
@@ -1319,52 +1330,60 @@ def _retention_target_signature(plan: dict[str, Any]) -> str:
 
 
 def _retention_preflight(items: list[dict[str, Any]]) -> dict[str, Any]:
-    """检查边界月 VACUUM 前的可用空间。
+    """估算边界月删除后能否压缩；只用于展示，绝不阻止保存策略或删除。
 
-    整月文件会先删，因此可把它们的当前体积计入可用空间预期；边界月逐个
-    压缩，所需临时空间取其中最大值而非累计值。
+    删除本身不需要额外空间。当前写入月永远不压缩（释放的页由后续写入复用）；
+    其它边界月在删除后按实际存活数据（page_count − freelist_count）决定是否
+    用 VACUUM INTO 压缩。这里用删除前的存活大小作为上界估算，整月文件会先删，
+    其体积计入预期可用空间。
     """
 
     partial = [item for item in items if item.get("action") == "trim_and_vacuum"]
-    if not partial:
-        return {
-            "ok": True,
-            "available_bytes": 0,
-            "full_delete_credit_bytes": 0,
-            "effective_available_bytes": 0,
-            "required_bytes": 0,
-            "reason": "",
-        }
-    if _log_dir is None:
-        return {"ok": False, "reason": "日志目录尚未初始化"}
+    result: dict[str, Any] = {
+        "ok": True,
+        "available_bytes": 0,
+        "full_delete_credit_bytes": 0,
+        "effective_available_bytes": 0,
+        "required_bytes": 0,
+        "reason": "",
+        "compaction": [],
+    }
+    if not partial or _log_dir is None:
+        return result
     try:
         free_bytes = int(shutil.disk_usage(_log_dir).free)
-        full_credit = sum(
-            _log_bundle_bytes(str(item["path"]))
-            for item in items
-            if item.get("action") == "delete_file"
-        )
-        required = 0
-        for item in partial:
-            db_bytes = int(os.path.getsize(str(item["path"])))
-            margin = max(_RETENTION_VACUUM_MIN_MARGIN_BYTES, db_bytes // 10)
-            required = max(required, db_bytes * 2 + margin)
-        effective = free_bytes + full_credit
-        ok = effective >= required
-        reason = "" if ok else (
-            f"可用空间不足：压缩边界月需要至少 {required} 字节可用空间，"
-            f"当前可用（含先删除完整月份后的预期）为 {effective} 字节"
-        )
-        return {
-            "ok": ok,
-            "available_bytes": free_bytes,
-            "full_delete_credit_bytes": full_credit,
-            "effective_available_bytes": effective,
-            "required_bytes": required,
-            "reason": reason,
-        }
     except OSError as exc:
-        return {"ok": False, "reason": f"读取日志目录磁盘空间失败：{exc}"}
+        result["reason"] = f"读取日志目录磁盘空间失败：{exc}；删除后若空间不足将暂不压缩"
+        return result
+    full_credit = sum(
+        _log_bundle_bytes(str(item["path"]))
+        for item in items
+        if item.get("action") == "delete_file"
+    )
+    effective = free_bytes + full_credit
+    required = 0
+    for item in partial:
+        if item.get("active"):
+            result["compaction"].append({
+                "month": item.get("month"), "will_compact": False, "required_bytes": 0,
+                "reason": "当前写入月不压缩：释放的空间会被后续写入复用",
+            })
+            continue
+        live = int(item.get("live_bytes") or item.get("db_bytes") or 0)
+        need = live + max(_RETENTION_VACUUM_MIN_MARGIN_BYTES, live // 10)
+        required = max(required, need)
+        enough = effective >= need
+        result["compaction"].append({
+            "month": item.get("month"), "will_compact": enough, "required_bytes": need,
+            "reason": "" if enough else "可用空间可能不足：将只删除记录，暂不压缩",
+        })
+    result.update({
+        "available_bytes": free_bytes,
+        "full_delete_credit_bytes": full_credit,
+        "effective_available_bytes": effective,
+        "required_bytes": required,
+    })
+    return result
 
 
 def _build_retention_plan(
@@ -1436,6 +1455,8 @@ def _build_retention_plan(
             "total_independent_rows": independent_total,
             "expired_independent_rows": independent_expired,
             "freelist_bytes": int(meta["freelist_bytes"]),
+            "live_bytes": int(meta["live_bytes"]),
+            "active": month == active_month,
         })
 
     plan["preflight"] = (
@@ -1476,8 +1497,7 @@ def _revalidate_retention_plan(plan: dict[str, Any]) -> dict[str, Any]:
         raise RetentionPlanError("；".join(str(x) for x in fresh["errors"]))
     if fresh.get("signature") != plan.get("signature"):
         raise RetentionPlanError("日志数据在确认期间发生变化，请重新扫描后再确认")
-    if not bool((fresh.get("preflight") or {}).get("ok")):
-        raise RetentionPlanError(str((fresh.get("preflight") or {}).get("reason") or "磁盘空间预检失败"))
+    # 压缩空间只决定删除后是否压缩，不再阻止确认后的删除。
     return fresh
 
 
@@ -1688,18 +1708,14 @@ def _trim_retention_month(
             pass
 
         if target_count or independent_deleted:
-            _emit_retention_progress(progress, {
-                "phase": "trim_vacuum", "item": item, "index": index, "total": total,
-            })
-            # 先落下 WAL，随后 VACUUM；若此阶段失败，逻辑删除已提交，结果会如实
-            # 标记“未完成压缩”，而不会谎称已释放磁盘。
-            try:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                conn.execute("VACUUM")
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                result["compacted"] = True
-            except Exception as exc:
-                result["error"] = f"历史记录已删除，但数据库压缩失败：{exc}"
+            # 删除不依赖压缩：当前写入月永远不压缩（空闲页由后续写入复用）；其它
+            # 月份在释放日志写锁后由 apply_retention_plan 按实际存活数据决定是否
+            # 用 VACUUM INTO 压缩，空间不足时如实说明“已删除、暂未压缩”。
+            is_active = bool(item.get("active")) or path == _current_db_path()[0]
+            if is_active:
+                result["compaction_reason"] = "当前写入月不压缩：释放的空间会被后续写入复用"
+            else:
+                result["needs_compaction"] = True
         result["ok"] = not bool(result["error"])
     except Exception as exc:
         if conn is not None and conn.in_transaction:
@@ -1773,8 +1789,45 @@ def _execute_retention_plan(plan: dict[str, Any], progress=None) -> dict[str, An
         "full_months_deleted": sum(1 for row in results if row.get("ok") and row.get("action") == "delete_file"),
         "logical_bytes_removed": max(0, logical_before - logical_after),
         "actual_free_bytes": max(0, after_free - before_free),
+        "before_free_bytes": before_free,
         "errors": errors,
     }
+
+
+def _compact_trimmed_months(result: dict[str, Any], plan: dict[str, Any], progress=None) -> None:
+    """在释放日志写锁后压缩已裁剪的非当前月；结果如实写回各项。"""
+
+    pending = [row for row in result.get("items") or [] if row.get("needs_compaction")]
+    if not pending:
+        return
+    from . import log_body_retention
+
+    by_month = {str(item.get("month")): item for item in plan.get("items") or []}
+    total = len(result.get("items") or [])
+    active_month = datetime.fromtimestamp(float(plan.get("reference_ts") or time.time()), tz=_BJT).strftime("%Y-%m")
+    for row in pending:
+        item = by_month.get(str(row.get("month"))) or {}
+        index = list(result["items"]).index(row) + 1
+        _emit_retention_progress(progress, {
+            "phase": "trim_vacuum", "item": item, "index": index, "total": total,
+        })
+        compaction = log_body_retention.compact_month(
+            str(item.get("path") or ""), str(row.get("month")), reference_month=active_month,
+        )
+        row.pop("needs_compaction", None)
+        row["compacted"] = bool(compaction.get("compacted"))
+        if not row["compacted"] and compaction.get("action") != "not_needed":
+            row["compaction_reason"] = str(compaction.get("reason") or "未压缩")
+        row["after_bytes"] = int(compaction.get("after_bytes") or row.get("after_bytes") or 0)
+    logical_before = sum(int(row.get("before_bytes") or 0) for row in result["items"])
+    logical_after = sum(int(row.get("after_bytes") or 0) for row in result["items"])
+    result["logical_bytes_removed"] = max(0, logical_before - logical_after)
+    if _log_dir is not None:
+        try:
+            after_free = int(shutil.disk_usage(_log_dir).free)
+            result["actual_free_bytes"] = max(0, after_free - int(result.get("before_free_bytes") or 0))
+        except OSError:
+            pass
 
 
 def _mark_retention_cleanup(days: int, reference_ts: float) -> None:
@@ -1826,7 +1879,10 @@ def apply_retention_plan(
             result["config_saved"] = config_saved
             result["days"] = int(fresh["days"])
             _mark_retention_cleanup(int(fresh["days"]), float(fresh["reference_ts"]))
-            return result
+        # VACUUM INTO 可能耗时数分钟：只在本身的替换瞬间持有日志写锁，
+        # 不让请求流水写入等待整个压缩过程。
+        _compact_trimmed_months(result, fresh, progress)
+        return result
     finally:
         _retention_lock.release()
 
@@ -1835,6 +1891,14 @@ def maybe_cleanup_retention(now_ts: float | None = None) -> dict[str, Any]:
     """按已保存策略每天最多执行一次自动到期清理。"""
 
     now = time.time() if now_ts is None else float(now_ts)
+    # 正文保留策略独立于整行留存：只在后台线程启动分批清理，这里不等待。
+    try:
+        from . import log_body_retention
+        body = log_body_retention.maybe_start_daily(now)
+        if not body.get("ok"):
+            print(f"[log_db] body retention schedule failed: {body.get('reason')}")
+    except Exception as exc:
+        print(f"[log_db] body retention schedule failed: {exc}")
     policy = retention_policy()
     if policy["mode"] != _RETENTION_MODE_DAYS:
         return {"ok": True, "skipped": True, "reason": "永久保留"}
@@ -3251,8 +3315,13 @@ def mcp_call_detail(call_id: str) -> dict | None:
         try:
             if "mcp_call_detail" not in _existing_tables(conn):
                 continue
+            purged_expr = (
+                "purged_at" if "purged_at" in _table_columns(conn, "mcp_call_detail")
+                else "NULL AS purged_at"
+            )
             row = conn.execute(
-                "SELECT call_id, created_at, result_body FROM mcp_call_detail WHERE call_id=?",
+                f"SELECT call_id, created_at, result_body, {purged_expr} "
+                "FROM mcp_call_detail WHERE call_id=?",
                 (key,),
             ).fetchone()
         except (sqlite3.OperationalError, HistoricalLogError):
@@ -7830,8 +7899,10 @@ def log_detail(request_id: str) -> dict:
         "SELECT * FROM request_log WHERE request_id=?",
         (request_id,),
     ).fetchone()
+    # The live month connection always ran _ensure_migrations, so purged_at exists.
     detail_row = conn.execute(
-        "SELECT request_headers, request_body, response_body FROM request_detail WHERE request_id=?",
+        "SELECT request_headers, request_body, response_body, purged_at "
+        "FROM request_detail WHERE request_id=?",
         (request_id,),
     ).fetchone()
     chain_rows = conn.execute(
@@ -7913,7 +7984,7 @@ def _management_historical_log_detail(
             raise sqlite3.OperationalError("request_detail.request_id is required")
         detail_projection = ", ".join(
             name if name in detail_columns else f"NULL AS {name}"
-            for name in ("request_headers", "request_body", "response_body")
+            for name in ("request_headers", "request_body", "response_body", "purged_at")
         )
         detail_row = conn.execute(
             f"SELECT {detail_projection} FROM request_detail WHERE request_id=?",

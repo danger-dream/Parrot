@@ -34,7 +34,8 @@ def test_current_overlay_case_coverage_is_bidirectional_and_unique():
         assert len(ids) == len(set(ids)) and not seen.intersection(ids)
         seen.update(ids)
         loaded = current.load_current_jsonl(archived_path)
-        extra_ids = list(current.OAUTH_ADDITION_CASE_IDS) if segment == 'oauth' else []
+        extra_ids = (list(current.OAUTH_ADDITION_CASE_IDS) if segment == 'oauth'
+                     else list(current.SYSTEM_ADDITION_CASE_IDS) if segment == 'system' else [])
         assert [c['caseId'] for c in loaded] == [c['caseId'] for c in archived] + extra_ids
         assert [c['capabilityId'] for c in loaded] == [c['capabilityId'] for c in archived] + [case_id.split('.', 1)[0] for case_id in extra_ids]
     assert len(seen) == 157  # includes MCP UI, cold-stat page, notification, discovery, subscription-label, safe-diagnostic and mapping-identity traces

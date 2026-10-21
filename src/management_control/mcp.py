@@ -218,9 +218,13 @@ class MCPControl(DomainControl):
         row = log_db.mcp_call_detail(str(call_id or ""))
         if row is None:
             return None
-        return {"callId": str(row.get("call_id") or ""),
-                "createdAt": float(row.get("created_at") or 0.0),
-                "body": row.get("result_body")}
+        result = {"callId": str(row.get("call_id") or ""),
+                  "createdAt": float(row.get("created_at") or 0.0),
+                  "body": row.get("result_body")}
+        if row.get("purged_at") and not row.get("result_body"):
+            # 正文按 logBodyRetention 清理过，区别于“从未留存”。
+            result["purgedAt"] = float(row["purged_at"])
+        return result
 
 
 def _period_start(period: str) -> float:

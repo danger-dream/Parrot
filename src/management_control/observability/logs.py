@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import json
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -91,6 +91,16 @@ class LogBodyPageResult:
     @property
     def has_next(self) -> bool:
         return self.page * self.page_size < self.total
+
+
+def _purged_at(detail: dict[str, Any]) -> datetime | None:
+    """UTC time the bodies were purged by logBodyRetention, else ``None``."""
+
+    value = detail.get("purged_at") if isinstance(detail, dict) else None
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc) if value else None
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
 
 
 class LogsControl:
@@ -231,6 +241,9 @@ class LogsControl:
             "requestBodyAvailable": bool(detail.get("request_body")),
             "responseBodyAvailable": bool(detail.get("response_body")),
             "requestHeadersAvailable": bool(detail.get("request_headers")),
+            # logBodyRetention keeps the row and stamps purged_at, so the UI can
+            # say "purged by policy" instead of "body was never stored".
+            "bodyPurgedAt": _purged_at(detail),
         }
         result["revision"] = revision_for(result)
         return result
@@ -248,6 +261,11 @@ class LogsControl:
         detail = raw.get("detail") or {}
         value = detail.get("request_body" if kind is LogBodyKind.REQUEST else "response_body")
         if value is None or value == "":
+            if _purged_at(detail) is not None:
+                raise ManagementError(
+                    ManagementErrorCode.RESOURCE_NOT_FOUND,
+                    "Log body was purged by the body retention policy",
+                )
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         return value, self._list_record(raw["log"])["revision"]
 

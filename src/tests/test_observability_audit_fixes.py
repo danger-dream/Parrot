@@ -130,7 +130,7 @@ def test_live_call_handles_survive_retention_then_release(logs, boundary):
 
 def test_orphan_mcp_details_use_their_own_date(logs):
     conn = log_db._get_conn_for_ref(log_db._db_ref_for_timestamp(ts("2026-08-01")))
-    conn.executemany("INSERT INTO mcp_call_detail VALUES (?,?,?)", [
+    conn.executemany("INSERT INTO mcp_call_detail (call_id, created_at, result_body) VALUES (?,?,?)", [
         ("old", ts("2026-08-01"), "old"), ("new", ts("2026-08-31"), "new")])
     conn.commit()
     result = log_db.apply_retention_plan(plan())

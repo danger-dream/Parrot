@@ -14,6 +14,7 @@ callback_data 前缀：``mcp:...``
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from ...management_control.auxiliary.common import telegram_context
@@ -581,6 +582,16 @@ def show_result(
         payload = _CONTROL.result_body(_ctx(chat_id), call_id)
     except Exception:
         payload = None
+    if payload and payload.get("purgedAt") and not str(payload.get("body") or "").strip():
+        purged = datetime.fromtimestamp(float(payload["purgedAt"]), tz=timezone(timedelta(hours=8)))
+        ui.edit(
+            chat_id, message_id,
+            "🧹 <b>结果内容已按正文保留策略清理</b>\n\n"
+            f"<i>清理时间：{purged.strftime('%Y-%m-%d %H:%M')}（北京时间）。"
+            "调用摘要、来源与用量等元数据仍保留。</i>",
+            reply_markup=back,
+        )
+        return
     if not payload or not str(payload.get("body") or "").strip():
         ui.edit(
             chat_id, message_id,

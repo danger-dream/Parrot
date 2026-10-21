@@ -13,6 +13,7 @@ callback_data：
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
@@ -1004,6 +1005,9 @@ def show_detail(chat_id: int, message_id: int, cb_id: str, short: str,
     text = detail_pages[detail_page - 1]
     if len(detail_pages) > 1:
         text += f"\n\n<i>详情第 {detail_page}/{len(detail_pages)} 页</i>"
+    purged_note = _body_purged_note(detail)
+    if purged_note:
+        text += "\n\n" + purged_note
     rows: list[list[dict]] = []
     if _CONTROL.log_store_bodies(_CONTEXT):
         stored_detail = detail.get("detail") or {}
@@ -1030,6 +1034,25 @@ def show_detail(chat_id: int, message_id: int, cb_id: str, short: str,
     rows.append([ui.btn(f"◀ 返回第 {list_state['p']} 页", _list_cb(list_state))])
     ui.edit(chat_id, message_id, text, reply_markup=ui.inline_kb(rows))
 
+_BODY_PURGE_TZ = timezone(timedelta(hours=8))
+
+
+def _body_purged_note(detail: dict | None) -> str:
+    """正文被 logBodyRetention 清理时的说明；从未保存正文时返回空串。"""
+
+    stored = (detail or {}).get("detail") or {}
+    if not isinstance(stored, dict) or not stored.get("purged_at"):
+        return ""
+    if stored.get("request_body") or stored.get("response_body"):
+        return ""
+    try:
+        when = datetime.fromtimestamp(float(stored["purged_at"]), tz=_BODY_PURGE_TZ).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OverflowError, OSError):
+        when = "未知时间"
+    return (
+        f"🧹 <i>请求/响应正文已按保留策略清理（{when}）；"
+        "摘要、Token、金额、重试与计费明细仍保留。</i>"
+    )
 
 
 def _chunk_for_tg(text: str, chunk_size: int = 3200) -> list[str]:
@@ -1075,18 +1098,19 @@ def _raw_for_kind(detail: dict, kind: str):
     return data.get("response_body")
 
 
-def _items_for_state(state: dict) -> tuple[str, list[dict], str]:
+def _items_for_state(state: dict) -> tuple[str, list[dict], str, str]:
     rid = str(state.get("r") or "")
     kind = "request" if state.get("k") == "request" else "response"
     detail = _CONTROL.raw_detail_for_telegram(_CONTEXT, rid)
     raw = _raw_for_kind(detail, kind)
     if not raw:
-        return rid, [], ""
+        # 第四项：正文已按保留策略清理时的说明（从未保存则为空串）。
+        return rid, [], "", _body_purged_note(detail)
     if kind == "request":
         items = log_inspector.parse_request_body(raw)
     else:
         items = log_inspector.parse_response_body(raw)
-    return rid, items, str(raw)
+    return rid, items, str(raw), ""
 
 
 def _query_filtered_items(items: list[dict], state: dict) -> list[dict]:
@@ -1273,7 +1297,7 @@ def _show_inspector(chat_id: int, message_id: int, cb_id: str | None, state: dic
         ui.answer_cb(cb_id)
     kind = "request" if state.get("k") == "request" else "response"
     try:
-        rid, all_items, _raw = _items_for_state(state)
+        rid, all_items, _raw, purged_note = _items_for_state(state)
     except Exception as exc:
         ui.edit(chat_id, message_id, f"❌ 解析失败: <code>{ui.escape_html(str(exc))}</code>")
         return
@@ -1285,8 +1309,11 @@ def _show_inspector(chat_id: int, message_id: int, cb_id: str | None, state: dic
     type_counts = _kind_counts(query_items)
     items = log_inspector.sort_items(_apply_kind_filter(query_items, state), sort_key)
     if not items:
+        empty_text = _empty_inspector_text(rid, kind, query)
+        if purged_note:
+            empty_text = purged_note
         ui.edit(
-            chat_id, message_id, _empty_inspector_text(rid, kind, query),
+            chat_id, message_id, empty_text,
             reply_markup=_inspector_kb(state=state, rid=rid, items=[], selected_seq=None, page=1,
                                        total_pages=1, all_count=len(all_items),
                                        type_counts=type_counts, base_count=len(query_items)),
@@ -1351,7 +1378,7 @@ def _send_full_item(chat_id: int, cb_id: str, state_short: str) -> None:
         ui.answer_cb(cb_id, "短码已失效")
         return
     try:
-        rid, all_items, _raw = _items_for_state(state)
+        rid, all_items, _raw, _purged = _items_for_state(state)
         items = _filtered_sorted_items(all_items, state)
         selected = log_inspector.selected_item(items, state.get("s"))
     except Exception as exc:

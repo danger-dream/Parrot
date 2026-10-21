@@ -372,6 +372,10 @@ OAuth 备用模型已退役。普通对话只使用账户 `models` 的成功同�
     "mode": "forever",              // "forever" | "days"；默认永久保留
     "days": null                      // mode="days" 时为整数，最少 1；无业务上限
   },
+  "logBodyRetention": {
+    "mode": "forever",              // 只清理完整正文；"forever" | "days"；默认永久保留
+    "days": null                      // mode="days" 时为整数，最少 1
+  },
   "stateDbPath": "state.db",          // 仅旧版只读迁移源
   "runtimeStatePath": "runtime-cache.json",
   "durableStatePath": "durable-state.json"
@@ -444,8 +448,14 @@ OAuth 备用模型已退役。普通对话只使用账户 `models` 的成功同�
 - `mode="days"`：仅保留从当前时刻向前回溯 `days` 天内的数据；`days` 必须为整数且 `>= 1`，无业务上限。模式与天数是独立字段，已处于该模式时可单独修改 `days`。
 - 在按天留存模式增大 `days`（如 3 → 5）只更新配置、不触发即时清理；首次启用或缩短 `days`（如 5 → 3）会扩大删除范围，TG Bot 必须先展示警告、扫描并逐月列出待清理项，第二次确认后才写入配置并执行删除。确认页的计划短期有效，执行前会重新验证，避免确认期间数据范围变化。
 - 仅影响月度业务日志：请求摘要、原始请求/响应、重试链、代理链与本地 Web 明细；**不影响**状态 JSON、只读旧 `state.db`、统一多媒体日志/图片缓存和翻译缓存。
-- 完整过期月份会删除整个 DB 文件（及其 WAL/SHM sidecar）；留存临界落在某个月中间时，会精确删除关联记录并执行 SQLite 压缩，才能实际释放磁盘空间。压缩前会做磁盘余量预检，空间不足时 fail-closed。
-- 已启用的策略由后台维护循环每天最多执行一次到期检查；不会在正常 API 请求的同步写入路径执行大型删除或 `VACUUM`。
+- 完整过期月份会删除整个 DB 文件（及其 WAL/SHM sidecar）；留存临界落在某个月中间时，会精确删除关联记录。删除不依赖压缩：当前写入月永远不压缩（空闲页由后续写入复用）；其它月份在删除后若可用空间 ≥ 存活数据（`page_count − freelist_count`）+ 10%（至少 512 MiB），用 `VACUUM INTO` + `integrity_check` + 原子替换压缩，否则如实报告“已删除、暂未压缩”及原因。
+- 已启用的策略由后台维护循环每天最多执行一次到期检查；不会在正常 API 请求的同步写入路径执行大型删除或压缩。
+
+### 完整正文保留 `logBodyRetention`
+
+- 只作用于大字段：`request_detail` 的 `request_headers` / `request_body` / `response_body` 与 `mcp_call_detail.result_body`；被清理行保留并写入 `purged_at`。`request_log`、`retry_chain`、`upstream_attempt_usage`、`proxy_chain`、`search_call_log`、`mcp_call_log` 等元数据永久保留，统计与成本不受影响。
+- 缺失或非法配置 fail-closed 为 `forever`。首次启用或缩短 `days` 必须经扫描预览与二次确认（TG 或管理接口 `scope="bodies"` 计划）；延长或切回 `forever` 直接保存。
+- 清理由单个后台线程按 `created_at` 游标分批执行（每批 ≤ 500 行且约 ≤ 16 MiB，批间释放日志写锁），跳过进行中的请求；每月库的 `parrot_retention_state` 表记录水位，重启后从水位继续。非当前月整月过期后按上一条规则压缩。
 
 ### 渠道 `disabled_reason` 状态机
 

@@ -237,17 +237,91 @@ def test_revalidation_refuses_plan_when_expired_target_changes(retention_log_dir
     assert _table_counts(path)["request_log"] == 2
 
 
-def test_preflight_failure_is_fail_closed(retention_log_dir, monkeypatch):
+def test_insufficient_compaction_space_never_blocks_saving_or_deleting(retention_log_dir, monkeypatch):
+    """Regression: the old preflight demanded 2x the pre-delete file size and
+    refused to save the policy at all, exactly when the user needed space."""
+
+    config.update(lambda cfg: cfg.__setitem__("logRetention", {"mode": "forever", "days": None}))
     _write_complete_request("old", _ts(2026, 2, 2))
+    _write_complete_request("fresh", _ts(2026, 2, 14))
+    monkeypatch.setattr(log_db.shutil, "disk_usage", lambda _path: SimpleNamespace(free=0))
     plan = log_db.plan_retention(7, now_ts=_ts(2026, 2, 15))
     assert plan["items"]
+    assert plan["preflight"]["ok"] is True
+    # The boundary month is the plan's writing month: it is never compacted.
+    assert plan["preflight"]["compaction"][0]["will_compact"] is False
 
+    try:
+        result = log_db.apply_retention_plan(plan, activate_policy=True)
+        assert result["ok"] is True, result
+        assert result["config_saved"] is True
+        assert config.get()["logRetention"] == {"mode": "days", "days": 7}
+        assert _table_counts(retention_log_dir / "2026-02.db")["request_log"] == 1
+        item = result["items"][0]
+        assert item["compacted"] is False
+        assert "当前写入月不压缩" in item["compaction_reason"]
+    finally:
+        config.update(lambda cfg: cfg.__setitem__("logRetention", {"mode": "forever", "days": None}))
+
+
+def test_sealed_boundary_month_reports_deleted_but_not_compacted_without_space(retention_log_dir, monkeypatch):
+    from src import log_body_retention
+
+    monkeypatch.setattr(log_body_retention, "COMPACT_MIN_RECLAIM_BYTES", 0)
+    monkeypatch.setattr(log_body_retention, "COMPACT_MIN_RECLAIM_RATIO", 0.0)
+    _write_complete_request("feb-old", _ts(2026, 2, 2))
+    _write_complete_request("feb-fresh", _ts(2026, 2, 26))
+    path = retention_log_dir / "2026-02.db"
     monkeypatch.setattr(log_db.shutil, "disk_usage", lambda _path: SimpleNamespace(free=0))
+
+    # Reference month is March, so February is a sealed boundary month.
+    plan = log_db.plan_retention(10, now_ts=_ts(2026, 3, 3))
+    assert [item["action"] for item in plan["items"]] == ["trim_and_vacuum"]
+    assert plan["items"][0]["active"] is False
     result = log_db.apply_retention_plan(plan)
-    assert result["ok"] is False
-    assert result["config_saved"] is False
-    assert "可用空间不足" in result["reason"]
-    assert _table_counts(retention_log_dir / "2026-02.db")["request_log"] == 1
+    assert result["ok"] is True, result
+    item = result["items"][0]
+    assert item["deleted_requests"] == 1
+    assert item["compacted"] is False
+    assert "可用空间不足" in item["compaction_reason"]
+    assert _table_counts(path)["request_log"] == 1
+    assert not _ap_os.path.exists(str(path) + ".compact-tmp")
+
+
+def test_sealed_boundary_month_is_compacted_with_vacuum_into_when_space_allows(retention_log_dir, monkeypatch):
+    from src import log_body_retention
+
+    monkeypatch.setattr(log_body_retention, "COMPACT_MIN_RECLAIM_BYTES", 0)
+    monkeypatch.setattr(log_body_retention, "COMPACT_MIN_RECLAIM_RATIO", 0.0)
+    monkeypatch.setattr(log_body_retention, "COMPACT_MIN_MARGIN_BYTES", 0)
+    big = "x" * 400_000
+    for index in range(8):
+        handle = log_db.insert_pending(
+            f"old-{index}", "127.0.0.1", "k", "m", False, 1, 0, {}, {"blob": big},
+            created_at=_ts(2026, 2, 2) + index,
+        )
+        log_db.finish_success(handle, "api:test", "api", "m", response_body=big)
+    _write_complete_request("feb-fresh", _ts(2026, 2, 26))
+    path = retention_log_dir / "2026-02.db"
+    plan = log_db.plan_retention(10, now_ts=_ts(2026, 3, 3))
+    result = log_db.apply_retention_plan(plan)
+    assert result["ok"] is True, result
+    item = result["items"][0]
+    assert item["compacted"] is True, item
+    assert item["after_bytes"] < item["before_bytes"]
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert conn.execute("SELECT request_id FROM request_log").fetchall() == [("feb-fresh",)]
+    finally:
+        conn.close()
+    # Later writes to the compacted month reopen the replaced file normally.
+    late = log_db.insert_pending(
+        "feb-late", "127.0.0.1", "k", "m", False, 1, 0, {}, {}, created_at=_ts(2026, 2, 27),
+    )
+    log_db.finish_success(late, "api:test", "api", "m", response_body="late")
+    assert _table_counts(path)["request_log"] == 2
 
 
 def test_retention_policy_is_fail_closed_for_invalid_config():

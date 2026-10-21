@@ -344,6 +344,10 @@
     "mode": "forever",
     "days": null
   },
+  "logBodyRetention": {
+    "mode": "forever",
+    "days": null
+  },
   "pricing": {
     "enabled": true,
     "autoUpdate": true,

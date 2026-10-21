@@ -168,7 +168,52 @@ class SystemEnv:
         mp.setattr(sm.log_db, "set_retention_forever", forever)
         mp.setattr(sm.log_db, "plan_retention", plan)
         mp.setattr(sm.log_db, "apply_retention_plan", apply)
+        self._install_body_retention(mp)
         mp.setattr(sm.log_db, "proxy_stats", lambda limit=1000: deepcopy(self.fake.get("proxyStats") or []))
+
+    def _install_body_retention(self, mp) -> None:
+        """Deterministic logBodyRetention fakes; no real runner thread is started."""
+
+        from src import log_body_retention as body
+
+        def status():
+            return deepcopy(self.fake.get("bodyStatus") or {
+                "running": False, "finished_at": None, "purged_requests": 0, "purged_mcp": 0,
+                "purged_bytes": 0, "errors": [], "stopped": "", "last_compaction": [],
+            })
+
+        def update(*, mode, days=None, expected_policy=None):
+            self.events.append({"event": "bodyRetention.update", "mode": mode, "days": days})
+            result = deepcopy(self.fake.get("bodyUpdate", {"ok": True}))
+            if result.get("ok"):
+                self.cfg["logBodyRetention"] = {"mode": mode, "days": days}
+            return result
+
+        def plan(days, now_ts=None):
+            self.events.append({"event": "bodyRetention.plan", "days": days})
+            result = deepcopy(self.fake.get("bodyPlan") or {
+                "scope": "bodies", "days": days, "cutoff": 1_770_000_000.0, "reference_ts": self.now,
+                "base_policy": body.body_retention_policy(self.cfg), "items": [], "errors": [],
+                "scanned_months": 0, "scanned_bytes": 0, "scanned_requests": 0,
+                "preflight": {"ok": True, "reason": ""}, "signature": "fake-body-signature",
+            })
+            result["days"] = days
+            return result
+
+        def apply(got_plan, *, activate_policy=True):
+            self.events.append({"event": "bodyRetention.apply", "plan": deepcopy(got_plan)})
+            result = deepcopy(self.fake.get("bodyApply") or {
+                "ok": True, "scope": "bodies", "config_saved": True,
+                "days": got_plan.get("days"), "started": True, "reason": "",
+            })
+            if result.get("config_saved"):
+                self.cfg["logBodyRetention"] = {"mode": "days", "days": int(got_plan.get("days"))}
+            return result
+
+        mp.setattr(body, "body_retention_status", status)
+        mp.setattr(body, "update_body_retention_settings", update)
+        mp.setattr(body, "plan_body_retention", plan)
+        mp.setattr(body, "apply_body_retention_plan", apply)
 
     def _install_network(self, mp) -> None:
         net = sm.network

@@ -669,6 +669,18 @@ docker compose logs --since 1h         # 最近 1 小时
 
 按月分库在 `data/logs/YYYY-MM.db`（SQLite）。在 TG Bot「📋 最近日志」查看；或宿主机直接 `sqlite3 <安装目录>/data/logs/2026-04.db`。
 
+#### 数据留存（TG「系统设置 → 🗃 数据留存」/ 管理接口 `/api/management/v1/logs/retention`）
+
+两种互相独立的策略，默认都是永久保留：
+
+- **完整正文保留 `logBodyRetention`**（推荐用于释放磁盘）：只清理过期的请求 Headers、请求 Body、响应正文（`request_detail`）和 MCP 返回内容（`mcp_call_detail`）。请求摘要、Token、金额、重试链、代理链、计费结算和各类调用日志**永久保留**，统计、成本、通知与排行照常可用；正文约占日志库体积的 99%，元数据每 1 万条请求约 50 MB。
+  - 首次启用或缩短天数需要“扫描预览 → 确认”两步；延长天数或切回永久保留直接生效。管理接口对应 `PATCH {"bodyMode","bodyDays"}`，危险变更返回 `CONFIRMATION_REQUIRED`，需用 `POST /plans {"days":7,"scope":"bodies"}` + commit。
+  - 清理在后台线程分批进行（每批最多 500 行 / 16 MiB，批间释放日志写锁），跳过进行中的请求；进度水位写在各月库的 `parrot_retention_state` 表，服务重启后由每日维护（`maybe_cleanup_retention`）自动续做。进度和压缩结果显示在 TG 数据留存页与 `GET .../logs/retention` 的 `bodyCleanup`。
+  - 被清理的记录保留并标记 `purged_at`：日志详情和正文查看器会显示“正文已按保留策略清理”，与“未保存正文”区分；管理接口详情返回 `bodyPurgedAt`。
+- **按天留存 `logRetention`**：整行删除过期请求（含摘要与统计来源）。整月过期的库直接删文件；边界月精确删除旧记录。
+
+**磁盘回收**：SQLite 删除数据后文件不会自动变小，释放的页由后续写入复用。当前写入月**永远不压缩**；非当前月在数据清理完毕后，若可用空间 ≥ 存活数据（`page_count − freelist_count`）+ 10%（至少 512 MiB），用 `VACUUM INTO` 生成压缩副本，`integrity_check` 通过后在日志写锁下原子替换原文件；空间不足、压缩期间有新写入或仍有进行中的请求时跳过并如实说明原因，原文件保持不变，下次维护重试。保存策略和删除本身都不再依赖压缩空间。例如保留 7 天正文时，上个月的库会在本月 8 日前后整月过期并自动压缩。
+
 GPT/Grok/Antigravity 图片及 Grok 视频任务使用独立日志库 `data/image_logs.db`；历史主调用表原地扩展为统一多媒体任务日志，GPT 图片账号尝试表继续保留。视频创建记一条 `pending`，客户端轮询只更新该记录直至 `success / failed / expired`，不会污染普通文本请求日志。
 
 ### 多媒体缓存

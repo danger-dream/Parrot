@@ -567,6 +567,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "mode": "forever",
         "days": None,
     },
+    # 完整正文保留：只清理 request_detail 的请求头/请求正文/响应正文与
+    # mcp_call_detail 的返回正文；摘要、Token、成本、重试与代理元数据永久保留。
+    # forever = 永久保留正文；days = 只保留最近 N 天正文（N >= 1）。同样 fail-closed。
+    "logBodyRetention": {
+        "mode": "forever",
+        "days": None,
+    },
     # models.dev 单一目录与金额开关。新请求只从 modelBindings 指向的
     # provider/model 读取费率；xAI 返回可信 cost_in_usd_ticks 时优先实际金额。
     "pricing": {

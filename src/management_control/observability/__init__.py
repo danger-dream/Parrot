@@ -21,7 +21,7 @@ from .media import (
     MediaSort,
     MediaStatus,
 )
-from .retention import DEFAULT_RETENTION_CONTROL, RetentionControl, RetentionMode
+from .retention import DEFAULT_RETENTION_CONTROL, RetentionControl, RetentionMode, RetentionScope
 from .stats import (
     DEFAULT_STATS_CONTROL,
     StatsBreakdownQuery,
@@ -56,6 +56,7 @@ __all__ = [
     "RequestProtocol",
     "RetentionControl",
     "RetentionMode",
+    "RetentionScope",
     "StatsBreakdownQuery",
     "StatsControl",
     "StatsDimension",

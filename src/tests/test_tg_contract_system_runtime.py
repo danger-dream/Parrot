@@ -89,6 +89,7 @@ CALLBACK_FAMILIES = {
     "sys:retention:forever", "sys:retention:toggle_bodies",
     "sys:retention:cancel_input", "sys:retention:noop", "sys:retention:scan:*",
     "sys:retention:plan:*", "sys:retention:commit:*", "sys:retention:cancel:*",
+    "sys:retention:body:*",
     "sys:show:retry", "sys:retry:toggle_transient", "sys:retry:failover_info",
     "sys:retry:edit_attempts", "sys:retry:edit_backoff",
     "sys:retry:toggle_error:*", "sys:retry:toggle_recovery:*",
@@ -121,7 +122,7 @@ UNAVAILABLE_ENTRY_CALLBACKS = {
     "sys:mon:history",  # history is embedded in sys:mon:show, not a separate route
 }
 STATE_FAMILIES = {
-    "sys_retention_days", "sys_retry_attempts", "sys_retry_backoff",
+    "sys_retention_days", "sys_retention_body_days", "sys_retry_attempts", "sys_retry_backoff",
     "sys_timeouts", "sys_errwin", "sys_oauth_grace", "sys_ladder_interval",
     "sys_perm_min_age", "sys_scoring:*", "sys_affinity:*",
     "sys_bl_add_default", "sys_bl_add_ch", "sys_net_dns", "sys_net_socks5",

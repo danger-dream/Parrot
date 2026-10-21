@@ -47,5 +47,18 @@ class TelegramRetentionAdapter:
     ) -> dict[str, Any]:
         return self.control.sync_commit_plan(context, plan, progress=progress)
 
+    # 正文保留（logBodyRetention）：只清理完整正文，元数据永久保留。
+    def body_settings(self, context: ManagementContext) -> dict[str, Any]:
+        return self.control.sync_body_settings(context)
+
+    def update_body_policy(self, context: ManagementContext, *, mode: str, days: int | None) -> dict[str, Any]:
+        return self.control.sync_update_body_policy(context, mode=mode, days=days)
+
+    def create_body_plan(self, context: ManagementContext, days: int) -> dict[str, Any]:
+        return self.control.sync_create_body_plan(context, days)
+
+    def commit_body_plan(self, context: ManagementContext, plan: dict[str, Any]) -> dict[str, Any]:
+        return self.control.sync_commit_body_plan(context, plan)
+
 
 DEFAULT_TELEGRAM_RETENTION_ADAPTER = TelegramRetentionAdapter(DEFAULT_RETENTION_CONTROL)

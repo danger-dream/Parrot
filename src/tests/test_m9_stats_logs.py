@@ -760,7 +760,8 @@ def test_log_detail_reads_large_response_body_once(m, stored_log_bodies):
 
     def tracking_row_factory(cursor, row):
         columns = tuple(column[0] for column in cursor.description)
-        if columns == ("request_headers", "request_body", "response_body"):
+        # purged_at (body-retention marker) follows the three body columns.
+        if columns[:3] == ("request_headers", "request_body", "response_body"):
             materialized_detail_bodies.append(row[2])
         return original_row_factory(cursor, row)
 

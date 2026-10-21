@@ -97,6 +97,35 @@ def _forever(e):
     e.callback("sys:retention:forever")
 
 
+def _pending_code(kind):
+    return next(code for code, item in sm._retention_pending.items() if item.get("kind") == kind)
+
+
+def _body_retention(e):
+    """logBodyRetention: enable via scan/confirm, extend, shorten-cancel, forever."""
+    e.callback("sys:show:retention")
+    e.callback("sys:retention:body:days")
+    e.text("sys_retention_body_days", "bad")
+    e.text("sys_retention_body_days", "0")
+    e.text("sys_retention_body_days", "7")
+    first = _pending_code("body_first")
+    e.callback("sys:retention:body:scan:" + first)
+    e.callback("sys:retention:body:scan:" + first, "body-scan-repeat")
+    plan = _pending_code("body_plan")
+    e.callback("sys:retention:body:commit:" + plan)
+    e.callback("sys:retention:body:commit:" + plan, "body-commit-repeat")
+    e.callback("sys:show:retention", "menu-after-body-commit")
+    e.callback("sys:retention:body:days", "body-days-again")
+    e.text("sys_retention_body_days", "7", "body-days-same")
+    e.callback("sys:retention:body:days", "body-days-extend")
+    e.text("sys_retention_body_days", "10", "body-days-extend-input")
+    e.callback("sys:retention:body:days", "body-days-shorten")
+    e.text("sys_retention_body_days", "3", "body-days-shorten-input")
+    e.callback("sys:retention:cancel:" + _pending_code("body_first"), "body-shorten-cancel")
+    e.callback("sys:retention:body:forever")
+    e.callback("sys:retention:body:bogus")
+
+
 RUNNERS = {
     "menu_toggle_busy": _menu_toggle_and_busy,
     "days_validation_same": _days_validation_same,
@@ -109,6 +138,7 @@ RUNNERS = {
     "ttl": _ttl,
     "wrong_chat": _wrong_chat,
     "forever": _forever,
+    "body_retention": _body_retention,
 }
 
 

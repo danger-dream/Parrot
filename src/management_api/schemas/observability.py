@@ -421,6 +421,9 @@ class RequestLogDetailData(StrictSchema):
     requestBodyAvailable: bool
     responseBodyAvailable: bool
     requestHeadersAvailable: bool
+    # Set when the bodies were removed by logBodyRetention (distinct from
+    # "never stored"); metadata, attempts and billing remain available.
+    bodyPurgedAt: datetime | None = None
     revision: str
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
         "id": "request-example", "log": RequestLogData.model_json_schema().get("examples", [{}])[0],
@@ -540,16 +543,51 @@ class RetentionCurrentData(StrictSchema):
     rows: int = Field(ge=0)
 
 
+class RetentionCompactionData(StrictSchema):
+    month: str
+    action: Literal["compacted", "skipped", "not_needed", "failed"]
+    compacted: bool
+    reason: str
+    beforeBytes: int = Field(ge=0)
+    afterBytes: int = Field(ge=0)
+    at: datetime | None = None
+
+
+class RetentionBodyCleanupData(StrictSchema):
+    """Background body-retention runner state (in-memory; resets on restart)."""
+
+    running: bool = False
+    automatic: bool = False
+    month: str | None = None
+    startedAt: datetime | None = None
+    finishedAt: datetime | None = None
+    purgedRequests: int = Field(default=0, ge=0)
+    purgedMcpResults: int = Field(default=0, ge=0)
+    purgedBytes: int = Field(default=0, ge=0)
+    skippedActive: int = Field(default=0, ge=0)
+    errors: list[str] = Field(default_factory=list)
+    stopped: str = ""
+    compaction: list[RetentionCompactionData] = Field(default_factory=list)
+
+
 class RetentionSettingsData(StrictSchema):
     mode: Literal["forever", "days"]
     days: int | None = Field(default=None, ge=1)
     logStoreBodies: bool
     currentData: RetentionCurrentData
     busy: bool
+    # Body-only retention: purges request/response bodies and MCP results;
+    # request summaries, tokens, costs, retries and proxy metadata stay forever.
+    bodyMode: Literal["forever", "days"] = "forever"
+    bodyDays: int | None = Field(default=None, ge=1)
+    bodyCleanup: RetentionBodyCleanupData = Field(default_factory=RetentionBodyCleanupData)
     revision: str
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
-        "mode": "days", "days": 30, "logStoreBodies": True,
-        "currentData": {"rows": 100}, "busy": False, "revision": "rev_example",
+        "mode": "forever", "days": None, "logStoreBodies": True,
+        "currentData": {"rows": 100}, "busy": False,
+        "bodyMode": "days", "bodyDays": 7,
+        "bodyCleanup": {"running": False, "purgedRequests": 0, "compaction": []},
+        "revision": "rev_example",
     }]})
 
 
@@ -557,6 +595,9 @@ class RetentionSettingsPatch(StrictSchema):
     mode: Literal["forever", "days"] | None = None
     days: int | None = Field(default=None, ge=1)
     logStoreBodies: bool | None = None
+    # Enabling or shortening body retention requires a scope=bodies plan.
+    bodyMode: Literal["forever", "days"] | None = None
+    bodyDays: int | None = Field(default=None, ge=1)
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
         "mode": "days", "days": 30, "logStoreBodies": True,
     }]})
@@ -564,6 +605,9 @@ class RetentionSettingsPatch(StrictSchema):
 
 class RetentionPlanCreate(StrictSchema):
     days: int = Field(ge=1)
+    # requests = delete whole expired rows (logRetention); bodies = purge only
+    # full request/response bodies and MCP results (logBodyRetention).
+    scope: Literal["requests", "bodies"] = "requests"
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{"days": 30}]})
 
 
@@ -571,6 +615,7 @@ class RetentionPlanData(StrictSchema):
     planId: str
     state: Literal["prepared", "committed", "cancelled"]
     days: int = Field(ge=1)
+    scope: Literal["requests", "bodies"] = "requests"
     cutoff: datetime
     expiresAt: datetime
     affectedRows: int = Field(ge=0)
