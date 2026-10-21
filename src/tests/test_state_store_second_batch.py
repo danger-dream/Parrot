@@ -63,7 +63,7 @@ def test_strict_durable_install_failure_restores_memory_generation_main_and_back
     store._mutate("xai_video_jobs", lambda d: d.__setitem__("one", {"v": 1}))
     store._mutate("xai_video_jobs", lambda d: d.__setitem__("two", {"v": 2}))
     before_main, before_backup = Path(path).read_bytes(), Path(path + ".bak").read_bytes()
-    before_health = store.health(); real_replace, real_read = os.replace, StateStore.read_snapshot
+    before_health = store.health(); real_replace, real_verify = os.replace, StateStore._verify_file
     real_open, real_fsync = os.open, os.fsync
     real_chmod, real_sync = os.chmod, StateStore._sync_dir; sync_calls = fsync_calls = 0
     def open_file(candidate, flags, *args):
@@ -78,10 +78,10 @@ def test_strict_durable_install_failure_restores_memory_generation_main_and_back
         if fault == "main_replace" and dst == path and str(src).endswith(".tmp"): raise OSError("main replace fault")
         if fault == "backup_replace" and dst == path + ".bak" and str(src).endswith(".new-bak"): raise OSError("backup replace fault")
         return real_replace(src, dst)
-    def read(candidate, kind):
+    def verify(candidate, expected):
         if fault == "candidate_verify" and str(candidate).endswith(".tmp"): raise OSError("candidate verify fault")
         if fault == "backup_verify" and candidate == path + ".bak": raise OSError("backup verify fault")
-        return real_read(candidate, kind)
+        return real_verify(candidate, expected)
     def chmod(candidate, mode):
         if fault == "backup_chmod" and candidate == path + ".bak": raise OSError("backup chmod fault")
         return real_chmod(candidate, mode)
@@ -93,7 +93,7 @@ def test_strict_durable_install_failure_restores_memory_generation_main_and_back
         return real_sync(directory)
     with monkeypatch.context() as patch:
         patch.setattr(os, "open", open_file); patch.setattr(os, "fsync", fsync)
-        patch.setattr(os, "replace", replace); patch.setattr(StateStore, "read_snapshot", staticmethod(read))
+        patch.setattr(os, "replace", replace); patch.setattr(StateStore, "_verify_file", staticmethod(verify))
         patch.setattr(os, "chmod", chmod); patch.setattr(StateStore, "_sync_dir", staticmethod(sync))
         with pytest.raises(OSError, match="fault"):
             store._mutate("xai_video_jobs", lambda d: d.__setitem__("ghost", {"v": 3}))

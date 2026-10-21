@@ -672,6 +672,12 @@ def codex_identity_tombstone_claim(owner_digest:str,installation_id:str,generati
 def codex_identity_tombstone_delete(owner_digest:str)->bool:
     return bool(_mut("codex_identity_tombstones",lambda d:d.pop(owner_digest,None) is not None,strict=True))
 
+# Usage stamps are informational; refreshing one per request would rewrite the
+# whole durable snapshot for every Codex request.
+_TOUCH_INTERVAL_MS=3600_000
+def _recently_used(old:dict,field:str,ts:int)->bool:
+    return 0<=ts-int(old.get(field) or 0)<_TOUCH_INTERVAL_MS
+
 def _codex_logical_key(owner_digest:str,principal_digest:str,anchor_digest:str)->str:
     return _key(owner_digest,principal_digest,anchor_digest)
 def codex_logical_session_load(owner_digest:str,principal_digest:str,anchor_digest:str):
@@ -686,6 +692,7 @@ def codex_logical_session_resolve(candidate:dict[str,Any])->dict:
     def op(d):
         old=d.get(key)
         if old:
+            if _recently_used(old,"last_used_at",ts):return dict(old)
             row=dict(old);row["last_used_at"]=ts;d[key]=row;return row
         row=dict(candidate);row["last_used_at"]=ts;d[key]=row;return row
     return _mut("codex_logical_sessions",op,strict=True)
@@ -756,6 +763,7 @@ def compaction_owner_upsert(compaction_id:str,content_digest:str,owner_key:str,o
         row=dict(old or {"compaction_id":compaction_id,"content_digest":content_digest,"created_at":ts});row.update(owner_key=owner_key,owner_identity=owner_identity,last_used=ts)
         if model:row["model"]=model
         if logical_session_id:row["logical_session_id"]=logical_session_id
+        if old and _recently_used(old,"last_used",ts) and {**row,"last_used":old.get("last_used")}==old:return dict(old)
         d[key]=row;return row
     return _mut("codex_compaction_owners",op,strict=True)
 def compaction_owner_delete_owner(owner_identity:str)->int:

@@ -14,6 +14,17 @@ from collections.abc import Iterator, MutableMapping
 from typing import Any
 
 
+def _same(left: Any, right: Any) -> bool:
+    """JSON-identical equality: ``1``, ``1.0`` and ``True`` encode differently."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(_same(value, right[key]) for key, value in left.items())
+    if isinstance(left, list):
+        return len(left) == len(right) and all(_same(a, b) for a, b in zip(left, right))
+    return left == right
+
+
 class CowDomain(MutableMapping[Any, Any]):
     """A lazy mutable view over one immutable published domain.
 
@@ -78,6 +89,11 @@ class CowDomain(MutableMapping[Any, Any]):
     def __len__(self) -> int:
         return len(self._visible_keys())
 
+    def peek_items(self) -> list[tuple[Any, Any]]:
+        """Visible records without detaching them; callers must not mutate values."""
+        return [(key, self._working[key] if key in self._working else self._base[key])
+                for key in self._visible_keys()]
+
     def clear(self) -> None:
         self._working.clear()
         self._deleted.clear()
@@ -118,6 +134,11 @@ class CowDomain(MutableMapping[Any, Any]):
             return self._base
 
         visible_keys = self._visible_keys()
+        # Reads detach records too; publishing an equal copy would only force a
+        # durable rewrite of unchanged state.
+        if visible_keys.keys() == self._base.keys() and all(
+                _same(value, self._base[key]) for key, value in self._working.items()):
+            return self._base
         committed = {
             key: copy.deepcopy(value)
             for key, value in self._working.items()

@@ -32,7 +32,7 @@ def test_both_snapshots_round_trip_permissions_and_copies(tmp_path):
 def test_runtime_failure_keeps_memory_dirty_but_durable_raises(tmp_path, monkeypatch):
     runtime, durable = paths(tmp_path); store = StateStore(runtime, durable); store.start()
     real = store.write_snapshot
-    def fail(path, kind, generation, payload): raise OSError("injected")
+    def fail(path, kind, generation, payload, **kwargs): raise OSError("injected")
     monkeypatch.setattr(store, "write_snapshot", fail)
     store._mutate("performance_stats", lambda d: d.__setitem__("a", {"v": 1}))
     assert store.flush("runtime") is False
@@ -49,7 +49,7 @@ def test_generation_write_during_flush_remains_dirty(tmp_path, monkeypatch):
     runtime, durable = paths(tmp_path); store = StateStore(runtime, durable); store.start()
     store._mutate("performance_stats", lambda d: d.__setitem__("a", {"v": 1}))
     entered = threading.Event(); release = threading.Event(); real = store.write_snapshot
-    def blocked(*args): entered.set(); release.wait(5); return real(*args)
+    def blocked(*args, **kwargs): entered.set(); release.wait(5); return real(*args, **kwargs)
     monkeypatch.setattr(store, "write_snapshot", blocked)
     thread = threading.Thread(target=lambda: store.flush("runtime", strict=True)); thread.start()
     assert entered.wait(2)

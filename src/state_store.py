@@ -100,6 +100,9 @@ class StateStore:
         self._debounce_seconds = 1.0
         self._lock_files: list[Any] = []
         self._loaded_from: dict[str, str | None] = {"runtime": None, "durable": None}
+        self._encoded: dict[str, dict[str, tuple[Any, bytes]]] = {"runtime": {}, "durable": {}}
+        self._installed: dict[str, tuple[int, ...] | None] = {"runtime": None, "durable": None}
+        self._unvalidated = {"runtime": False, "durable": False}
 
     @staticmethod
     def lock_path(target: str) -> str:
@@ -137,6 +140,36 @@ class StateStore:
                 "generation": generation, "checksum": hashlib.sha256(body).hexdigest(),
                 "payload": payload}
 
+    @staticmethod
+    def _envelope_bytes(kind: str, generation: int, body: bytes) -> bytes:
+        """Byte-identical to the sorted compact dump of ``_envelope`` plus newline."""
+        compact = {"ensure_ascii": False, "sort_keys": True, "separators": (",", ":")}
+        head = json.dumps({"checksum": hashlib.sha256(body).hexdigest(), "generation": generation,
+                           "kind": kind}, **compact)
+        tail = json.dumps({"schema": SCHEMA, "version": VERSION}, **compact)
+        return (head[:-1] + ',"payload":').encode() + body + ("," + tail[1:] + "\n").encode()
+
+    def _encode(self, kind: str, payload: dict[str, Any]) -> bytes:
+        """Payload bytes reusing the encoding of every unchanged published domain."""
+        cache = self._encoded[kind]; parts = []
+        for name in sorted(payload):
+            value = payload[name]; hit = cache.get(name)
+            if hit is None or hit[0] is not value:
+                hit = cache[name] = (value, self._payload_bytes(value))
+            parts.append(json.dumps(name, ensure_ascii=False).encode() + b":" + hit[1])
+        return b"{" + b",".join(parts) + b"}"
+
+    @staticmethod
+    def _signature(path: str) -> tuple[int, ...]:
+        info = os.stat(path)
+        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+
+    @staticmethod
+    def _verify_file(path: str, expected: bytes) -> None:
+        with open(path, "rb") as handle:
+            if handle.read() != expected:
+                raise SnapshotError(f"closed-file verification mismatch: {os.path.basename(path)}")
+
     @classmethod
     def _validate_obj(cls, obj: Any, expected_kind: str) -> tuple[int, dict[str, Any]]:
         if not isinstance(obj, dict) or obj.get("schema") != SCHEMA or obj.get("version") != VERSION:
@@ -172,60 +205,72 @@ class StateStore:
 
     @classmethod
     def write_snapshot(cls, path: str, kind: str, generation: int,
-                       payload: dict[str, Any], *, make_backup: bool = True) -> None:
-        """Atomically install main and backup as one recoverable transaction."""
+                       payload: dict[str, Any], *, make_backup: bool = True,
+                       body: bytes | None = None,
+                       trusted: tuple[int, ...] | None = None) -> tuple[int, ...]:
+        """Atomically install main and backup as one recoverable transaction.
+
+        ``body`` is the payload already encoded from records validated at their
+        mutation boundary; without it the payload itself must round-trip as JSON.
+        ``trusted`` is the signature of the main this process installed or
+        verified, so the old main can become the backup without being decoded
+        again. Returns the installed main's signature.
+        """
         path = os.path.abspath(path); backup = path + ".bak"
         directory = os.path.dirname(path) or "."
         if not os.path.isdir(directory): os.makedirs(directory, mode=0o700, exist_ok=True)
-        encoded = (json.dumps(cls._envelope(kind, generation, payload), ensure_ascii=False,
-                              sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
+        if body is None:
+            body = cls._payload_bytes(payload)
+            if json.loads(body) != payload:
+                raise SnapshotError("closed-file verification mismatch")
+        encoded = cls._envelope_bytes(kind, generation, body)
         token = uuid.uuid4().hex; base = os.path.basename(path)
         candidate = os.path.join(directory, f".{base}.{token}.tmp")
         old_main = os.path.join(directory, f".{base}.{token}.old-main")
         old_backup = os.path.join(directory, f".{base}.{token}.old-bak")
         backup_candidate = os.path.join(directory, f".{base}.{token}.new-bak")
         had_main, had_backup = os.path.exists(path), os.path.exists(backup)
-        main_installed = backup_installed = False
+        main_installed = backup_aside = backup_installed = False
+        restore_main = old_main
 
-        def copy_file(source: str, destination: str) -> None:
+        def write_file(destination: str, data: bytes) -> None:
             fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with open(source, "rb") as inp, os.fdopen(fd, "wb") as out:
-                while chunk := inp.read(1024 * 1024): out.write(chunk)
-                out.flush(); os.fsync(out.fileno())
-            os.chmod(destination, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data); handle.flush(); os.fsync(handle.fileno())
 
         try:
-            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(encoded); handle.flush(); os.fsync(handle.fileno())
-            checked_generation, checked_payload = cls.read_snapshot(candidate, kind)
-            if checked_generation != generation or checked_payload != payload:
-                raise SnapshotError("closed-file verification mismatch")
-            if had_main: copy_file(path, old_main)
-            if had_backup: copy_file(backup, old_backup)
-            old_valid = False
+            write_file(candidate, encoded)
+            cls._verify_file(candidate, encoded)
+            old_bytes, old_valid = b"", False
             if had_main:
-                try: cls.read_snapshot(old_main, kind); old_valid = True
-                except Exception: pass
-            if make_backup and old_valid:
-                copy_file(old_main, backup_candidate)
-                cls.read_snapshot(backup_candidate, kind)
+                old_valid = trusted is not None and cls._signature(path) == trusted
+                with open(path, "rb") as handle: old_bytes = handle.read()
+                if not old_valid:
+                    try: cls._validate_obj(json.loads(old_bytes), kind); old_valid = True
+                    except Exception: pass
+            rotate = make_backup and old_valid
+            if had_main:
+                # One copy of the old main is both the rollback source and,
+                # once rotated, the new backup.
+                restore_main = backup_candidate if rotate else old_main
+                write_file(restore_main, old_bytes); os.chmod(restore_main, 0o600)
+                cls._verify_file(restore_main, old_bytes)
             os.replace(candidate, path); main_installed = True
-            os.chmod(path, 0o600); cls.read_snapshot(path, kind); cls._sync_dir(directory)
-            if make_backup and old_valid:
+            os.chmod(path, 0o600); cls._verify_file(path, encoded); cls._sync_dir(directory)
+            if rotate:
+                if had_backup: os.replace(backup, old_backup); backup_aside = True
                 os.replace(backup_candidate, backup); backup_installed = True
-                os.chmod(backup, 0o600); cls.read_snapshot(backup, kind); cls._sync_dir(directory)
+                os.chmod(backup, 0o600); cls._verify_file(backup, old_bytes); cls._sync_dir(directory)
+            return cls._signature(path)
         except BaseException as install_exc:
-            if main_installed or backup_installed:
+            if main_installed:
                 try:
-                    if had_main: os.replace(old_main, path)
-                    else:
+                    if not had_main:
                         try: os.unlink(path)
                         except FileNotFoundError: pass
-                    if had_backup: os.replace(old_backup, backup)
-                    elif make_backup and old_valid:
-                        try: os.unlink(backup)
-                        except FileNotFoundError: pass
+                    elif backup_installed: os.replace(backup, path)
+                    else: os.replace(restore_main, path)
+                    if backup_aside: os.replace(old_backup, backup)
                     cls._sync_dir(directory)
                 except BaseException as rollback_exc:
                     raise SnapshotError(f"snapshot install failed ({install_exc}) and rollback failed: {rollback_exc}") from install_exc
@@ -234,6 +279,15 @@ class StateStore:
             for temporary in (candidate, old_main, old_backup, backup_candidate):
                 try: os.unlink(temporary)
                 except FileNotFoundError: pass
+
+    def _write(self, kind: str, generation: int, payload: dict[str, Any], *,
+               validated: bool = True, make_backup: bool = True) -> None:
+        """Install a snapshot of published, mutation-validated domains."""
+        validated = validated and not self._unvalidated[kind]
+        self._installed[kind] = self.write_snapshot(
+            self._paths[kind], kind, generation, payload, make_backup=make_backup,
+            body=self._encode(kind, payload) if validated else None, trusted=self._installed[kind])
+        if not validated: self._unvalidated[kind] = False
 
     def _acquire_process_lock(self) -> None:
         """Acquire deterministic per-target locks, making partial overlaps contend."""
@@ -288,16 +342,17 @@ class StateStore:
                         try:
                             # Do not claim a healthy durable startup while only the
                             # backup is good. Runtime retains the good copy and retries.
-                            self.write_snapshot(self._paths[kind], kind, generation, payload,
-                                                make_backup=False)
+                            self._write(kind, generation, payload, make_backup=False)
                         except BaseException as exc:
                             if kind == "durable":
                                 raise SnapshotError(f"durable main self-heal from {selected} failed: {exc}") from exc
                             self._last_error[kind] = f"runtime main self-heal from {selected} failed: {exc}"
                             self._dirty[kind] = True
                             print(f"[state_store] {self._last_error[kind]}; will retry")
-                    elif len(valid) > 1 and valid[1][0] > valid[0][0]:
-                        print(f"[state_store] selected higher verified {kind} generation {generation}")
+                    else:
+                        self._installed[kind] = self._signature(selected)
+                        if len(valid) > 1 and valid[1][0] > valid[0][0]:
+                            print(f"[state_store] selected higher verified {kind} generation {generation}")
                 elif failures and kind == "durable":
                     raise SnapshotError("durable state exists but no valid snapshot: " + "; ".join(failures))
                 elif failures:
@@ -313,6 +368,7 @@ class StateStore:
                             for domain in domains:
                                 self._data[domain] = copy.deepcopy(migrated.get(domain, {}))
                             self._generation[kind] += 1; self._dirty[kind] = True
+                            self._unvalidated[kind] = True
                 self._started = True
             if migrated is not None:
                 if self._dirty["durable"]: self.flush("durable", strict=True)
@@ -376,13 +432,15 @@ class StateStore:
                 # Commit validates only touched records and detaches callback-owned
                 # values. Runtime-wide encoding is deliberately deferred to flush.
                 candidate_domain = transaction.commit()
+                if candidate_domain is self._data[domain] and not self._dirty[kind]:
+                    return copy.deepcopy(result)
                 generation = self._generation[kind] + 1
                 candidate = self._candidate_for(kind) if kind == "durable" else None
                 if candidate is not None:
                     candidate[domain] = candidate_domain
             if kind == "durable":
                 try:
-                    self.write_snapshot(self._paths[kind], kind, generation, candidate)
+                    self._write(kind, generation, candidate)
                 except BaseException as exc:
                     with self._lock: self._last_error[kind] = str(exc)
                     raise
@@ -418,12 +476,15 @@ class StateStore:
                     for name, transaction in transactions.items()
                     if name in declared or transaction.touched
                 }
+                if not self._dirty[kind] and all(
+                        value is self._data[name] for name, value in candidate_domains.items()):
+                    return copy.deepcopy(result)
                 generation = self._generation[kind] + 1
                 candidate = self._candidate_for(kind) if kind == "durable" else None
                 if candidate is not None:
                     candidate.update(candidate_domains)
             if kind == "durable":
-                self.write_snapshot(self._paths[kind], kind, generation, candidate)
+                self._write(kind, generation, candidate)
             with self._lock:
                 self._data.update(candidate_domains); self._generation[kind] = generation
                 self._dirty[kind] = kind == "runtime"; self._last_error[kind] = None
@@ -439,7 +500,7 @@ class StateStore:
                     generation = self._generation[current]
                     payload = self._candidate_for(current)
                 try:
-                    self.write_snapshot(self._paths[current], current, generation, payload)
+                    self._write(current, generation, payload)
                 except BaseException as exc:
                     with self._lock:
                         self._last_error[current] = str(exc); self._dirty[current] = True
@@ -473,7 +534,7 @@ class StateStore:
             # Durable first: an interruption remains detectable because the
             # manifest is still stale, and each old main becomes a verified .bak.
             for kind in ("durable", "runtime"):
-                self.write_snapshot(self._paths[kind], kind, generations[kind], candidates[kind])
+                self._write(kind, generations[kind], candidates[kind], validated=False)
             with self._lock:
                 for kind, payload in candidates.items():
                     self._data.update(payload); self._generation[kind] = generations[kind]

@@ -116,6 +116,9 @@ def _observe(account_key: str, *, usage: dict | None, snapshot: dict | None) -> 
         balance = credits.get("balance")
         if isinstance(balance, (int, float)) and not isinstance(balance, bool):
             metrics.append({"metric_id": "credits", "display_name": "积分余额", "kind": "credits", "remaining": balance, "unit": "积分"})
+        # Without a newly queued push, an episode some recipient already saw must
+        # still stop here; otherwise every usage sample records another repeat.
         if notifications.account_event("account.credits.started", account_key, {"metrics": metrics},
-                Effect("confirmed", "credits_allowed"), source="codex_usage"):
+                Effect("confirmed", "credits_allowed"), source="codex_usage") or notifications.notified(
+                "account.credits.started", notifications.subjects.account(account_key)):
             state.sent = True

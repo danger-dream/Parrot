@@ -44,6 +44,17 @@ def channel_event(event_type, channel_key, facts, effect, *, source="local", sco
                                   "model", scope_ref, dimension, source))
 
 
+def notified(event_type, subject, *, scope="account", scope_ref="", dimension=""):
+    """Whether the open episode already reached a recipient; a switched-off episode has not."""
+    from . import store
+    try:
+        key = store.incident_for(event_type, subject, scope=scope, scope_ref=scope_ref, dimension=dimension)
+        incident = store.get("incidents", key) or {}
+        return bool(incident.get("active") and incident.get("pushed"))
+    except Exception:
+        return False
+
+
 def resolve_silently(event_type, subject, *, scope="account", scope_ref="", dimension="", version=0):
     """Business-confirmed end of a non-broadcast episode (e.g. included quota returns)."""
     from . import store

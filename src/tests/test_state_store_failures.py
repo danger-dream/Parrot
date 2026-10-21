@@ -22,11 +22,11 @@ def test_atomic_fault_before_replace_preserves_last_healthy(tmp_path, monkeypatc
     if fault=="fsync":
         monkeypatch.setattr(os,"fsync",lambda _fd: (_ for _ in ()).throw(OSError("fsync fault")))
     else:
-        real=StateStore.read_snapshot
-        def fail_temp(path,kind):
+        real=StateStore._verify_file
+        def fail_temp(path,expected):
             if str(path).endswith(".tmp"):raise OSError("read-after-close fault")
-            return real(path,kind)
-        monkeypatch.setattr(StateStore,"read_snapshot",fail_temp)
+            return real(path,expected)
+        monkeypatch.setattr(StateStore,"_verify_file",staticmethod(fail_temp))
     assert store.flush("runtime",strict=False) is False
     generation,payload=StateStore.read_snapshot(runtime,"runtime")
     assert payload["performance_stats"]=={"healthy":{"v":1}}

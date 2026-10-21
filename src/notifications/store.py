@@ -2,7 +2,9 @@
 import hashlib
 import json
 import secrets
+import threading
 import time
+import weakref
 from .catalog import CATALOG, enabled
 
 DOMAINS = ("notification_events", "notification_incidents", "notification_deliveries", "notification_refs", "notification_policy")
@@ -12,6 +14,8 @@ MAX_INCIDENTS = 2000
 MAX_DELIVERIES = 16000
 MAX_OPERATIONS = 8000
 OUTBOX = {"queued", "sending", "retry_wait"}
+_versions = weakref.WeakKeyDictionary()
+_versions_lock = threading.Lock()
 
 
 def db():
@@ -38,13 +42,23 @@ def mutate(domain, fn):
     return db()._mutate("notification_" + domain, change, strict=True)
 
 
+def _rows(table):
+    """Read-only scan that does not detach every record of a transaction."""
+    return table.peek_items() if hasattr(table, "peek_items") else list(table.items())
+
+
 def next_version(subject):
+    # Captures happen per account per background pass; only ``record`` persists
+    # the high-water mark, which is all a restart needs to stay above every
+    # version an incident retains.
     key = "version:" + subject.generation
-    def change(rows):
-        value = int((rows.get(key) or {}).get("value", 0)) + 1
-        rows[key] = {"value": value, "at": time.time()}
-        return value
-    return mutate("policy", change)
+    store = db()
+    with _versions_lock:
+        counters = _versions.setdefault(store, {})
+        if key not in counters:
+            counters[key] = int((store.get("notification_policy", key) or {}).get("value", 0))
+        counters[key] += 1
+        return counters[key]
 
 
 def incident_key(event):
@@ -66,7 +80,8 @@ def _prune_policy(rows, now):
     # Preferences are configuration, not event history. Each auxiliary type has
     # its own budget; operation history never consumes preference admission.
     groups = {}
-    for key, value in list(rows.items()):
+    current = dict(_rows(rows))
+    for key, value in current.items():
         kind = key.split(":", 1)[0]
         if kind == "mute" and value.get("until", 0) <= now:
             rows.pop(key, None)
@@ -80,10 +95,10 @@ def _prune_policy(rows, now):
         if len(keys) <= limit:
             continue
         if kind == "operation":
-            for key in sorted(keys, key=lambda k: rows[k].get("at", 0)):
+            for key in sorted(keys, key=lambda k: current[k].get("at", 0)):
                 if len(keys) <= limit:
                     break
-                if rows[key].get("status") not in {"queued", "running"}:
+                if current[key].get("status") not in {"queued", "running"}:
                     rows.pop(key, None)
                     keys.remove(key)
         if len(keys) > limit:
@@ -96,13 +111,15 @@ def _protected_delivery(row, now):
 
 def _trim_deliveries(rows, now):
     # Never evict an outbox item just because its event is no longer latest.
-    removable = sorted((key for key, row in rows.items() if not _protected_delivery(row, now)),
-        key=lambda key: (rows[key]["state"] != "suppressed", rows[key].get("created_at", 0)))
-    for key in removable:
-        row = rows[key]
-        if len(rows) > MAX_DELIVERIES or row.get("created_at", now) < now - RETENTION:
+    current = _rows(rows)
+    removable = sorted((pair for pair in current if not _protected_delivery(pair[1], now)),
+        key=lambda pair: (pair[1]["state"] != "suppressed", pair[1].get("created_at", 0)))
+    size = len(current)
+    for key, row in removable:
+        if size > MAX_DELIVERIES or row.get("created_at", now) < now - RETENTION:
             rows.pop(key, None)
-    if len(rows) > MAX_DELIVERIES:
+            size -= 1
+    if size > MAX_DELIVERIES:
         raise RuntimeError("notification outbox capacity reached")
 
 
@@ -111,20 +128,26 @@ def _prune(tables, now):
     # cost, and moving latest releases the obsolete observation atomically.
     events, incidents, deliveries, refs, policy = (tables[d] for d in DOMAINS)
     _trim_deliveries(deliveries, now)
-    pending = {d["incident_id"] for d in deliveries.values() if _protected_delivery(d, now)}
-    for key, value in sorted(list(incidents.items()), key=lambda pair: pair[1].get("last_at", 0)):
-        if not value.get("active") and key not in pending and (len(incidents) > MAX_INCIDENTS or value.get("last_at", now) < now - RETENTION):
+    delivery_rows = _rows(deliveries)
+    pending = {d["incident_id"] for _, d in delivery_rows if _protected_delivery(d, now)}
+    incident_rows = sorted(_rows(incidents), key=lambda pair: pair[1].get("last_at", 0))
+    size = len(incident_rows)
+    for key, value in incident_rows:
+        if not value.get("active") and key not in pending and (size > MAX_INCIDENTS or value.get("last_at", now) < now - RETENTION):
             incidents.pop(key, None)
-    protected = {i.get("latest") for i in incidents.values() if i.get("active")}
-    protected |= {d["event_id"] for d in deliveries.values() if _protected_delivery(d, now)}
-    removable = sorted((e for e in events.values() if e["event_id"] not in protected), key=lambda e: e["occurred_at"])
+            size -= 1
+    protected = {i.get("latest") for _, i in _rows(incidents) if i.get("active")}
+    protected |= {d["event_id"] for _, d in delivery_rows if _protected_delivery(d, now)}
+    event_rows = _rows(events)
+    removable = sorted((e for _, e in event_rows if e["event_id"] not in protected), key=lambda e: e["occurred_at"])
+    size = len(event_rows)
     for e in removable:
-        if len(events) > MAX_EVENTS or e["occurred_at"] < now - RETENTION:
-            events.pop(e["event_id"], None)
-    for key, d in list(deliveries.items()):
+        if (size > MAX_EVENTS or e["occurred_at"] < now - RETENTION) and events.pop(e["event_id"], None) is not None:
+            size -= 1
+    for key, d in delivery_rows:
         if d["event_id"] not in events:
             deliveries.pop(key, None)
-    for key, ref in list(refs.items()):
+    for key, ref in _rows(refs):
         if ref["expires_at"] < now or ref["delivery_id"] not in deliveries:
             refs.pop(key, None)
     _prune_policy(policy, now)
@@ -160,11 +183,7 @@ def record(event, config, recipients, *, transactional=False):
                     "affected": sorted(affected), "effect": event["effect"]["code"], "effect_status": event["effect"]["status"],
                     "episode": old.get("episode", 0) + (1 if first and not recovered else 0),
                     "push_delivery": {} if first and not recovered else dict(old.get("push_delivery") or {})}
-        if recovered:
-            event["previous_event"] = old.get("latest")
-            event["incident_started_at"] = old.get("first_at")
-        events[event["event_id"]] = event
-        queued = []
+        planned = []
         for recipient in recipients:
             rid = str(recipient)
             previous = incident["pushed"].get(rid, 0)
@@ -184,9 +203,26 @@ def record(event, config, recipients, *, transactional=False):
                 due = False
             state = "queued" if allow and (due or transactional) else "suppressed"
             delivery_id = secrets.token_hex(12)
-            deliveries[delivery_id] = {"id": delivery_id, "event_id": event["event_id"], "incident_id": key,
+            planned.append((recipient, rid, {"id": delivery_id, "event_id": event["event_id"], "incident_id": key,
                 "episode": incident["episode"], "recipient": int(recipient), "chat_id": int(recipient), "bypass_repeat_mute": bool(first or upgrade or recovered), "state": state, "created_at": now,
-                "message_id": None, "attempts": 0, "transactional": transactional, "reason": "policy" if not allow else "duplicate" if not due else ""}
+                "message_id": None, "attempts": 0, "transactional": transactional, "reason": "policy" if not allow else "duplicate" if not due else ""}))
+        if not (transactional or recovered or spec.episodic or first or upgrade) and sources == old.get("sources") and all(
+                row["state"] != "queued" for _, _, row in planned):
+            # A same-source repeat of an open incident that notifies no one
+            # (disabled, muted or already sent) changes nothing any decision reads.
+            return []
+        if recovered:
+            event["previous_event"] = old.get("latest")
+            event["incident_started_at"] = old.get("first_at")
+        events[event["event_id"]] = event
+        version_key = "version:" + event["subject"]["generation"]
+        if event["version"] > int((policy.get(version_key) or {}).get("value", 0)):
+            policy[version_key] = {"value": event["version"], "at": now}
+        queued = []
+        for recipient, rid, row in planned:
+            delivery_id = row["id"]
+            deliveries[delivery_id] = row
+            state = row["state"]
             if state == "queued":
                 queued.append(delivery_id)
                 incident["pushed"][rid] = now
@@ -196,7 +232,7 @@ def record(event, config, recipients, *, transactional=False):
                 incident["reminders"] = counts
         incidents[key] = incident
         if len(events) > MAX_EVENTS or len(deliveries) > MAX_DELIVERIES:
-            for did, row in list(deliveries.items()):
+            for did, row in _rows(deliveries):
                 if row["incident_id"] != key or row["state"] not in {"queued", "retry_wait"} or row["event_id"] == event["event_id"]:
                     continue
                 prior = events.get(row["event_id"])
@@ -242,7 +278,7 @@ def action_refs(delivery_id, choices, *, ttl=RETENTION, message_id=None):
     if not pending:
         return []
     def save(rows):
-        for old, value in list(rows.items()):
+        for old, value in _rows(rows):
             if value["expires_at"] < time.time():
                 rows.pop(old, None)
         if len(rows) + len(pending) > 20000:

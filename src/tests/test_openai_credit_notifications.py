@@ -69,6 +69,28 @@ def test_credit_notification_is_shared_by_live_and_monitor_paths(m, account, mon
     assert len(sent) == 1
 
 
+def test_sent_episode_stops_repeat_events_at_the_source(m, monkeypatch):
+    # Real durable store: a duplicate is suppressed there, so emit reports no
+    # new push even though the episode was already delivered.
+    key, channel = _account(m, "credit-repeat")
+    _allow(m, key)
+    m["config"].update(lambda cfg: cfg.update(notifications={"enabled": True, "events": {}},
+                                              telegram={**(cfg.get("telegram") or {}), "adminIds": [11]}))
+    queued = []
+    monkeypatch.setattr(notifier, "enqueue_delivery", lambda delivery_id: queued.append(delivery_id) or True)
+    alerts._states.clear()
+    headers(m, channel)
+    assert len(queued) == 1
+    calls = []
+    real = alerts.notifications.account_event
+    monkeypatch.setattr(alerts.notifications, "account_event", lambda *a, **k: calls.append(a[0]) or real(*a, **k))
+    alerts._states.clear()  # a restart loses memory; the durable episode still stops repeats
+    for _ in range(3):
+        headers(m, channel)
+    assert calls == ["account.credits.started"] and len(queued) == 1
+    alerts._states.clear()
+
+
 @pytest.mark.parametrize("used", [0, 95, 99.9])
 def test_disable_threshold_is_not_exhaustion(m, account, used):
     key, channel, sent = account
