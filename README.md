@@ -357,6 +357,8 @@ JSON 请求体：
 返回当前所有启用渠道聚合的可用模型（按 API Key 白名单过滤），Anthropic 标准格式。
 **配置了模型映射的别名也会在这里一同列出**（条件：别名所在入口的家族对该 Key 放行，且别名指向的真实模型本身对该 Key 可见），这样下游客户端直接拉列表就能看到最新别名。
 
+开启统一模型名后，每个对话模型还声明 `context_window`、`context_length`（OpenRouter 写法，同值）、`max_input_tokens`、`max_output_tokens` 和 `capabilities`（`vision`、`tool_call`、`structured_output`、`reasoning_efforts`）。数值来自模型中心元数据，只统计该 Key 当前能调度到的来源，且取最保守值：上限取各来源最小值，能力要各来源都支持才为 `true`，思考档位取交集（按强度分 ID 的来源以它提供的档位为准）；没声明某项的来源不参与该项，所有来源都没声明的字段不输出。图片模型只有基础字段。
+
 ### 统一模型名（`modelRegistry.enabled`）
 
 开启后，同一个模型不论来自哪个渠道、上游怎么写，对下游只有一个小写名字，所有来源按负载均衡的顺序和策略分流，发给每个来源的仍是它自己的 ID。

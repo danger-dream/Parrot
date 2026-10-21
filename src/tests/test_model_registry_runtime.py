@@ -264,3 +264,58 @@ def test_second_migration_keys_metadata_by_model_without_touching_switches():
     assert defaults["gem-3"] == {"target": "h"}
     assert cfg["modelMetadataOverrides"]["scoped"]["api:G"]["gem-3"] == {"fields": {"vision": True}}
     assert notes == ["元数据匹配里 gem-3-high、gem-3-low 都属于 gem-3，按模型查询时采用 gem-3-high 的设置"]
+
+
+def test_declared_capabilities_hold_for_every_schedulable_source(env, monkeypatch):
+    from src.model_registry import capabilities
+    metadata = {
+        "api:Official": {"contextWindow": 1_000_000, "maxOutputTokens": 128_000, "vision": True,
+                         "toolCall": True, "reasoningEfforts": ["low", "medium", "high", "max"]},
+        "api:Reseller": {"contextWindow": 200_000, "maxOutputTokens": 64_000, "vision": True,
+                         "toolCall": False, "reasoningEfforts": ["low", "high"]},
+    }
+    monkeypatch.setattr(capabilities, "_metadata", lambda model_id, offer: metadata[offer.source])
+    assert capabilities.describe("minimax-m3.1-flash", None) == {
+        "context_window": 200_000, "context_length": 200_000, "max_input_tokens": 200_000, "max_output_tokens": 64_000,
+        "capabilities": {"vision": True, "tool_call": False, "reasoning_efforts": ["low", "high"]}}
+    # A source out of scheduling no longer narrows what is declared; one declaring nothing does not count.
+    _switches(env, apiSourceDisabledModels={"api:Reseller": ["minimax-m3.1-flash"]})
+    metadata["api:Official"].pop("vision")
+    declared = capabilities.describe("minimax-m3.1-flash", None)
+    assert declared["context_window"] == 1_000_000 and "vision" not in declared["capabilities"]
+
+
+def test_ids_fixed_to_one_effort_declare_only_their_levels(monkeypatch):
+    from src.model_registry import capabilities, pipeline, runtime
+    from src.model_registry.offers import Offer
+    offers = [Offer("oauth:ag", "antigravity", f"m-1-{level}", f"M 1 ({level.title()})", basis="name",
+                    traits={"effort": level}) for level in ("low", "high")]
+    monkeypatch.setattr(runtime, "_registry", pipeline.build(offers, catalog=pipeline.CatalogIndex([])))
+    monkeypatch.setattr(capabilities, "serving_offers", lambda model_id, api_key: offers)
+    monkeypatch.setattr(capabilities, "_metadata", lambda model_id, offer: {"reasoningEfforts": ["low", "high", "max"]})
+    assert capabilities.describe("m-1", None) == {"capabilities": {"reasoning_efforts": ["low", "high"]}}
+
+
+def test_models_endpoint_declares_context_and_capabilities(env, monkeypatch):
+    import asyncio
+    import server
+    from starlette.requests import Request
+    from src.model_registry import capabilities
+    monkeypatch.setattr(capabilities, "_metadata", lambda model_id, offer: {"contextWindow": 300_000, "vision": False})
+    monkeypatch.setattr(server.auth, "validate", lambda headers: ("lower", ["MiniMax-M3.1-Flash"], None))
+    body = asyncio.run(server.list_models(Request({"type": "http", "method": "GET", "path": "/v1/models",
+                                                    "headers": [], "query_string": b""})))
+    assert body["data"] == [{
+        "type": "model", "id": "minimax-m3.1-flash", "display_name": "MiniMax-M3.1-Flash",
+        "created_at": "2025-01-01T00:00:00Z", "context_window": 300_000, "context_length": 300_000,
+        "max_input_tokens": 300_000, "capabilities": {"vision": False}}]
+
+
+def test_models_endpoint_applies_an_unscoped_keys_allowlist(env, monkeypatch):
+    import asyncio
+    import server
+    from starlette.requests import Request
+    monkeypatch.setattr(server.auth, "validate", lambda headers: ("lower", ["MiniMax-M3.1-Flash"], None))
+    body = asyncio.run(server.list_models(Request({"type": "http", "method": "GET", "path": "/v1/models",
+                                                    "headers": [], "query_string": b""})))
+    assert [item["id"] for item in body["data"]] == ["minimax-m3.1-flash"]

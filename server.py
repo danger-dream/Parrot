@@ -1059,13 +1059,15 @@ async def list_models(request: Request):
     scoped = auth.allowed_channels(key_name) is not None
     image_models = (image_catalog.available_models(api_key_name=key_name) if scoped
                     else image_catalog.available_models()) if auth.images_allowed(key_name) else []
-    text_models = registry.available_models(api_key_name=key_name) if scoped else registry.available_models()
+    from src.model_registry import runtime as model_registry
+    # The unified registry applies the key's allowlist itself, by model; it needs the key even when unscoped.
+    keyed = scoped or model_registry.current() is not None
+    text_models = registry.available_models(api_key_name=key_name) if keyed else registry.available_models()
     known_image_models = image_catalog.models()
     all_models = sorted({
         model for model in text_models + image_models
         if model not in known_image_models or model in image_models
     })
-    from src.model_registry import runtime as model_registry
     registry_models = set(text_models) if model_registry.current() is not None else set()
     if allowed_models:
         allowed_set = set(allowed_models)
@@ -1120,8 +1122,18 @@ async def list_models(request: Request):
     placeholder_ts = datetime(2025, 1, 1, tzinfo=timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
+    from src.model_registry import capabilities
+    unified = model_registry.current()
+
+    def declared(name: str) -> dict:
+        if unified is None or name in image_models:
+            return {}
+        found = unified.lookup(global_map.get(name, name))
+        return capabilities.describe(found[0], key_name) if found else {}
+
     data = [
-        {"type": "model", "id": m, "display_name": model_registry.display_name(m), "created_at": placeholder_ts}
+        {"type": "model", "id": m, "display_name": model_registry.display_name(m), "created_at": placeholder_ts,
+         **declared(m)}
         for m in visible
     ]
     return {
