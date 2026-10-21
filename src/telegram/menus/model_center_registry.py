@@ -30,7 +30,7 @@ def entry_button(chat_id: int) -> dict | None:
     if model_registry.current() is None:
         return None
     overview, _revision = _overview(chat_id)
-    count = len(overview.pending) + len(overview.suggestions)
+    count = len(_pending_groups(overview)) + len(overview.suggestions)
     return ui.btn("🧩 统一命名" + (f"（待处理 {count}）" if count else ""), menu._freeze(chat_id, "registry"))
 
 

@@ -165,6 +165,8 @@ def test_telegram_page_decides_one_upstream_id_for_every_account_of_a_provider(e
     registry.rebuild_from_config()
     menu.reset_for_tests()
     _text, keyboard = menu.render(42)
+    # The entry counts what the page lists: one decision per provider and id.
+    assert any(item["text"] == "🧩 统一命名（待处理 1）" for item in _buttons(keyboard))
     text, keyboard = _press("统一命名", keyboard)
     assert "<b>待确认 1</b>" in text and "workbuddy（2 个账号）" in text
     text, keyboard = _press("待确认 1", keyboard)
