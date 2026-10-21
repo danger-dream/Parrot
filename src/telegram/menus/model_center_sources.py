@@ -62,7 +62,8 @@ def _fold_source_ids(
             if len(group) > 1 and levels:
                 # Each level is its own id here; the catalog's list would overstate what can be asked for.
                 line = f"思考档位：<code>{ui.escape_html(' / '.join(levels))}</code>（每档一个上游 ID）"
-                body = [line if item.startswith("思考档位：") else item for item in body]
+                kept = [item for item in body if not item.startswith("思考档位：")]
+                body = kept + [line]
             folded.append((brand, label, upstream(wires[position] for position in group) + list(body)))
             folded_ranks.append(ranks[group[0]] if ranks else None)
     return folded, folded_ranks if ranks else []
@@ -129,6 +130,118 @@ def _ordered_sources(view: ModelView, order: list[str]) -> tuple[list, list[int 
     rank = {key: position for position, key in enumerate(order, 1)}
     sources = sorted(view.sources, key=lambda item: rank.get(_source_key(item), len(rank) + 1))
     return sources, [rank.get(_source_key(item)) for item in sources]
+
+
+_GROUP_TITLES = {"capacity": "📐 <b>容量</b>", "capability": "🧩 <b>能力</b>", "price": "💵 <b>价格（每百万 Tokens）</b>"}
+
+
+def _fields(metadata) -> dict[str, tuple[str, str, str]]:
+    """Field key -> (label, group, shown text), as the detail page shows each known value."""
+    from .model_center_catalog import _max_context_above_normal
+    result: dict[str, tuple[str, str, str]] = {}
+    for item in menu._META_FIELDS:
+        value = menu._display_value(metadata, item.key)
+        if value is None or value == "" or value == () or value == []:
+            continue
+        result[item.key] = (item.label, item.group, menu._fmt_meta(value, item))
+        if item.key == "contextWindow":
+            maximum = _max_context_above_normal(metadata, value)
+            if maximum is not None:
+                result["contextWindowMaxMode"] = ("Max Context 上下文", item.group, menu._fmt_meta(maximum, item))
+    return result
+
+
+def _field_line(label: str, text: str) -> str:
+    return f"{label}：<code>{ui.escape_html(text)}</code>"
+
+
+def _grouped(fields: dict[str, tuple[str, str, str]]) -> list[str]:
+    lines: list[str] = []
+    for group, title in _GROUP_TITLES.items():
+        members = [(label, text) for label, item_group, text in fields.values() if item_group == group]
+        if members:
+            lines += ([""] if lines else []) + [title] + [_field_line(label, text) for label, text in members]
+    return lines
+
+
+def _not_scheduled_reason(view: ModelView, item) -> str:
+    if item.unavailable_reason == "account_restricted":
+        return "账户受限，全部模型暂停"
+    if not item.container_enabled:
+        return f"{menu._container_label(item.type)}已停用"
+    if not item.source_enabled:
+        return "本来源已停用"
+    if not view.global_enabled and not item.enabled_override:
+        return "模型全局停用"
+    return "当前不可用"
+
+
+def title_badges(view: ModelView) -> str:
+    badges = []
+    if view.identity.kind in (ModelKind.CHAT, ModelKind.IMAGE):
+        live = any(item.effective_routable for item in view.sources)
+        if not view.global_enabled:
+            badges.append("⚠️ 全局停用，仅部分来源启用" if live else "🚫 已停用")
+        elif view.sources and not live:
+            badges.append("⚠️ 无可用来源")
+    if view.visible is False:
+        badges.append("🙈 已隐藏")
+    return "".join(f" · {badge}" for badge in badges)
+
+
+def chat_sources_section(chat_id: int, view: ModelView, order: list[str]) -> list[str]:
+    """Shared values once on top; then the scheduled sources in order, then the rest with why they are out."""
+    from .model_center_catalog import _qoder_rate_lines, _workbuddy_rate
+    options = {(item.ref.type, item.ref.id): item for item in menu._source_options(chat_id)}
+    sources, ranks = _ordered_sources(view, order)
+    entries = []
+    for item, rank in zip(sources, ranks or [None] * len(sources)):
+        option = options.get((item.type, item.id))
+        icon = ui.provider_custom_emoji_html(option.provider) if option and ui.provider_custom_emoji_id(option.provider) else ""
+        label = option.label if option else ("已移除的账户" if item.type is ModelSourceType.OAUTH else "已移除的渠道")
+        entries.append((item, rank, f"{icon} " if icon else "", label, _fields(item.effective_metadata)))
+    live = [entry for entry in entries if entry[0].effective_routable]
+    # Sources out of scheduling are skipped when a request is tried, so the order counts only the rest.
+    numbers = iter(range(1, len(live) + 1))
+    live = [(item, next(numbers) if rank is not None else None, *rest) for item, rank, *rest in live]
+    # A source with no metadata at all says nothing about the others; it gets one line of its own.
+    basis = [entry for entry in live or entries if entry[4]] or live or entries
+    common = {key: value for key, value in basis[0][4].items() if all(entry[4].get(key) == value for entry in basis[1:])}
+    lines = ["", "<b>容量、能力与价格</b>（" + ("参与调度的来源一致" if live else "各来源一致") + "）"]
+    if not any(entry[4] for entry in entries):
+        lines.append("元数据：<code>未提供</code>（可点「同步元数据」从模型目录匹配）")
+    else:
+        lines += _grouped(common) or ["各来源没有一致的项。"]
+    for title, group in (("参与调度", live), ("未参与调度", [entry for entry in entries if not entry[0].effective_routable])):
+        if not group:
+            continue
+        blocks, wires, refs, group_ranks = [], [], [], []
+        for item, rank, brand, label, fields in group:
+            body = []
+            if not item.effective_routable:
+                body.append(f"原因：<code>{_not_scheduled_reason(view, item)}</code>")
+            elif item.enabled_override:
+                body.append("本来源显式启用（覆盖全局停用）")
+            if item.provider == "workbuddy":
+                body.append("💳 WorkBuddy 倍率：" + _workbuddy_rate(item.effective_metadata))
+            body += _qoder_rate_lines(view, ModelSourceRef(item.type, item.id))
+            body += [_field_line(label_, text) for key, (label_, _group, text) in fields.items() if common.get(key) != (label_, _group, text)]
+            if fields:
+                body += [_field_line(label_, "未提供") for key, (label_, _group, _text) in common.items() if key not in fields]
+            elif common:
+                body.append(_field_line("元数据", "未提供"))
+            if item.unavailable_reason == "account_restricted":
+                body.append("⛔ 供应商限制账户（11140），全部模型暂停；请在账户详情确认解除后清除暂停。")
+            blocks.append((brand if item.effective_routable else "🚫 " + brand, label, body))
+            wires.append(item.outbound_model if item.provider != "qoder" else None)
+            refs.append((item.type, item.id))
+            group_ranks.append(rank)
+        ranked = group is live and bool(order)
+        blocks, group_ranks = _fold_source_ids(view.model_id, blocks, wires, refs, group_ranks if ranked else [])
+        count = len(dict.fromkeys(refs))
+        lines += ["", f"<b>{title}</b>（{count} 个来源" + ("，只列与上面不同的项" if common else "") + "）"]
+        lines += _merged_source_blocks(blocks, group_ranks if ranked else None)
+    return lines
 
 
 def _source_states_render(chat_id: int, resource_key: str, detail_back: str) -> tuple[str, dict]:

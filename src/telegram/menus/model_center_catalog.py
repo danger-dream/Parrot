@@ -27,7 +27,9 @@ from .. import ui
 from . import model_center_usage as usage
 from . import model_center_menu as menu
 from .model_center_icons import inline_kb
-from .model_center_sources import _fold_source_ids, _merged_source_blocks, _ordered_sources, _schedule
+from .model_center_sources import (
+    _fold_source_ids, _merged_source_blocks, _ordered_sources, _schedule, chat_sources_section, title_badges,
+)
 
 
 def _enum_value(value: Any) -> str:
@@ -361,7 +363,8 @@ def _provider_for_view(view: ModelView, source: ModelSourceRef | None) -> str | 
     selected = menu._source_for_view(view, source)
     if selected is not None:
         return selected.provider
-    return view.sources[0].provider if view.sources else None
+    providers = {item.provider for item in view.sources}
+    return providers.pop() if len(providers) == 1 else None
 
 
 def _selected_count(chat_id: int, ctx=None) -> int:
@@ -649,7 +652,8 @@ def _detail_render(
         return menu._media_view_detail_render(chat_id, view, back_callback=back_callback)
     provider = menu._provider_for_view(view, s.source)
     display_name = _model_display_name(view, s.source)
-    title = f"{ui.provider_tag(provider)} <b>{ui.escape_html(display_name)}</b>" if provider else f"🧬 <b>{ui.escape_html(display_name)}</b>"
+    title = (f"{ui.provider_tag(provider)} <b>{ui.escape_html(display_name)}</b>" if provider
+             else f"🧬 <b>{ui.escape_html(display_name)}</b>") + title_badges(view)
     lines = [title, "", f"类型：<code>{ui.escape_html(menu._kind_label(menu._enum_value(view.identity.kind)))}</code>"]
     aliases = tuple(item for item in view.aliases if item != display_name)
     if aliases:
@@ -662,22 +666,23 @@ def _detail_render(
     if view.identity.kind in (ModelKind.CHAT, ModelKind.IMAGE):
         enabled, state_text = menu._model_state(view, s.source)
         lines.extend([
-            f"状态：<code>{ui.escape_html(state_text)}</code>",
-            f"全局默认：<code>{'启用' if view.global_enabled else '停用'}</code>",
-            f"下游展示开关：<code>{'开' if view.visible else '关'}</code>",
-            "关闭时不出现在 /v1/models，仍可按名称调用；开启不代表停用模型会出现在列表，只有可用来源才会贡献模型。",
+            f"状态：<code>{ui.escape_html(state_text)}</code> · 全局默认：<code>{'启用' if view.global_enabled else '停用'}</code>"
+            f" · 下游展示开关：<code>{'开' if view.visible else '关'}</code>",
+            *(["关闭时不出现在 /v1/models，仍可按名称调用；开启不代表停用模型会出现在列表，只有可用来源才会贡献模型。"]
+              if view.visible is False else []),
         ])
         schedule_mode, schedule_text, schedule_order = _schedule(view) if view.identity.kind is ModelKind.CHAT else ("", "", [])
         if schedule_text:
             lines.append(f"调度：<code>{ui.escape_html(schedule_text)}</code>")
-        lines.extend(["", "<b>容量、能力与价格</b>"])
+        unified = view.identity.kind is ModelKind.CHAT and s.source is None and len(view.sources) > 1
+        lines.extend(chat_sources_section(chat_id, view, schedule_order) if unified else ["", "<b>容量、能力与价格</b>"])
         if view.identity.kind is ModelKind.IMAGE:
             lines.extend(["生成 / 编辑：JSON 与 multipart；默认 PNG / base64，URL 有效期 1 小时。",
                           "尺寸按需等比缩放并补边（不裁切）；透明背景校验真实 alpha。",
                           "OpenAI 单图接口：n 张最多 n 次生成，模糊超时不重试。", ""])
         selected_source = menu._source_for_view(view, s.source)
         ordered, ranks = _ordered_sources(view, schedule_order)
-        metadata_sources = ordered
+        metadata_sources = () if unified else ordered
         if selected_source is not None:
             metadata_sources = [item for item in view.sources
                                 if item.type is selected_source.type and item.id == selected_source.id]
@@ -746,7 +751,7 @@ def _detail_render(
             blocks, ranks = _fold_source_ids(
                 view.model_id, blocks, wires, [(item.type, item.id) for item in metadata_sources], ranks)
             lines.extend(_merged_source_blocks(blocks, ranks))
-        else:
+        elif not unified:
             lines.extend(menu._metadata_lines(view.common_metadata))
         target_enabled = not bool(enabled)
         state_scope = s.source if s.source is not None else None

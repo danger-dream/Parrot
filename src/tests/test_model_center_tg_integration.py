@@ -528,6 +528,8 @@ def test_tg_api_state_visibility_alias_share_real_controls_and_survive_rebuild(
     menu.handle_callback(42, 100, "tg-hide", _button(detail_kb, "对下游隐藏")["callback_data"])
     api_detail = client.get(f"/api/management/v1/models/{resource_key}", headers=admin)
     assert api_detail.json()["data"]["visible"] is False
+    hidden_text, _hidden_kb = menu._detail_render(42, resource_key)
+    assert "🙈 已隐藏" in hidden_text and "只有可用来源才会贡献模型" in hidden_text
     listed = client.get("/api/management/v1/models?type=chat", headers=admin).json()
     visible = client.patch(
         "/api/management/v1/models/actions/state",
@@ -537,7 +539,8 @@ def test_tg_api_state_visibility_alias_share_real_controls_and_survive_rebuild(
     assert visible.status_code == 200, visible.text
     detail_text, _detail_kb = menu._detail_render(42, resource_key)
     assert "下游展示开关：<code>开</code>" in detail_text
-    assert "只有可用来源才会贡献模型" in detail_text
+    # The explanation only matters while the model is hidden.
+    assert "只有可用来源才会贡献模型" not in detail_text
 
     # Seed one alias over the API, perform one atomic Telegram rename through
     # its input state (immediately effective), then observe it over the API.

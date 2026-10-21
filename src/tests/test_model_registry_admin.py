@@ -289,3 +289,27 @@ def test_reasoning_flags_are_not_effort_levels():
     from src import model_metadata
     assert model_metadata.normalize_metadata({"reasoning": True, "thinking": "true"}) == {}
     assert model_metadata.normalize_metadata({"reasoning": ["low", "High"]}) == {"reasoningEfforts": ["low", "high"]}
+
+
+def test_detail_puts_shared_values_on_top_and_unscheduled_sources_last(enabled, monkeypatch):
+    from src.telegram.menus import model_center_catalog as catalog
+    _client, runtime, _admin, _read_only, _denied = enabled
+
+    def priority(cfg):
+        cfg["modelCenter"]["disabledModels"] = []
+        cfg["modelCenter"]["apiSourceDisabledModels"] = {"api:Official": ["minimax-m2.7"]}
+        cfg["channelSelection"] = "priority"
+        cfg["loadBalancing"] = {"initialized": True, "channelPriorityOrder": ["api:Official", "api:Reseller"]}
+        cfg["modelBindings"] = {"defaults": {}}
+    config.update(priority)
+    registry.rebuild_from_config()
+    monkeypatch.setattr(menu, "_CONTROL", runtime.control_owner().models)
+    monkeypatch.setattr(ui, "is_admin", lambda chat_id: int(chat_id) == 42)
+    menu.reset_for_tests()
+    view = next(item for item in menu._CONTROL.list_models(menu._ctx(42)).items if item.model_id == "minimax-m2.7")
+    text, _keyboard = catalog._detail_render(42, view.resource_key)
+    assert "OpenAI <b>minimax-m2.7</b>" in text.split("\n", 1)[0]  # one provider: its tag, not 🧬
+    assert "元数据：<code>未提供</code>（可点「同步元数据」从模型目录匹配）" in text
+    scheduled, unscheduled = text.index("<b>参与调度</b>"), text.index("<b>未参与调度</b>")
+    assert scheduled < text.index("<b>1. ") < text.index("Reseller") < unscheduled < text.index("Official")
+    assert "原因：<code>本来源已停用</code>" in text[unscheduled:] and "🚫 " in text[unscheduled:]
