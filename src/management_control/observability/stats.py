@@ -12,6 +12,7 @@ from typing import Any
 from src import concurrency as concurrency_module
 from src import config as config_module
 from src import log_db as log_db_module
+from src import log_timeseries as log_timeseries_module
 from src import model_names
 from src import oauth_manager as oauth_manager_module
 from src import state_db as state_db_module
@@ -22,6 +23,7 @@ from src.management_control.errors import ManagementError, ManagementErrorCode
 
 from ._log_errors import map_historical_log_errors
 from .common import PageResult, page_slice, require, revision_for
+from .timeseries import TimeseriesBucket, TimeseriesGroup, TimeseriesRange, build_timeseries
 
 
 _BJT = timezone(timedelta(hours=8))
@@ -74,8 +76,10 @@ class StatsControl:
         state_db=state_db_module,
         audit_sink: AuditSink | None = None,
         now=time.time,
+        timeseries_source=log_timeseries_module,
     ) -> None:
         self.log_db = log_db
+        self.timeseries_source = timeseries_source
         self.config = config
         self.concurrency = concurrency
         self.registry = registry
@@ -234,6 +238,22 @@ class StatsControl:
         if sort is StatsSort.TPS:
             return metrics["averageTokensPerSecond"] or 0
         return metrics["total"]
+
+    def timeseries(
+        self,
+        context: ManagementContext,
+        *,
+        range_value: TimeseriesRange | str,
+        bucket: TimeseriesBucket | str | None = None,
+        group: TimeseriesGroup | str = TimeseriesGroup.NONE,
+        limit: int = 6,
+    ) -> dict[str, Any]:
+        """Continuous, zero-filled bucketed series (same cost rules as summary)."""
+        require(context)
+        return build_timeseries(
+            self.timeseries_source, now=self._now(), range_value=range_value,
+            bucket=bucket, group=group, limit=limit,
+        )
 
     def breakdown(self, context: ManagementContext, query: StatsBreakdownQuery) -> PageResult[dict[str, Any]]:
         snapshot = self.period_snapshot(context, query.period)

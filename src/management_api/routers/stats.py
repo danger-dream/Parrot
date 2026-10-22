@@ -7,6 +7,7 @@ from fastapi import APIRouter, Body, Depends, Header, Path, Query, Request
 from src.management_auth import Capability
 from src.management_control import ManagementContext, ManagementErrorCode
 from src.management_control.observability import StatsBreakdownQuery, StatsDimension, StatsPeriod, StatsSort
+from src.management_control.observability import TimeseriesBucket, TimeseriesGroup, TimeseriesRange
 from src.management_control.observability.common import revision_for
 
 from ..dependencies import require_capability
@@ -22,6 +23,7 @@ from ..schemas.observability import (
     TelegramStatsPreferencesData,
     TelegramStatsPreferencesPatch,
 )
+from ..schemas.webui import StatsTimeseriesData
 from ._observability import controls, meta, paged_meta, reject_unknown_query
 
 
@@ -76,6 +78,25 @@ def get_stats_summary(
     reject_unknown_query(request, ("period",))
     value = controls(request).stats.summary(context, period)
     return DataEnvelope(data=StatsSummaryData.model_validate(value), meta=meta(request))
+
+
+@router.get(
+    "/stats/timeseries", operation_id="getStatsTimeseries",
+    response_model=DataEnvelope[StatsTimeseriesData], responses=_READ_ERRORS,
+)
+def get_stats_timeseries(
+    request: Request,
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
+    range_value: Annotated[TimeseriesRange, Query(alias="range")],
+    bucket: Annotated[TimeseriesBucket | None, Query()] = None,
+    group_by: Annotated[TimeseriesGroup, Query(alias="groupBy")] = TimeseriesGroup.NONE,
+    limit: Annotated[int, Query(ge=1, le=12)] = 6,
+) -> DataEnvelope[StatsTimeseriesData]:
+    reject_unknown_query(request, ("range", "bucket", "groupBy", "limit"))
+    value = controls(request).stats.timeseries(
+        context, range_value=range_value, bucket=bucket, group=group_by, limit=limit,
+    )
+    return DataEnvelope(data=StatsTimeseriesData.model_validate(value), meta=meta(request))
 
 
 @router.get(

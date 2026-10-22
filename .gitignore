@@ -72,3 +72,6 @@ _debug/
 
 # Fixed release entrypoint: receipts, logs and temporary candidate worktrees
 .release-runs/
+
+# WebUI 前端依赖（构建产物 src/webui/ 需要提交）
+/webui/node_modules/

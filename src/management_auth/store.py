@@ -33,7 +33,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_seen_at REAL NOT NULL,
     expires_at REAL NOT NULL,
     generation INTEGER NOT NULL,
-    revoked_at REAL
+    revoked_at REAL,
+    client_name TEXT,
+    source_address TEXT,
+    device_summary TEXT
 );
 CREATE INDEX IF NOT EXISTS sessions_selector_idx ON sessions(selector);
 CREATE TABLE IF NOT EXISTS approvals (
@@ -48,7 +51,8 @@ CREATE TABLE IF NOT EXISTS approvals (
     request_id TEXT NOT NULL,
     decided_by TEXT,
     decided_at REAL,
-    consumed_at REAL
+    consumed_at REAL,
+    confirm_code TEXT
 );
 CREATE TABLE IF NOT EXISTS audit (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,6 +64,20 @@ CREATE TABLE IF NOT EXISTS audit (
     occurred_at REAL NOT NULL
 );
 """
+
+
+# Additive columns introduced after the first released schema. ``CREATE TABLE
+# IF NOT EXISTS`` never alters an existing table, so older databases receive
+# them through idempotent ALTERs. Every column is nullable: legacy rows simply
+# report "unknown" device facts / no confirmation code.
+_ADDITIVE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "sessions": (
+        ("client_name", "TEXT"),
+        ("source_address", "TEXT"),
+        ("device_summary", "TEXT"),
+    ),
+    "approvals": (("confirm_code", "TEXT"),),
+}
 
 
 class StoreCapacityError(RuntimeError):
@@ -97,6 +115,20 @@ class ManagementStateStore:
             self._conn.execute("PRAGMA synchronous=FULL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(_SCHEMA)
+            self._migrate_additive_columns()
+
+    def _migrate_additive_columns(self) -> None:
+        with self._conn:
+            for table, columns in _ADDITIVE_COLUMNS.items():
+                existing = {
+                    str(row[1])
+                    for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                for name, declaration in columns:
+                    if name not in existing:
+                        self._conn.execute(
+                            f"ALTER TABLE {table} ADD COLUMN {name} {declaration}"
+                        )
 
     def close(self) -> None:
         with self._lock:
@@ -208,14 +240,18 @@ class ManagementStateStore:
             values["last_seen_at"],
             values["expires_at"],
             values["generation"],
+            values.get("client_name"),
+            values.get("source_address"),
+            values.get("device_summary"),
         )
 
     def _insert_session(self, values: Mapping[str, Any]) -> None:
         self._conn.execute(
             """INSERT INTO sessions(
                 session_id,selector,verifier,subject_id,auth_method,roles_json,
-                capabilities_json,issued_at,last_seen_at,expires_at,generation
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                capabilities_json,issued_at,last_seen_at,expires_at,generation,
+                client_name,source_address,device_summary
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             self._session_values(values),
         )
 
@@ -246,6 +282,29 @@ class ManagementStateStore:
                 (self._clock(), session_id),
             )
             return cursor.rowcount == 1
+
+    def list_active_sessions(self, *, now: float, idle_timeout_seconds: float) -> list[dict[str, Any]]:
+        """Unrevoked, current-generation sessions that are neither absolutely
+        nor idly expired at ``now``; most recently used first."""
+        with self._lock:
+            generation = self.credential_generation()
+            rows = self._conn.execute(
+                "SELECT session_id,auth_method,issued_at,last_seen_at,expires_at,"
+                "client_name,source_address,device_summary FROM sessions "
+                "WHERE revoked_at IS NULL AND generation=? AND expires_at>? "
+                "AND last_seen_at>? ORDER BY last_seen_at DESC, issued_at DESC",
+                (generation, now, now - idle_timeout_seconds),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def revoke_other_sessions(self, keep_session_id: str) -> int:
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "UPDATE sessions SET revoked_at=? "
+                "WHERE revoked_at IS NULL AND session_id<>?",
+                (self._clock(), keep_session_id),
+            )
+            return cursor.rowcount
 
     def revoke_all_sessions(self) -> int:
         now = self._clock()
@@ -284,8 +343,9 @@ class ManagementStateStore:
             self._conn.execute(
                 """INSERT INTO approvals(
                     approval_id,secret_verifier,status,created_at,expires_at,
-                    client_name,source_address,device_summary,request_id
-                ) VALUES(?,?,'pending',?,?,?,?,?,?)""",
+                    client_name,source_address,device_summary,request_id,
+                    confirm_code
+                ) VALUES(?,?,'pending',?,?,?,?,?,?,?)""",
                 (
                     values["approval_id"],
                     values["secret_verifier"],
@@ -295,6 +355,7 @@ class ManagementStateStore:
                     values["source_address"],
                     values.get("device_summary"),
                     values["request_id"],
+                    values.get("confirm_code"),
                 ),
             )
 
@@ -376,7 +437,14 @@ class ManagementStateStore:
                 if row and row["status"] == "consumed":
                     return "alreadyConsumed", None
                 return str(row["status"]) if row else "notFound", None
-            self._insert_session(session_values)
+            # The browser that created the approval is the device that owns the
+            # session; copy its non-secret description for the device list.
+            self._insert_session({
+                **session_values,
+                "client_name": row["client_name"],
+                "source_address": row["source_address"],
+                "device_summary": row["device_summary"],
+            })
             return "consumed", dict(row)
 
     def record_audit(

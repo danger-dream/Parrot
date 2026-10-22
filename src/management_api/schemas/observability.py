@@ -80,6 +80,15 @@ class ResourceCounts(StrictSchema):
     quotaHot: int = Field(ge=0)
 
 
+class OverviewTelegramBot(StrictSchema):
+    configured: bool
+
+
+class OverviewUpdate(StrictSchema):
+    available: bool
+    latestVersion: str | None = None
+
+
 class OverviewData(StrictSchema):
     version: str
     uptimeSeconds: int = Field(ge=0)
@@ -88,13 +97,19 @@ class OverviewData(StrictSchema):
     today: dict[str, JsonValue]
     lifetime: dict[str, JsonValue]
     activeAlerts: dict[str, JsonValue]
+    publicIp: str | None = None
+    telegramBot: OverviewTelegramBot = OverviewTelegramBot(configured=False)
+    update: OverviewUpdate = OverviewUpdate(available=False)
     revision: str
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
         "version": "0.31.13", "uptimeSeconds": 42,
         "listeners": {"host": "127.0.0.1", "port": 22123},
         "counts": {"channels": 2, "oauthAccounts": 1, "apiKeys": 3, "quotaHot": 0},
         "today": {"total": 8}, "lifetime": {"total": 120},
-        "activeAlerts": {}, "revision": "rev_example",
+        "activeAlerts": {}, "publicIp": "203.0.113.10",
+        "telegramBot": {"configured": True},
+        "update": {"available": False, "latestVersion": None},
+        "revision": "rev_example",
     }]})
 
 

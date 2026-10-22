@@ -64,6 +64,7 @@ from src.management_auth import (
 from src.management_control import OperationRegistry, OperationStore, StoreAuditSink
 from src.management_control.composition import ManagementControls
 from src import mcp
+from src import webui_static
 from src.model_registry import runtime as model_registry_runtime
 from src.openai.codex_constants import codex_cli_version
 from src.openai.transform.guard import GuardError, guard_collection_fields
@@ -672,6 +673,8 @@ app.state.management_controls = None
 app.state.management_controls_runtime = None
 install_management_routers(app)
 install_management_error_handlers(app)
+# Browser WebUI static build under /ui/ (gated per request by management.webUi.enabled).
+WEBUI_HOST = webui_static.install_webui(app, enabled=lambda: config.web_ui_enabled())
 
 app.add_middleware(
     CORSMiddleware,

@@ -250,3 +250,10 @@ updateTimeoutSettings
 updateTranslationSettings
 updateVideoSettings
 updateXaiMediaSettings
+getManagementLoginOptions
+listManagementSessions
+revokeManagementSession
+revokeOtherManagementSessions
+getStatsTimeseries
+getWebUiSettings
+updateWebUiSettings

@@ -139,6 +139,19 @@ class LogsControl:
             int(total),
         )
 
+    def list_records(
+        self, context: ManagementContext, log_ids: list[str], *, month: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """The exact ``list_logs`` item mapping for known IDs (live events)."""
+        require(context)
+        with map_historical_log_errors():
+            rows = self.log_db.management_log_rows(list(log_ids), month=month)
+        billing = self.log_db.costs_for_logs(rows)
+        return [
+            self._list_record(row, billing=billing.get(str(row.get("request_id") or "")))
+            for row in rows
+        ]
+
     def list_telegram(
         self,
         context: ManagementContext,

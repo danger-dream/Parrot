@@ -32,9 +32,14 @@ from src.management_control import (
 )
 from src.management_control.composition import ManagementControls, build_management_controls
 
+from .origin_policy import origin_allowed
+
 
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _BEARER = HTTPBearer(auto_error=False, scheme_name="ManagementSession")
+SESSION_COOKIE_NAME = "parrot_management_session"
+SESSION_COOKIE_PATH = "/api/management"
+_SAFE_METHODS = frozenset({"GET", "HEAD"})
 
 
 @dataclass(slots=True)
@@ -49,6 +54,8 @@ class ManagementRuntime:
     application_version: str
     documentation_url: str
     controls: ManagementControls | None = field(default=None, init=False, repr=False)
+    # Lazily created by the /events WebSocket; closed with this runtime.
+    live_events: object | None = field(default=None, init=False, repr=False)
     _close_lock: RLock = field(default_factory=RLock, init=False, repr=False)
     _close_complete: Event = field(default_factory=Event, init=False, repr=False)
     _closing: bool = field(default=False, init=False, repr=False)
@@ -77,7 +84,14 @@ class ManagementRuntime:
                 return False
             self._closing = True
             self.controls = None
-            return True
+            live_events, self.live_events = self.live_events, None
+        close = getattr(live_events, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        return True
 
     def _finish_close(self) -> None:
         try:
@@ -114,6 +128,7 @@ class ManagementRuntime:
 class AuthenticatedSession:
     credential: str
     verified: VerifiedSession
+    transport: str = "bearer"
 
 
 def management_request_id(request: Request) -> str:
@@ -140,15 +155,22 @@ def get_management_runtime(request: Request) -> ManagementRuntime:
     return runtime
 
 
-async def get_authenticated_session(
-    request: Request,
-    runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
-    authorization: Annotated[HTTPAuthorizationCredentials | None, Security(_BEARER)],
-) -> AuthenticatedSession:
-    if authorization is None or authorization.scheme.lower() != "bearer":
-        raise ManagementError(ManagementErrorCode.SESSION_REQUIRED)
+def browser_origin_allowed(runtime: ManagementRuntime, headers) -> bool:
+    """Whether the request carries an Origin accepted by the management policy."""
+    origin = headers.get("origin")
+    if origin is None:
+        return False
+    return origin_allowed(
+        origin,
+        allowed=getattr(runtime, "allowed_origins", ()),
+        host=headers.get("host"),
+        forwarded_host=headers.get("x-forwarded-host"),
+    )
+
+
+def _verify(runtime: ManagementRuntime, credential: str) -> VerifiedSession:
     try:
-        verified = runtime.sessions.verify(authorization.credentials)
+        return runtime.sessions.verify(credential)
     except SessionAuthenticationError as exc:
         code = (
             ManagementErrorCode.SESSION_EXPIRED
@@ -156,9 +178,31 @@ async def get_authenticated_session(
             else ManagementErrorCode.SESSION_REQUIRED
         )
         raise ManagementError(code) from exc
+
+
+async def get_authenticated_session(
+    request: Request,
+    runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
+    authorization: Annotated[HTTPAuthorizationCredentials | None, Security(_BEARER)],
+) -> AuthenticatedSession:
+    if authorization is not None and authorization.scheme.lower() == "bearer":
+        return AuthenticatedSession(
+            credential=authorization.credentials,
+            verified=_verify(runtime, authorization.credentials),
+        )
+    cookie = request.cookies.get(SESSION_COOKIE_NAME)
+    if not cookie:
+        raise ManagementError(ManagementErrorCode.SESSION_REQUIRED)
+    # Cookies are attached by the browser automatically, so every state-changing
+    # cookie request must prove it comes from an allowed page (CSRF defense).
+    if request.method.upper() not in _SAFE_METHODS and not browser_origin_allowed(
+        runtime, request.headers,
+    ):
+        raise ManagementError(ManagementErrorCode.ORIGIN_DENIED)
     return AuthenticatedSession(
-        credential=authorization.credentials,
-        verified=verified,
+        credential=cookie,
+        verified=_verify(runtime, cookie),
+        transport="cookie",
     )
 
 

@@ -77,8 +77,15 @@ def configure_management_approval_handler(
 def send_management_approval(admin_ids: tuple[int, ...], notification) -> bool:
     """Render the only new TG surface without exposing browser credentials."""
     device = notification.device_summary or "未提供"
+    confirm_code = str(getattr(notification, "confirm_code", "") or "")
+    confirm = (
+        f"确认码：<b><code>{ui.escape_html(confirm_code)}</code></b>\n"
+        "请确认与网页上显示的一致\n\n"
+        if confirm_code else ""
+    )
     text = (
         "🔐 <b>Management 登录批准</b>\n\n"
+        f"{confirm}"
         f"客户端：<code>{ui.escape_html(notification.client_name)}</code>\n"
         f"来源：<code>{ui.escape_html(notification.source_address)}</code>\n"
         f"设备：<code>{ui.escape_html(device)}</code>\n"

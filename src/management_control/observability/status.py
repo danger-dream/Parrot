@@ -55,6 +55,20 @@ def _plain(value: Any) -> Any:
     return str(value)
 
 
+def _telegram_configured(cfg: Any) -> bool:
+    """Bot token present and at least one numeric administrator id."""
+    telegram = cfg.get("telegram") if isinstance(cfg, dict) else None
+    if not isinstance(telegram, dict) or not telegram.get("botToken"):
+        return False
+    for value in telegram.get("adminIds") or ():
+        try:
+            int(value)
+            return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 class StatusControl:
     def __init__(
         self,
@@ -203,6 +217,31 @@ class StatusControl:
         value = self.public_ip_service.get()
         return str(value) if value else None
 
+    def _cached_public_ip(self) -> str | None:
+        """The same cached egress IP the TG main menu shows; never fetches."""
+        try:
+            value = self.public_ip_service.get()
+        except Exception:
+            return None
+        return str(value) if value else None
+
+    def _cached_update(self) -> dict[str, Any]:
+        """Last background check result only; never triggers a network check.
+
+        ``available`` follows the TG main-menu banner rule exactly (newer than
+        the running version and not ignored by the operator).
+        """
+        latest = None
+        available = False
+        try:
+            cached = self.update_checker.get_cached() or {}
+            value = cached.get("latest_version") if isinstance(cached, dict) else None
+            latest = str(value) if value else None
+            available = self.update_checker.get_update_banner() is not None
+        except Exception:
+            pass
+        return {"available": bool(available and latest), "latestVersion": latest}
+
     def status_summary(self, context: ManagementContext) -> str | None:
         require(context)
         return self.status_monitor.get_active_summary()
@@ -309,6 +348,9 @@ class StatusControl:
             "today": camelize(sanitize_credentials(_plain(today or {}))),
             "lifetime": camelize(sanitize_credentials(_plain(lifetime or {}))),
             "activeAlerts": camelize(sanitize_credentials(_plain(self.status_monitor.snapshot_active()))),
+            "publicIp": self._cached_public_ip(),
+            "telegramBot": {"configured": _telegram_configured(cfg)},
+            "update": self._cached_update(),
         }
         # Uptime is a clock-derived display value, not a resource mutation.
         data["revision"] = revision_for({

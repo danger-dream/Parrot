@@ -29,6 +29,7 @@ from ..dependencies import (
 from ..discovery import build_discovery_snapshot, supported_capabilities
 from ..error_mapping import management_error_responses
 from ..response_helpers import response_meta as _meta
+from ..session_cookie import clear_session_cookie, has_session_cookie, set_session_cookie
 from ..schemas import (
     DataEnvelope,
     ManagementCapabilitiesData,
@@ -50,6 +51,16 @@ _SESSION_GRANT_EXAMPLES = {
     "managementKey": {
         "summary": "Exchange a configured management key",
         "value": {"grantType": "managementKey", "managementKey": "<write-only>"},
+    },
+    "browserCookie": {
+        "summary": "Browser login that stores the session in an HttpOnly cookie",
+        "value": {
+            "grantType": "managementKey",
+            "managementKey": "<write-only>",
+            "sessionTransport": "cookie",
+            "clientName": "Parrot WebUI",
+            "deviceSummary": "Chrome on macOS",
+        },
     },
     "telegramApproval": {
         "summary": "Exchange an approved Telegram challenge",
@@ -92,6 +103,7 @@ _APPROVAL_CREATED_EXAMPLE = {
         "exchangeSecret": "<one-time-exchange-secret>",
         "expiresAt": "2026-01-02T03:07:05Z",
         "pollAfterSeconds": 2,
+        "confirmCode": "7KQ2",
     },
     "meta": {"requestId": "request-example"},
 }
@@ -234,10 +246,19 @@ async def create_management_session(
     try:
         if isinstance(grant, ManagementKeyGrant):
             source = request.client.host if request.client else "unknown"
+            device = {
+                key: value
+                for key, value in (
+                    ("client_name", grant.clientName),
+                    ("device_summary", grant.deviceSummary),
+                )
+                if value is not None
+            }
             issued = runtime.sessions.create_from_management_key(
                 grant.managementKey.get_secret_value(),
                 source=source,
                 request_id=request_id,
+                **device,
             )
         else:
             issued = runtime.sessions.create_from_telegram_approval(
@@ -253,9 +274,14 @@ async def create_management_session(
     except SessionAuthenticationError as exc:
         raise ManagementError(ManagementErrorCode.AUTHENTICATION_FAILED) from exc
     response.headers["Cache-Control"] = "no-store"
+    credential: str | None = issued.credential
+    if grant.sessionTransport == "cookie":
+        # Script-invisible: the credential exists only in the HttpOnly cookie.
+        set_session_cookie(request, response, issued.credential, issued.expires_at)
+        credential = None
     return DataEnvelope(
         data=SessionCredentialData(
-            credential=issued.credential,
+            credential=credential,
             session=_session_summary(issued),
         ),
         meta=_meta(request),
@@ -314,7 +340,10 @@ async def revoke_current_management_session(
         authenticated.credential,
         request_id=management_request_id(request),
     )
-    return Response(status_code=status.HTTP_204_NO_CONTENT, headers={"Cache-Control": "no-store"})
+    response = Response(status_code=status.HTTP_204_NO_CONTENT, headers={"Cache-Control": "no-store"})
+    if has_session_cookie(request):
+        clear_session_cookie(request, response)
+    return response
 
 
 @router.post(
@@ -369,6 +398,7 @@ async def create_telegram_approval(
             exchangeSecret=issued.exchange_secret,
             expiresAt=issued.expires_at,
             pollAfterSeconds=issued.poll_after_seconds,
+            confirmCode=issued.confirm_code,
         ),
         meta=_meta(request),
     )

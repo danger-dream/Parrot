@@ -200,6 +200,15 @@ class OpenAiWebSocketSettingsPatch(StrictRequestSchema):
     responsesUpstreamWsForOAuth: bool | None = None
 
 
+class WebUiSettingsData(StrictSchema):
+    enabled: bool
+    revision: str
+
+
+class WebUiSettingsPatch(StrictRequestSchema):
+    enabled: bool | None = None
+
+
 class BlacklistTermRequest(StrictRequestSchema):
     term: str = Field(min_length=1, max_length=200)
 

@@ -118,6 +118,12 @@ class OpenAiWebSocketSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class WebUiSettings:
+    enabled: bool
+    revision: str
+
+
+@dataclass(frozen=True, slots=True)
 class ChannelBlacklist:
     channelId: str
     terms: tuple[str, ...]

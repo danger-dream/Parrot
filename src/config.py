@@ -491,6 +491,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "authRateLimitGlobal": 30,
         "maxOperations": 500,
         "maxAuditRecords": 5000,
+        # Browser WebUI (/ui/). Upgraded installations stay closed until an
+        # administrator enables it from Telegram or the Management API.
+        "webUi": {
+            "enabled": False,
+        },
     },
     "telegram": {
         "botToken": "",
@@ -1047,6 +1052,10 @@ def management_settings(cfg: dict | None = None) -> dict[str, Any]:
             raise ValueError("management.allowedOrigins contains an invalid origin")
         clean_origins.append(f"{parsed.scheme}://{parsed.netloc}")
 
+    web_ui = management.get("webUi", {})
+    if not isinstance(web_ui, dict) or not isinstance(web_ui.get("enabled", False), bool):
+        raise ValueError("management.webUi.enabled must be a boolean")
+
     configured_path = management.get("stateDbPath")
     if not isinstance(configured_path, str) or not configured_path.strip():
         raise ValueError("management.stateDbPath must not be empty")
@@ -1064,7 +1073,20 @@ def management_settings(cfg: dict | None = None) -> dict[str, Any]:
         "authRateLimitGlobal": rate_global,
         "maxOperations": max_operations,
         "maxAuditRecords": max_audit,
+        "webUiEnabled": web_ui.get("enabled", False),
     }
+
+
+def web_ui_enabled(cfg: dict | None = None) -> bool:
+    """Return True only for an explicit boolean ``management.webUi.enabled``.
+
+    Missing or malformed values fail closed so a damaged section never exposes
+    the browser surface.
+    """
+    source = cfg if cfg is not None else get()
+    management = source.get("management") if isinstance(source, dict) else None
+    web_ui = management.get("webUi") if isinstance(management, dict) else None
+    return isinstance(web_ui, dict) and web_ui.get("enabled") is True
 
 
 def _load_from_disk() -> dict:

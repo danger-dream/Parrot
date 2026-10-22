@@ -1,0 +1,1 @@
+import{Dt as e,Jt as t,Mt as n,St as r}from"./vendor-DbmO0zVR.js";import{w as i}from"./index-B1elDzYS.js";var a=i(e({__name:`Skeleton`,props:{w:{},h:{},r:{}},setup(e){return(i,a)=>(n(),r(`span`,{class:`sk`,style:t({width:e.w||`100%`,height:e.h||`12px`,borderRadius:e.r||`6px`})},null,4))}}),[[`__scopeId`,`data-v-47f2776f`]]);export{a as t};

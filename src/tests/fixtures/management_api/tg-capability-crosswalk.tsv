@@ -1,5 +1,5 @@
 capabilityId	coverage	owner	operationIds	note
-TG-CORE-01	auth	SessionService+ApprovalService	createManagementSession,getCurrentManagementSession,revokeCurrentManagementSession,createTelegramApproval,getTelegramApproval,getManagementMetadata,getManagementCapabilities,getManagementOperation,cancelManagementOperation	TG lifecycle remains adapter-owned; management authentication and operation polling are exposed here
+TG-CORE-01	auth	SessionService+ApprovalService	createManagementSession,getCurrentManagementSession,revokeCurrentManagementSession,createTelegramApproval,getTelegramApproval,getManagementMetadata,getManagementCapabilities,getManagementOperation,cancelManagementOperation,getManagementLoginOptions,listManagementSessions,revokeManagementSession,revokeOtherManagementSessions	TG lifecycle remains adapter-owned; management authentication and operation polling are exposed here
 TG-CORE-02	adapter-only	Telegram adapter		command registration text/order has no HTTP business counterpart
 TG-CORE-03	adapter-only	Telegram adapter		text command dispatch only navigates to capabilities mapped below
 TG-CORE-04	adapter-only	Telegram adapter		callback dispatch only navigates to capabilities mapped below
@@ -27,7 +27,7 @@ TG-AK-02	shared	ApiKeyControl	updateApiKey,deleteApiKey,planApiKeyRegeneration,r
 TG-AK-03	shared	ApiKeyControl	updateApiKey,getApiKeyStats	permissions, limits and model stats
 TG-AK-04	shared	ApiKeyControl	reorderApiKeys	API key ordering
 TG-CACHE-01	shared+adapter	StatsControl	getStatsSummary	query is shared; scheduler/view-token/message-lock remain Telegram adapter mechanics
-TG-STATS-01	shared	StatsControl	getStatsSummary,getStatsBreakdown,getModelStats,listRecentCalls	statistics queries
+TG-STATS-01	shared	StatsControl	getStatsSummary,getStatsBreakdown,getModelStats,listRecentCalls,getStatsTimeseries	statistics queries
 TG-STATS-02	shared	StatsControl	getTelegramStatsPreferences,updateTelegramStatsPreferences	Telegram statistics visibility preferences
 TG-LOG-01	shared	LogsControl	listRequestLogs,getRequestLogFilterOptions	request-log list and filter options
 TG-LOG-02	shared	LogsControl	listRequestLogs,getRequestLogFilterOptions	request-log filter semantics
@@ -41,7 +41,7 @@ TG-SYS-04	shared	SettingsControl+ContentBlacklistControl	getNotificationSettings
 TG-SYS-05	shared	RetentionControl	getLogRetentionSettings,updateLogRetentionSettings,createLogRetentionPlan,commitLogRetentionPlan,cancelLogRetentionPlan	log body retention and two-phase deletion
 TG-SYS-06	shared	NetworkControl	getNetworkSettings,testDnsSettings,commitDnsSettings,syncSystemDns,listDnsCache,clearDnsCache,testSocks5Settings,commitSocks5Settings,updateSocks5State	DNS and SOCKS5
 TG-SYS-07	shared	NetworkControl	getNetworkMonitor,updateNetworkMonitor,listNetworkChecks,runNetworkMonitor	network monitor
-TG-SYS-08	shared	SettingsControl	getConcurrencySettings,updateConcurrencySettings,getApiKeyConcurrencySettings,updateApiKeyConcurrencySettings,getOpenAiWebSocketSettings,updateOpenAiWebSocketSettings	channel/API-key concurrency and OpenAI WebSocket
+TG-SYS-08	shared	SettingsControl	getConcurrencySettings,updateConcurrencySettings,getApiKeyConcurrencySettings,updateApiKeyConcurrencySettings,getOpenAiWebSocketSettings,updateOpenAiWebSocketSettings,getWebUiSettings,updateWebUiSettings	channel/API-key concurrency and OpenAI WebSocket
 TG-MAP-01	shared	ModelCenterControl+MappingControl	listModels,getModel,setModelState,getModelRegistry,replaceModelRegistryRules,putModelDefaultEffort,listModelMappings,putModelMapping,updateModelMapping,deleteModelMapping,getIngressDefaultModel,putIngressDefaultModel,deleteIngressDefaultModel	unified model catalog/state and independent aliases; ingress-default operations remain compatibility read/cleanup or explicit unsupported writes, not a Telegram default-model feature
 TG-MAP-02	shared	MappingControl	getCompressionModel,putCompressionModel,deleteCompressionModel,listModelInventory,listModelMetadata,getModelMetadata,putModelMetadataBinding,deleteModelMetadataBinding,patchModelMetadataOverrides,deleteModelMetadataOverrides,syncModelMetadata,searchModelCatalog	metadata, scoped field overrides/inheritance, catalog, bindings and compression model
 TG-LB-01	shared	LoadBalancingControl	getLoadBalancing,updateLoadBalancingMode,getChannelOrder,replaceChannelOrder,getModelChannelOrder,replaceModelChannelOrder,deleteModelChannelOrder,bulkReplaceModelChannelOrders,clearAllAffinity,clearFamilyAffinity	load balancing, ordering and affinity cleanup

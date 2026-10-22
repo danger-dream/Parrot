@@ -1,0 +1,112 @@
+:root {
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", "Noto Sans CJK SC", "Segoe UI", sans-serif;
+  --font-display: ui-rounded, "SF Pro Rounded", -apple-system, BlinkMacSystemFont, "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+  --font-mono: "SF Mono", ui-monospace, "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+  --radius-xs: 5px;
+  --radius-sm: 7px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
+
+  --sidebar-w: 232px;
+  --sidebar-rail-w: 64px;
+  --topbar-h: 52px;
+  --inspector-w: 440px;
+  --tabbar-h: 58px;
+
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  --blue: #0a84ff;
+  --green: #30d158;
+  --orange: #ff9f0a;
+  --red: #ff453a;
+  --purple: #bf5af2;
+  --teal: #64d2ff;
+  --yellow: #ffd60a;
+  --pink: #ff375f;
+  --indigo: #5e5ce6;
+  --telegram: #2aabee;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #111113;
+  --bg-elev: #18181b;
+  --bg-glow-1: rgba(10, 132, 255, 0.16);
+  --bg-glow-2: rgba(48, 209, 88, 0.08);
+  --bg-glow-3: rgba(191, 90, 242, 0.1);
+  --sidebar: rgba(28, 28, 31, 0.72);
+  --topbar: rgba(17, 17, 19, 0.72);
+  --surface: rgba(38, 38, 42, 0.62);
+  --surface-solid: #1f1f23;
+  --surface-hover: rgba(58, 58, 64, 0.7);
+  --surface-sunken: rgba(0, 0, 0, 0.28);
+  --surface-raised: #2a2a2f;
+  --overlay: rgba(0, 0, 0, 0.5);
+  --border: rgba(255, 255, 255, 0.075);
+  --border-strong: rgba(255, 255, 255, 0.14);
+  --hairline: rgba(255, 255, 255, 0.06);
+  --text: rgba(255, 255, 255, 0.92);
+  --text-2: rgba(235, 235, 245, 0.62);
+  --text-3: rgba(235, 235, 245, 0.38);
+  --text-inverse: #111;
+  --fill: rgba(120, 120, 128, 0.2);
+  --fill-2: rgba(120, 120, 128, 0.14);
+  --fill-3: rgba(120, 120, 128, 0.08);
+  --selection: rgba(10, 132, 255, 0.22);
+  --accent: var(--blue);
+  --accent-soft: rgba(10, 132, 255, 0.16);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 8px 24px -8px rgba(0, 0, 0, 0.6), 0 0 0 0.5px rgba(255, 255, 255, 0.08);
+  --shadow-lg: 0 24px 64px -16px rgba(0, 0, 0, 0.75), 0 0 0 0.5px rgba(255, 255, 255, 0.1);
+  --card-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.045);
+  --chart-grid: rgba(255, 255, 255, 0.06);
+  --chart-axis: rgba(235, 235, 245, 0.38);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f2f2f5;
+  --bg-elev: #ffffff;
+  --bg-glow-1: rgba(10, 132, 255, 0.1);
+  --bg-glow-2: rgba(48, 209, 88, 0.07);
+  --bg-glow-3: rgba(191, 90, 242, 0.06);
+  --sidebar: rgba(236, 236, 240, 0.78);
+  --topbar: rgba(242, 242, 245, 0.78);
+  --surface: rgba(255, 255, 255, 0.82);
+  --surface-solid: #ffffff;
+  --surface-hover: rgba(255, 255, 255, 1);
+  --surface-sunken: rgba(0, 0, 0, 0.035);
+  --surface-raised: #ffffff;
+  --overlay: rgba(0, 0, 0, 0.22);
+  --border: rgba(0, 0, 0, 0.07);
+  --border-strong: rgba(0, 0, 0, 0.13);
+  --hairline: rgba(0, 0, 0, 0.06);
+  --text: rgba(0, 0, 0, 0.86);
+  --text-2: rgba(60, 60, 67, 0.7);
+  --text-3: rgba(60, 60, 67, 0.42);
+  --text-inverse: #fff;
+  --fill: rgba(120, 120, 128, 0.16);
+  --fill-2: rgba(120, 120, 128, 0.11);
+  --fill-3: rgba(120, 120, 128, 0.07);
+  --selection: rgba(10, 132, 255, 0.16);
+  --accent: #007aff;
+  --accent-soft: rgba(0, 122, 255, 0.11);
+  --blue: #007aff;
+  --green: #28b04a;
+  --orange: #f08c00;
+  --red: #ff3b30;
+  --purple: #af52de;
+  --teal: #32ade6;
+  --yellow: #e6b800;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 8px 24px -10px rgba(0, 0, 0, 0.18), 0 0 0 0.5px rgba(0, 0, 0, 0.06);
+  --shadow-lg: 0 24px 64px -16px rgba(0, 0, 0, 0.28), 0 0 0 0.5px rgba(0, 0, 0, 0.08);
+  --card-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  --chart-grid: rgba(0, 0, 0, 0.06);
+  --chart-axis: rgba(60, 60, 67, 0.45);
+}
