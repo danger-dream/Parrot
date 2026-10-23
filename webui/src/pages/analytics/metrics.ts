@@ -26,11 +26,28 @@ export const PERIOD_LONG: Record<Period, string> = {
   lifetime: '累计',
 }
 
-export const DIMS: { value: Dim; label: string }[] = [
-  { value: 'model', label: '按模型' },
-  { value: 'channel', label: '按渠道' },
-  { value: 'apiKey', label: '按 Key' },
+/** What a ranking lists; OAuth accounts and API channels share the backend's channel dimension. */
+export type RankView = 'model' | 'oauth' | 'api' | 'apiKey'
+
+export const RANK_VIEWS: { value: RankView; label: string }[] = [
+  { value: 'model', label: '模型' },
+  { value: 'oauth', label: 'OAuth 账号' },
+  { value: 'api', label: 'API 渠道' },
+  { value: 'apiKey', label: '下游 Key' },
 ]
+
+export const VIEW_NAME: Record<RankView, string> = { model: '模型', oauth: 'OAuth 账号', api: 'API 渠道', apiKey: '下游 Key' }
+
+export function viewDim(v: RankView): Dim {
+  return v === 'oauth' || v === 'api' ? 'channel' : v
+}
+
+/** Whether a breakdown row belongs to the view (the unrecorded "?" row is not an account or channel). */
+export function inView(v: RankView, key: string): boolean {
+  if (v === 'oauth') return key.startsWith('oauth:')
+  if (v === 'api') return key.startsWith('api:')
+  return true
+}
 
 export const FOCI: { value: Focus; label: string }[] = [
   { value: 'requests', label: '请求数' },
@@ -42,8 +59,10 @@ export const FOCI: { value: Focus; label: string }[] = [
 export function parsePeriod(v: unknown): Period | null {
   return PERIODS.some((p) => p.value === v) ? (v as Period) : null
 }
-export function parseDim(v: unknown): Dim | null {
-  return DIMS.some((d) => d.value === v) ? (v as Dim) : null
+/** `dimension` in the analytics URL; the older `channel` opens the account ranking. */
+export function parseView(v: unknown): RankView | null {
+  if (v === 'channel') return 'oauth'
+  return RANK_VIEWS.some((d) => d.value === v) ? (v as RankView) : null
 }
 export function parseFocus(v: unknown): Focus | null {
   return FOCI.some((f) => f.value === v) ? (v as Focus) : null

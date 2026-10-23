@@ -14,7 +14,7 @@ import Btn from '@/components/ui/Btn.vue'
 import TrafficTrend from './TrafficTrend.vue'
 import HealthTimeline from './HealthTimeline.vue'
 import TokenMix from './TokenMix.vue'
-import ModelRanking from './ModelRanking.vue'
+import UsageRanking from './UsageRanking.vue'
 import ChannelHealth from './ChannelHealth.vue'
 import AccountQuota from './AccountQuota.vue'
 import FamilyTable from './FamilyTable.vue'
@@ -150,7 +150,7 @@ const waiting = computed(() => live.snapshot?.channelTotals.waiting ?? catalog.s
     </section>
 
     <section class="row b">
-      <ModelRanking :rows="ov.models" :ready="ov.ready" />
+      <UsageRanking :ready="ov.ready" />
       <ChannelHealth :ready="ov.ready" />
       <AccountQuota :ready="ov.ready" />
     </section>
@@ -212,8 +212,10 @@ const waiting = computed(() => live.snapshot?.channelTotals.waiting ?? catalog.s
 .row.a {
   grid-template-columns: minmax(0, 1.25fr) minmax(0, 1.25fr) minmax(0, 0.8fr);
 }
+/* One height for the three list cards; each list fills its card and scrolls, so the bottoms line up. */
 .row.b {
   grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-auto-rows: 440px;
 }
 @media (max-width: 1279px) {
   .row.a,

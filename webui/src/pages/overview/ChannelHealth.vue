@@ -5,7 +5,8 @@ import OutcomeStrip from '@/components/ui/OutcomeStrip.vue'
 import ProviderIcon from '@/components/ProviderIcon.vue'
 import { catalog } from '@/stores/catalog'
 import { channelProvider } from '@/utils/providers'
-import { goPage, openChannel } from '@/links'
+import { goLogs, goPage, openChannel } from '@/links'
+import { Ban } from '@lucide/vue'
 import { compact, integer, pctValue } from '@/utils/format'
 import { ov } from './data'
 import { promptOf } from './metrics'
@@ -35,7 +36,8 @@ function problemOf(c: Status): { label: string; tone: string } | null {
   return null
 }
 
-// Enabled channels/accounts with requests in the last 24 hours: problems first, then by today's traffic.
+// Enabled channels/accounts with requests today: problems first, then by today's traffic.
+// The strip, the request count and the failure count all cover today, like the request health timeline.
 const all = computed(() => {
   const today = new Map(ov.channels.map((r) => [r.key, r.metrics]))
   return (catalog.status?.channels || [])
@@ -59,19 +61,40 @@ const all = computed(() => {
 })
 const rows = computed(() => all.value.filter((r) => r.n > 0))
 const quiet = computed(() => all.value.length - rows.value.length)
+// Requests that failed before reaching any channel (e.g. no channel available for the model).
+const unassigned = computed(() => {
+  const o = ov.outcomes?.items['?']
+  return o && o.total ? o : null
+})
+const elapsed = computed(() => ov.outcomes?.count ?? 0)
+
+function openUnassigned(): void {
+  const start = new Date()
+  start.setHours(0, 0, 0, 0)
+  goLogs({ status: 'error', from: start.getTime() })
+}
 </script>
 
 <template>
-  <Card title="渠道健康" subtitle="近 24 小时，一格一小时：绿全部成功、橙有失败、红失败占两成以上，右侧最新">
+  <Card title="渠道健康" subtitle="今日按小时：绿全部成功、橙有失败、红失败超两成">
     <template #actions>
       <button class="more" @click="goPage('/channels')">全部渠道</button>
     </template>
     <div class="head">
       <span>渠道 / 账号</span>
-      <span>近 24 小时</span>
+      <span>今日 00–23 时</span>
       <span class="r">失败</span>
     </div>
     <div class="list">
+      <button v-if="unassigned && unassigned.errorCount" class="item" @click="openUnassigned">
+        <span class="ic"><Ban /></span>
+        <div class="main">
+          <span class="name truncate">未分配到渠道</span>
+          <span class="sub o truncate" title="没有可用渠道等原因，请求没有发到任何渠道">今日 {{ integer(unassigned.total) }} 次 · 没有可用渠道等原因</span>
+        </div>
+        <OutcomeStrip :item="unassigned" :from="ov.outcomes?.from" :count="24" :elapsed="elapsed" :width="3" :gap="1" :height="16" />
+        <span class="rate num r">失败 {{ integer(unassigned.errorCount) }}</span>
+      </button>
       <button v-for="r in rows" :key="r.id" class="item" @click="openChannel(r.id)">
         <ProviderIcon :provider="channelProvider(r.id)" :size="22" />
         <div class="main">
@@ -79,11 +102,11 @@ const quiet = computed(() => all.value.length - rows.value.length)
           <span v-if="r.health" class="sub truncate" :class="r.health.tone" :title="r.health.label">{{ r.health.label }}</span>
           <span v-else class="sub">今日 {{ integer(r.today) }} 次 · {{ compact(r.tokens) }} Token</span>
         </div>
-        <OutcomeStrip :item="r.outcome" :from="ov.outcomes?.from" :width="3" :gap="1" :height="16" />
-        <span class="rate num" :class="r.errors ? (r.errors / r.n >= 0.2 ? 'r' : 'o') : 'g'" :title="`近 24 小时 ${integer(r.n)} 次`">{{ r.errors ? `失败 ${integer(r.errors)}` : '无失败' }}</span>
+        <OutcomeStrip :item="r.outcome" :from="ov.outcomes?.from" :count="24" :elapsed="elapsed" :width="3" :gap="1" :height="16" />
+        <span class="rate num" :class="r.errors ? (r.errors / r.n >= 0.2 ? 'r' : 'o') : 'g'" :title="`今日 ${integer(r.n)} 次`">{{ r.errors ? `失败 ${integer(r.errors)}` : '无失败' }}</span>
       </button>
-      <p v-if="ready && !rows.length" class="empty">近 24 小时没有请求</p>
-      <p v-if="quiet" class="quiet">另有 {{ quiet }} 个启用的渠道近 24 小时没有请求</p>
+      <p v-if="ready && !rows.length && !unassigned" class="empty">今天还没有请求</p>
+      <p v-if="quiet" class="quiet">另有 {{ quiet }} 个启用的渠道今天没有请求</p>
     </div>
   </Card>
 </template>
@@ -101,12 +124,28 @@ const quiet = computed(() => all.value.length - rows.value.length)
   text-align: right;
 }
 .list {
-  height: 278px;
+  flex: 1;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 2px;
   overflow-y: auto;
+  overflow-x: hidden;
   margin: 0 -8px;
+}
+.ic {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  border-radius: 6px;
+  color: var(--text-orange);
+  background: color-mix(in srgb, var(--orange) 12%, transparent);
+}
+.ic svg {
+  width: 14px;
+  height: 14px;
 }
 .item {
   display: flex;

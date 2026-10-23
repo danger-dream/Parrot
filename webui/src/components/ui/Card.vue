@@ -52,7 +52,9 @@ defineProps<{
   gap: 8px 12px;
   padding: 16px 18px 0;
 }
+/* The titles give way first, so the actions stay in the top-right corner; they only wrap below on narrow screens. */
 .card-titles {
+  flex: 1 1 200px;
   min-width: 0;
 }
 .card-title {

@@ -1,1 +1,0 @@
-import{$n as e,Hn as t,Jn as n,hr as r}from"./vendor-DE0cqphB.js";import{s as i}from"./client-QfKjXhzW.js";var a=i(n({__name:`Skeleton`,props:{w:{},h:{},r:{}},setup(n){return(i,a)=>(e(),t(`span`,{class:`sk`,style:r({width:n.w||`100%`,height:n.h||`12px`,borderRadius:n.r||`6px`})},null,4))}}),[[`__scopeId`,`data-v-c05b5495`]]);export{a as t};

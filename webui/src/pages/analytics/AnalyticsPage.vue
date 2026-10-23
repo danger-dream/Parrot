@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ListFilter, RefreshCw } from '@lucide/vue'
 import { api, type Schemas } from '@/api/client'
@@ -16,7 +16,7 @@ import FamilyCards from './FamilyCards.vue'
 import GroupTrend from './GroupTrend.vue'
 import RankingCard from './RankingCard.vue'
 import CacheMisses from './CacheMisses.vue'
-import { DIMS, FOCI, parseDim, parseFocus, parsePeriod, PERIODS, periodStart, type Dim, type Focus, type Period } from './metrics'
+import { FOCI, inView, parseFocus, parsePeriod, parseView, PERIODS, periodStart, viewDim, type Focus, type Period, type RankView } from './metrics'
 
 type Summary = Schemas['StatsSummaryData']
 type Row = Schemas['StatsBreakdownData']
@@ -26,7 +26,8 @@ const router = useRouter()
 
 // Deep link: /analytics?period=7d&dimension=channel&metric=cost — applied on entry and whenever the query changes.
 const period = ref<Period>(parsePeriod(route.query.period) || 'today')
-const dim = ref<Dim>(parseDim(route.query.dimension) || 'model')
+const view = ref<RankView>(parseView(route.query.dimension) || 'model')
+const dim = computed(() => viewDim(view.value))
 const focus = ref<Focus>(parseFocus(route.query.metric) || 'requests')
 
 watch(
@@ -34,13 +35,13 @@ watch(
   (q) => {
     if (route.path !== '/analytics') return
     period.value = parsePeriod(q.period) || 'today'
-    dim.value = parseDim(q.dimension) || 'model'
+    view.value = parseView(q.dimension) || 'model'
     focus.value = parseFocus(q.metric) || 'requests'
   },
 )
 
-watch([period, dim, focus], () => {
-  const want: Record<string, string> = { period: period.value, dimension: dim.value }
+watch([period, view, focus], () => {
+  const want: Record<string, string> = { period: period.value, dimension: view.value }
   if (focus.value !== 'requests') want.metric = focus.value
   const cur = route.query
   const same =
@@ -55,6 +56,7 @@ const rows = ref<Row[]>([])
 const rowsTruncated = ref(false)
 const rowsLoading = ref(false)
 const rowsError = ref('')
+const rankRows = computed(() => rows.value.filter((r) => inView(view.value, r.key)))
 const loadedAt = ref(0)
 /** This period against the one before it; null for 累计. */
 const compare = ref<Compare | null>(null)
@@ -154,7 +156,6 @@ onBeforeUnmount(() => {
     </template>
     <template #toolbar>
       <Segmented v-model="period" :options="PERIODS" />
-      <Segmented v-model="dim" :options="DIMS" />
       <span class="spacer" />
       <span class="lab faint">重点指标</span>
       <Segmented v-model="focus" size="sm" :options="FOCI" />
@@ -170,7 +171,7 @@ onBeforeUnmount(() => {
       @focus="focus = $event"
     />
     <GroupTrend ref="trend" :dim="dim" :focus="focus" />
-    <RankingCard :rows="rows" :dim="dim" :period="period" :focus="focus" :loading="rowsLoading" :truncated="rowsTruncated" :error="rowsError" />
+    <RankingCard v-model:view="view" :rows="rankRows" :dim="dim" :period="period" :focus="focus" :loading="rowsLoading" :truncated="rowsTruncated" :error="rowsError" />
     <div class="two">
       <FamilyCards :families="summary?.families || null" :overall="summary?.overall || null" :loading="summaryLoading" />
       <div class="side">

@@ -50,6 +50,9 @@ export interface ScopeMetrics {
   unpricedSuccess: number
   pendingCount?: number
   cancelledCount?: number
+  averageFirstTokenMilliseconds?: number | null
+  averageTotalMilliseconds?: number | null
+  averageTokensPerSecond?: number | null
 }
 
 export interface ScopeResult {

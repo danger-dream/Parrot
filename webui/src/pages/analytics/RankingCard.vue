@@ -8,6 +8,7 @@ import Badge from '@/components/ui/Badge.vue'
 import Btn from '@/components/ui/Btn.vue'
 import Empty from '@/components/ui/Empty.vue'
 import SearchField from '@/components/ui/SearchField.vue'
+import Segmented from '@/components/ui/Segmented.vue'
 import Skeleton from '@/components/ui/Skeleton.vue'
 import ModelChannels from './ModelChannels.vue'
 import { cacheShare, promptOf } from '@/pages/overview/metrics'
@@ -22,9 +23,12 @@ import {
   successRate,
   tps,
   UNKNOWN_KEYS,
+  RANK_VIEWS,
+  VIEW_NAME,
   type Dim,
   type Focus,
   type Period,
+  type RankView,
 } from './metrics'
 
 type Row = Schemas['StatsBreakdownData']
@@ -44,6 +48,7 @@ type ColKey =
   | 'tps'
 
 const props = defineProps<{ rows: Row[]; dim: Dim; period: Period; focus: Focus; loading?: boolean; truncated?: boolean; error?: string }>()
+const view = defineModel<RankView>('view', { required: true })
 
 const FOCUS_SORT: Record<Focus, ColKey> = { requests: 'total', cost: 'actual', latency: 'latency', cache: 'cache' }
 
@@ -157,20 +162,20 @@ function viewLogs(r: Row): void {
   logsFor(props.dim, r.key, { from: periodStart(props.period) })
 }
 
-const DIM_NAME: Record<Dim, string> = { model: '模型', channel: '渠道', apiKey: 'Key' }
 </script>
 
 <template>
-  <Card :title="`${DIM_NAME[dim]}排行`" :subtitle="`${PERIOD_LONG[period]} · 点击表头排序，点击一行查看详情`" flush>
+  <Card :title="`${VIEW_NAME[view]}排行`" :subtitle="`${PERIOD_LONG[period]} · 点击表头排序，点击一行查看详情`" flush>
     <template #icon><Trophy /></template>
     <template #actions>
-      <SearchField v-model="q" :placeholder="`筛选${DIM_NAME[dim]}`" width="200px" />
+      <Segmented v-model="view" size="sm" :options="RANK_VIEWS" />
+      <SearchField v-model="q" :placeholder="`筛选${VIEW_NAME[view]}`" width="200px" />
     </template>
     <p v-if="error" class="state">{{ error }}</p>
     <div v-else class="table" :class="`d-${dim}`">
       <div class="head">
         <button type="button" class="c-name" :class="{ on: sortKey === 'name' }" @click="sortBy('name')">
-          {{ DIM_NAME[dim] }}
+          {{ VIEW_NAME[view] }}
           <component :is="desc ? ArrowDown : ArrowUp" v-if="sortKey === 'name'" class="arr" />
         </button>
         <button
@@ -189,7 +194,7 @@ const DIM_NAME: Record<Dim, string> = { model: '模型', channel: '渠道', apiK
       <template v-if="loading && !rows.length">
         <div v-for="i in 8" :key="i" class="skl"><Skeleton h="14px" /></div>
       </template>
-      <Empty v-else-if="!sorted.length" :title="q ? '没有匹配的项' : '这段时间没有请求'" />
+      <Empty v-else-if="!sorted.length" :title="q ? '没有匹配的项' : `这段时间没有${VIEW_NAME[view]}的请求`" />
       <div v-else :class="{ dim: loading }">
         <template v-for="(r, i) in visibleRows" :key="r.key">
           <div

@@ -117,11 +117,13 @@ const rows = computed(() => {
 
 <style scoped>
 .list {
-  height: 300px;
+  flex: 1;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 6px;
   overflow-y: auto;
+  overflow-x: hidden;
   margin: 0 -8px;
 }
 .item {
@@ -197,18 +199,20 @@ const rows = computed(() => {
   color: var(--text-3);
   background: var(--fill-2);
 }
+/* One grid per account, so its bars line up whatever the widths of their texts. */
 .quota {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 4px 8px;
   padding-left: 30px;
+  font-size: 11.5px;
 }
 .q {
-  display: grid;
-  grid-template-columns: 64px minmax(0, 1fr) 54px 76px;
-  align-items: center;
-  gap: 8px;
-  font-size: 11.5px;
+  display: contents;
+}
+.vals {
+  grid-column: 1 / -1;
 }
 .ql {
   color: var(--text-2);
@@ -239,6 +243,7 @@ const rows = computed(() => {
 .qv {
   font-weight: 650;
   text-align: right;
+  white-space: nowrap;
 }
 .qr {
   color: var(--text-3);

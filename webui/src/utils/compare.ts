@@ -94,7 +94,7 @@ export const affinityOf = (m: CompareMetrics) => (m.total ? m.affinityHits / m.t
 /** The standard deltas; tiles pick the ones they show. */
 export function deltas(c: Compare | null, period?: ComparePeriod | null) {
   // Logs that do not reach back over the previous window would read as growth from zero.
-  if (!c || !c.previousComplete) return {} as Partial<Record<'requests' | 'success' | 'errors' | 'tokens' | 'cache' | 'hit' | 'cost' | 'firstToken' | 'output' | 'prompt' | 'cacheRead' | 'cacheWrite' | 'tps' | 'affinity', Delta | null>>
+  if (!c || !c.previousComplete) return {} as Partial<Record<'requests' | 'success' | 'errors' | 'tokens' | 'cache' | 'hit' | 'cost' | 'firstToken' | 'output' | 'prompt' | 'cacheRead' | 'cacheWrite' | 'tps' | 'totalTime' | 'affinity', Delta | null>>
   const a = previousLabel(c, period)
   const cur = c.current
   const prev = c.previous
@@ -112,6 +112,7 @@ export function deltas(c: Compare | null, period?: ComparePeriod | null) {
     cost: changeDelta(cur.costTicks, prev.costTicks, a, usd(prev.costTicks)),
     firstToken: changeDelta(cur.averageFirstTokenMilliseconds, prev.averageFirstTokenMilliseconds, a, ms(prev.averageFirstTokenMilliseconds), 'lower'),
     tps: changeDelta(cur.averageTokensPerSecond, prev.averageTokensPerSecond, a, tps(prev.averageTokensPerSecond), 'higher'),
+    totalTime: changeDelta(cur.averageTotalMilliseconds, prev.averageTotalMilliseconds, a, ms(prev.averageTotalMilliseconds), 'lower'),
     affinity: prev.total ? pointDelta(affinityOf(cur), affinityOf(prev), a) : null,
   }
 }
@@ -142,6 +143,7 @@ export function sparks(c: Compare | null) {
     cost: sparkOf(c, (p) => p.costTicks),
     firstToken: sparkOf(c, (p) => p.averageFirstTokenMilliseconds ?? null),
     tps: sparkOf(c, (p) => p.averageTokensPerSecond ?? null),
+    totalTime: sparkOf(c, (p) => p.averageTotalMilliseconds ?? null),
     affinity: sparkOf(c, (p) => (p.total ? affinityOf(p)! * 100 : null)),
     errors: sparkOf(c, (p) => p.errorCount),
   }

@@ -2,8 +2,8 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
-  ArrowRight, ChevronLeft, ChevronRight, ChevronsLeft, CircleCheck, CircleX, Coins, DatabaseZap, Download, Inbox,
-  Layers, Pause, Play, RefreshCw, Search, Upload, X,
+  ArrowRight, ChevronLeft, ChevronRight, ChevronsLeft, CircleCheck, CircleX, Coins, Hourglass, Inbox,
+  Layers, Pause, Play, RefreshCw, Search, Timer, X, Zap,
 } from '@lucide/vue'
 import { api } from '@/api/client'
 import { eventLink, onEvent } from '@/api/events'
@@ -11,7 +11,7 @@ import type { RequestLogData, RequestLogFilterOptionsData } from '@/api/types'
 import { live, seedFeed, type LiveRequest } from '@/stores/live'
 import { channelName } from '@/stores/catalog'
 import { inspector } from '@/stores/ui'
-import { compact, dateTime, integer, usd } from '@/utils/format'
+import { compact, dateTime, integer, ms, tps, usd } from '@/utils/format'
 import { openRequest } from './openRequest'
 import { rowChannelName, type LogRow } from './logView'
 import { loadScope, periodStart, PERIODS, type Period, type ScopeResult } from './scopeStats'
@@ -405,6 +405,10 @@ const kpi = computed(() => {
     cacheShare: prompt ? cacheRead / prompt : null,
     cost: m.costTicks + d.cost,
     unpriced: m.unpricedSuccess,
+    // Averages come from the snapshot; a few live requests do not move them noticeably.
+    firstToken: m.averageFirstTokenMilliseconds ?? null,
+    totalTime: m.averageTotalMilliseconds ?? null,
+    tps: m.averageTokensPerSecond ?? null,
   }
 })
 const change = computed(() => deltas(scope.value?.compare || null, scope.value?.period))
@@ -475,10 +479,11 @@ const scopeNote = computed(() => {
       <StatTile dense label="成功" :icon="CircleCheck" tone="green" :loading="scopeLoading" :value="kpi ? integer(kpi.success) : null" value-tone="green" :sub="kpi ? `成功率 ${pctText(kpi.rate)}` : ''" :delta="change.success" :spark="trend.success" />
       <StatTile dense label="失败" :icon="CircleX" tone="red" :loading="scopeLoading" :value="kpi ? integer(kpi.error) : null" :value-tone="kpi && kpi.error ? 'red' : ''" :sub="kpi && kpi.total ? pctText(kpi.error / kpi.total) : ''" :delta="change.errors" :spark="trend.errors" />
       <StatTile dense label="金额" :icon="Coins" tone="orange" :loading="scopeLoading" :value="kpi ? usd(kpi.cost) : null" :sub="kpi?.unpriced ? `未计价 ${integer(kpi.unpriced)} 次` : ''" :delta="change.cost" :spark="trend.cost" />
-      <StatTile dense label="Token" :icon="Layers" tone="purple" :loading="scopeLoading" :value="kpi ? compact(kpi.prompt + kpi.output) : null" :sub="kpi ? `读入 + 写出` : ''" :delta="change.tokens" :spark="trend.tokens" />
-      <StatTile dense label="读入 ↑" :icon="Download" tone="teal" :loading="scopeLoading" :value="kpi ? compact(kpi.prompt) : null" :sub="kpi && kpi.prompt + kpi.output ? `占比 ${pctText(kpi.prompt / (kpi.prompt + kpi.output))}` : ''" :delta="change.prompt" :spark="trend.prompt" />
-      <StatTile dense label="写出 ↓" :icon="Upload" tone="indigo" :loading="scopeLoading" :value="kpi ? compact(kpi.output) : null" :sub="kpi && kpi.prompt + kpi.output ? `占比 ${pctText(kpi.output / (kpi.prompt + kpi.output))}` : ''" :delta="change.output" :spark="trend.output" />
-      <StatTile dense label="缓存读" :icon="DatabaseZap" tone="cyan" :loading="scopeLoading" :value="kpi ? compact(kpi.cacheRead) : null" :sub="kpi ? `占读入 ${pctText(kpi.cacheShare)}` : ''" :delta="change.cacheRead" :spark="trend.cacheRead" />
+      <StatTile dense label="Token" :icon="Layers" tone="purple" :loading="scopeLoading" :value="kpi ? compact(kpi.prompt + kpi.output) : null"
+        :sub="kpi ? `读入 ${compact(kpi.prompt)} · 写出 ${compact(kpi.output)} · 缓存占比 ${pctText(kpi.cacheShare)}` : ''" :delta="change.tokens" :spark="trend.tokens" />
+      <StatTile dense label="首字" :icon="Timer" tone="blue" :loading="scopeLoading" :value="kpi ? ms(kpi.firstToken) : null" sub="平均首字耗时" :delta="change.firstToken" :spark="trend.firstToken" />
+      <StatTile dense label="总耗时" :icon="Hourglass" tone="teal" :loading="scopeLoading" :value="kpi ? ms(kpi.totalTime) : null" sub="平均请求总耗时" :delta="change.totalTime" :spark="trend.totalTime" />
+      <StatTile dense label="TPS" :icon="Zap" tone="indigo" :loading="scopeLoading" :value="kpi ? tps(kpi.tps) : null" sub="平均生成速度" :delta="change.tps" :spark="trend.tps" />
     </section>
     <p class="note">{{ scopeNote }}</p>
 

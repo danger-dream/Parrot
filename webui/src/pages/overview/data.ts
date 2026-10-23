@@ -17,6 +17,7 @@ export const ov = reactive({
   tenMinutes: [] as TimePoint[],
   models: [] as StatsBreakdownData[],
   channels: [] as StatsBreakdownData[],
+  apiKeys: [] as StatsBreakdownData[],
   outcomes: null as OutcomeTimeline | null,
   accounts: [] as OAuthAccountSummaryData[],
   /** Today against yesterday up to the same time; also today's sparklines. */
@@ -32,13 +33,14 @@ export async function loadOverview(): Promise<void> {
   if (ov.loading) return
   ov.loading = true
   try {
-    const [summary, hourly, tenMinutes, models, channels, outcomes, accounts, , compare] = await Promise.all([
+    const [summary, hourly, tenMinutes, models, channels, apiKeys, outcomes, accounts, , compare] = await Promise.all([
       api.get<StatsSummaryData>('/stats/summary', { period: 'today' }).catch(() => null),
       api.get<TimeSeriesData>('/stats/timeseries', { range: '24h', bucket: 'hour' }).catch(() => null),
       api.get<TimeSeriesData>('/stats/timeseries', { range: '24h', bucket: '10m' }).catch(() => null),
       api.get<StatsBreakdownData[]>('/stats/breakdown', { dimension: 'model', period: 'today', sort: 'cost', pageSize: 8 }).catch(() => null),
       api.get<StatsBreakdownData[]>('/stats/breakdown', { dimension: 'channel', period: 'today', sort: 'tokens', pageSize: 200 }).catch(() => null),
-      loadOutcomeTimeline('channel'),
+      api.get<StatsBreakdownData[]>('/stats/breakdown', { dimension: 'apiKey', period: 'today', sort: 'cost', pageSize: 50 }).catch(() => null),
+      loadOutcomeTimeline('channel', { today: true }),
       api.get<{ items: OAuthAccountSummaryData[] }>('/oauth/accounts', { pageSize: 200 }).catch(() => null),
       refreshCatalog(true).catch(() => undefined),
       loadCompare({ period: 'today' }).catch(() => null),
@@ -48,6 +50,7 @@ export async function loadOverview(): Promise<void> {
     if (tenMinutes) ov.tenMinutes = totalSeries(tenMinutes)
     if (models) ov.models = models.data
     if (channels) ov.channels = channels.data
+    if (apiKeys) ov.apiKeys = apiKeys.data
     if (outcomes) ov.outcomes = outcomes
     if (accounts) ov.accounts = accounts.data.items
     if (compare) ov.compare = compare

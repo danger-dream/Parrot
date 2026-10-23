@@ -3,18 +3,20 @@ import { computed } from 'vue'
 import type { OutcomeItem } from '@/utils/outcomes'
 
 /**
- * Last 24 hours, one cell per clock hour (newest on the right): grey = no requests, green = all fine,
+ * One cell per clock hour (newest on the right): grey = no requests, green = all fine,
  * orange = some failures, red = at least a fifth failed. A single failure among hundreds still shows.
+ * `elapsed` < `count` draws the remaining cells as hours still to come (a "today" strip from 00:00).
  */
 const props = withDefaults(defineProps<{
   item?: OutcomeItem | null
   from?: string | null
   step?: number
   count?: number
+  elapsed?: number
   width?: number
   gap?: number
   height?: number
-}>(), { item: null, from: null, step: 3600, count: 24, width: 4, gap: 2, height: 16 })
+}>(), { item: null, from: null, step: 3600, count: 24, elapsed: undefined, width: 4, gap: 2, height: 16 })
 
 const pad = (n: number) => String(n).padStart(2, '0')
 const hm = (d: Date) => `${pad(d.getHours())}:${pad(d.getMinutes())}`
@@ -22,6 +24,7 @@ const hm = (d: Date) => `${pad(d.getHours())}:${pad(d.getMinutes())}`
 const cells = computed(() => {
   const start = props.from ? Date.parse(props.from) : 0
   return Array.from({ length: props.count }, (_, i) => {
+    if (props.elapsed !== undefined && i >= props.elapsed) return { tone: 'future', title: '未到' }
     const b = props.item?.buckets[i]
     const total = b?.total ?? 0
     const errors = b?.errorCount ?? 0
@@ -62,5 +65,9 @@ i.warn {
 }
 i.bad {
   background: var(--red);
+}
+i.future {
+  background: transparent;
+  box-shadow: inset 0 0 0 0.5px var(--border);
 }
 </style>
