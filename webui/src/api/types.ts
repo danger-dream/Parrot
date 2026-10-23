@@ -115,6 +115,7 @@ export interface RequestUpdatedEvent {
   channelId?: string | null
   model?: string | null
   retryCount?: number
+  proxyName?: string | null
 }
 
 export interface ServerEventMap {

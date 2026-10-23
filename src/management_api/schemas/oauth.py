@@ -27,6 +27,108 @@ class OAuthPageMeta(StrictSchema):
     hasNext: bool
 
 
+class OAuthLocalUsageStatsData(StrictSchema):
+    """Field names follow StatsMetricData."""
+    total: int
+    successCount: int
+    errorCount: int
+    inputTokens: int
+    outputTokens: int
+    cacheCreationTokens: int
+    cacheReadTokens: int
+    promptTokens: int
+    cacheReadRatio: float | None = None
+    averageTokensPerSecond: float | None = None
+    maximumTokensPerSecond: float | None = None
+    minimumTokensPerSecond: float | None = None
+    costTicks: int
+    actualCostTicks: int
+    estimatedCostTicks: int
+    actualCostedSuccess: int
+    costedSuccess: int
+    unpricedSuccess: int
+
+
+class OAuthLocalPeriodData(StrictSchema):
+    """TG 「💎 本地自然月 / 套餐本期 / 本周 / 账单本期」 local statistics."""
+    source: str
+    label: str
+    moneyLabel: str
+    since: datetime
+    stats: OAuthLocalUsageStatsData | None = None
+    statsLoading: bool = False
+
+
+class OAuthWindowStatsData(StrictSchema):
+    """Local usage inside the current upstream 5h / 7d window (TG detail lines)."""
+    since: datetime
+    stats: OAuthLocalUsageStatsData | None = None
+    statsLoading: bool = False
+
+
+class OAuthWeeklyProjectionData(StrictSchema):
+    tokens: int
+    costTicks: int | None = None
+
+
+class OAuthCooldownSummaryData(StrictSchema):
+    accountPaused: bool
+    quotaPausedModels: int
+    permanentModels: int
+    coolingModels: int
+
+
+class OAuthAccessData(StrictSchema):
+    state: Literal["ok", "limited", "blocked"] | None = None
+    grokCode: bool | None = None
+
+
+class OAuthCreditObservationData(StrictSchema):
+    observedAt: datetime | None = None
+    source: Literal["official_usage", "response_sample"] | None = None
+    stale: bool = False
+
+
+class OAuthPlanFactsData(StrictSchema):
+    """Provider-specific plan line facts (TG 🏷️ 套餐 / 订阅 / 到期 …); others null."""
+    label: str | None = None
+    status: str | None = None
+    billingType: str | None = None
+    startedAt: datetime | None = None
+    expiresAt: datetime | None = None
+    tier: str | None = None
+    access: OAuthAccessData | None = None
+    textModelCount: int | None = None
+    imageModelCount: int | None = None
+    variantCount: int | None = None
+    workspaceLabel: str | None = None
+    resetCreditCount: int | None = None
+    credits: OAuthCreditObservationData | None = None
+    globalDisabledModelCount: int | None = None
+    organizationId: str | None = None
+    projectId: str | None = None
+    site: str | None = None
+    credentialMode: str | None = None
+    entitlement: str | None = None
+    managementStatus: str | None = None
+    setupIncomplete: bool | None = None
+    region: str | None = None
+    accountType: str | None = None
+    authMethod: str | None = None
+    deviceChat: bool | None = None
+
+
+class OAuthAccountCardData(StrictSchema):
+    statusTag: Literal["userDisabled", "quotaDisabled", "authFailed", "providerRestricted"] | None = None
+    plan: OAuthPlanFactsData
+    usageSections: list["OAuthUsageSectionData"]
+    usageFetchedAt: datetime | None = None
+    localPeriod: OAuthLocalPeriodData
+    windowStats: dict[str, OAuthWindowStatsData]
+    weeklyProjection: OAuthWeeklyProjectionData | None = None
+    cooldown: OAuthCooldownSummaryData
+
+
 class OAuthAccountSummaryData(StrictSchema):
     accountId: str
     provider: OAuthProvider
@@ -43,6 +145,8 @@ class OAuthAccountSummaryData(StrictSchema):
     disabledModelCount: int
     credentialConfigured: bool = True
     revision: str
+    # Round 3: TG list-card facts (null for Telegram-internal reads only).
+    card: OAuthAccountCardData | None = None
 
 
 class OAuthAccountListData(StrictSchema):
@@ -67,6 +171,28 @@ class OAuthLocalStatsData(StrictSchema):
     inputTokens: int
     outputTokens: int
     costUsd: float | None = None
+    # Round 3: TG honest period (套餐本期 / 账单本期 / 本周 / 本地自然月) and the
+    # full StatsMetricData-named figures; requestCount/inputTokens/... now use it.
+    periodLabel: str | None = None
+    periodSource: str | None = None
+    moneyLabel: str | None = None
+    since: datetime | None = None
+    total: int | None = None
+    successCount: int | None = None
+    errorCount: int | None = None
+    cacheCreationTokens: int | None = None
+    cacheReadTokens: int | None = None
+    promptTokens: int | None = None
+    cacheReadRatio: float | None = None
+    averageTokensPerSecond: float | None = None
+    maximumTokensPerSecond: float | None = None
+    minimumTokensPerSecond: float | None = None
+    costTicks: int | None = None
+    actualCostTicks: int | None = None
+    estimatedCostTicks: int | None = None
+    actualCostedSuccess: int | None = None
+    costedSuccess: int | None = None
+    unpricedSuccess: int | None = None
 
 
 class OAuthRuntimeErrorData(StrictSchema):
@@ -74,6 +200,31 @@ class OAuthRuntimeErrorData(StrictSchema):
     message: str | None = None
     cooldownUntil: datetime | None = None
     cooldownPermanent: bool
+    errorCount: int = 0
+    # fault | quotaPause (Cursor pool, not a failure) | quotaPauseHidden
+    # (paused model hidden/disabled on the account) | accountRestriction (11140)
+    kind: str = "fault"
+    pool: Literal["cursor_models", "other_models", "unknown"] | None = None
+
+
+class OAuthUsageItemData(StrictSchema):
+    label: str
+    usedPercent: float | None = None
+    remainingPercent: float | None = None
+    used: float | None = None
+    limit: float | None = None
+    remaining: float | None = None
+    unit: Literal["usd", "credits", "count"] | None = None
+    resetsAt: datetime | None = None
+    note: str | None = None
+    # Round 3 (windows section): local Parrot usage inside this upstream window.
+    local: "OAuthLocalUsageStatsData | None" = None
+
+
+class OAuthUsageSectionData(StrictSchema):
+    id: str
+    title: str
+    items: list[OAuthUsageItemData]
 
 
 class OAuthAccountDetailData(StrictSchema):
@@ -90,6 +241,14 @@ class OAuthAccountDetailData(StrictSchema):
     workbuddy: dict | None = None
     zhipu: dict | None = None
     qoder: dict | None = None
+    usageSections: list[OAuthUsageSectionData] = Field(default_factory=list)
+    usageFetchedAt: datetime | None = None
+    allowCredits: bool | None = None
+    # Round 3: TG detail facts (null for Telegram-internal reads).
+    plan: OAuthPlanFactsData | None = None
+    weeklyProjection: "OAuthWeeklyProjectionData | None" = None
+    windowStats: "dict[str, OAuthWindowStatsData] | None" = None
+    lastRefreshAt: datetime | None = None
 
 
 # WorkBuddy credentials are acquired only through its browser login flow.
@@ -147,6 +306,8 @@ class UpdateOAuthAccountRequest(StrictSchema):
     displayName: str | None = Field(default=None, min_length=1, max_length=200)
     enabled: bool | None = None
     maxConcurrent: int | None = Field(default=None, ge=0, le=10_000)
+    # OpenAI only: TG's 「允许使用积分」 (config field ``allowCredits``).
+    allowCredits: bool | None = None
 
 
 class ReorderOAuthAccountsRequest(StrictSchema):
@@ -192,8 +353,10 @@ class StartOAuthLoginFlowRequest(StrictSchema):
 
     @model_validator(mode="after")
     def validate_provider_fields(self):
-        if self.provider is not OAuthProvider.QODER and (self.loginMethod != "device" or self.proxyTarget is not None or self.reloginAccountId is not None):
-            raise ValueError("device preparation options are Qoder-only")
+        if self.provider is not OAuthProvider.QODER and self.loginMethod != "device":
+            raise ValueError("loginMethod=pat is Qoder-only")
+        if self.proxyTarget is not None and self.reloginAccountId is not None:
+            raise ValueError("proxyTarget applies to new accounts only; a relogin keeps the account's routing")
         if self.provider is OAuthProvider.ZHIPU and self.site is None:
             raise ValueError("Zhipu site is required")
         if self.provider is not OAuthProvider.ZHIPU and self.site is not None:
@@ -342,7 +505,9 @@ class OAuthDeletedCountData(StrictSchema):
 
 
 class OAuthQuotaResetPlanRequest(StrictSchema):
-    """Explicit empty body; the current domain exposes one reset action."""
+    """OpenAI may pick one reset card (creditId from listOAuthOpenAiResetCredits);
+    omitted → the upstream's default card. Other providers send ``{}``."""
+    creditId: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class OAuthQuotaResetPlanData(StrictSchema):
@@ -350,6 +515,7 @@ class OAuthQuotaResetPlanData(StrictSchema):
     accountId: str
     provider: OAuthProvider
     creditCount: int | None = None
+    creditId: str | None = None
     expiresAt: datetime
 
 
@@ -367,3 +533,9 @@ class OAuthRequestMeta(StrictSchema):
 
 
 OAuthOperationEnvelope.model_rebuild()
+
+
+OAuthUsageItemData.model_rebuild()
+OAuthAccountCardData.model_rebuild()
+OAuthAccountSummaryData.model_rebuild()
+OAuthAccountDetailData.model_rebuild()

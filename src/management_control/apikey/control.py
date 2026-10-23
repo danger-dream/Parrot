@@ -24,6 +24,7 @@ from src.management_auth import (
 )
 from src.management_control.context import AuditSink, ManagementContext, audit_record
 from src.management_control.errors import ErrorField, ManagementError, ManagementErrorCode
+from src.management_control.stats_cache import CachingStatsSource
 
 from .models import (
     ApiKeyEnabledFilter,
@@ -94,7 +95,7 @@ class ApiKeyControl:
         self._plans: dict[str, _Plan] = {}
         self._plan_lock = threading.RLock()
 
-    # ----- public queries -------------------------------------------------
+    statistics_source = property(lambda self: self._stats)  # public queries below
 
     def list_api_keys(
         self,
@@ -113,7 +114,7 @@ class ApiKeyControl:
         if page < 1 or not 1 <= page_size <= 200:
             raise self._validation("page", "OUT_OF_RANGE", "page/pageSize is out of range")
         raw_keys = self._raw_keys()
-        stats = self._period_stats() if include_stats else {}
+        stats = self._period_stats(stats=self._stats_source(context)) if include_stats else {}
         rows = [
             self._view(name, entry, index, stats.get(name), (), include_secret)
             for index, (name, entry) in enumerate(raw_keys.items(), start=1)
@@ -174,8 +175,9 @@ class ApiKeyControl:
         raw = raw_keys.get(key_id)
         if raw is None:
             raise self._not_found(key_id)
-        month = self._period_stats(key_id).get(key_id) if include_stats else None
-        models = self._model_stats(key_id) if include_stats else ()
+        source = self._stats_source(context)
+        month = self._period_stats(key_id, stats=source).get(key_id) if include_stats else None
+        models = self._model_stats(key_id, stats=source) if include_stats else ()
         order = list(raw_keys).index(key_id) + 1
         return self._view(key_id, raw, order, month, models, include_secret)
 
@@ -191,8 +193,8 @@ class ApiKeyControl:
             raise self._not_found(key_id)
         since_ts = self._month_start_ts()
         try:
-            overall = self._usage(self._stats.tokens_for_apikey(key_id, since_ts))
-            models = self._model_stats(key_id, since_ts=since_ts)
+            overall = self._usage((source := self._stats_source(context)).tokens_for_apikey(key_id, since_ts))
+            models = self._model_stats(key_id, since_ts=since_ts, stats=source)
         except ManagementError:
             raise
         except Exception as exc:
@@ -664,11 +666,16 @@ class ApiKeyControl:
         while len(self._plans) >= 512:
             self._plans.pop(next(iter(self._plans)))
 
-    def _period_stats(self, key_id: str | None = None) -> dict[str, Mapping[str, Any]]:
+    def _stats_source(self, context: ManagementContext) -> Any:  # API reads: shared cache; TG: exact path
+        tg = context.actor.auth_method is AuthMethod.TELEGRAM_ADMIN
+        return self._stats if tg else CachingStatsSource(self._stats)
+
+    def _period_stats(self, key_id: str | None = None, stats: Any = None) -> dict[str, Mapping[str, Any]]:
+        stats = stats or self._stats
         try:
             if key_id is not None:
-                return {key_id: self._stats.tokens_for_apikey(key_id, self._month_start_ts())}
-            snapshot = self._stats.stats_period_snapshot(self._month_start_ts())
+                return {key_id: stats.tokens_for_apikey(key_id, self._month_start_ts())}
+            snapshot = stats.stats_period_snapshot(self._month_start_ts())
             return dict((snapshot or {}).get("by_apikey") or {})
         except Exception as exc:
             raise ManagementError(
@@ -677,9 +684,9 @@ class ApiKeyControl:
                 retryable=True,
             ) from exc
 
-    def _model_stats(self, key_id: str, *, since_ts: float | None = None) -> tuple[ApiKeyModelUsage, ...]:
+    def _model_stats(self, key_id: str, *, since_ts: float | None = None, stats: Any = None) -> tuple[ApiKeyModelUsage, ...]:
         try:
-            rows = self._stats.apikey_model_stats(key_id, since_ts=since_ts or self._month_start_ts())
+            rows = (stats or self._stats).apikey_model_stats(key_id, since_ts=since_ts or self._month_start_ts())
         except Exception as exc:
             raise ManagementError(
                 ManagementErrorCode.DEPENDENCY_UNAVAILABLE,

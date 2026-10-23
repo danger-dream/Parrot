@@ -317,7 +317,10 @@ class OperationStore:
         message: str,
         retryable: bool = False,
         diagnostic: safe_diagnostics.Diagnostic | None = None,
+        public_detail: str | None = None,
     ) -> ManagementOperation:
+        """``public_detail`` is an already-redacted, caller-vetted reason that
+        is appended to the stable code when no diagnostic is available."""
         with self._lock:
             operation = self._items.get(operation_id)
             if operation is None:
@@ -331,7 +334,9 @@ class OperationStore:
                 # Worker exception text is intentionally not persisted: it may embed
                 # credentials or upstream payloads.  The stable code is safe to expose.
                 error=OperationFailure(code=code, message=(safe_diagnostics.message(diagnostic) + safe_diagnostics.guidance(diagnostic)
-                    if isinstance(diagnostic, safe_diagnostics.Diagnostic) else self._failure_message(operation, code)), retryable=retryable),
+                    if isinstance(diagnostic, safe_diagnostics.Diagnostic)
+                    else f"{code.value}: {public_detail}" if public_detail
+                    else self._failure_message(operation, code)), retryable=retryable),
                 finished_at=self._now(),
                 cancellable=False,
             )

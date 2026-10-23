@@ -21,8 +21,12 @@ from src.management_auth import Capability
 from src.management_control.context import AuditSink, ManagementContext, audit_record
 from src.management_control.errors import ManagementError, ManagementErrorCode
 
+from src.management_control.stats_cache import cached, snapshot_key
+
 from ._log_errors import map_historical_log_errors
+from .stats_view import summary_tops, with_rates
 from .common import PageResult, page_slice, require, revision_for
+from .compare import HourCache, build_compare
 from .timeseries import TimeseriesBucket, TimeseriesGroup, TimeseriesRange, build_timeseries
 
 
@@ -62,6 +66,9 @@ class StatsBreakdownQuery:
     descending: bool = True
     page: int = 1
     page_size: int = 50
+    # Round 3: TG family Top blocks / one account's model breakdown.
+    family: str | None = None
+    channel: str | None = None
 
 
 class StatsControl:
@@ -87,6 +94,7 @@ class StatsControl:
         self.state_db = state_db
         self.audit_sink = audit_sink
         self._now = now
+        self._compare_hours = HourCache()
 
     def _audit(self, context: ManagementContext, action: str, result: str) -> None:
         if self.audit_sink is not None:
@@ -121,8 +129,36 @@ class StatsControl:
         normalized = StatsPeriod(period)
         # API lifetime breakdown needs the same complete dimensional snapshot;
         # the lighter stats_lifetime() remains available to the TG cache worker.
-        raw = self.log_db.stats_period_snapshot(self.period_since(normalized))
+        # Cached per period (stale-while-revalidate, see stats_cache); the
+        # aggregation itself and therefore every statistic is unchanged.
+        since = self.period_since(normalized)
+        raw = cached(
+            snapshot_key(normalized.value, since),
+            lambda: self.log_db.stats_period_snapshot(since),
+            source=self.log_db,
+        )
         return copy.deepcopy(raw or {})
+
+    def warm_cache(self) -> None:
+        """Precompute the month snapshot shared by statistics and API-key pages.
+
+        Called once from a background thread after startup; a no-op when the
+        statistics cache is disabled. Failures only leave the cache cold.
+        """
+        from src.management_control.stats_cache import STATS_CACHE
+        if not STATS_CACHE.enabled or self.log_db is not log_db_module:
+            return
+        try:
+            since = self.period_since(StatsPeriod.MONTH)
+            cached(snapshot_key("month", since), lambda: self.log_db.stats_period_snapshot(since),
+                   source=self.log_db)
+            # Round 3: API-key 「历史 N 次」 and model-center lifetime usage.
+            cached(("apikey-history",), self.log_db.request_totals_by_apikey, source=self.log_db)
+            cached(("model-center-usage",), lambda: self._model_center_usage_raw(), source=self.log_db)
+            # Closed hours of this and last month, so period comparisons (any filter) start warm.
+            build_compare(self.timeseries_source, now=self._now(), period="month", hours=self._compare_hours)
+        except Exception as exc:
+            print(f"[management] statistics warm-up skipped ({type(exc).__name__})")
 
     def period_snapshot_since(self, context: ManagementContext, since_ts: float) -> dict[str, Any]:
         """Compatibility query for TG's exact BJT cache keys."""
@@ -148,6 +184,9 @@ class StatsControl:
             "families": {
                 name: self._normalize_metrics(metrics) for name, metrics in families.items()
             },
+            # Round 3: TG 汇总 Top blocks (per family channel/model Top 3 with
+            # "所属" channels, cross-family Key Top 3 with family split).
+            **summary_tops(snapshot, raw_families, self._normalize_metrics),
         }
         # Hash exactly the non-secret public representation.  Hidden aggregate
         # columns and internal timestamps must not perturb a client revision.
@@ -157,6 +196,10 @@ class StatsControl:
     @staticmethod
     def _normalize_metrics(raw: Any) -> dict[str, Any]:
         """Map every authoritative aggregate shape to one stable API metric DTO."""
+        return with_rates(StatsControl._base_metrics(raw))
+
+    @staticmethod
+    def _base_metrics(raw: Any) -> dict[str, Any]:
         metrics = raw if isinstance(raw, dict) else {}
 
         def integer(*keys: str) -> int:
@@ -239,6 +282,27 @@ class StatsControl:
             return metrics["averageTokensPerSecond"] or 0
         return metrics["total"]
 
+    def compare(
+        self,
+        context: ManagementContext,
+        *,
+        period: str | None = None,
+        start: float | None = None,
+        end: float | None = None,
+        filters: dict[str, str | None] | None = None,
+    ) -> dict[str, Any]:
+        """This period against the one before it (same elapsed time), plus a sparkline of this one."""
+        require(context)
+        f = filters or {}
+        # Calendar windows carry their day/month so a rollover never serves the old window.
+        local = datetime.fromtimestamp(self._now(), tz=_BJT)
+        calendar = local.strftime("%Y-%m-%d") if period == "today" else local.strftime("%Y-%m") if period == "month" else None
+        key = ("compare", period, calendar, start, end, f.get("model"), f.get("channel"), f.get("apiKey"))
+        return cached(key, lambda: build_compare(
+            self.timeseries_source, now=self._now(), period=period, start=start, end=end, filters=f,
+            hours=self._compare_hours,
+        ), source=self.log_db if self.timeseries_source is log_timeseries_module else None)
+
     def timeseries(
         self,
         context: ManagementContext,
@@ -250,10 +314,39 @@ class StatsControl:
     ) -> dict[str, Any]:
         """Continuous, zero-filled bucketed series (same cost rules as summary)."""
         require(context)
-        return build_timeseries(
+        key = ("timeseries", str(getattr(range_value, "value", range_value)),
+               str(getattr(bucket, "value", bucket)), str(getattr(group, "value", group)), int(limit))
+        return cached(key, lambda: build_timeseries(
             self.timeseries_source, now=self._now(), range_value=range_value,
             bucket=bucket, group=group, limit=limit,
-        )
+        ), source=self.log_db if self.timeseries_source is log_timeseries_module else None)
+
+    def recent_outcomes(
+        self, context: ManagementContext, *, dimension: StatsDimension | str, limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Last ``limit`` finished outcomes (oldest first) per channel / API key / model, over 7 days."""
+        require(context)
+        dimension = StatsDimension(dimension)
+        group = {"channel": "channel", "apiKey": "apikey", "model": "model"}[dimension.value]
+        since = self._now() - 7 * 86400
+
+        def load() -> list[dict[str, Any]]:
+            raw = self.timeseries_source.recent_outcomes(since=since, group=group, per_key=int(limit))
+            items = []
+            for key, outcomes in raw.items():
+                statuses = [status for _ts, status in outcomes]
+                items.append({
+                    "key": key,
+                    "outcomes": statuses,
+                    "successCount": statuses.count("success"),
+                    "errorCount": statuses.count("error"),
+                    "lastAt": datetime.fromtimestamp(outcomes[-1][0], tz=timezone.utc) if outcomes else None,
+                })
+            items.sort(key=lambda item: item["key"])
+            return items
+
+        return cached(("recent-outcomes", dimension.value, int(limit)), load,
+                      source=self.log_db if self.timeseries_source is log_timeseries_module else None)
 
     def breakdown(self, context: ManagementContext, query: StatsBreakdownQuery) -> PageResult[dict[str, Any]]:
         snapshot = self.period_snapshot(context, query.period)
@@ -263,12 +356,30 @@ class StatsControl:
             StatsDimension.API_KEY: "by_apikey",
         }[query.dimension]
         summary = snapshot.get("summary") if isinstance(snapshot.get("summary"), dict) else {}
+        if query.family is not None:
+            families = snapshot.get("families") or {}
+            if query.family not in families:
+                raise ManagementError(ManagementErrorCode.VALIDATION_FAILED, "Unknown family")
+            summary = families[query.family] if isinstance(families[query.family], dict) else {}
         # Summary group rows preserve latency while the object maps preserve
         # token/TPS/cost. Prefer complete summary rows and support legacy maps.
         raw = summary.get(key)
-        if raw is None:
+        if raw is None and query.family is None:
             raw = snapshot.get(key)
         raw = raw or {}
+        if query.channel is not None:
+            if query.dimension is not StatsDimension.MODEL or query.family is not None:
+                raise ManagementError(ManagementErrorCode.VALIDATION_FAILED,
+                                      "channel applies to dimension=model without family")
+            since = self.period_since(StatsPeriod(query.period))
+            from src.management_control.routing_account_ids import oauth_channel_key_from_account_id
+            channel_key = (query.channel if query.channel.startswith("api:")
+                           else oauth_channel_key_from_account_id(query.channel))  # accountId or oauth:<id>
+            with map_historical_log_errors():
+                rows = cached(("channel-models", channel_key, since),
+                              lambda: self.log_db.channel_model_stats(channel_key, since_ts=since),
+                              source=self.log_db)
+            raw = [{"key": str(row.get("final_model") or "?"), "metrics": row} for row in rows or []]
         if isinstance(raw, dict):
             items = [
                 {"key": str(name), "metrics": self._normalize_metrics(metrics)}
@@ -288,8 +399,14 @@ class StatsControl:
         )
         result = page_slice(items, page=query.page, page_size=query.page_size)
         public_items = []
+        model_channels = snapshot.get("model_channels") if isinstance(snapshot.get("model_channels"), dict) else {}
         for item in result.items:
             public = {"key": item["key"], "metrics": item["metrics"]}
+            if query.dimension is StatsDimension.MODEL and query.channel is None:
+                public["channels"] = [{"key": str(entry.get("key") or "?"), "type": entry.get("type"),
+                                       "count": int(entry.get("count") or 0)}
+                                      for entry in (model_channels.get(item["key"]) or [])[:5]
+                                      if isinstance(entry, dict)]
             public["revision"] = revision_for(public)
             public_items.append(public)
         return PageResult(
@@ -307,7 +424,11 @@ class StatsControl:
         metrics = by_model.get(model_id) if isinstance(by_model, dict) else None
         if metrics is None:
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
-        channels = self.log_db.channels_by_requested_model(self.period_since(StatsPeriod(period)))
+        # The snapshot already carries channels_by_requested_model() for the
+        # same window; reuse it instead of a second full scan.
+        channels = snapshot.get("model_channels")
+        if not isinstance(channels, dict):
+            channels = self.log_db.channels_by_requested_model(self.period_since(StatsPeriod(period)))
         channel_rows = []
         for row in (channels or {}).get(model_id) or []:
             if not isinstance(row, dict):
@@ -326,6 +447,16 @@ class StatsControl:
         }
         data["revision"] = revision_for(data)
         return data
+
+    def cache_misses(self, context: ManagementContext, period: StatsPeriod | str) -> list[dict[str, Any]]:
+        """TG「最近未命中样本」: the latest successful requests without a cache read.
+
+        Read from the (cached) period snapshot; the same 3 rows TG shows.
+        """
+        snapshot = self.period_snapshot(context, period)
+        rows = (snapshot.get("summary") or {}).get("recent_cache_misses") or []
+        return [{key: value for key, value in row.items() if key != "response_body"}
+                for row in rows if isinstance(row, dict)]
 
     def recent_calls(self, context: ManagementContext, *, page: int, page_size: int) -> PageResult[dict[str, Any]]:
         require(context)
@@ -417,6 +548,9 @@ class StatsControl:
     def model_center_usage_snapshot(self, context: ManagementContext) -> dict:
         """Internal TG snapshot; raw weights, no API DTO or alias-history guesses."""
         require(context)
+        return self._model_center_usage_raw()
+
+    def _model_center_usage_raw(self) -> dict:
         routes = self.log_db.model_center_usage_snapshot()
         by_model: dict[str, dict] = {}
         for (channel, model), raw in routes.items():

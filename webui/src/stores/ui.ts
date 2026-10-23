@@ -13,8 +13,18 @@ function readPref(): ThemePref {
   }
 }
 
+function readPrivacy(): boolean {
+  try {
+    return localStorage.getItem('parrot.privacy') === '1'
+  } catch {
+    return false
+  }
+}
+
 export const ui = reactive({
   theme: readPref() as ThemePref,
+  /** Mask e-mails, phone numbers, API keys and IPs everywhere (see utils/privacy). */
+  privacy: readPrivacy(),
   dark: document.documentElement.dataset.theme !== 'light',
   width: window.innerWidth,
   paletteOpen: false,
@@ -35,6 +45,15 @@ export function setTheme(pref: ThemePref): void {
     /* storage unavailable */
   }
   applyTheme()
+}
+
+export function setPrivacy(on: boolean): void {
+  ui.privacy = on
+  try {
+    localStorage.setItem('parrot.privacy', on ? '1' : '0')
+  } catch {
+    /* storage unavailable */
+  }
 }
 
 export function cycleTheme(): void {
@@ -95,11 +114,35 @@ export const inspector = reactive<InspectorState>({
   key: '',
 })
 
+type InspectorEntry = Pick<InspectorState, 'title' | 'subtitle' | 'component' | 'props' | 'key'>
+
+// Panels opened from inside another panel stack up so the user can step back.
+export const inspectorHistory = reactive<InspectorEntry[]>([])
+let lastInsideInteraction = 0
+
+export function markInspectorInteraction(): void {
+  lastInsideInteraction = Date.now()
+}
+
 export function openInspector(key: string, title: string, component: Component, props: Record<string, unknown> = {}, subtitle?: string): void {
+  const fromInside = Date.now() - lastInsideInteraction < 1500
+  if (inspector.open && fromInside && inspector.key && inspector.key !== key && inspector.component) {
+    inspectorHistory.push({ key: inspector.key, title: inspector.title, subtitle: inspector.subtitle, component: inspector.component, props: inspector.props })
+    if (inspectorHistory.length > 20) inspectorHistory.shift()
+  } else if (!fromInside) {
+    inspectorHistory.splice(0)
+  }
   Object.assign(inspector, { open: true, title, subtitle, component: markRaw(component), props, key })
+}
+
+export function backInspector(): void {
+  const prev = inspectorHistory.pop()
+  if (!prev) return
+  Object.assign(inspector, { open: true, ...prev })
 }
 
 export function closeInspector(): void {
   inspector.open = false
   inspector.key = ''
+  inspectorHistory.splice(0)
 }

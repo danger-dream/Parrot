@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
-import { ChevronRight, Copy, Search } from '@lucide/vue'
+import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Copy, Search } from '@lucide/vue'
 import { api, ApiError, enc, type Schemas } from '@/api/client'
 import { toast } from '@/stores/ui'
 import { compact } from '@/utils/format'
@@ -27,13 +27,10 @@ const order = ref<'original' | 'reverse'>('reverse')
 const open = ref<Set<string>>(new Set())
 const full = ref<Record<string, string>>({})
 
-const PAGE = 30
+const PAGE = 20
 
 async function load(reset = true): Promise<void> {
-  if (reset) {
-    page.value = 1
-    items.value = []
-  }
+  if (reset) page.value = 1
   loading.value = true
   error.value = ''
   try {
@@ -45,7 +42,8 @@ async function load(reset = true): Promise<void> {
       page: page.value,
       pageSize: PAGE,
     })
-    items.value = reset ? res.data : [...items.value, ...res.data]
+    items.value = res.data
+    open.value = new Set()
     total.value = res.meta.total ?? items.value.length
     hasNext.value = Boolean(res.meta.hasNext)
     const counts = (res.meta as { kindCounts?: { kind: string; count: number }[] }).kindCounts
@@ -57,8 +55,11 @@ async function load(reset = true): Promise<void> {
   }
 }
 
-function more(): void {
-  page.value += 1
+const pages = computed(() => Math.max(1, Math.ceil(total.value / PAGE)))
+function goto(n: number): void {
+  const next = Math.min(Math.max(1, n), pages.value)
+  if (next === page.value) return
+  page.value = next
   load(false)
 }
 
@@ -143,7 +144,7 @@ watch(query, (q) => {
     </div>
     <p v-else-if="!items.length" class="none">没有内容</p>
 
-    <div class="items">
+    <div class="items" :class="{ dim: loading }">
       <div v-for="item in items" :key="key(item)" class="item" :class="{ open: open.has(key(item)) }">
         <button class="item-head" @click="toggle(item)">
           <ChevronRight class="chev" />
@@ -160,8 +161,12 @@ watch(query, (q) => {
         </div>
       </div>
     </div>
-    <div v-if="hasNext" class="more">
-      <Btn size="sm" :loading="loading" @click="more">加载更多（共 {{ total }} 条）</Btn>
+    <div v-if="pages > 1" class="pager">
+      <span class="pinfo">共 {{ total }} 条 · 第 {{ page }} / {{ pages }} 页</span>
+      <Btn icon size="sm" title="第一页" :disabled="page <= 1 || loading" @click="goto(1)"><ChevronsLeft /></Btn>
+      <Btn icon size="sm" title="上一页" :disabled="page <= 1 || loading" @click="goto(page - 1)"><ChevronLeft /></Btn>
+      <Btn icon size="sm" title="下一页" :disabled="(!hasNext && page >= pages) || loading" @click="goto(page + 1)"><ChevronRight /></Btn>
+      <Btn icon size="sm" title="最后一页" :disabled="page >= pages || loading" @click="goto(pages)"><ChevronsRight /></Btn>
     </div>
   </div>
 </template>
@@ -308,6 +313,18 @@ pre {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  padding-top: 8px;
+}
+.pinfo {
+  margin-right: auto;
+  font-size: 12px;
+  color: var(--text-3);
 }
 .more {
   display: flex;

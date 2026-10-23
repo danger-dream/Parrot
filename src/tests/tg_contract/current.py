@@ -37,6 +37,12 @@ WEBUI_OVERRIDE_CASE_IDS = (
     'TG-SYS-08.004-limiter-active',
     'TG-SYS-08.006-limiter-durations',
 )
+# Round 2: OpenAI-protocol API channels honour maxConcurrent (edit page label).
+WEBUI_CHANNEL_OVERRIDE_CASE_IDS = ('TG-CH-04.edit-fields-success',)
+WEBUI_OVERRIDE_IDS_BY_SEGMENT = {
+    'system.jsonl': WEBUI_OVERRIDE_CASE_IDS,
+    'channels_apikey.jsonl': WEBUI_CHANNEL_OVERRIDE_CASE_IDS,
+}
 WEBUI_ADDITION_CASE_IDS = ('TG-SYS-08.webui_wildcard', 'TG-SYS-08.webui_host')
 SYSTEM_ADDITION_CASE_IDS = BODY_RETENTION_ADDITION_CASE_IDS + WEBUI_ADDITION_CASE_IDS
 
@@ -102,9 +108,10 @@ def load_current_jsonl(segment: str | Path) -> list[dict]:
     webui_overlay = segment.parents[2] / 'webui-2026-10-22' / 'overrides' / segment.name
     if webui_overlay.exists():
         webui_cases = load_jsonl(webui_overlay)
-        if tuple(c['caseId'] for c in webui_cases) != WEBUI_OVERRIDE_CASE_IDS:
+        expected_ids = WEBUI_OVERRIDE_IDS_BY_SEGMENT.get(segment.name)
+        if tuple(c['caseId'] for c in webui_cases) != expected_ids:
             raise AssertionError('unexpected webui overlay scope')
-        replaced = set(WEBUI_OVERRIDE_CASE_IDS)
+        replaced = set(expected_ids)
         overrides = [c for c in overrides if c['caseId'] not in replaced] + webui_cases
     by_id = {case['caseId']: case for case in overrides}
     archived_ids = {case['caseId'] for case in archived}

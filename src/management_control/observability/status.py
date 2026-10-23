@@ -15,6 +15,7 @@ from src import apikey_limiter as apikey_limiter_module
 from src import concurrency as concurrency_module
 from src import config as config_module
 from src import cooldown as cooldown_module
+from src import job_telemetry as job_telemetry_module
 from src import load_balancing as load_balancing_module
 from src import log_db as log_db_module
 from src import network_monitor as network_monitor_module
@@ -27,6 +28,7 @@ from src import status_monitor as status_monitor_module
 from src import update_checker as update_checker_module
 from src.channel import registry as registry_module
 from src.management_control.context import ManagementContext
+from src.management_control.stats_cache import cached
 
 from .common import (
     PageResult,
@@ -89,6 +91,7 @@ class StatusControl:
         public_ip=public_ip_module,
         update_checker=update_checker_module,
         load_balancing=load_balancing_module,
+        job_telemetry=job_telemetry_module,
         now=time.time,
         service_started_at: float = _SERVICE_START_TS,
         version: str = __version__,
@@ -109,6 +112,7 @@ class StatusControl:
         self.public_ip_service = public_ip
         self.update_checker = update_checker
         self.load_balancing = load_balancing
+        self.job_telemetry = job_telemetry
         self._now = now
         self.service_started_at = service_started_at
         self.version = version
@@ -298,13 +302,13 @@ class StatusControl:
         now = datetime.fromtimestamp(self._now(), tz=_BJT)
         since = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         try:
-            today = self.log_db.stats_summary(
+            today = cached(("overview-today", since), lambda: self.log_db.stats_summary(
                 since_ts=since, family=None, summary_top_limit=0, include_cost=True,
-            ).get("overall") or {}
+            ), source=self.log_db).get("overall") or {}
         except Exception:
             today = {}
         try:
-            lifetime = self.log_db.stats_lifetime()
+            lifetime = cached(("overview-lifetime",), self.log_db.stats_lifetime, source=self.log_db)
             lifetime = lifetime.get("overall") if isinstance(lifetime, dict) and "overall" in lifetime else lifetime
         except Exception:
             lifetime = {}
@@ -561,9 +565,10 @@ class StatusControl:
     def background_jobs(self, context: ManagementContext, *, page: int, page_size: int) -> PageResult[dict]:
         """Describe configured jobs without inventing scheduler telemetry.
 
-        The runtime currently exposes no authoritative last/next/run-state
-        registry.  Therefore enabled jobs are ``unknown``; only explicit
-        configuration or the process-wide no-refresh guard proves ``disabled``.
+        Last/next run and result come from the in-process ``job_telemetry``
+        registry the loops update (reset on restart). A job that has not run
+        yet in this process stays ``unknown``; only explicit configuration or
+        the process-wide no-refresh guard proves ``disabled``.
         """
         require(context)
         cfg = self.config.get()
@@ -590,14 +595,27 @@ class StatusControl:
             ),
             ("providerUsage", None, False),
         ]
-        rows = [{
-            "id": name,
-            "intervalSeconds": int(interval) if interval is not None else None,
-            "lastRunAt": None,
-            "nextRunAt": None,
-            "status": "disabled" if disabled else "unknown",
-            "error": None,
-        } for name, interval, disabled in jobs]
+        try:
+            telemetry = self.job_telemetry.snapshot()
+        except Exception:
+            telemetry = {}
+        rows = []
+        for name, interval, disabled in jobs:
+            facts = telemetry.get(name) or {}
+            if disabled:
+                status = "disabled"
+            elif facts.get("running"):
+                status = "running"
+            else:
+                status = facts.get("last_result") or "unknown"
+            rows.append({
+                "id": name,
+                "intervalSeconds": int(interval) if interval is not None and int(interval) > 0 else None,
+                "lastRunAt": utc_datetime(facts.get("last_run_at")),
+                "nextRunAt": None if disabled else utc_datetime(facts.get("next_run_at")),
+                "status": status,
+                "error": facts.get("last_error"),
+            })
         return page_slice(rows, page=page, page_size=page_size)
 
 

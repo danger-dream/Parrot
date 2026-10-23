@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { CircleCheck, CircleX, Info, TriangleAlert, X } from '@lucide/vue'
-import { dismissToast, toasts } from '@/stores/ui'
+import { dismissToast, inspector, toasts, ui } from '@/stores/ui'
 
 const icons = { info: Info, success: CircleCheck, warning: TriangleAlert, error: CircleX }
 </script>
 
 <template>
-  <div class="toasts" aria-live="polite">
+  <div class="toasts" :class="{ shifted: inspector.open && ui.width >= 1280 }" aria-live="polite">
     <TransitionGroup name="toast">
       <div v-for="t in toasts" :key="t.id" class="toast glass" :class="`t-${t.tone}`">
         <component :is="icons[t.tone]" class="ic" />
@@ -32,6 +32,9 @@ const icons = { info: Info, success: CircleCheck, warning: TriangleAlert, error:
   width: min(360px, calc(100vw - 28px));
   pointer-events: none;
 }
+.toasts.shifted {
+  right: calc(var(--inspector-w) + 14px);
+}
 .toast {
   pointer-events: auto;
   display: flex;
@@ -39,7 +42,7 @@ const icons = { info: Info, success: CircleCheck, warning: TriangleAlert, error:
   gap: 10px;
   padding: 11px 12px;
   border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--surface-raised) 86%, transparent);
+  background: var(--popover);
   box-shadow: var(--shadow-lg);
 }
 .ic {

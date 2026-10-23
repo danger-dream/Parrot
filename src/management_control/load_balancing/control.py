@@ -185,6 +185,29 @@ class LoadBalancingControl(DomainControl):
             revision=self._revision(),
         )
 
+    def list_model_orders(
+        self, context: ManagementContext, *, source: str | None = None,
+    ) -> tuple[list[OrderRecord], str]:
+        """Every client model's effective order and its source in one read."""
+        self._read(context)
+        revision = self._revision()
+        overrides_only = source == "modelOverride"
+        records = []
+        for model_id in sorted(set(self._client_models()), key=str.lower):
+            override = load_balancing.has_model_priority(model_id)
+            if overrides_only and not override:
+                continue
+            channels = self._channels_for_model(model_id)
+            records.append(OrderRecord(
+                model_id=model_id,
+                order=tuple(load_balancing.effective_order_for_model(model_id, channels)),
+                source="modelOverride" if override else "channelDefault",
+                revision=revision,
+            ))
+        if source == "channelDefault":
+            records = [item for item in records if item.source == "channelDefault"]
+        return records, revision
+
     def replace_model_order(
         self,
         context: ManagementContext,

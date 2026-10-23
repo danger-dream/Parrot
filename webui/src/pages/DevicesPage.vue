@@ -196,6 +196,7 @@ async function revokeOthers(): Promise<void> {
 .meta {
   display: flex;
   flex-wrap: wrap;
+  align-items: baseline;
   gap: 2px 12px;
   margin-top: 3px;
   font-size: 12px;

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 withDefaults(
   defineProps<{
-    tone?: 'neutral' | 'blue' | 'green' | 'orange' | 'red' | 'purple' | 'teal'
+    tone?: 'neutral' | 'blue' | 'green' | 'orange' | 'red' | 'purple' | 'teal' | 'yellow' | 'pink'
     mono?: boolean
     dot?: boolean
   }>(),
@@ -52,4 +52,6 @@ withDefaults(
 .t-red { --tone: var(--red); }
 .t-purple { --tone: var(--purple); }
 .t-teal { --tone: var(--teal); }
+.t-yellow { --tone: var(--yellow); }
+.t-pink { --tone: var(--pink); }
 </style>

@@ -71,6 +71,37 @@ class ArtifactDownload:
     content_type: str
     size: int
     chunks: Iterator[bytes]
+    # Byte range actually served (HTTP Range); full file when range is None.
+    total_size: int | None = None
+    range: tuple[int, int] | None = None
+
+
+def parse_byte_range(header: str | None, size: int) -> tuple[int, int] | None:
+    """Parse one ``bytes=`` range into inclusive (start, end).
+
+    ``None`` means "serve the whole file" (no/unsupported header, e.g. multiple
+    ranges). Raises ``ValueError`` when the range is unsatisfiable (416).
+    """
+    if not header:
+        return None
+    unit, _, spec = header.strip().partition("=")
+    if unit.strip().lower() != "bytes" or "," in spec:
+        return None
+    first, _, last = spec.strip().partition("-")
+    try:
+        if first == "":
+            length = int(last)
+            if length <= 0:
+                raise ValueError("empty suffix range")
+            start, end = max(0, size - length), size - 1
+        else:
+            start = int(first)
+            end = int(last) if last != "" else size - 1
+    except ValueError:
+        raise ValueError("invalid range") from None
+    if start < 0 or start >= size or end < start:
+        raise ValueError("unsatisfiable range")
+    return start, min(end, size - 1)
 
 
 _SCAN_CHUNK = 200
@@ -234,6 +265,31 @@ class MediaControl:
         rows = self.media_db.recent(page_size, offset=(normalized - 1) * page_size)
         return copy.deepcopy(rows), copy.deepcopy(self.media_db.summary()), normalized, pages
 
+    def summary(self, context: ManagementContext) -> dict[str, Any]:
+        """TG 多媒体日志「📊 汇总」 + 「👤 OAuth Top 3」 in one read."""
+        require(context)
+        raw = self.media_db.summary() or {}
+        top = self.account_top(context, limit=3)
+        number = lambda value: int(value or 0)
+        return {
+            "total": number(raw.get("total")),
+            "openaiImages": number(raw.get("openai_images")),
+            "xaiImages": number(raw.get("xai_images")),
+            "videos": number(raw.get("videos")),
+            "successCount": number(raw.get("success_count")),
+            "failedCount": number(raw.get("failed_count")),
+            "pendingCount": number(raw.get("pending_count")),
+            "expiredCount": number(raw.get("expired_count")),
+            "costUsdTicks": number(raw.get("cost_usd_ticks")),
+            "topAccounts": [{
+                "accountKey": str(row.get("account_key") or ""),
+                "accountEmail": row.get("account_email") or None,
+                "provider": str(row.get("provider") or ""),
+                "total": number(row.get("total")),
+                "costUsdTicks": number(row.get("cost_usd_ticks")),
+            } for row in top],
+        }
+
     def account_top(self, context: ManagementContext, *, limit: int = 3) -> list[dict]:
         require(context)
         active_keys: set[str] = set()
@@ -308,7 +364,8 @@ class MediaControl:
             out.append(artifact)
         return out
 
-    def download(self, context: ManagementContext, media_log_id: str, artifact_id: str) -> ArtifactDownload:
+    def download(self, context: ManagementContext, media_log_id: str, artifact_id: str,
+                 *, range_header: str | None = None) -> ArtifactDownload:
         artifacts = self.artifacts(context, media_log_id)
         row = self.media_db.get_log(int(media_log_id))
         paths = self._paths(row or {})
@@ -316,13 +373,19 @@ class MediaControl:
             if metadata["id"] != artifact_id:
                 continue
 
-            def chunks(target: str = path) -> Iterator[bytes]:
+            total = int(metadata["sizeBytes"])
+            byte_range = parse_byte_range(range_header, total)  # ValueError → 416
+            start, end = byte_range if byte_range else (0, total - 1)
+
+            def chunks(target: str = path, offset: int = start, remaining: int = end - start + 1) -> Iterator[bytes]:
                 try:
                     with open(target, "rb") as handle:
-                        while True:
-                            chunk = handle.read(64 * 1024)
+                        handle.seek(offset)
+                        while remaining > 0:
+                            chunk = handle.read(min(64 * 1024, remaining))
                             if not chunk:
                                 break
+                            remaining -= len(chunk)
                             yield chunk
                 except FileNotFoundError as exc:
                     raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND) from exc
@@ -330,8 +393,10 @@ class MediaControl:
             return ArtifactDownload(
                 filename=metadata["fileName"],
                 content_type=metadata["contentType"],
-                size=metadata["sizeBytes"],
+                size=max(0, end - start + 1),
                 chunks=chunks(),
+                total_size=total,
+                range=byte_range,
             )
         raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
 

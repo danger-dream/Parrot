@@ -1,0 +1,1 @@
+.kv[data-v-cafa3be9]{grid-template-columns:repeat(var(--cols), minmax(0, 1fr));gap:10px 16px;margin:0;display:grid}.item[data-v-cafa3be9]{min-width:0}.item.full[data-v-cafa3be9]{grid-column:1/-1}dt[data-v-cafa3be9]{color:var(--text-3);font-size:11px}dd[data-v-cafa3be9]{word-break:break-word;margin:2px 0 0;font-size:12.5px}dd.mono[data-v-cafa3be9]{font-size:12px}

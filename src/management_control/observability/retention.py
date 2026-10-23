@@ -476,9 +476,54 @@ class RetentionControl:
             "scannedBytes": int(raw.get("scanned_bytes") or 0),
             "preflightOk": bool((raw.get("preflight") or {}).get("ok")),
             "errors": [str(item) for item in raw.get("errors") or []],
+            "items": RetentionControl._public_plan_items(raw),
             "revision": plan.revision,
             "operationId": plan.operation_id,
         }
+
+    @staticmethod
+    def _public_plan_items(raw: dict[str, Any]) -> list[dict[str, Any]]:
+        """Per-database breakdown, the same facts Telegram pages through.
+
+        ``releasableBytes`` is exact only for a whole-file delete; a trimmed
+        database frees space only if it is compacted afterwards, so it is
+        ``None`` there (``willCompact`` tells whether compaction is planned).
+        """
+        compaction = {
+            str(row.get("month")): row
+            for row in ((raw.get("preflight") or {}).get("compaction") or [])
+            if isinstance(row, dict)
+        }
+        out = []
+        for item in raw.get("items") or []:
+            month = str(item.get("month") or "")
+            action = str(item.get("action") or ("purge_bodies" if raw.get("scope") == "bodies" else ""))
+            if action not in {"delete_file", "trim_and_vacuum", "purge_bodies"}:
+                continue  # never invent an action for an unrecognised item
+            planned = compaction.get(month) or {}
+            if action == "delete_file":
+                will_compact, releasable = False, int(item.get("bundle_bytes") or 0)
+            elif "will_compact" in planned:
+                will_compact, releasable = bool(planned.get("will_compact")), None
+            else:
+                will_compact = bool(item.get("compact_after", not item.get("active")))
+                releasable = None
+            out.append({
+                "month": month,
+                "database": f"{month}.db",
+                "action": action,
+                "totalRows": int(item.get("total_requests") or 0),
+                "deletedRows": int(item.get("expired_requests") or 0),
+                "deletedCallRows": int(item.get("expired_mcp") or item.get("expired_independent_rows") or 0),
+                "currentBytes": int(item.get("bundle_bytes") or 0),
+                "releasableBytes": releasable,
+                "willCompact": will_compact,
+                "compactionRequiredBytes": (int(planned["required_bytes"])
+                                            if planned.get("required_bytes") is not None else None),
+                "note": str(planned.get("reason")) if planned.get("reason") else None,
+                "active": bool(item.get("active")),
+            })
+        return out
 
     def create_plan(
         self,

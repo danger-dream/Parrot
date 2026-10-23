@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory, type RouteLocationNormalizedLoaded } from 'vue-router'
 import { loadSession, session, setSignedOutHandler } from '@/stores/session'
-import { findNav } from '@/nav'
+import { findNav, navItems } from '@/nav'
+import { modulePages } from '@/pageRegistry'
 import { closeInspector } from '@/stores/ui'
 
 export const router = createRouter({
@@ -14,12 +15,10 @@ export const router = createRouter({
         { path: '', name: 'overview', component: () => import('@/pages/overview/OverviewPage.vue'), meta: { title: '概览' } },
         { path: 'live', name: 'live', component: () => import('@/pages/live/LivePage.vue'), meta: { title: '实时请求' } },
         { path: 'devices', name: 'devices', component: () => import('@/pages/DevicesPage.vue'), meta: { title: '登录设备' } },
-        {
-          path: 'planned/:key',
-          name: 'planned',
-          component: () => import('@/pages/PlannedPage.vue'),
-          beforeEnter: (to) => (findNav(String(to.params.key)) ? true : { name: 'overview' }),
-        },
+        ...navItems
+          .filter((item) => modulePages[item.key])
+          .map((item) => ({ path: item.to.slice(1), name: item.key, component: modulePages[item.key], meta: { title: item.label } })),
+        { path: 'planned/:key', redirect: (to: { params: Record<string, unknown> }) => findNav(String(to.params.key))?.to || '/' },
       ],
     },
     { path: '/:rest(.*)*', redirect: '/' },
@@ -45,12 +44,15 @@ router.beforeEach(async (to) => {
 })
 
 export function routeTitle(route: RouteLocationNormalizedLoaded): string {
-  if (route.name === 'planned') return findNav(String(route.params.key))?.label || 'Parrot'
   return route.meta.title || 'Parrot'
 }
 
-router.afterEach((to) => {
-  closeInspector()
+router.afterEach((to, from) => {
+  if (to.path !== from.path) {
+    closeInspector()
+    // Pages share one scrolling container, so a new page would otherwise open at the old offset.
+    document.querySelector('.content')?.scrollTo({ top: 0 })
+  }
   const title = routeTitle(to)
   document.title = title === 'Parrot' ? title : `${title} · Parrot`
 })

@@ -7,11 +7,26 @@ defineProps<{ w?: string; h?: string; r?: string }>()
 </template>
 
 <style scoped>
+/* Stays invisible for fast loads, then breathes slowly in sync with every other placeholder. */
 .sk {
   display: block;
-  background: linear-gradient(90deg, var(--fill-3) 0%, var(--fill) 50%, var(--fill-3) 100%) var(--fill-3);
-  background-size: 400px 100%;
-  background-repeat: no-repeat;
-  animation: shimmer 1.3s linear infinite;
+  background: var(--fill-2);
+  opacity: 0;
+  animation:
+    sk-in 0.35s ease-out 0.3s forwards,
+    sk-breathe 2.4s ease-in-out 0.65s infinite alternate;
+}
+@keyframes sk-in {
+  to {
+    opacity: 0.85;
+  }
+}
+@keyframes sk-breathe {
+  from {
+    opacity: 0.85;
+  }
+  to {
+    opacity: 0.45;
+  }
 }
 </style>

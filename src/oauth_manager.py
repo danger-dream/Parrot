@@ -6579,14 +6579,21 @@ async def oauth_model_sync_once(
 
 async def oauth_model_sync_loop() -> None:
     """Non-blocking startup/periodic maintenance loop for all OAuth providers."""
+    from . import job_telemetry
+    job_telemetry.scheduled("oauthModelSync", OAUTH_MODEL_SYNC_STARTUP_DELAY_SECONDS)
     await asyncio.sleep(OAUTH_MODEL_SYNC_STARTUP_DELAY_SECONDS)
     while True:
+        job_telemetry.started("oauthModelSync")
+        sync_error = None
         try:
             await oauth_model_sync_once(trigger="background", notify_changes=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            sync_error = type(exc).__name__
             safe_diagnostics.report(exc, operation="oauth_model_sync_loop")
+        job_telemetry.finished("oauthModelSync", ok=sync_error is None, error=sync_error,
+                               next_delay_seconds=OAUTH_MODEL_SYNC_CHECK_INTERVAL_SECONDS)
         await asyncio.sleep(OAUTH_MODEL_SYNC_CHECK_INTERVAL_SECONDS)
 
 
@@ -7199,13 +7206,20 @@ async def preload_openai_reset_credit_details_once() -> dict[str, str]:
 
 async def proactive_refresh_loop() -> None:
     """每60s按保护开关刷新Token，并独立运行用户已开启的自动签到。"""
+    from . import job_telemetry
+    job_telemetry.scheduled("oauthRefresh", 30)
     await asyncio.sleep(30)
     while True:
+        job_telemetry.started("oauthRefresh")
+        refresh_error = None
         try:
             if os.environ.get("PARROT_NO_REFRESH") != "1":
                 await proactive_refresh_once()
         except Exception as exc:
+            refresh_error = type(exc).__name__
             safe_diagnostics.report(exc, operation="proactive_refresh_loop")
+        job_telemetry.finished("oauthRefresh", ok=refresh_error is None, error=refresh_error,
+                               next_delay_seconds=60)
         try:
             from .oauth.workbuddy.actions import auto_checkin_once
             await asyncio.to_thread(auto_checkin_once)
@@ -7237,6 +7251,8 @@ async def quota_monitor_loop() -> None:
         safe_diagnostics.report(exc, operation="quota_monitor_loop")
 
     # Preserve the original stagger before the first quota-state evaluation.
+    from . import job_telemetry
+    job_telemetry.scheduled("quotaMonitor", 45)
     await asyncio.sleep(45)
     while True:
         cfg = config.get()
@@ -7244,8 +7260,13 @@ async def quota_monitor_loop() -> None:
         if not monitor_cfg.get("enabled", True):
             await asyncio.sleep(60)
             continue
+        job_telemetry.started("quotaMonitor")
+        quota_error = None
         try:
             await quota_monitor_once()
         except Exception as exc:
+            quota_error = type(exc).__name__
             safe_diagnostics.report(exc, operation="quota_monitor_loop")
+        job_telemetry.finished("quotaMonitor", ok=quota_error is None, error=quota_error,
+                               next_delay_seconds=int(monitor_cfg.get("intervalSeconds", 60)))
         await asyncio.sleep(int(monitor_cfg.get("intervalSeconds", 60)))

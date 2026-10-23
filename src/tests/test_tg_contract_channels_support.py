@@ -40,9 +40,24 @@ CURRENT_OVERRIDES = (
 )
 
 
+# WebUI round 2 (2026-10-22): OpenAI-protocol API channels now honour their
+# configured maxConcurrent, so the edit page shows the saved value instead of
+# 「（默认）」. Exactly this reviewed case is replaced.
+WEBUI_OVERRIDES = (
+    Path(__file__).parent
+    / "fixtures/tg_contract/webui-2026-10-22/overrides/channels_apikey.jsonl"
+)
+WEBUI_OVERRIDE_CASE_IDS = ("TG-CH-04.edit-fields-success",)
+
+
 def current_cases() -> list[dict[str, Any]]:
     archived = load_jsonl(SEGMENT)
     overrides = load_jsonl(CURRENT_OVERRIDES) if CURRENT_OVERRIDES.exists() else []
+    if WEBUI_OVERRIDES.exists():
+        webui = load_jsonl(WEBUI_OVERRIDES)
+        if tuple(case["caseId"] for case in webui) != WEBUI_OVERRIDE_CASE_IDS:
+            raise AssertionError("unexpected webui channel overlay scope")
+        overrides = [case for case in overrides if case["caseId"] not in WEBUI_OVERRIDE_CASE_IDS] + webui
     archived_ids = {case["caseId"] for case in archived}
     override_map = {case["caseId"]: case for case in overrides}
     if len(override_map) != len(overrides):

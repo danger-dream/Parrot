@@ -398,21 +398,52 @@ class OAuthAccountMutationControlMixin:
                     command.replace_plan_token,
                     flow_binding=(flow_id, flow_secret),
                 )
+                self._flows.browser.mark(flow_id, "completed", result)
             else:
                 completed = self._flows.complete(
                     context.actor.subject_id, flow_id, flow_secret, command,
                 )
-                with add_context.bind(completed.add_attempt):
-                    result = self._create_entry(
-                        context,
-                        completed.entry,
-                        flow_binding=(flow_id, flow_secret),
-                    )
+                try:
+                    if completed.relogin:
+                        result = self._complete_browser_relogin(context, completed)
+                    else:
+                        with add_context.bind(completed.add_attempt):
+                            result = self._create_entry(
+                                context,
+                                completed.entry,
+                                flow_binding=(flow_id, flow_secret),
+                            )
+                except OAuthReplaceRequired:
+                    raise  # Still "confirmed": the replacement plan can finish it.
+                except BaseException:
+                    self._flows.browser.mark(flow_id, "failed")
+                    raise
+                self._flows.browser.mark(flow_id, "completed", result)
         except BaseException:
             self._audit(context, "oauth.login.complete", "oauthLogin", "failed")
             raise
         self._audit(context, "oauth.login.complete", result.account_id)
         return result
+
+    def _complete_browser_relogin(self, context, completed) -> OAuthMutationResult:
+        """Re-authenticate exactly the bound account; never add or upsert.
+
+        Same guard as Telegram's relogin: the logged-in identity must resolve
+        to the bound account and that account must be unchanged since start.
+        """
+        relogin = completed.relogin
+        old = relogin["account"]
+        target = relogin["target_key"]
+        duplicate = self.prepare_account_save(context, completed.entry)
+        if duplicate is None or duplicate[0] != target or duplicate[1] != old:
+            raise ManagementError(ManagementErrorCode.IDENTITY_CONFLICT)
+        outcome = self.replace_account_entry(context, target, completed.entry, expected_account=old)
+        self._raise_conditional_status(outcome)
+        if outcome.get("status") != "replaced":
+            raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
+        account_id = outcome.get("account_key") or target
+        return OAuthMutationResult(account_id, revision(self._account(account_id)), "replaced",
+                                   post_save=outcome.get("_post_save"))
 
     def update_account(
         self,
@@ -427,14 +458,24 @@ class OAuthAccountMutationControlMixin:
             current = copy.deepcopy(self._account(account_id))
             if expected_revision and expected_revision != revision(current):
                 raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+            allow_credits = getattr(command, "allow_credits", None)
+            if allow_credits is not None and self.backend.provider_of(current) != "openai":
+                raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE, fields=[
+                    ErrorField("allowCredits", "OPENAI_ONLY", "allowCredits applies to OpenAI accounts only")])
             outcome = self.backend.update_account_conditional(
                 account_id,
                 current,
                 display_name=command.display_name,
                 enabled=command.enabled,
                 max_concurrent=command.max_concurrent,
+                **({"allow_credits": allow_credits} if allow_credits is not None else {}),
             )
             self._raise_conditional_status(outcome)
+            if allow_credits is False:
+                # Same as Telegram: turning credits off applies the gate now.
+                # Turning them on lifts a pause only after a fresh usage read
+                # (refreshOAuthUsage), never from a stale cached snapshot.
+                self.backend.evaluate_cached_quota(account_id)
             result = self.get_account(context, account_id)
         except BaseException:
             self._audit(context, "oauth.account.update", account_id, "failed")

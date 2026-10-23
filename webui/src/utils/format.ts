@@ -146,3 +146,57 @@ export function providerOf(id: string | null | undefined): string | null {
   if (id.startsWith('oauth:')) return id.slice(6).split(':')[0]
   return null
 }
+
+/** “30 分钟”, “1 小时 30 分”, “2 天” — rounded, for hints next to second-based inputs. */
+export function humanSeconds(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—'
+  const s = Math.max(0, Math.round(value))
+  if (s < 60) return `${s} 秒`
+  const d = Math.floor(s / 86400)
+  const h = Math.floor((s % 86400) / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const sec = s % 60
+  if (d) return h ? `${d} 天 ${h} 小时` : `${d} 天`
+  if (h) return m ? `${h} 小时 ${m} 分` : `${h} 小时`
+  return sec ? `${m} 分 ${sec} 秒` : `${m} 分钟`
+}
+
+/** Binary byte size: “1.2 GB”. */
+export function bytes(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—'
+  let n = Math.max(0, value)
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let i = 0
+  while (n >= 1024 && i < units.length - 1) {
+    n /= 1024
+    i += 1
+  }
+  return i === 0 ? `${n} B` : `${n.toFixed(n >= 100 ? 0 : 1)} ${units[i]}`
+}
+
+/** Full Beijing date-time, “2026-10-22 16:54”. */
+export function fullTime(value: string | number | null | undefined): string {
+  if (value === null || value === undefined || value === '') return '—'
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return '—'
+  const p: Record<string, string> = {}
+  for (const x of new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(d))
+    p[x.type] = x.value
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`
+}
+
+/** Random Idempotency-Key; crypto.randomUUID is missing on plain-HTTP (non-secure) origins. */
+export function newIdempotencyKey(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+  const buf = new Uint8Array(16)
+  crypto.getRandomValues(buf)
+  return Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('')
+}

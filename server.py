@@ -65,6 +65,7 @@ from src.management_control import OperationRegistry, OperationStore, StoreAudit
 from src.management_control.composition import ManagementControls
 from src import mcp
 from src import webui_static
+from src.management_compression import ManagementCompressionMiddleware
 from src.model_registry import runtime as model_registry_runtime
 from src.openai.codex_constants import codex_cli_version
 from src.openai.transform.guard import GuardError, guard_collection_fields
@@ -244,6 +245,15 @@ def _initialize_management_runtime(app: FastAPI) -> ManagementRuntime | None:
                 raise
 
         tgbot.configure_management_approval_handler(decide)
+        # Warm the month statistics snapshot off the request path so the first
+        # statistics / API-key page does not pay the full live-month scan.
+        def _warm_statistics() -> None:
+            controls.observability.stats.warm_cache()
+            controls.oauth.warm_card_stats()
+
+        warm = threading.Timer(20.0, _warm_statistics)
+        warm.daemon = True
+        warm.start()
         print("[management] control plane ready")
         return runtime
     except Exception as exc:
@@ -290,11 +300,16 @@ async def _close_management_runtime(app: FastAPI) -> None:
 
 
 async def _wal_checkpoint_loop():
+    from src import job_telemetry
     while True:
+        job_telemetry.scheduled("walCheckpoint", 300)
         await asyncio.sleep(300)
+        job_telemetry.started("walCheckpoint")
+        wal_error = None
         try:
             log_db.checkpoint()
         except Exception as e:
+            wal_error = type(e).__name__
             print(f"[log_db] checkpoint failed: {e}")
         try:
             image_db.checkpoint()
@@ -304,6 +319,8 @@ async def _wal_checkpoint_loop():
             translation.checkpoint()
         except Exception as e:
             print(f"[translation] checkpoint failed: {e}")
+        job_telemetry.finished("walCheckpoint", ok=wal_error is None, error=wal_error,
+                               next_delay_seconds=300)
 
 
 def _finalize_state_store() -> bool:
@@ -318,14 +335,21 @@ def _finalize_state_store() -> bool:
 
 
 async def _stale_pending_loop():
+    from src import job_telemetry
     while True:
+        job_telemetry.scheduled("pendingCleanup", 300)
         await asyncio.sleep(300)
+        job_telemetry.started("pendingCleanup")
+        pending_error = None
         try:
             cleared = await asyncio.to_thread(log_db.cleanup_stale_pending, 1800)
             if cleared:
                 print(f"[log_db] cleaned {cleared} stale pending records")
         except Exception as e:
+            pending_error = type(e).__name__
             print(f"[log_db] stale cleanup failed: {e}")
+        job_telemetry.finished("pendingCleanup", ok=pending_error is None, error=pending_error,
+                               next_delay_seconds=300)
         # 留存策略已经由 TG 二次确认后持久化；这里每天最多实际清理一次。
         # 放在后台维护线程而非请求写入路径，避免一条新请求撞上大型 VACUUM。
         try:
@@ -349,14 +373,20 @@ async def _affinity_cleanup_loop():
             interval = int(cfg.get("affinity", {}).get("cleanupIntervalSeconds", 300))
         except Exception:
             interval = 300
+        from src import job_telemetry
+        job_telemetry.scheduled("affinityCleanup", interval)
         await asyncio.sleep(interval)
+        job_telemetry.started("affinityCleanup")
+        affinity_error = None
         try:
             cleared = affinity.cleanup()
             client_cleared = affinity.client_cleanup()
             if cleared or client_cleared:
                 print(f"[affinity] cleaned {cleared} fp + {client_cleared} client stale entries")
         except Exception as e:
+            affinity_error = type(e).__name__
             print(f"[affinity] cleanup failed: {e}")
+        job_telemetry.finished("affinityCleanup", ok=affinity_error is None, error=affinity_error)
 
 
 @asynccontextmanager
@@ -682,6 +712,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Gzip only for /api/management/ and /ui/ (see src/management_compression.py).
+app.add_middleware(ManagementCompressionMiddleware)
 
 
 def _install_mcp(app: FastAPI) -> None:

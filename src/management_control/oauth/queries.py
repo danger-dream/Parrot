@@ -50,13 +50,40 @@ class OAuthQueryControlMixin:
         """Redacted local view for Telegram; never refreshes or claims."""
         return self.backend.qoder_snapshot(account_id)
 
+    def _month_channel_stats(self, context, account_id: str, since_ts: float) -> dict:
+        """Month token/cost stats for the detail view; API reads share the
+        statistics cache (Telegram keeps its exact uncached read)."""
+        from src.management_auth import AuthMethod
+        from src.management_control.stats_cache import cached
+        from .backend import OAuthBackend
+        if type(self.backend) is OAuthBackend and context.actor.auth_method is not AuthMethod.TELEGRAM_ADMIN:
+            # Single-object detail: a cached per-account read, never the
+            # global month snapshot (see test_management_read_performance).
+            return cached(("oauth-month", account_id, since_ts),
+                          lambda: self.backend.tokens_for_channel(f"oauth:{account_id}", since_ts) or {})
+        return self.backend.tokens_for_channel(f"oauth:{account_id}", since_ts) or {}
+
     def _provider_snapshots(self, provider, account_id: str) -> dict:
         """The account detail's provider-specific redacted views; None for other providers."""
         from .models import OAuthProvider
+        from .usage_sections import build_usage_sections, _time
+        zhipu = self.backend.zhipu_snapshot(account_id) if provider is OAuthProvider.ZHIPU else None
+        row = self.backend.quota_load(account_id) or {}
+        try:
+            snapshot = (self.backend.workbuddy_snapshot(account_id) if provider is OAuthProvider.WORKBUDDY
+                        else self.backend.qoder_snapshot(account_id) if provider is OAuthProvider.QODER else None)
+            sections = build_usage_sections(provider.value, row, self.backend, zhipu_snapshot=zhipu,
+                                            provider_snapshot=snapshot)
+        except Exception:
+            sections = ()  # Presentation-only; never fail the account detail.
+        account = self.backend.get_account_exact(account_id) if provider is OAuthProvider.OPENAI else None
         return {
             "workbuddy": self.backend.workbuddy_snapshot(account_id) if provider is OAuthProvider.WORKBUDDY else None,
-            "zhipu": self.backend.zhipu_snapshot(account_id) if provider is OAuthProvider.ZHIPU else None,
+            "zhipu": zhipu,
             "qoder": self.backend.qoder_snapshot(account_id) if provider is OAuthProvider.QODER else None,
+            "usage_sections": sections,
+            "usage_fetched_at": _time(row.get("fetched_at")),
+            "allow_credits": (account or {}).get("allowCredits") is True if provider is OAuthProvider.OPENAI else None,
         }
 
     def _refresh_enabled_for(self, provider: str) -> bool:

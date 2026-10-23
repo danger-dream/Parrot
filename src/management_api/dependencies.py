@@ -180,7 +180,7 @@ def _verify(runtime: ManagementRuntime, credential: str) -> VerifiedSession:
         raise ManagementError(code) from exc
 
 
-async def get_authenticated_session(
+def get_authenticated_session(
     request: Request,
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
     authorization: Annotated[HTTPAuthorizationCredentials | None, Security(_BEARER)],
@@ -190,6 +190,8 @@ async def get_authenticated_session(
             credential=authorization.credentials,
             verified=_verify(runtime, authorization.credentials),
         )
+    # A plain ``def`` dependency: FastAPI runs it on the worker threadpool, so
+    # the SQLite session read/touch never executes on the event loop.
     cookie = request.cookies.get(SESSION_COOKIE_NAME)
     if not cookie:
         raise ManagementError(ManagementErrorCode.SESSION_REQUIRED)

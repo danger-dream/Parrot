@@ -1,0 +1,34 @@
+/* Shared look for text-like controls (TextInput, NumberInput, Select, TextArea, SearchField). */
+.ctl {
+  width: 100%;
+  min-width: 0;
+  height: 30px;
+  padding: 0 10px;
+  border: 0;
+  outline: 0;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: inset 0 0 0 0.5px var(--border-strong), 0 0.5px 1px rgba(0, 0, 0, 0.04);
+  font-size: 13px;
+  color: var(--text);
+  transition: box-shadow 0.15s, background 0.15s;
+}
+.ctl::placeholder {
+  color: var(--text-3);
+}
+.ctl:focus,
+.ctl:focus-within,
+.ctl.open {
+  box-shadow: inset 0 0 0 1px var(--accent), 0 0 0 3px var(--accent-soft);
+}
+.ctl:disabled,
+.ctl.disabled {
+  opacity: 0.55;
+}
+.ctl.invalid {
+  box-shadow: inset 0 0 0 1px var(--red);
+}
+.ctl.mono {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}

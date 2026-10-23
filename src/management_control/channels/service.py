@@ -375,6 +375,9 @@ class ChannelControl(ChannelOperationWorkers):
             max_tps=raw.get("max_tps"),
             min_tps=raw.get("min_tps"),
             cost=format(Decimal(raw.get("cost_ticks") or 0) / TICKS_PER_USD, "f") if raw.get("costed_success") else None,
+            cost_ticks=int(raw.get("cost_ticks") or 0),
+            costed_success=int(raw.get("costed_success") or 0),
+            unpriced_success=int(raw.get("unpriced_success") or 0),
         )
 
     def get_channel_detail(self, context: ManagementContext, channel_id: str) -> ChannelDetail:
@@ -869,9 +872,12 @@ class ChannelControl(ChannelOperationWorkers):
         self._authorize(context, Capability.WRITE)
         self._authorize(context, Capability.SECRETS_WRITE)
         channel = self._draft_channel(command)
+        # A draft has no channel yet: never record a cooldown for the
+        # temporary ``api:<name>__wiz`` key. Failed models are carried into
+        # createChannel (initialProbeResults) and cooled down on the real
+        # channel there, exactly like the Telegram wizard's save.
         return await self._probe(
-            channel, command.model, progress_cb=progress_cb,
-            pre_save=not telegram_compatibility,
+            channel, command.model, progress_cb=progress_cb, pre_save=False,
         )
 
     async def probe_existing(

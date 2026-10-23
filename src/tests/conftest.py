@@ -113,6 +113,9 @@ def _protect_repository_account_state():
 
 _worker_data_root()
 _validate_import_time_isolation()
+# Tests read statistics right after writing them; the production
+# stale-while-revalidate statistics cache is opted into only by its own tests.
+os.environ["PARROT_STATS_CACHE"] = "0"
 _protect_repository_account_state()
 
 import pytest
@@ -308,6 +311,15 @@ def _isolate_proxy_runtime(monkeypatch):
     monkeypatch.setattr(manager, "_initialized", False)
     monkeypatch.setattr(manager, "_config_generation", None)
     monkeypatch.setattr(manager, "_snapshot", manager._EMPTY_SNAPSHOT)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_job_telemetry():
+    """Background-loop telemetry is process-global; start every test empty."""
+    from src import job_telemetry
+    job_telemetry._reset_for_tests()
+    yield
+    job_telemetry._reset_for_tests()
 
 
 @pytest.fixture(autouse=True)

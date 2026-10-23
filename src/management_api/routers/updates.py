@@ -26,6 +26,8 @@ from ..schemas.auxiliary_updates import (
     UpdatePageMeta,
     UpdateSettingsData,
     UpdateSettingsPatch,
+    UpdateActivationPlanData,
+    UpdateStateData,
 )
 from .auxiliary_support import (
     get_bound_auxiliary_controls,
@@ -370,3 +372,73 @@ def cancel_staged_update(
 ) -> Response:
     controls.updates.cancel_staged(context, expected_revision=if_match)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+_STATE_EXAMPLE = {
+    "stage": "staged", "mode": "git", "fromVersion": "0.35.0", "toVersion": None,
+    "targetVersion": "v0.36.0", "message": None, "repository": "danger-dream/Parrot",
+    "currentVersion": "0.35.0", "busy": False, "activationAvailable": True, "revision": "rev_example",
+}
+
+
+@router.get(
+    "/updates/state",
+    operation_id="getUpdateState",
+    dependencies=[Depends(reject_unknown_query())],
+    tags=["updates"],
+    response_model=DataEnvelope[UpdateStateData],
+    responses={**success_response(200, {"data": _STATE_EXAMPLE, "meta": {"requestId": "request-example"}}), **management_error_responses(*_ERRORS)},
+)
+def get_update_state(
+    request: Request,
+    controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
+) -> DataEnvelope[UpdateStateData]:
+    value = controls.updates.state_view(context)
+    return DataEnvelope(data=UpdateStateData(
+        stage=value["stage"], mode=value["mode"], fromVersion=value["from_version"],
+        toVersion=value["to_version"], targetVersion=value["target_version"], message=value["message"],
+        repository=value["repository"], currentVersion=value["current_version"], busy=value["busy"],
+        activationAvailable=value["activation_available"], revision=value["revision"],
+    ), meta=response_meta(request))
+
+
+@router.get(
+    "/updates/check",
+    operation_id="getCachedUpdateCheck",
+    dependencies=[Depends(reject_unknown_query())],
+    tags=["updates"],
+    response_model=DataEnvelope[UpdateCheckData],
+    responses={**success_response(200, _CHECK_EXAMPLE), **management_error_responses(*_ERRORS)},
+)
+def get_cached_update_check(
+    request: Request,
+    controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
+) -> DataEnvelope[UpdateCheckData]:
+    """Last check result (with release notes) without contacting GitHub."""
+    return DataEnvelope(data=_check(controls.updates.cached_check(context)), meta=response_meta(request))
+
+
+@router.post(
+    "/updates/staged/actions/activation-plan",
+    operation_id="createUpdateActivationPlan",
+    dependencies=[Depends(reject_unknown_query())],
+    tags=["updates"],
+    response_model=DataEnvelope[UpdateActivationPlanData],
+    responses={**success_response(200, {"data": {"planToken": "<one-time-stage-plan>", "targetVersion": "v0.36.0",
+                                                "revision": "rev_example", "expiresAt": "2026-01-02T03:14:05Z"},
+                                       "meta": {"requestId": "request-example"}}),
+               **management_error_responses(*_ERRORS)},
+)
+def create_update_activation_plan(
+    request: Request,
+    controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.UPDATE))],
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> DataEnvelope[UpdateActivationPlanData]:
+    value = controls.updates.issue_activation_plan(context, expected_revision=if_match)
+    return DataEnvelope(data=UpdateActivationPlanData(
+        planToken=value["plan_token"], targetVersion=value["target_version"],
+        revision=value["revision"], expiresAt=value["expires_at"],
+    ), meta=response_meta(request))

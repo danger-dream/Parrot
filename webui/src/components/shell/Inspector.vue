@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted } from 'vue'
-import { X } from '@lucide/vue'
-import { closeInspector, inspector, ui } from '@/stores/ui'
+import { ChevronLeft, X } from '@lucide/vue'
+import { backInspector, closeInspector, inspector, inspectorHistory, markInspectorInteraction, ui } from '@/stores/ui'
 
-const mode = computed(() => (ui.width >= 1280 ? 'docked' : ui.width >= 768 ? 'overlay' : 'sheet'))
+// Details float over the page (like a drawer) so opening one never reflows the list underneath.
+const mode = computed(() => (ui.width >= 768 ? 'overlay' : 'sheet'))
 
 function onKey(e: KeyboardEvent): void {
   if (e.key === 'Escape' && inspector.open && !ui.paletteOpen) closeInspector()
@@ -14,14 +15,17 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 
 <template>
   <Transition name="backdrop">
-    <div v-if="inspector.open && mode !== 'docked'" class="backdrop" @click="closeInspector" />
+    <div v-if="inspector.open" class="backdrop" @click="closeInspector" />
   </Transition>
-  <aside class="inspector" :class="[mode, { open: inspector.open }]" :aria-hidden="!inspector.open">
+  <aside class="inspector" :class="[mode, { open: inspector.open }]" :aria-hidden="!inspector.open" @pointerdown.capture="markInspectorInteraction">
     <div class="inner">
       <header class="head">
+        <button v-if="inspectorHistory.length" class="back" :title="`返回 ${inspectorHistory[inspectorHistory.length - 1].title}`" @click="backInspector">
+          <ChevronLeft />
+        </button>
         <div class="titles">
           <p class="title">{{ inspector.title }}</p>
-          <p v-if="inspector.subtitle" class="sub mono">{{ inspector.subtitle }}</p>
+          <p v-if="inspector.subtitle" class="sub mono" :data-private="inspector.key.startsWith('account:') ? '' : undefined">{{ inspector.subtitle }}</p>
         </div>
         <button class="close" aria-label="关闭" @click="closeInspector"><X /></button>
       </header>
@@ -45,28 +49,13 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   height: 100%;
   min-width: 0;
 }
-.inspector.docked {
-  position: relative;
-  height: 100%;
-  width: 0;
-  flex-shrink: 0;
-  overflow: hidden;
-  border-left: 0.5px solid transparent;
-  transition: width 0.34s var(--ease-out), border-color 0.34s;
-}
-.inspector.docked .inner {
-  width: var(--inspector-w);
-}
-.inspector.docked.open {
-  width: var(--inspector-w);
-  border-left-color: var(--border);
-}
 .inspector.overlay {
   position: fixed;
   top: 0;
   right: 0;
   bottom: 0;
   width: min(var(--inspector-w), 92vw);
+  border-left: 1px solid var(--border);
   box-shadow: var(--shadow-lg);
   transform: translateX(104%);
   transition: transform 0.34s var(--ease-out);
@@ -93,7 +82,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   height: var(--topbar-h);
   padding: 0 12px 0 18px;
   flex-shrink: 0;
-  border-bottom: 0.5px solid var(--border);
+  border-bottom: 1px solid var(--border);
 }
 .titles {
   flex: 1;
@@ -112,6 +101,23 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.back {
+  width: 28px;
+  height: 28px;
+  margin-left: -6px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  color: var(--accent);
+}
+.back:hover {
+  background: var(--accent-soft);
+}
+.back svg {
+  width: 18px;
+  height: 18px;
 }
 .close {
   width: 28px;

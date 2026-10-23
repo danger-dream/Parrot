@@ -164,6 +164,7 @@ def insert_request(conn, **values) -> None:
         "total_time_ms": values.pop("total_time_ms", None),
         "retry_count": values.pop("retry_count", 0),
         "usage_observed": values.pop("usage_observed", 1),
+        "affinity_hit": int(values.pop("affinity_hit", 0)),
     }
     assert not values, values
     columns = ",".join(row)

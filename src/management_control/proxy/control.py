@@ -17,6 +17,7 @@ from src.management_control.context import AuditSink, ManagementContext
 from src.management_control.errors import ErrorField, ManagementError, ManagementErrorCode
 from src.management_control.models.common import DomainControl, ListPage, stable_revision
 from src.management_control.operations import OperationStore
+from src.management_control.stats_cache import cached
 from src.management_control.routing_account_ids import (
     oauth_account_id_from_channel_key,
     oauth_channel_key_from_account_id,
@@ -106,9 +107,11 @@ class ProxyControl(DomainControl):
 
     @staticmethod
     def _stats() -> dict[str, dict]:
+        # Aggregating the live month takes about a second; share it through the statistics cache.
+        rows = cached(("proxy-stats",), lambda: log_db.proxy_stats(limit=1000), source=log_db)
         return {
             str(item.get("proxy_name")): dict(item)
-            for item in log_db.proxy_stats(limit=1000)
+            for item in rows
             if item.get("proxy_name")
         }
 

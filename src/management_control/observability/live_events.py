@@ -29,6 +29,15 @@ from src.management_control.context import ManagementContext
 
 Encoder = Callable[[str, dict[str, Any]], str]
 
+
+async def _offload(function, /, *args, **kwargs):
+    """Run enrichment reads on anyio's worker threads, not on the asyncio
+    default executor that the inference path uses for request logging."""
+    import functools
+
+    import anyio.to_thread
+    return await anyio.to_thread.run_sync(functools.partial(function, *args, **kwargs))
+
 _CLOSE = object()
 
 
@@ -247,7 +256,7 @@ class LiveEventBus:
             })
         elif kind == "updated":
             data = {"id": str(payload.get("id") or "")}
-            for key in ("channelId", "model", "retryCount"):
+            for key in ("channelId", "model", "retryCount", "proxyName"):
                 if payload.get(key) is not None:
                     data[key] = payload[key]
             self.broadcast("request.updated", data)
@@ -272,7 +281,7 @@ class LiveEventBus:
                 by_month.setdefault(month, []).append(request_id)
             for month, ids in by_month.items():
                 try:
-                    records = await asyncio.to_thread(
+                    records = await _offload(
                         self.logs.list_records, self._context, ids, month=month,
                     )
                 except asyncio.CancelledError:
@@ -292,7 +301,7 @@ class LiveEventBus:
             if not self._subscribers:
                 return
             try:
-                snapshot = await asyncio.to_thread(
+                snapshot = await _offload(
                     self.status.api_concurrency_snapshot, self._context,
                 )
             except asyncio.CancelledError:

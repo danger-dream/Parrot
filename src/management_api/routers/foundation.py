@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Header, Path, Request, Response, status
+from starlette.concurrency import run_in_threadpool
 
 from src.management_auth import (
     ApprovalError,
@@ -235,7 +235,7 @@ def _session_summary(issued_or_verified) -> SessionSummary:
         ),
     },
 )
-async def create_management_session(
+def create_management_session(
     grant: Annotated[SessionGrant, Body(openapi_examples=_SESSION_GRANT_EXAMPLES)],
     request: Request,
     response: Response,
@@ -304,7 +304,7 @@ async def create_management_session(
         ),
     },
 )
-async def get_current_management_session(
+def get_current_management_session(
     request: Request,
     response: Response,
     authenticated: Annotated[AuthenticatedSession, Depends(get_authenticated_session)],
@@ -330,7 +330,7 @@ async def get_current_management_session(
         ),
     },
 )
-async def revoke_current_management_session(
+def revoke_current_management_session(
     request: Request,
     authenticated: Annotated[AuthenticatedSession, Depends(get_authenticated_session)],
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
@@ -375,7 +375,7 @@ async def create_telegram_approval(
     reject_unknown_query_parameters(request)
     request_id = management_request_id(request)
     try:
-        issued = await asyncio.to_thread(
+        issued = await run_in_threadpool(
             runtime.approvals.create,
             client_name=body.clientName,
             source_address=request.client.host if request.client else "unknown",
@@ -419,7 +419,7 @@ async def create_telegram_approval(
         ),
     },
 )
-async def get_telegram_approval(
+def get_telegram_approval(
     approvalId: Annotated[str, Path(min_length=8, max_length=128)],
     request: Request,
     response: Response,
@@ -464,7 +464,7 @@ async def get_telegram_approval(
         ),
     },
 )
-async def get_management_metadata(
+def get_management_metadata(
     request: Request,
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
     context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
@@ -508,7 +508,7 @@ async def get_management_metadata(
         ),
     },
 )
-async def get_management_capabilities(
+def get_management_capabilities(
     request: Request,
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
     context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
@@ -552,7 +552,7 @@ async def get_management_capabilities(
         ),
     },
 )
-async def get_management_operation(
+def get_management_operation(
     operationId: Annotated[str, Path(min_length=4, max_length=128)],
     request: Request,
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
@@ -583,7 +583,7 @@ async def get_management_operation(
         ),
     },
 )
-async def cancel_management_operation(
+def cancel_management_operation(
     operationId: Annotated[str, Path(min_length=4, max_length=128)],
     request: Request,
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],

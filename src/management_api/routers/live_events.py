@@ -7,7 +7,6 @@ not allowed, 1013 too many connections (or control plane not ready),
 
 from __future__ import annotations
 
-import asyncio
 import json
 
 import anyio
@@ -15,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, WebSocket
+from starlette.concurrency import run_in_threadpool
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from src.management_auth import SessionAuthenticationError
@@ -126,7 +126,7 @@ async def management_events(websocket: WebSocket) -> None:
         await _close(websocket, CLOSE_UNAUTHENTICATED, "session required")
         return
     try:
-        verified = await asyncio.to_thread(runtime.sessions.verify, credential, touch=False)
+        verified = await run_in_threadpool(runtime.sessions.verify, credential, touch=False)
     except SessionAuthenticationError:
         await _close(websocket, CLOSE_UNAUTHENTICATED, "session required")
         return
@@ -181,7 +181,7 @@ async def _serve(websocket, runtime, credential, subscription) -> None:
                     if anyio.current_time() >= next_check:
                         next_check = anyio.current_time() + SESSION_CHECK_SECONDS
                         try:
-                            await asyncio.to_thread(
+                            await run_in_threadpool(
                                 runtime.sessions.verify, credential, touch=False,
                             )
                         except SessionAuthenticationError:

@@ -284,12 +284,46 @@ class StatsMetricData(StrictSchema):
     maximumTokensPerSecond: float | None = Field(default=None, ge=0)
     minimumTokensPerSecond: float | None = Field(default=None, ge=0)
     serviceTierCounts: dict[str, int] = Field(default_factory=dict)
+    # Round 3: TG-derived values (null when the denominator is 0).
+    promptTokens: int = Field(default=0, ge=0)
+    cacheReadRatio: float | None = None
+    successRate: float | None = None
+    cacheHitRate: float | None = None
+    cacheWriteRate: float | None = None
+    retriedRequestRate: float | None = None
+    affinityHitRate: float | None = None
+
+
+class StatsTopRowData(StrictSchema):
+    key: str
+    metrics: StatsMetricData
+
+
+class StatsModelChannelShareData(StrictSchema):
+    key: str
+    type: str | None = None
+    count: int = Field(ge=0)
+
+
+class StatsTopModelRowData(StatsTopRowData):
+    channels: list[StatsModelChannelShareData] = Field(default_factory=list)
+
+
+class StatsFamilyTopsData(StrictSchema):
+    channels: list[StatsTopRowData]
+    models: list[StatsTopModelRowData]
+
+
+class StatsTopApiKeyRowData(StatsTopRowData):
+    familyTotals: dict[str, int] = Field(default_factory=dict)
 
 
 class StatsSummaryData(StrictSchema):
     period: Literal["today", "3d", "7d", "month", "lifetime"]
     overall: StatsMetricData
     families: dict[str, StatsMetricData]
+    familyTops: dict[str, StatsFamilyTopsData] = Field(default_factory=dict)
+    topApiKeys: list[StatsTopApiKeyRowData] = Field(default_factory=list)
     revision: str
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
         "period": "today", "overall": {"total": 10, "successCount": 9},
@@ -300,6 +334,8 @@ class StatsSummaryData(StrictSchema):
 class StatsBreakdownData(StrictSchema):
     key: str
     metrics: StatsMetricData
+    # Round 3 (dimension=model): TG 「所属」 channels (top 5 by count).
+    channels: list["StatsModelChannelShareData"] | None = None
     revision: str
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
         "key": "example", "metrics": {"total": 10, "successCount": 9},
@@ -342,6 +378,29 @@ class RecentCallData(StrictSchema):
     }]})
 
 
+class CacheMissSampleData(StrictSchema):
+    """One TG「最近未命中样本」 row: a successful request without cache read."""
+    id: str
+    createdAt: datetime | None = None
+    model: str | None = None
+    apiKeyName: str | None = None
+    channelId: str | None = None
+    inputTokens: int
+    cacheCreationTokens: int
+    outputTokens: int
+    messageCount: int
+    toolCount: int
+
+
+class RecentOutcomeData(StrictSchema):
+    """Last finished outcomes (oldest first) of one channel / API key / model within 7 days."""
+    key: str
+    outcomes: list[Literal["success", "error", "cancelled"]]
+    successCount: int
+    errorCount: int
+    lastAt: datetime | None = None
+
+
 class TelegramStatsPreferencesData(StrictSchema):
     byChannel: bool
     byModel: bool
@@ -374,6 +433,17 @@ class RequestLogBillingData(StrictSchema):
     unpricedSuccess: int = Field(ge=0)
 
 
+class RequestLogModelConflictData(StrictSchema):
+    httpHeader: list[str]
+    eventHeaders: list[str]
+    bodyModels: list[str]
+
+
+class RequestLogSafetyReviewData(StrictSchema):
+    flagged: bool
+    reason: str | None = None
+
+
 class RequestLogData(StrictSchema):
     id: str
     status: str
@@ -391,6 +461,41 @@ class RequestLogData(StrictSchema):
     costTicks: int = Field(ge=0)
     billing: RequestLogBillingData
     error: str | None = None
+    # ── Round 3: every fact of the Telegram list card (ui.fmt_log_entry_*) ──
+    httpStatus: int | None = None
+    channelName: str | None = None
+    channelProvider: str | None = None
+    channelType: str | None = None
+    ingressProtocol: str | None = None
+    upstreamProtocol: str | None = None
+    websocket: Literal["ingress", "upstream"] | None = None
+    isStream: bool = False
+    cacheCreationTokens: int = Field(default=0, ge=0)
+    cacheReadTokens: int = Field(default=0, ge=0)
+    promptTokens: int = Field(default=0, ge=0)
+    cacheReadRatio: float | None = None
+    connectMilliseconds: float | None = None
+    firstTokenMilliseconds: float | None = None
+    idleMilliseconds: float | None = None
+    tokensPerSecond: float | None = None
+    reasoningEffort: str | None = None
+    serviceTier: str | None = None
+    speedMode: Literal["ultrafast", "fast", "tier"] | None = None
+    affinityHit: bool = False
+    proxyName: str | None = None
+    proxyBytesUp: int | None = None
+    proxyBytesDown: int | None = None
+    localSearchCount: int = Field(default=0, ge=0)
+    usageObserved: bool | None = None
+    errorSummary: str | None = None
+    upstreamActualModel: str | None = None
+    modelSignalConflict: RequestLogModelConflictData | None = None
+    safetyReview: RequestLogSafetyReviewData | None = None
+    # ── detail only (getRequestLog): TG 「请求总览 / 客户端」 ──
+    clientIp: str | None = None
+    finalRoundId: str | None = None
+    requestElapsedMilliseconds: float | None = None
+    stageMilliseconds: dict[str, float | None] | None = None
     revision: str
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
         "id": "request-example", "status": "success", "createdAt": "2026-01-02T03:04:05Z",
@@ -626,6 +731,21 @@ class RetentionPlanCreate(StrictSchema):
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{"days": 30}]})
 
 
+class RetentionPlanItemData(StrictSchema):
+    month: str
+    database: str
+    action: Literal["delete_file", "trim_and_vacuum", "purge_bodies"]
+    totalRows: int = Field(ge=0)
+    deletedRows: int = Field(ge=0)
+    deletedCallRows: int = Field(ge=0)
+    currentBytes: int = Field(ge=0)
+    releasableBytes: int | None = Field(default=None, ge=0)
+    willCompact: bool
+    compactionRequiredBytes: int | None = Field(default=None, ge=0)
+    note: str | None = None
+    active: bool
+
+
 class RetentionPlanData(StrictSchema):
     planId: str
     state: Literal["prepared", "committed", "cancelled"]
@@ -641,6 +761,7 @@ class RetentionPlanData(StrictSchema):
     scannedBytes: int = Field(ge=0)
     preflightOk: bool
     errors: list[str]
+    items: list[RetentionPlanItemData] = Field(default_factory=list)
     revision: str
     operationId: str | None = None
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
@@ -650,3 +771,6 @@ class RetentionPlanData(StrictSchema):
         "scannedRows": 100, "scannedFiles": 2, "scannedBytes": 4096,
         "preflightOk": True, "errors": [], "revision": "rev_example", "operationId": None,
     }]})
+
+
+StatsBreakdownData.model_rebuild()

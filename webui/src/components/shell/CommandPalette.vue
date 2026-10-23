@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type Component } from 'vue'
 import { useRouter } from 'vue-router'
 import { ArrowUpRight, CornerDownLeft, LogOut, Moon, RefreshCw, Search, Sun, SunMoon } from '@lucide/vue'
-import { navItems } from '@/nav'
+import { visibleNavItems as navItems } from '@/nav'
 import { logout } from '@/stores/session'
 import { setTheme, ui } from '@/stores/ui'
 import { openRequest } from '@/pages/live/openRequest'
@@ -29,7 +29,6 @@ const base = computed<Cmd[]>(() => [
   ...navItems.map((n) => ({
     id: `nav:${n.key}`,
     label: n.label,
-    hint: n.phase > 1 ? '规划中' : undefined,
     group: '页面',
     icon: n.icon,
     tint: n.tint,
@@ -170,7 +169,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   display: flex;
   flex-direction: column;
   border-radius: 14px;
-  background: color-mix(in srgb, var(--surface-raised) 88%, transparent);
+  background: var(--popover);
   box-shadow: var(--shadow-lg);
   overflow: hidden;
 }

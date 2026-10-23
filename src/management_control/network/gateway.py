@@ -96,7 +96,8 @@ class ModuleNetworkGateway:
         return list(state_db.network_check_load_all())
 
     async def run_monitor(self) -> list[Any]:
-        return await network_monitor.run_once(save=True)
+        # Manual run: executes even when the monitor master switch is off.
+        return await network_monitor.run_once(save=True, manual=True)
 
     def format_monitor_result(self, item: Any) -> dict[str, Any]:
         if isinstance(item, dict):

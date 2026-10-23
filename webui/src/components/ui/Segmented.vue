@@ -34,9 +34,8 @@ const index = computed(() => Math.max(0, props.options.findIndex((o) => o.value 
   display: inline-grid;
   grid-template-columns: repeat(var(--n), minmax(0, 1fr));
   padding: 2px;
-  border-radius: 8px;
+  border-radius: 9px;
   background: var(--fill-2);
-  box-shadow: inset 0 0 0 0.5px var(--border);
   flex-shrink: 0;
 }
 .thumb {
@@ -46,28 +45,39 @@ const index = computed(() => Math.max(0, props.options.findIndex((o) => o.value 
   left: 2px;
   width: calc((100% - 4px) / var(--n));
   transform: translateX(calc(var(--i) * 100%));
-  border-radius: 6px;
+  border-radius: 7px;
   background: var(--surface-raised);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18), 0 0 0 0.5px var(--border);
-  transition: transform 0.28s var(--ease-out);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12), 0 0 0 0.5px rgba(0, 0, 0, 0.06);
+  transition: transform 0.24s var(--ease-out);
 }
+:root[data-theme='dark'] .thumb {
+  background: #636366;
+}
+/* One line while there is room; a squeezed control (a phone-width dialog) wraps instead of
+   letting the label run out of its segment. */
 button {
   position: relative;
   z-index: 1;
-  height: 24px;
-  padding: 0 12px;
-  font-size: 12px;
+  min-width: 0;
+  min-height: 26px;
+  padding: 3px 13px;
+  font-size: 12.5px;
   font-weight: 500;
+  line-height: 1.2;
   color: var(--text-2);
-  white-space: nowrap;
+  overflow-wrap: anywhere;
   transition: color 0.15s;
+}
+button:hover {
+  color: var(--text);
 }
 button.on {
   color: var(--text);
+  font-weight: 600;
 }
 .s-sm button {
-  height: 20px;
-  padding: 0 9px;
-  font-size: 11.5px;
+  min-height: 22px;
+  padding: 2px 10px;
+  font-size: 12px;
 }
 </style>

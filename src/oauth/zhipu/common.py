@@ -160,7 +160,12 @@ def _request(url, *, headers, method, body, account_key, timeout, envelope, read
 
     try:
         asyncio.get_running_loop()
+        in_loop = True
     except RuntimeError:
+        in_loop = False
+    if not in_loop:
+        # Run outside the ``except`` block: a provider failure must not be
+        # chained to (and reported as) the probe's "no running event loop".
         return asyncio.run(read())
     # Keep the synchronous API usable by existing callers under an event loop.
     # This thread is joined; the coroutine owns cancellation and its client.

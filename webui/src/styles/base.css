@@ -12,8 +12,8 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--font-sans);
-  font-size: 13px;
-  line-height: 1.45;
+  font-size: 13.5px;
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
@@ -103,6 +103,12 @@ kbd,
   border-radius: var(--radius-xs);
 }
 
+select option,
+select optgroup {
+  background-color: var(--popover);
+  color: var(--text);
+}
+
 .glass {
   backdrop-filter: blur(30px) saturate(180%);
   -webkit-backdrop-filter: blur(30px) saturate(180%);
@@ -176,17 +182,6 @@ kbd,
   }
 }
 
-.stagger > * {
-  animation: fade-up 0.5s var(--ease-out) both;
-}
-.stagger > *:nth-child(1) { animation-delay: 0.02s; }
-.stagger > *:nth-child(2) { animation-delay: 0.06s; }
-.stagger > *:nth-child(3) { animation-delay: 0.1s; }
-.stagger > *:nth-child(4) { animation-delay: 0.14s; }
-.stagger > *:nth-child(5) { animation-delay: 0.18s; }
-.stagger > *:nth-child(6) { animation-delay: 0.22s; }
-.stagger > *:nth-child(7) { animation-delay: 0.26s; }
-.stagger > *:nth-child(8) { animation-delay: 0.3s; }
 
 @media (prefers-reduced-motion: reduce) {
   *,
@@ -194,5 +189,22 @@ kbd,
   *::after {
     animation-duration: 0.01ms !important;
     transition-duration: 0.01ms !important;
+  }
+}
+
+/* Privacy mode: input values cannot be rewritten in place, so sensitive ones stay blurred until focused. */
+.pm-blur {
+  filter: blur(4px);
+}
+
+/* iOS Safari zooms the whole page into any focused field whose text is under 16px, and stays
+   zoomed after editing. Touch screens therefore get 16px text in every editable field; component
+   styles set smaller sizes for the desktop, hence !important. */
+@media (pointer: coarse) {
+  input:not([type='checkbox']):not([type='radio']):not([type='range']):not([type='file']):not([type='color']),
+  textarea,
+  select,
+  [contenteditable='true'] {
+    font-size: 16px !important;
   }
 }

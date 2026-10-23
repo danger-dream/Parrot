@@ -80,6 +80,8 @@ class OAuthAccountSummary:
     disabled_model_count: int
     credential_configured: bool
     revision: str
+    # Round 3: TG list-card facts (account_card.py); filled for returned items.
+    card: dict | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +105,8 @@ class OAuthLocalStats:
     input_tokens: int
     output_tokens: int
     cost_usd: float | None
+    # Round 3: full TG period statistics + period label (account_card.py).
+    details: dict | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +115,9 @@ class OAuthRuntimeError:
     message: str | None
     cooldown_until: datetime | None
     cooldown_permanent: bool
+    kind: str = "fault"
+    pool: str | None = None
+    error_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +135,15 @@ class OAuthAccountDetail:
     workbuddy: dict | None = None
     zhipu: dict | None = None
     qoder: dict | None = None
+    # Telegram-parity structured usage (see usage_sections.py) and OpenAI's
+    # workspace-local 「允许使用积分」 switch (None for other providers).
+    usage_sections: tuple = ()
+    usage_fetched_at: str | None = None
+    allow_credits: bool | None = None
+    plan: dict | None = None
+    weekly_projection: dict | None = None
+    window_stats: dict | None = None
+    last_refresh_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +186,7 @@ class UpdateOAuthAccountCommand:
     display_name: str | None = None
     enabled: bool | None = None
     max_concurrent: int | None = None
+    allow_credits: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,6 +292,7 @@ class OAuthQuotaResetPlan:
     provider: OAuthProvider
     credit_count: int | None
     expires_at: datetime
+    credit_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

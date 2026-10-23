@@ -105,8 +105,8 @@ class ApiKeyView:
     month_stats: ApiKeyUsage
     model_stats: tuple[ApiKeyModelUsage, ...]
     revision: str
-    # Compatibility-only privileged material. Management API adapters must never
-    # request or serialize it; the frozen Telegram v0.31.13 renderer still does.
+    # The saved secret. Requested only by Telegram's renderer and (round 3,
+    # user requirement) by listApiKeys/getApiKey for secrets-capable sessions.
     secret: str | None = None
     allowed_channels: tuple[str, ...] = ()
     channel_binding_enabled: bool = False

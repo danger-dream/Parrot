@@ -1,401 +1,352 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { Coins, DatabaseZap, Gauge, Layers, RefreshCw, Send } from '@lucide/vue'
-import { api } from '@/api/client'
+import { Activity, CircleCheck, Coins, DatabaseZap, Inbox, Layers, RefreshCw, Timer, Zap } from '@lucide/vue'
 import { onEvent } from '@/api/events'
-import type { StatsSummaryData, TimePoint, TimeSeriesData } from '@/api/types'
-import { catalog, refreshCatalog } from '@/stores/catalog'
-import { live, seedQps } from '@/stores/live'
-import { refreshSystem, system } from '@/stores/system'
-import { compact, duration, integer, ms, percent, usd } from '@/utils/format'
-import KpiCard from './KpiCard.vue'
-import LiveTrafficCard from './LiveTrafficCard.vue'
-import HealthCard from './HealthCard.vue'
-import TrendCard from './TrendCard.vue'
-import BreakdownCard from './BreakdownCard.vue'
-import OAuthPoolCard from './OAuthPoolCard.vue'
-import RecentErrorsCard from './RecentErrorsCard.vue'
+import type { ChannelStatusData, RequestLogData } from '@/api/types'
+import { catalog } from '@/stores/catalog'
+import { live, qps, seedQps } from '@/stores/live'
+import { api } from '@/api/client'
+import type { TimeSeriesData } from '@/api/types'
+import { goLogs, goPage, openChannel } from '@/links'
+import { clock, compact, integer, ms, usd } from '@/utils/format'
+import StatTile from '@/components/ui/StatTile.vue'
 import Btn from '@/components/ui/Btn.vue'
-import StatusDot from '@/components/ui/StatusDot.vue'
+import TrafficTrend from './TrafficTrend.vue'
+import HealthTimeline from './HealthTimeline.vue'
+import TokenMix from './TokenMix.vue'
+import ModelRanking from './ModelRanking.vue'
+import ChannelHealth from './ChannelHealth.vue'
+import AccountQuota from './AccountQuota.vue'
+import FamilyTable from './FamilyTable.vue'
+import { loadOverview, ov } from './data'
+import { cacheShare, pctText, promptOf, successRateOf, tpsText, type Metrics } from './metrics'
+import { deltas, sparks as compareSparks } from '@/utils/compare'
 
-const summary = ref<StatsSummaryData | null>(null)
-const hourly = ref<TimePoint[]>([])
-const refreshing = ref(false)
-const delta = reactive({ total: 0, success: 0, error: 0, input: 0, output: 0, cost: 0 })
+// Requests finished since the last summary snapshot (the summary is cached ~15 s server-side).
+const delta = reactive({ total: 0, success: 0, error: 0, prompt: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 })
+const now = ref(Date.now())
 
-const trend = ref<InstanceType<typeof TrendCard> | null>(null)
-const breakdown = ref<InstanceType<typeof BreakdownCard> | null>(null)
-const pool = ref<InstanceType<typeof OAuthPoolCard> | null>(null)
-const errors = ref<InstanceType<typeof RecentErrorsCard> | null>(null)
-
-async function loadSummary(): Promise<void> {
-  const res = await api.get<StatsSummaryData>('/stats/summary', { period: 'today' })
-  summary.value = res.data
-  Object.assign(delta, { total: 0, success: 0, error: 0, input: 0, output: 0, cost: 0 })
+async function refresh(): Promise<void> {
+  await loadOverview()
+  Object.assign(delta, { total: 0, success: 0, error: 0, prompt: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 })
 }
 
-async function loadHourly(): Promise<void> {
-  try {
-    const res = await api.get<TimeSeriesData>('/stats/timeseries', { range: '7d', bucket: 'hour' })
-    hourly.value = res.data.series.find((s) => s.key === 'total')?.points || res.data.series[0]?.points || []
-  } catch {
-    hourly.value = []
-  }
-}
-
-async function seedLive(): Promise<void> {
-  if (live.finished > 0) return
-  try {
-    const res = await api.get<TimeSeriesData>('/stats/timeseries', { range: '1h', bucket: 'minute' })
-    const pts = res.data.series.find((s) => s.key === 'total')?.points || []
-    seedQps(pts, res.data.bucketSeconds || 60)
-  } catch {
-    /* live chart fills from events */
-  }
-}
-
-async function refreshAll(): Promise<void> {
-  refreshing.value = true
-  try {
-    await Promise.allSettled([
-      loadSummary(),
-      loadHourly(),
-      refreshSystem(),
-      refreshCatalog(true),
-      trend.value?.reload(),
-      breakdown.value?.reload(),
-      pool.value?.reload(),
-      errors.value?.reload(),
-    ])
-  } finally {
-    refreshing.value = false
-  }
-}
-
-const off = onEvent('request.finished', ({ log }) => {
-  if (!summary.value) return
+const off = onEvent('request.finished', ({ log }: { log: RequestLogData }) => {
+  if (!ov.summary) return
   delta.total += 1
   if (log.status === 'success') delta.success += 1
   else if (log.status === 'error') delta.error += 1
-  delta.input += log.inputTokens
+  delta.prompt += log.promptTokens
   delta.output += log.outputTokens
-  delta.cost += log.costTicks
+  delta.cacheRead += log.cacheReadTokens
+  delta.cacheWrite += log.cacheCreationTokens
+  delta.cost += log.billing?.costTicks ?? log.costTicks
 })
 
-let fast: number | undefined
-let slow: number | undefined
+let poll: number | undefined
+let tick: number | undefined
 onMounted(() => {
-  loadSummary()
-  loadHourly()
-  seedLive()
-  fast = window.setInterval(() => document.visibilityState === 'visible' && loadSummary(), 30_000)
-  slow = window.setInterval(() => document.visibilityState === 'visible' && loadHourly(), 300_000)
+  refresh()
+  if (!live.finished)
+    api
+      .get<TimeSeriesData>('/stats/timeseries', { range: '1h', bucket: 'minute' })
+      .then((res) => seedQps(res.data.series.find((s) => s.key === 'total')?.points || [], res.data.bucketSeconds || 60))
+      .catch(() => undefined)
+  poll = window.setInterval(() => document.visibilityState === 'visible' && refresh(), 30_000)
+  tick = window.setInterval(() => (now.value = Date.now()), 1000)
 })
 onBeforeUnmount(() => {
   off()
-  window.clearInterval(fast)
-  window.clearInterval(slow)
+  window.clearInterval(poll)
+  window.clearInterval(tick)
 })
 
-// ---- derived KPI values ----
-const m = computed(() => summary.value?.overall)
-const total = computed(() => (m.value ? m.value.total + delta.total : null))
-const success = computed(() => (m.value ? m.value.successCount + delta.success : 0))
-const errorsToday = computed(() => (m.value ? m.value.errorCount + delta.error : 0))
-const tokens = computed(() =>
-  m.value ? m.value.inputTokens + m.value.outputTokens + m.value.cacheReadTokens + m.value.cacheCreationTokens + delta.input + delta.output : null,
-)
-const cost = computed(() => (m.value ? m.value.costTicks + delta.cost : null))
-const cacheRate = computed(() => (m.value && m.value.successCount ? m.value.cacheHitRequests / m.value.successCount : null))
-
-function bjtDayStart(ts: number): number {
-  const offset = 8 * 3600_000
-  return Math.floor((ts + offset) / 86400_000) * 86400_000 - offset
-}
-
-const windows = computed(() => {
-  const now = Date.now()
-  const todayStart = bjtDayStart(now)
-  const today = hourly.value.filter((p) => new Date(p.t).getTime() >= todayStart)
-  const yStart = todayStart - 86400_000
-  const yEnd = now - 86400_000
-  const yesterday = hourly.value.filter((p) => {
-    const t = new Date(p.t).getTime()
-    return t >= yStart && t < yEnd
-  })
-  return { today, yesterday }
-})
-
-function sumOf(points: TimePoint[], fn: (p: TimePoint) => number): number {
-  return points.reduce((a, p) => a + fn(p), 0)
-}
-
-function change(fn: (p: TimePoint) => number): number | null {
-  const { today, yesterday } = windows.value
-  if (!yesterday.length) return null
-  const before = sumOf(yesterday, fn)
-  if (!before) return null
-  return sumOf(today, fn) / before - 1
-}
-
-const tokenOf = (p: TimePoint) => p.inputTokens + p.outputTokens + p.cacheReadTokens + p.cacheCreationTokens
-
-const sparks = computed(() => {
-  const pts = windows.value.today
+const m = computed<Metrics | null>(() => {
+  const o = ov.summary?.overall
+  if (!o) return null
+  if (!delta.total) return o
+  const total = o.total + delta.total
+  const successCount = o.successCount + delta.success
+  const promptTokens = promptOf(o) + delta.prompt
+  const cacheReadTokens = o.cacheReadTokens + delta.cacheRead
   return {
-    req: pts.map((p) => p.total),
-    tok: pts.map(tokenOf),
-    cost: pts.map((p) => p.costTicks),
-    speed: pts.map((p) => p.averageFirstTokenMilliseconds ?? 0),
+    ...o,
+    total,
+    successCount,
+    errorCount: o.errorCount + delta.error,
+    outputTokens: o.outputTokens + delta.output,
+    cacheReadTokens,
+    cacheCreationTokens: o.cacheCreationTokens + delta.cacheWrite,
+    costTicks: o.costTicks + delta.cost,
+    promptTokens,
+    cacheReadRatio: promptTokens ? cacheReadTokens / promptTokens : null,
+    successRate: total ? successCount / total : null,
   }
 })
 
-const firstTokenChange = computed(() => {
-  const { today, yesterday } = windows.value
-  const avg = (pts: TimePoint[]) => {
-    const vals = pts.filter((p) => p.averageFirstTokenMilliseconds != null)
-    if (!vals.length) return null
-    const weight = vals.reduce((a, p) => a + p.successCount, 0) || vals.length
-    return vals.reduce((a, p) => a + (p.averageFirstTokenMilliseconds ?? 0) * (p.successCount || 1), 0) / weight
-  }
-  const a = avg(today)
-  const b = avg(yesterday)
-  return a && b ? a / b - 1 : null
+const success = computed(() => successRateOf(m.value))
+const successTone = computed(() => {
+  const v = success.value
+  if (v == null) return ''
+  return v >= 0.99 ? 'green' : v >= 0.95 ? 'orange' : 'red'
 })
 
-// ---- hero ----
-const issues = computed(() => {
-  const s = catalog.status
-  const alerts = Object.values(system.overview?.activeAlerts || {}).reduce((n: number, v) => n + (Array.isArray(v) ? v.length : 0), 0)
-  return {
-    channels: s?.problemChannels.filter((c) => c.health !== 'disabled').length || 0,
-    quota: s?.quotaWarnings.length || 0,
-    alerts,
+/** Today's sparklines and the change against yesterday up to the same time. */
+const sparks = computed(() => compareSparks(ov.compare))
+const change = computed(() => deltas(ov.compare, 'today'))
+
+const perMinute = computed(() => {
+  void qps.version
+  const n = qps.ok.length
+  let s = 0
+  for (let i = n - 60; i < n; i++) s += (qps.ok[i] || 0) + (qps.err[i] || 0)
+  return s
+})
+const minuteSpark = computed(() => {
+  void qps.version
+  const out: number[] = []
+  const n = qps.ok.length
+  for (let i = n - 900; i < n; i += 60) {
+    let s = 0
+    for (let j = i; j < i + 60; j++) s += (qps.ok[j] || 0) + (qps.err[j] || 0)
+    out.push(s)
   }
+  return out
 })
-const healthy = computed(() => !issues.value.channels && !issues.value.quota && !issues.value.alerts)
-const headline = computed(() => {
-  if (!catalog.status) return '正在检查…'
-  if (healthy.value) return '运行正常'
-  const parts: string[] = []
-  if (issues.value.channels) parts.push(`${issues.value.channels} 个渠道异常`)
-  if (issues.value.quota) parts.push(`${issues.value.quota} 个账号额度紧张`)
-  if (issues.value.alerts) parts.push(`${issues.value.alerts} 条上游告警`)
-  return parts.join('，')
-})
+const waiting = computed(() => live.snapshot?.channelTotals.waiting ?? catalog.status?.concurrency.channelTotals.waiting ?? 0)
+
+// ---- status line ----
+const problems = computed(() => (catalog.status?.problemChannels || []).filter((c) => c.enabled))
+const HEALTH_TEXT: Record<string, string> = {
+  permanentCooldown: '永久冷却',
+  quotaCooldown: '额度冷却',
+  cooldown: '冷却中',
+  unhealthy: '有模型成功率低',
+  degraded: '有模型成功率下降',
+}
+/** Health is the lowest per-model recent success rate (same rule as Telegram), so say "有模型". */
+function problemText(c: ChannelStatusData): string {
+  const base = HEALTH_TEXT[c.health] || (c.problemReasons[0] === 'auth_error' ? '认证失效' : c.problemReasons[0]) || '异常'
+  if ((c.health === 'unhealthy' || c.health === 'degraded') && c.recentSuccessRate != null) return `${base}（最低 ${Math.round(c.recentSuccessRate)}%）`
+  if (c.cooldownCount) return `${base} · ${c.cooldownCount} 个模型`
+  return base
+}
+const quotaWarnings = computed(() => catalog.status?.quotaWarnings || [])
+const lastHourErrors = computed(() => ov.tenMinutes.slice(-6).reduce((a, p) => a + p.errorCount, 0))
+const lastHourTotal = computed(() => ov.tenMinutes.slice(-6).reduce((a, p) => a + p.total, 0))
 </script>
 
 <template>
   <div class="ov">
-    <header class="hero">
-      <div class="state">
-        <StatusDot :tone="!catalog.status ? 'gray' : healthy ? 'green' : 'orange'" :size="10" :pulse="healthy" />
-        <h2>{{ headline }}</h2>
+    <section class="strip">
+      <div class="st-main" :class="problems.length ? 'warn' : 'ok'">
+        <i class="dot" />
+        <b>{{ problems.length ? `${problems.length} 个渠道异常` : '运行正常' }}</b>
       </div>
-      <p class="facts">
-        <template v-if="system.overview">
-          <span>Parrot v{{ system.overview.version }}</span>
-          <span>已运行 {{ duration(system.overview.uptimeSeconds) }}</span>
-          <span v-if="system.overview.publicIp">出口 <b class="mono">{{ system.overview.publicIp }}</b></span>
-          <span v-if="system.overview.telegramBot" class="tg">
-            <Send /> {{ system.overview.telegramBot.configured ? 'TG Bot 已配置' : 'TG Bot 未配置' }}
-          </span>
-          <span v-if="system.overview.update?.available" class="upd">有新版本 {{ system.overview.update.latestVersion }}</span>
-        </template>
-      </p>
-      <Btn class="refresh" variant="ghost" :loading="refreshing" @click="refreshAll"><RefreshCw /> 刷新</Btn>
-    </header>
-
-    <section class="kpis stagger">
-      <KpiCard
-        label="今日请求"
-        :icon="Layers"
-        tint="var(--blue)"
-        :value="total === null ? null : integer(total)"
-        :sub="total ? `成功率 ${percent(success, total)} · 失败 ${integer(errorsToday)}` : ''"
-        :delta="change((p) => p.total)"
-        neutral-delta
-        :spark="sparks.req"
-      />
-      <KpiCard
-        label="今日 Token"
-        :icon="DatabaseZap"
-        tint="var(--purple)"
-        :value="tokens === null ? null : compact(tokens)"
-        :sub="m ? `输入 ${compact(m.inputTokens + delta.input)} · 输出 ${compact(m.outputTokens + delta.output)} · 缓存读 ${compact(m.cacheReadTokens)}` : ''"
-        :delta="change(tokenOf)"
-        neutral-delta
-        :spark="sparks.tok"
-      />
-      <KpiCard
-        label="今日费用"
-        :icon="Coins"
-        tint="var(--orange)"
-        :value="cost === null ? null : usd(cost, { precise: true })"
-        :sub="m ? (m.estimatedCostTicks ? `其中估算 ${usd(m.estimatedCostTicks)} · 未定价 ${integer(m.unpricedSuccess)} 次` : '全部为实际计费') : ''"
-        :delta="change((p) => p.costTicks)"
-        neutral-delta
-        :spark="sparks.cost"
-      />
-      <KpiCard
-        label="首字耗时"
-        :icon="Gauge"
-        tint="var(--teal)"
-        :value="m ? ms(m.averageFirstTokenMilliseconds) : null"
-        :sub="m ? `平均总耗时 ${ms(m.averageTotalMilliseconds)} · 输出 ${m.averageTokensPerSecond ? m.averageTokensPerSecond.toFixed(0) : '—'} tok/s` : ''"
-        :delta="firstTokenChange"
-        :delta-good-when-up="false"
-        :spark="sparks.speed"
-      />
-      <KpiCard
-        label="缓存命中"
-        :icon="DatabaseZap"
-        tint="var(--green)"
-        :value="cacheRate === null ? (m ? '—' : null) : (cacheRate * 100).toFixed(1)"
-        :unit="cacheRate === null ? '' : '%'"
-        :sub="m ? `${integer(m.cacheHitRequests)} 次命中 · ${integer(m.affinityHits)} 次会话亲和` : ''"
-      />
+      <div class="st-items">
+        <button v-for="c in problems.slice(0, 2)" :key="c.id" class="chip warn" :title="`${c.name} · ${problemText(c)}`" @click="openChannel(c.id)">
+          {{ c.name }} · {{ problemText(c) }}
+        </button>
+        <button v-if="problems.length > 2" class="chip" @click="goPage('/channels')">另外 {{ problems.length - 2 }} 个</button>
+        <button v-if="quotaWarnings.length" class="chip warn" @click="goPage('/oauth')">{{ quotaWarnings.length }} 个账号额度紧张</button>
+        <button class="chip" :class="{ bad: lastHourErrors > 0 }" @click="goLogs({ status: 'error', from: Date.now() - 3600_000 })">
+          最近 1 小时 {{ integer(lastHourTotal) }} 次请求 · 失败 {{ integer(lastHourErrors) }}
+        </button>
+        <span class="chip plain">进行中 {{ live.inFlight.size }} · 排队 {{ waiting }}</span>
+      </div>
+      <div class="st-right">
+        <span class="clock num">{{ clock(now) }}</span>
+        <Btn size="sm" variant="secondary" :loading="ov.loading && ov.ready" @click="refresh"><RefreshCw /> 刷新</Btn>
+      </div>
     </section>
 
-    <section class="grid">
-      <LiveTrafficCard class="span-8" />
-      <HealthCard class="span-4" />
-      <TrendCard ref="trend" class="span-8" />
-      <BreakdownCard ref="breakdown" class="span-4" />
-      <OAuthPoolCard ref="pool" class="span-6" />
-      <RecentErrorsCard ref="errors" class="span-6" />
+    <h3 class="sec">今日概览</h3>
+    <section class="kpis">
+      <StatTile label="今日请求" :icon="Inbox" tone="blue" :loading="!ov.ready" :value="m ? integer(m.total) : null"
+        :sub="m ? `成功 ${integer(m.successCount)} · 失败 ${integer(m.errorCount)}` : ''" :spark="sparks.requests" :delta="change.requests" />
+      <StatTile label="成功率" :icon="CircleCheck" tone="green" :loading="!ov.ready" :value="m ? pctText(success, 2) : null"
+        :value-tone="successTone" :sub="m ? `${integer(m.successCount)} / ${integer(m.total)}` : ''" :spark="sparks.success" :delta="change.success" />
+      <StatTile label="Token" :icon="Layers" tone="purple" :loading="!ov.ready" :value="m ? compact(promptOf(m) + m.outputTokens) : null"
+        :sub="m ? `读入 ${compact(promptOf(m))} · 写出 ${compact(m.outputTokens)}` : ''" :spark="sparks.tokens" :delta="change.tokens" />
+      <StatTile label="缓存占比" :icon="DatabaseZap" tone="teal" :loading="!ov.ready" :value="m ? pctText(cacheShare(m)) : null"
+        :sub="m ? `缓存读 ${compact(m.cacheReadTokens)} · 命中 ${integer(m.cacheHitRequests)} 次` : ''" :spark="sparks.cache" :delta="change.cache" />
+      <StatTile label="今日金额" :icon="Coins" tone="orange" :loading="!ov.ready" :value="m ? usd(m.costTicks) : null"
+        :sub="m ? (m.unpricedSuccess ? `未计价 ${integer(m.unpricedSuccess)} 次` : `实际 ${usd(m.actualCostTicks)} · 估算 ${usd(m.estimatedCostTicks)}`) : ''" :spark="sparks.cost" :delta="change.cost" />
+      <StatTile label="首字" :icon="Timer" tone="cyan" :loading="!ov.ready" :value="m ? ms(m.averageFirstTokenMilliseconds) : null"
+        :sub="m ? `总耗时 ${ms(m.averageTotalMilliseconds)} · 连接 ${ms(m.averageConnectMilliseconds)}` : ''" :spark="sparks.firstToken" :delta="change.firstToken" />
+      <StatTile label="生成速度" :icon="Zap" tone="indigo" :loading="!ov.ready" :value="m ? tpsText(m.averageTokensPerSecond) : null"
+        :sub="m ? `峰值 ${tpsText(m.maximumTokensPerSecond)} · 最低 ${tpsText(m.minimumTokensPerSecond)}` : ''" :spark="sparks.tps" :delta="change.tps" />
+      <StatTile label="当前负载" :icon="Activity" tone="pink" :value="integer(perMinute)" unit="次/分"
+        :sub="`进行中 ${live.inFlight.size} · 排队 ${waiting}`" :spark="minuteSpark" @click="goPage('/live')" />
     </section>
+
+    <section class="row a">
+      <TrafficTrend :points="ov.hourly" :ready="ov.ready" />
+      <HealthTimeline :points="ov.tenMinutes" :ready="ov.ready" />
+      <TokenMix :m="m" :ready="ov.ready" />
+    </section>
+
+    <section class="row b">
+      <ModelRanking :rows="ov.models" :ready="ov.ready" />
+      <ChannelHealth :ready="ov.ready" />
+      <AccountQuota :ready="ov.ready" />
+    </section>
+
+    <FamilyTable :ready="ov.ready" />
   </div>
 </template>
 
 <style scoped>
 .ov {
-  container-type: inline-size;
+  max-width: 1720px;
+  margin: 0 auto;
+  padding: 20px 24px 40px;
   display: flex;
   flex-direction: column;
   gap: 16px;
-  max-width: 1680px;
-  margin: 0 auto;
-  padding: 22px 24px 32px;
 }
-.hero {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  grid-template-areas: 'state refresh' 'facts refresh';
-  align-items: center;
-  gap: 4px 12px;
-}
-.state {
-  grid-area: state;
+.strip {
   display: flex;
   align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  padding: 12px 16px;
+  background: var(--surface);
+  border: 0.5px solid var(--border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-sm);
 }
-.state h2 {
-  font-family: var(--font-display);
-  font-size: 22px;
-  font-weight: 700;
-  letter-spacing: -0.02em;
+.st-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
 }
-.facts {
-  grid-area: facts;
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 22%, transparent);
+}
+.st-main.warn .dot {
+  background: var(--orange);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--orange) 22%, transparent);
+}
+.st-main.ok b {
+  color: var(--text-green);
+}
+.st-main.warn b {
+  color: var(--text-orange);
+}
+.st-items {
+  flex: 1;
+  min-width: 0;
   display: flex;
   flex-wrap: wrap;
-  gap: 2px 14px;
+  gap: 8px;
+}
+.chip {
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
   font-size: 12.5px;
   color: var(--text-2);
-  padding-left: 20px;
+  background: var(--surface-sunken);
+  border: 0.5px solid var(--border);
+  white-space: nowrap;
 }
-.facts b {
-  font-weight: 500;
-  color: var(--text);
+button.chip:hover {
+  border-color: var(--accent-line);
+  color: var(--accent);
 }
-.tg {
+.chip.warn {
+  color: var(--text-orange);
+  background: color-mix(in srgb, var(--orange) 9%, transparent);
+  border-color: color-mix(in srgb, var(--orange) 30%, transparent);
+}
+.chip.bad {
+  color: var(--text-red);
+  background: color-mix(in srgb, var(--red) 8%, transparent);
+  border-color: color-mix(in srgb, var(--red) 26%, transparent);
+}
+.chip.plain {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
 }
-.tg svg {
-  width: 12px;
-  height: 12px;
-  color: var(--telegram);
+.st-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
-.upd {
-  color: var(--green);
+.clock {
+  font-size: 15px;
+  font-weight: 600;
 }
-.refresh {
-  grid-area: refresh;
+.sec {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+  font-size: 16px;
+  font-weight: 650;
+}
+.sec::before {
+  content: '';
+  width: 3px;
+  height: 16px;
+  border-radius: 2px;
+  background: var(--accent);
 }
 .kpis {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
 }
-@container (max-width: 900px) {
-  .kpis {
-    grid-template-columns: repeat(6, minmax(0, 1fr));
-  }
-  .kpis > :nth-child(-n + 3) {
-    grid-column: span 2;
-  }
-  .kpis > :nth-child(n + 4) {
-    grid-column: span 3;
-  }
+.kpis > :last-child {
+  cursor: pointer;
 }
-.grid {
+.row {
   display: grid;
-  grid-template-columns: repeat(12, minmax(0, 1fr));
   gap: 16px;
-  align-items: start;
 }
-.span-8 {
-  grid-column: span 8;
+.row.a {
+  grid-template-columns: minmax(0, 1.25fr) minmax(0, 1.25fr) minmax(0, 0.8fr);
 }
-.span-4 {
-  grid-column: span 4;
+.row.b {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
-.span-6 {
-  grid-column: span 6;
-}
-@container (max-width: 1080px) {
-  .span-8,
-  .span-4 {
-    grid-column: span 12;
+@media (max-width: 1279px) {
+  .row.a,
+  .row.b {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
-}
-@container (max-width: 760px) {
-  .span-6 {
-    grid-column: span 12;
+  .row.a > :first-child {
+    grid-column: 1 / -1;
+  }
+  .row.b > :last-child {
+    grid-column: 1 / -1;
   }
 }
 @media (max-width: 767px) {
   .ov {
-    padding: 14px 12px 24px;
+    padding: 12px 10px 28px;
     gap: 12px;
-  }
-  .state h2 {
-    font-size: 19px;
-  }
-  .facts {
-    padding-left: 0;
   }
   .kpis {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 10px;
   }
-  .kpis > :nth-child(n) {
-    grid-column: span 1;
+  .row.a,
+  .row.b {
+    grid-template-columns: minmax(0, 1fr);
   }
-  .kpis > :last-child:nth-child(odd) {
-    grid-column: span 2;
-  }
-}
-@media (max-width: 340px) {
-  .kpis {
-    grid-template-columns: 1fr;
-  }
-  .kpis > :last-child:nth-child(odd) {
-    grid-column: auto;
+  .st-right {
+    width: 100%;
+    justify-content: space-between;
   }
 }
 </style>

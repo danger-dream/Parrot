@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { LogOut, Monitor, MonitorSmartphone, Moon, Search, Sun, SunMoon } from '@lucide/vue'
+import { Eye, EyeOff, LogOut, Monitor, MonitorSmartphone, Moon, Search, Sun, SunMoon, UserRound } from '@lucide/vue'
 import { eventLink } from '@/api/events'
 import { logout, session } from '@/stores/session'
-import { system, modeLabel } from '@/stores/system'
-import { setTheme, ui, type ThemePref } from '@/stores/ui'
+import { system } from '@/stores/system'
+import { setPrivacy, setTheme, ui, type ThemePref } from '@/stores/ui'
 import { dateTime } from '@/utils/format'
 import { routeTitle } from '@/router'
+import { goPage } from '@/links'
+import LbModeMenu from '@/components/LbModeMenu.vue'
 import BrandMark from './BrandMark.vue'
 import StatusDot from '@/components/ui/StatusDot.vue'
 import Segmented from '@/components/ui/Segmented.vue'
@@ -58,13 +60,29 @@ function goDevices(): void {
 
     <div class="pill" :title="eventLink.state === 'open' ? '实时连接正常' : '实时连接中断'">
       <StatusDot :tone="linkTone" :pulse="eventLink.state === 'open'" :size="6" />
-      <span class="seg"><span class="k">端口</span><span class="v mono">{{ system.overview?.listeners.port ?? '—' }}</span></span>
-      <span class="seg hide-md"><span class="k">调度</span><span class="v tag">{{ modeLabel(system.loadBalancing?.mode) }}</span></span>
-      <span v-if="system.overview?.publicIp" class="seg hide-lg"><span class="k">出口</span><span class="v mono">{{ system.overview.publicIp }}</span></span>
-      <span v-if="system.overview?.update?.available" class="seg hide-md"><span class="v upd">有新版本 {{ system.overview.update.latestVersion }}</span></span>
+      <span class="seg"><span class="k">端口</span><span class="v num">{{ system.overview?.listeners.port ?? '—' }}</span></span>
+      <span class="seg hide-md"><span class="k">调度</span><LbModeMenu align="center" /></span>
+      <button v-if="system.overview?.publicIp" class="seg link hide-lg" title="网络设置" @click="goPage('/network')">
+        <span class="k">出口</span><span class="v num">{{ system.overview.publicIp }}</span>
+      </button>
+      <button v-if="system.overview?.update?.available" class="seg link hide-md" @click="goPage('/updates')">
+        <span class="v upd">有新版本 {{ system.overview.update.latestVersion }}</span>
+      </button>
     </div>
 
     <div class="right">
+      <button
+        class="privacy"
+        :class="{ on: ui.privacy }"
+        role="switch"
+        :aria-checked="ui.privacy"
+        :title="ui.privacy ? '隐私模式已开启：邮箱、手机号、API Key、IP 地址已脱敏。点击关闭' : '开启隐私模式：脱敏邮箱、手机号、API Key、IP 地址'"
+        @click="setPrivacy(!ui.privacy)"
+      >
+        <EyeOff v-if="ui.privacy" />
+        <Eye v-else />
+        <span class="privacy-text">隐私</span>
+      </button>
       <button class="search" @click="ui.paletteOpen = true">
         <Search />
         <span class="search-text">搜索</span>
@@ -72,8 +90,8 @@ function goDevices(): void {
       </button>
       <div ref="menuRef" class="menu-wrap">
         <button class="avatar" :class="{ on: menuOpen }" aria-label="账户菜单" @click="menuOpen = !menuOpen">
+          <UserRound class="avatar-ic" />
           <component :is="themeIcon" class="avatar-theme" />
-          <span>管</span>
         </button>
         <Transition name="pop">
           <div v-if="menuOpen" class="menu glass">
@@ -139,11 +157,16 @@ function goDevices(): void {
   white-space: nowrap;
   flex-shrink: 1;
   min-width: 0;
-  overflow: hidden;
+}
+.seg.link {
+  border-radius: 0;
+}
+.seg.link:hover .v {
+  color: var(--accent);
 }
 .seg {
   display: inline-flex;
-  align-items: center;
+  align-items: baseline;
   gap: 5px;
 }
 .seg + .seg {
@@ -156,13 +179,6 @@ function goDevices(): void {
 .v {
   color: var(--text);
 }
-.tag {
-  padding: 1px 6px;
-  border-radius: 5px;
-  font-size: 11px;
-  color: var(--orange);
-  background: color-mix(in srgb, var(--orange) 14%, transparent);
-}
 .upd {
   color: var(--green);
 }
@@ -172,6 +188,31 @@ function goDevices(): void {
   justify-content: flex-end;
   gap: 8px;
   flex: 1;
+}
+.privacy {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 9px;
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  font-size: 12px;
+  background: var(--fill-2);
+  box-shadow: inset 0 0 0 0.5px var(--border);
+  transition: background 0.15s, color 0.15s;
+}
+.privacy:hover {
+  background: var(--fill);
+}
+.privacy.on {
+  color: #fff;
+  background: var(--accent);
+  box-shadow: none;
+}
+.privacy svg {
+  width: 14px;
+  height: 14px;
 }
 .search {
   display: flex;
@@ -197,6 +238,7 @@ function goDevices(): void {
   text-align: left;
 }
 kbd {
+  white-space: nowrap;
   padding: 1px 5px;
   border-radius: 4px;
   background: var(--fill);
@@ -213,12 +255,13 @@ kbd {
   border-radius: 50%;
   display: grid;
   place-items: center;
-  font-size: 12px;
-  font-weight: 650;
-  color: #fff;
-  background: linear-gradient(135deg, #5e5ce6, #0a84ff);
-  box-shadow: 0 0 0 0.5px var(--border-strong);
-  transition: box-shadow 0.15s;
+  color: var(--text-2);
+  background: var(--fill-2);
+  transition: box-shadow 0.15s, background 0.15s;
+}
+.avatar-ic {
+  width: 17px;
+  height: 17px;
 }
 .avatar.on,
 .avatar:hover {
@@ -243,7 +286,7 @@ kbd {
   width: 252px;
   padding: 6px;
   border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--surface-raised) 90%, transparent);
+  background: var(--popover);
   box-shadow: var(--shadow-lg);
 }
 .menu-head {
@@ -316,10 +359,12 @@ kbd {
     display: none;
   }
   .search-text,
+  .privacy-text,
   .search kbd {
     display: none;
   }
-  .search {
+  .search,
+  .privacy {
     width: 28px;
     padding: 0;
     justify-content: center;

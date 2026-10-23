@@ -1,14 +1,15 @@
 """Qoder HTTP adapters; shared controls own all account/action behavior."""
 from __future__ import annotations
 
-import asyncio
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Header, Path, Request
+from starlette.concurrency import run_in_threadpool
 
 from src.management_auth import Capability
 from src.management_control import ManagementContext, ManagementErrorCode
 from src.management_control.oauth import OAuthControl
+from src.management_control.oauth.upstream import call_upstream
 from src.management_control.oauth.contracts import public_value
 
 from ..dependencies import require_capability
@@ -43,7 +44,7 @@ def flow_data(flow):
              response_model=DataEnvelope[OAuthLoginFlowData], responses=responses(200, {}))
 def regenerate_device(flowId: Annotated[str, Path(min_length=1, max_length=200)],
                       body: QoderDeviceRegenerateRequest, request: Request, context: SecretContext, control: Control):
-    result = control.regenerate_qoder_device(context, flowId, body.flowSecret.get_secret_value(), body.revision,
+    result = call_upstream(control.regenerate_qoder_device, context, flowId, body.flowSecret.get_secret_value(), body.revision,
                                              platform=body.platform)
     return DataEnvelope(data=flow_data(result), meta=meta(request))
 
@@ -52,7 +53,7 @@ def regenerate_device(flowId: Annotated[str, Path(min_length=1, max_length=200)]
              response_model=DataEnvelope[OAuthLoginFlowData], responses=responses(200, {}))
 async def confirm_device(flowId: Annotated[str, Path(min_length=1, max_length=200)],
                          body: QoderDeviceRequest, request: Request, context: SecretContext, control: Control):
-    result = await asyncio.to_thread(control.confirm_qoder_device, context, flowId, body.flowSecret.get_secret_value(),
+    result = await run_in_threadpool(call_upstream, control.confirm_qoder_device, context, flowId, body.flowSecret.get_secret_value(),
                                      body.revision, pat=body.pat.get_secret_value() if body.pat else None)
     return DataEnvelope(data=flow_data(result), meta=meta(request))
 
@@ -66,7 +67,7 @@ def account_view(accountId: AccountId, request: Request, context: ReadContext, c
 @router.post("/oauth/accounts/{accountId}/qoder/actions/refresh-status", operation_id="refreshOAuthQoderStatus",
     response_model=DataEnvelope[QoderViewData], responses=responses(200, VIEW_EXAMPLE, ManagementErrorCode.UPSTREAM_ERROR))
 async def refresh_status(accountId: AccountId, request: Request, context: WriteContext, control: Control):
-    value = await asyncio.to_thread(control.refresh_qoder_status_now, context, accountId)
+    value = await run_in_threadpool(call_upstream, control.refresh_qoder_status_now, context, accountId)
     return DataEnvelope(data=QoderViewData(**public(value)), meta=meta(request))
 
 
@@ -75,7 +76,7 @@ async def refresh_status(accountId: AccountId, request: Request, context: WriteC
     responses=responses(200, {"businessDate": "2026-10-20", "status": "claimed", "source": "manual", "at": 1792500000.0, "realm": "global", "credit": 100},
                         ManagementErrorCode.INVALID_OPERATION_STATE))
 async def checkin(accountId: AccountId, request: Request, context: WriteContext, control: Control):
-    value = await asyncio.to_thread(control.checkin_qoder_now, context, accountId)
+    value = await run_in_threadpool(call_upstream, control.checkin_qoder_now, context, accountId)
     return DataEnvelope(data=QoderCheckinData(**public(value)), meta=meta(request))
 
 

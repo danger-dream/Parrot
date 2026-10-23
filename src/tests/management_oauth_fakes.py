@@ -251,7 +251,7 @@ class InMemoryOAuthBackend(OAuthBackend):
 
     def update_account_conditional(
         self, account_id, expected_account, *, display_name=None,
-        enabled=None, max_concurrent=None,
+        enabled=None, max_concurrent=None, allow_credits=None,
     ):
         with self._lock:
             self._interleave()
@@ -269,6 +269,8 @@ class InMemoryOAuthBackend(OAuthBackend):
                 current.pop("quota_observation", None)
             if max_concurrent is not None:
                 current["maxConcurrent"] = max(0, int(max_concurrent))
+            if allow_credits is not None:
+                current["allowCredits"] = bool(allow_credits)
             return {"status": "updated", "account": copy.deepcopy(current)}
 
     def delete_account(self, account_id):

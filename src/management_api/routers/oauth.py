@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Header, Path, Query, Request, Response, status
+from starlette.concurrency import run_in_threadpool
 
 from src.management_auth import Capability
 from src.management_control import ManagementContext, ManagementError, ManagementErrorCode
@@ -192,7 +192,7 @@ def update_oauth_account(
     result = control.update_account(
         context,
         accountId,
-        UpdateOAuthAccountCommand(body.displayName, body.enabled, body.maxConcurrent),
+        UpdateOAuthAccountCommand(body.displayName, body.enabled, body.maxConcurrent, body.allowCredits),
         expected_revision=if_match,
     )
     return DataEnvelope(data=detail(result), meta=meta(request))
@@ -244,11 +244,12 @@ async def start_oauth_login_flow(
     context: SecretContext,
     control: Control,
 ) -> DataEnvelope[OAuthLoginFlowData]:
-    result = await asyncio.to_thread(control.start_login_flow, context, body.provider,
+    result = await run_in_threadpool(control.start_login_flow, context, body.provider,
                                      realm=body.realm, client_profile=body.clientProfile, **({"site": body.site} if body.site is not None else {}),
                                      **({"pat": body.pat.get_secret_value()} if body.pat is not None else {}),
-                                     **({"login_method": body.loginMethod, "proxy_target": body.proxyTarget,
-                                         "relogin_account_id": body.reloginAccountId} if body.provider.value == "qoder" else {}))
+                                     **({"login_method": body.loginMethod} if body.provider.value == "qoder" else {}),
+                                     **({"proxy_target": body.proxyTarget} if body.proxyTarget is not None else {}),
+                                     **({"relogin_account_id": body.reloginAccountId} if body.reloginAccountId is not None else {}))
     return DataEnvelope(
         data=OAuthLoginFlowData(
             flowId=result.flow_id,
@@ -274,7 +275,7 @@ async def poll_oauth_login_flow(
     body: Annotated[PollOAuthLoginFlowRequest, Body()],
     request: Request, context: SecretContext, control: Control,
 ) -> DataEnvelope[OAuthLoginPollData]:
-    result = await asyncio.to_thread(control.poll_login_flow, context, flowId, body.flowSecret.get_secret_value())
+    result = await run_in_threadpool(control.poll_login_flow, context, flowId, body.flowSecret.get_secret_value())
     return DataEnvelope(data=OAuthLoginPollData(flowId=result.flow_id, status=result.status,
                          expiresAt=result.expires_at, accountPreview=result.account_preview,
                          accountId=result.account_id, saveStatus=result.save_status, revision=result.revision), meta=meta(request))
@@ -290,7 +291,7 @@ async def cancel_oauth_login_flow(
     body: Annotated[PollOAuthLoginFlowRequest, Body()],
     context: SecretContext, control: Control,
 ) -> Response:
-    await asyncio.to_thread(control.cancel_login_flow, context, flowId, body.flowSecret.get_secret_value())
+    await run_in_threadpool(control.cancel_login_flow, context, flowId, body.flowSecret.get_secret_value())
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -315,7 +316,7 @@ async def complete_oauth_login_flow(
         replace_plan_token=body.replacePlanToken.get_secret_value() if body.replacePlanToken else None,
     )
     try:
-        result = await asyncio.to_thread(
+        result = await run_in_threadpool(
             control.complete_login_flow,
             context,
             flowId,
@@ -523,13 +524,14 @@ def plan_oauth_quota_reset(
     context: DestructiveContext,
     control: Control,
 ) -> DataEnvelope[OAuthQuotaResetPlanData]:
-    result = control.plan_quota_reset(context, accountId)
+    result = control.plan_quota_reset(context, accountId, credit_id=body.creditId)
     return DataEnvelope(
         data=OAuthQuotaResetPlanData(
             planToken=result.plan_token,
             accountId=result.account_id,
             provider=result.provider,
             creditCount=result.credit_count,
+            creditId=result.credit_id,
             expiresAt=result.expires_at,
         ),
         meta=meta(request),
@@ -810,3 +812,5 @@ from .oauth_zhipu import router as zhipu_router
 router.include_router(zhipu_router)
 from .oauth_qoder import router as qoder_router
 router.include_router(qoder_router)
+from .oauth_extras import router as extras_router
+router.include_router(extras_router)

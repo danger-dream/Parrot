@@ -48,3 +48,6 @@ getTelegramOAuthPreferences
 updateTelegramOAuthPreferences
 regenerateOAuthQoderDevice
 confirmOAuthQoderDevice
+listOAuthOpenAiResetCredits
+planOAuthClaudeReset
+executeOAuthClaudeReset

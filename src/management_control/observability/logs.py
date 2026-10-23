@@ -16,7 +16,7 @@ from src.management_auth import Capability
 from src.management_control.context import ManagementContext
 from src.management_control.errors import ManagementError, ManagementErrorCode
 
-from . import inspector
+from . import inspector, log_fields
 from ._log_errors import map_historical_log_errors
 from .common import (
     PageResult,
@@ -129,9 +129,10 @@ class LogsControl:
                 page_size=query.page_size,
             )
         billing = self.log_db.costs_for_logs(rows)
+        names = self._channel_names()
         return PageResult(
             tuple(
-                self._list_record(row, billing=billing.get(str(row.get("request_id") or "")))
+                self._list_record(row, billing=billing.get(str(row.get("request_id") or "")), names=names)
                 for row in rows
             ),
             query.page,
@@ -147,8 +148,9 @@ class LogsControl:
         with map_historical_log_errors():
             rows = self.log_db.management_log_rows(list(log_ids), month=month)
         billing = self.log_db.costs_for_logs(rows)
+        names = self._channel_names()
         return [
-            self._list_record(row, billing=billing.get(str(row.get("request_id") or "")))
+            self._list_record(row, billing=billing.get(str(row.get("request_id") or "")), names=names)
             for row in rows
         ]
 
@@ -198,11 +200,17 @@ class LogsControl:
             "unpricedSuccess": int(clean.get("unpriced_success") or 0),
         }
 
+    def _channel_names(self) -> log_fields.ChannelNames:
+        from src.channel import registry
+        return log_fields.ChannelNames(self.oauth_manager, registry)
+
     def _list_record(
         self,
         row: dict[str, Any],
         *,
         billing: dict[str, Any] | None = None,
+        names: log_fields.ChannelNames | None = None,
+        detail: bool = False,
     ) -> dict[str, Any]:
         clean = sanitize_credentials(dict(row))
         billing = self._billing_summary(
@@ -226,6 +234,11 @@ class LogsControl:
             "billing": billing,
             "error": clean.get("error_message"),
         }
+        # Round 3: every fact of the TG list card (and detail page) as fields.
+        names = names or self._channel_names()
+        result.update(log_fields.list_fields(row, channel=names(row.get("final_channel_key"))))
+        if detail:
+            result.update(log_fields.detail_fields(row))
         result["revision"] = revision_for(result)
         return result
 
@@ -244,9 +257,16 @@ class LogsControl:
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         detail = raw.get("detail") or {}
         log = raw.get("log") or {}
+        # The detail row is SELECT * (no local_web_count projection): count the
+        # same local_web_log rows TG lists so detail and list agree.
+        if log.get("local_web_count") is None:
+            log = {**log, "local_web_count": len(raw.get("local_web_log") or [])}
+        # TG prices xAI rows from the stored response tail; do the same here.
+        cost_row = dict(log)
+        cost_row["response_body"] = detail.get("response_body") if isinstance(detail, dict) else None
         result = {
             "id": log_id,
-            "log": self._list_record(log),
+            "log": self._list_record(log, billing=self.log_db.cost_for_log(cost_row), detail=True),
             "stages": camelize(sanitize_credentials(raw.get("proxy_chain") or [])),
             "attempts": camelize(sanitize_credentials(raw.get("retry_chain") or [])),
             "localWebRounds": camelize(sanitize_credentials(raw.get("local_web_log") or [])),

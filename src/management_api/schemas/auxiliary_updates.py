@@ -92,3 +92,24 @@ class ActivateStagedUpdateRequest(StrictSchema):
         max_length=256,
         json_schema_extra={"writeOnly": True},
     )
+
+
+class UpdateStateData(StrictSchema):
+    stage: str
+    mode: str
+    fromVersion: str | None = None
+    toVersion: str | None = None
+    targetVersion: str | None = None
+    message: str | None = None
+    repository: str
+    currentVersion: str
+    busy: bool
+    activationAvailable: bool
+    revision: str
+
+
+class UpdateActivationPlanData(StrictSchema):
+    planToken: str
+    targetVersion: str
+    revision: str
+    expiresAt: datetime | None = None

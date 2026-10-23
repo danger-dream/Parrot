@@ -2,7 +2,7 @@
 import { ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { Activity, Ellipsis, LayoutDashboard, ShieldCheck, Waypoints, X } from '@lucide/vue'
-import { navGroups } from '@/nav'
+import { visibleNavGroups as navGroups } from '@/nav'
 
 const route = useRoute()
 const moreOpen = ref(false)
@@ -10,8 +10,8 @@ const moreOpen = ref(false)
 const tabs = [
   { to: '/', label: '概览', icon: LayoutDashboard },
   { to: '/live', label: '实时', icon: Activity },
-  { to: '/planned/oauth', label: '账户', icon: ShieldCheck },
-  { to: '/planned/channels', label: '渠道', icon: Waypoints },
+  { to: '/oauth', label: '账户', icon: ShieldCheck },
+  { to: '/channels', label: '渠道', icon: Waypoints },
 ]
 
 function active(to: string): boolean {
@@ -46,7 +46,6 @@ function active(to: string): boolean {
               <RouterLink v-for="item in g.items" :key="item.key" :to="item.to" class="cell" @click="moreOpen = false">
                 <span class="cell-ic" :style="{ color: item.tint }"><component :is="item.icon" /></span>
                 <span class="cell-label">{{ item.label }}</span>
-                <span v-if="item.phase > 1" class="cell-soon">规划中</span>
               </RouterLink>
             </div>
           </section>
@@ -101,7 +100,7 @@ function active(to: string): boolean {
   display: flex;
   flex-direction: column;
   border-radius: 18px 18px 0 0;
-  background: color-mix(in srgb, var(--surface-raised) 92%, transparent);
+  background: var(--popover);
   box-shadow: var(--shadow-lg);
   padding-bottom: env(safe-area-inset-bottom);
 }
@@ -179,13 +178,6 @@ function active(to: string): boolean {
 .cell-label {
   font-size: 11.5px;
   text-align: center;
-}
-.cell-soon {
-  position: absolute;
-  top: 5px;
-  right: 6px;
-  font-size: 9px;
-  color: var(--text-3);
 }
 .sheet-enter-active,
 .sheet-leave-active {

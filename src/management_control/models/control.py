@@ -612,6 +612,13 @@ class ModelCenterControl(DomainControl):
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         return matches[0]
 
+    def presentation(self, context: ManagementContext | None, views, *, detail: bool = False,
+                     source: ModelSourceRef | None = None) -> dict[str, dict]:
+        """Round 3: TG list/detail facts beyond ModelView (see presentation.py)."""
+        self._read(context)
+        from .presentation import present
+        return present(self, context, list(views), detail=detail, source=source)
+
     @staticmethod
     def _chat_by_id(values: list[ModelView]) -> dict[str, ModelView]:
         return {item.model_id: item for item in values if item.identity.kind in (ModelKind.CHAT, ModelKind.IMAGE)}
@@ -747,6 +754,11 @@ class ModelCenterControl(DomainControl):
         self._read(context)
         cfg = config.get()
         return model_registry.overview(cfg), stable_revision(model_registry.admin_revision(cfg))
+
+    def global_default_effort(self, context: ManagementContext | None) -> str:
+        """The current global default reasoning effort (TG 「跟随全局（…）」)."""
+        self._read(context)
+        return model_registry.global_default_effort(config.get())
 
     def replace_registry_rules(
         self,

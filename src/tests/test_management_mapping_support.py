@@ -44,7 +44,7 @@ OWNED_OPERATION_IDS = {
     "deleteCompressionModel", "getLoadBalancing", "updateLoadBalancingMode",
     "getChannelOrder", "replaceChannelOrder", "getModelChannelOrder",
     "replaceModelChannelOrder", "deleteModelChannelOrder",
-    "bulkReplaceModelChannelOrders", "clearAllAffinity", "clearFamilyAffinity",
+    "bulkReplaceModelChannelOrders", "listModelChannelOrders", "clearAllAffinity", "clearFamilyAffinity",
     "listProxies", "createProxies", "getProxy", "updateProxy", "deleteProxy",
     "testProxy", "listProxyGroups", "createProxyGroups", "getProxyGroup",
     "updateProxyGroup", "deleteProxyGroup", "testProxyGroup", "getProxyRouting",
@@ -160,7 +160,7 @@ def test_openapi_matches_owned_operation_manifest(domain_client):
         if set(operation.get("tags") or ()) & OWNED_TAGS
     }
     assert owned == OWNED_OPERATION_IDS
-    assert len(owned) == 43
+    assert len(owned) == 44
 
 
 def test_p5_router_operations_each_call_control_once_with_authorized_context():
@@ -207,7 +207,7 @@ def test_p5_router_operations_each_call_control_once_with_authorized_context():
             assert isinstance(first_argument, ast.Name)
             assert first_argument.id == "context", (relative, node.name)
             operations.append((relative, node.name))
-    assert len(operations) == 43
+    assert len(operations) == 44
 
 
 STRICT_QUERY_CASES = [

@@ -30,6 +30,7 @@ from src.management_control.channels import (
     CompatibilityFeature,
     DiscoveryCommand,
     DraftProbeCommand,
+    ProbeResult,
     SortDirection,
 )
 
@@ -44,7 +45,11 @@ from ..dependencies import (
 from ..error_mapping import management_error_responses
 from ..response_helpers import response_meta as _meta
 from ..schemas.base import DataEnvelope
+from src.management_control.channels.list_stats import month_stats_by_channel
+
 from ..schemas.channels import (
+    ChannelListItemData,
+    month_stats_data,
     ActionResultData,
     CatalogProtocolEndpointData,
     ChannelActionEnvelope,
@@ -395,6 +400,7 @@ def _channel_data(view) -> ChannelData:
         health=view.health,
         recentSuccessRate=view.recent_success_rate,
         cooldownCount=view.cooldown_count,
+        permanentCooldownCount=view.permanent_cooldown_count,
         affinityCount=view.affinity_count,
         clientAffinityCount=view.client_affinity_count,
         providerUsage=_usage_data(view.provider_usage),
@@ -459,19 +465,7 @@ def _detail_data(detail) -> ChannelDetailData:
     month = detail.month_stats
     return ChannelDetailData(
         **base,
-        monthStats=ChannelMonthStatsData(
-            total=month.total,
-            successCount=month.success_count,
-            errorCount=month.error_count,
-            inputTokens=month.input,
-            outputTokens=month.output,
-            cacheCreationTokens=month.cache_creation,
-            cacheReadTokens=month.cache_read,
-            averageTokensPerSecond=month.avg_tps,
-            maximumTokensPerSecond=month.max_tps,
-            minimumTokensPerSecond=month.min_tps,
-            cost=month.cost,
-        ),
+        monthStats=month_stats_data(month),
         modelStats=[_model_stats(item) for item in detail.model_stats],
         runtimeModels=_runtime_models(detail.channel),
     )
@@ -503,7 +497,21 @@ def _create_command(body) -> ChannelCreateCommand:
         provider_id=None if manual else body.providerId,
         provider_preset_id=None if manual else body.providerPresetId,
         enabled=body.enabled,
+        initial_probe_results=_initial_probe_results(body),
     )
+
+
+def _initial_probe_results(body) -> dict[str, ProbeResult]:
+    models = {item.real for item in body.models}
+    unknown = [item.model for item in body.initialProbeResults if item.model not in models]
+    if unknown or len({item.model for item in body.initialProbeResults}) != len(body.initialProbeResults):
+        raise ManagementError(ManagementErrorCode.VALIDATION_FAILED, fields=(ErrorField(
+            "initialProbeResults", "UNKNOWN_OR_DUPLICATE_MODEL",
+            "each result must name one of the channel's models (real id) once"),))
+    return {
+        item.model: ProbeResult(item.ok, 0, item.reason or ("PROBE_FAILED" if not item.ok else None), False, False)
+        for item in body.initialProbeResults
+    }
 
 
 def _update_command(body: ChannelUpdateRequest) -> ChannelUpdateCommand:
@@ -562,8 +570,13 @@ def list_channels(
         protocol=protocol, provider_id=providerId, health=health,
         sort=sort, direction=direction,
     ))
+    month, loading = month_stats_by_channel(context)
     return ChannelListEnvelope(
-        data=[_channel_data(item) for item in result.items],
+        data=[ChannelListItemData(
+            **_channel_data(item).model_dump(),
+            monthStats=month_stats_data(month[item.id]) if item.id in month else None,
+            monthStatsLoading=loading,
+        ) for item in result.items],
         meta=ChannelPageMeta(
             requestId=management_request_id(request), page=result.page,
             pageSize=result.page_size, total=result.total, hasNext=result.has_next,

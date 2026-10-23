@@ -31,14 +31,17 @@ export class ApiError extends Error {
   readonly fields: ApiErrorBody['fields']
   readonly retryable: boolean
   readonly requestId?: string
+  /** The whole response body; some endpoints put extra blocks (e.g. `conflict`) next to `error`. */
+  readonly payload: Record<string, unknown>
 
-  constructor(status: number, body: Partial<ApiErrorBody>) {
+  constructor(status: number, body: Partial<ApiErrorBody>, payload: Record<string, unknown> = {}) {
     super(body.message || `HTTP ${status}`)
     this.status = status
     this.code = body.code || (status === 0 ? 'NETWORK_ERROR' : `HTTP_${status}`)
     this.fields = body.fields || []
     this.retryable = Boolean(body.retryable)
     this.requestId = body.requestId
+    this.payload = payload
   }
 
   get isAuth(): boolean {
@@ -105,8 +108,9 @@ export async function request<T>(method: string, path: string, opts: RequestOpti
     }
   }
   if (!response.ok) {
-    const body = (payload as { error?: ApiErrorBody } | null)?.error || { message: text.slice(0, 200) }
-    const error = new ApiError(response.status, body)
+    const raw = payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : {}
+    const body = (raw.error as ApiErrorBody | undefined) || { message: text.slice(0, 200) }
+    const error = new ApiError(response.status, body, raw)
     if (error.isAuth && unauthorizedHandler) unauthorizedHandler()
     throw error
   }

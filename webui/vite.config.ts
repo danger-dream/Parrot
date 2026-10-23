@@ -1,7 +1,7 @@
 import { defineConfig, type Plugin } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { createHash } from 'node:crypto'
-import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join, relative, sep } from 'node:path'
 import { fileURLToPath, URL } from 'node:url'
 
@@ -34,11 +34,16 @@ function sourceDigest(): string {
 }
 
 function buildMeta(): Plugin {
+  let target = outDir
   return {
     name: 'parrot-build-meta',
     apply: 'build',
-    closeBundle() {
-      writeFileSync(join(outDir, 'build-meta.json'), JSON.stringify({ sourceDigest: sourceDigest() }, null, 2) + '\n')
+    configResolved(config) {
+      target = config.build.outDir
+    },
+    writeBundle() {
+      mkdirSync(target, { recursive: true })
+      writeFileSync(join(target, 'build-meta.json'), JSON.stringify({ sourceDigest: sourceDigest() }, null, 2) + '\n')
     },
   }
 }
@@ -54,11 +59,12 @@ export default defineConfig({
     emptyOutDir: true,
     assetsDir: 'assets',
     chunkSizeWarningLimit: 900,
-    rollupOptions: {
+    rolldownOptions: {
       output: {
-        manualChunks(id) {
-          if (id.includes('node_modules/echarts') || id.includes('node_modules/zrender')) return 'charts'
-          if (id.includes('node_modules')) return 'vendor'
+        // echarts stays in the lazily loaded EChart chunk; a separate charts group produced a
+        // circular import with the bundler runtime helper and failed at load time.
+        codeSplitting: {
+          groups: [{ name: 'vendor', test: /^(?!.*[\\/](echarts|zrender)[\\/]).*[\\/]node_modules[\\/]/ }],
         },
       },
     },

@@ -880,6 +880,57 @@ export interface paths {
         patch: operations["updateOAuthQoderSettings"];
         trace?: never;
     };
+    "/api/management/v1/oauth/accounts/{accountId}/openai/reset-credits": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Openai Reset Credits */
+        get: operations["listOAuthOpenAiResetCredits"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/management/v1/oauth/accounts/{accountId}/claude-reset/plans": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Plan Claude Reset */
+        post: operations["planOAuthClaudeReset"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/management/v1/oauth/accounts/{accountId}/claude-reset/execute": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Execute Claude Reset */
+        post: operations["executeOAuthClaudeReset"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/management/v1/channels": {
         parameters: {
             query?: never;
@@ -1346,6 +1397,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/management/v1/stats/compare": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Stats Compare
+         * @description Totals for a window and the window right before it covering the same elapsed time.
+         *
+         *     ``period`` (today / 3d / 7d / month) or ``from`` + ``to``; ``model``, ``channel`` and
+         *     ``apiKey`` narrow both windows with the same keys the request log uses.
+         */
+        get: operations["getStatsCompare"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/management/v1/stats/timeseries": {
         parameters: {
             query?: never;
@@ -1380,6 +1454,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/management/v1/stats/recent-outcomes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Recent Outcomes */
+        get: operations["listRecentOutcomes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/management/v1/stats/models/{modelId}": {
         parameters: {
             query?: never;
@@ -1389,6 +1480,26 @@ export interface paths {
         };
         /** Get Model Stats */
         get: operations["getModelStats"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/management/v1/stats/cache-misses": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Cache Miss Samples
+         * @description TG「最近未命中样本」: up to 3 latest successful requests without cache read.
+         */
+        get: operations["listCacheMissSamples"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1595,6 +1706,23 @@ export interface paths {
         };
         /** Get Request Log */
         get: operations["getRequestLog"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/management/v1/media-logs/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Media Log Summary */
+        get: operations["getMediaLogSummary"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2004,6 +2132,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/management/v1/load-balancing/model-orders": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Model Channel Orders
+         * @description Batch form of getModelChannelOrder (one request instead of one per model).
+         */
+        get: operations["listModelChannelOrders"];
+        /** Bulk Replace Model Channel Orders */
+        put: operations["bulkReplaceModelChannelOrders"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/management/v1/load-balancing/model-orders/{modelId}": {
         parameters: {
             query?: never;
@@ -2018,23 +2167,6 @@ export interface paths {
         post?: never;
         /** Delete Model Channel Order */
         delete: operations["deleteModelChannelOrder"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/management/v1/load-balancing/model-orders": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        /** Bulk Replace Model Channel Orders */
-        put: operations["bulkReplaceModelChannelOrders"];
-        post?: never;
-        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -2494,6 +2626,60 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/management/v1/updates/state": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Update State */
+        get: operations["getUpdateState"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/management/v1/updates/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Cached Update Check
+         * @description Last check result (with release notes) without contacting GitHub.
+         */
+        get: operations["getCachedUpdateCheck"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/management/v1/updates/staged/actions/activation-plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create Update Activation Plan */
+        post: operations["createUpdateActivationPlan"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/management/v1/images/settings": {
         parameters: {
             query?: never;
@@ -2633,6 +2819,23 @@ export interface paths {
         head?: never;
         /** Update Media Source */
         patch: operations["updateMediaSource"];
+        trace?: never;
+    };
+    "/api/management/v1/media/{kind}/statistics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Media Statistics */
+        get: operations["getMediaStatistics"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/management/v1/settings/retry": {
@@ -2913,6 +3116,26 @@ export interface paths {
         };
         /** Get Accounts */
         get: operations["getSearchBackendAccounts"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/management/v1/search/backends/{backendId}/models": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Models
+         * @description Selectable models for an OAuth search source (SearchControl.models).
+         */
+        get: operations["getSearchBackendModels"];
         put?: never;
         post?: never;
         delete?: never;
@@ -3333,6 +3556,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/management/v1/mcp/logs/{callId}/result": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Mcp Call Result
+         * @description Stored result body of one call; 404 when the call or its body was never stored.
+         */
+        get: operations["getMcpCallResult"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/management/v1/mcp/stats": {
         parameters: {
             query?: never;
@@ -3556,6 +3799,10 @@ export interface components {
             modelStats: components["schemas"]["ApiKeyModelUsageData"][];
             /** Revision */
             revision: string;
+            /** Secret */
+            secret?: string | null;
+            /** Historytotal */
+            historyTotal?: number | null;
         };
         /**
          * ApiKeyEnabledFilter
@@ -3655,6 +3902,12 @@ export interface components {
         ApiKeyListData: {
             /** Items */
             items: components["schemas"]["ApiKeyData"][];
+            summary?: components["schemas"]["ApiKeyListSummaryData"] | null;
+            /**
+             * Historyloading
+             * @default false
+             */
+            historyLoading: boolean;
         };
         /** ApiKeyListEnvelope */
         ApiKeyListEnvelope: {
@@ -3675,6 +3928,26 @@ export interface components {
             hasNext: boolean;
             /** Revision */
             revision: string;
+        };
+        /**
+         * ApiKeyListSummaryData
+         * @description TG list header: 共 / 活跃 / 停用 / 闲置 | 本月 N 次 · ↑ · ↓ (all keys).
+         */
+        ApiKeyListSummaryData: {
+            /** Total */
+            total: number;
+            /** Active */
+            active: number;
+            /** Disabled */
+            disabled: number;
+            /** Idle */
+            idle: number;
+            /** Monthrequests */
+            monthRequests: number;
+            /** Monthprompttokens */
+            monthPromptTokens: number;
+            /** Monthoutputtokens */
+            monthOutputTokens: number;
         };
         /** ApiKeyModelUsageData */
         ApiKeyModelUsageData: {
@@ -3848,6 +4121,15 @@ export interface components {
             costedSuccess: number;
             /** Unpricedsuccess */
             unpricedSuccess: number;
+            /**
+             * Prompttokens
+             * @default 0
+             */
+            promptTokens: number;
+            /** Cachereadratio */
+            cacheReadRatio?: number | null;
+            /** Successrate */
+            successRate?: number | null;
         };
         /**
          * AuthMethod
@@ -3909,6 +4191,32 @@ export interface components {
             modelIds: string[];
             /** Order */
             order: string[];
+        };
+        /**
+         * CacheMissSampleData
+         * @description One TG「最近未命中样本」 row: a successful request without cache read.
+         */
+        CacheMissSampleData: {
+            /** Id */
+            id: string;
+            /** Createdat */
+            createdAt?: string | null;
+            /** Model */
+            model?: string | null;
+            /** Apikeyname */
+            apiKeyName?: string | null;
+            /** Channelid */
+            channelId?: string | null;
+            /** Inputtokens */
+            inputTokens: number;
+            /** Cachecreationtokens */
+            cacheCreationTokens: number;
+            /** Outputtokens */
+            outputTokens: number;
+            /** Messagecount */
+            messageCount: number;
+            /** Toolcount */
+            toolCount: number;
         };
         /**
          * Capability
@@ -4123,6 +4431,11 @@ export interface components {
             recentSuccessRate?: number | null;
             /** Cooldowncount */
             cooldownCount: number;
+            /**
+             * Permanentcooldowncount
+             * @default 0
+             */
+            permanentCooldownCount: number;
             /** Affinitycount */
             affinityCount: number;
             /** Clientaffinitycount */
@@ -4174,6 +4487,11 @@ export interface components {
             recentSuccessRate?: number | null;
             /** Cooldowncount */
             cooldownCount: number;
+            /**
+             * Permanentcooldowncount
+             * @default 0
+             */
+            permanentCooldownCount: number;
             /** Affinitycount */
             affinityCount: number;
             /** Clientaffinitycount */
@@ -4211,8 +4529,70 @@ export interface components {
         /** ChannelListEnvelope */
         ChannelListEnvelope: {
             /** Data */
-            data: components["schemas"]["ChannelData"][];
+            data: components["schemas"]["ChannelListItemData"][];
             meta: components["schemas"]["ChannelPageMeta"];
+        };
+        /** ChannelListItemData */
+        ChannelListItemData: {
+            /** Id */
+            id: string;
+            /** Revision */
+            revision: string;
+            /** Name */
+            name: string;
+            /** Baseurl */
+            baseUrl: string;
+            /** Apipath */
+            apiPath?: string | null;
+            /** Url */
+            url: string;
+            /** Apikeyconfigured */
+            apiKeyConfigured: boolean;
+            /** Apikeymaskedhint */
+            apiKeyMaskedHint?: string | null;
+            protocol: components["schemas"]["ChannelProtocol"];
+            /** Providerid */
+            providerId?: string | null;
+            /** Providerpresetid */
+            providerPresetId?: string | null;
+            /** Models */
+            models: components["schemas"]["ChannelModelData"][];
+            /** Modelcount */
+            modelCount: number;
+            /** Enabled */
+            enabled: boolean;
+            /** Disabledreason */
+            disabledReason?: string | null;
+            /** Maxconcurrent */
+            maxConcurrent: number;
+            /** Ccmimicry */
+            ccMimicry: boolean;
+            /** Omittemperature */
+            omitTemperature: boolean;
+            /** Omitthinking */
+            omitThinking: boolean;
+            compatibility: components["schemas"]["ChannelCompatibilityData"];
+            health: components["schemas"]["ChannelHealth"];
+            /** Recentsuccessrate */
+            recentSuccessRate?: number | null;
+            /** Cooldowncount */
+            cooldownCount: number;
+            /**
+             * Permanentcooldowncount
+             * @default 0
+             */
+            permanentCooldownCount: number;
+            /** Affinitycount */
+            affinityCount: number;
+            /** Clientaffinitycount */
+            clientAffinityCount: number;
+            providerUsage: components["schemas"]["ProviderUsageData"];
+            monthStats?: components["schemas"]["ChannelMonthStatsData"] | null;
+            /**
+             * Monthstatsloading
+             * @default false
+             */
+            monthStatsLoading: boolean;
         };
         /** ChannelModelData */
         ChannelModelData: {
@@ -4291,6 +4671,30 @@ export interface components {
             minimumTokensPerSecond?: number | null;
             /** Cost */
             cost?: string | null;
+            /**
+             * Prompttokens
+             * @default 0
+             */
+            promptTokens: number;
+            /** Successrate */
+            successRate?: number | null;
+            /** Cachereadratio */
+            cacheReadRatio?: number | null;
+            /**
+             * Costticks
+             * @default 0
+             */
+            costTicks: number;
+            /**
+             * Costedsuccess
+             * @default 0
+             */
+            costedSuccess: number;
+            /**
+             * Unpricedsuccess
+             * @default 0
+             */
+            unpricedSuccess: number;
         };
         /** ChannelOrderData */
         ChannelOrderData: {
@@ -4443,6 +4847,69 @@ export interface components {
             /** Providerpresetid */
             providerPresetId?: string | null;
         };
+        /** ClaudeResetExecuteRequest */
+        ClaudeResetExecuteRequest: {
+            /**
+             * Plantoken
+             * Format: password
+             */
+            planToken: string;
+        };
+        /** ClaudeResetPlanData */
+        ClaudeResetPlanData: {
+            /** Available */
+            available: boolean;
+            /** Reason */
+            reason?: string | null;
+            /**
+             * Program
+             * @enum {string}
+             */
+            program: "cedar_ember" | "juniper_tide";
+            /** Plantoken */
+            planToken?: string | null;
+            /** Expiresat */
+            expiresAt?: string | null;
+            /** Grantid */
+            grantId?: string | null;
+            /** Status */
+            status: {
+                [key: string]: unknown;
+            };
+        };
+        /** ClaudeResetPlanRequest */
+        ClaudeResetPlanRequest: {
+            /**
+             * Program
+             * @enum {string}
+             */
+            program: "cedar_ember" | "juniper_tide";
+        };
+        /** ClaudeResetResultData */
+        ClaudeResetResultData: {
+            /** Program */
+            program: string;
+            /** Grantid */
+            grantId?: string | null;
+            /** Result */
+            result?: string | null;
+            /** Reason */
+            reason?: string | null;
+            /** Resetsleft */
+            resetsLeft?: number | null;
+            /** Cleared */
+            cleared?: unknown[] | null;
+            /** Cooldownuntil */
+            cooldownUntil?: string | null;
+            /** Nextavailableat */
+            nextAvailableAt?: string | null;
+            /** Weeklyresetsat */
+            weeklyResetsAt?: string | null;
+            /** Quotaaction */
+            quotaAction?: {
+                [key: string]: unknown;
+            } | null;
+        };
         /** CommitOAuthImportRequest */
         CommitOAuthImportRequest: {
             /**
@@ -4460,6 +4927,73 @@ export interface components {
              * Format: password
              */
             planToken: string;
+        };
+        /** CompareMetricsData */
+        CompareMetricsData: {
+            /** Total */
+            total: number;
+            /** Successcount */
+            successCount: number;
+            /** Errorcount */
+            errorCount: number;
+            /** Inputtokens */
+            inputTokens: number;
+            /** Outputtokens */
+            outputTokens: number;
+            /** Cachereadtokens */
+            cacheReadTokens: number;
+            /** Cachecreationtokens */
+            cacheCreationTokens: number;
+            /** Costticks */
+            costTicks: number;
+            /** Unpricedsuccess */
+            unpricedSuccess: number;
+            /** Cachehitrequests */
+            cacheHitRequests: number;
+            /** Affinityhits */
+            affinityHits: number;
+            /** Averagefirsttokenmilliseconds */
+            averageFirstTokenMilliseconds?: number | null;
+            /** Averagetotalmilliseconds */
+            averageTotalMilliseconds?: number | null;
+            /** Averagetokenspersecond */
+            averageTokensPerSecond?: number | null;
+        };
+        /** ComparePointData */
+        ComparePointData: {
+            /** Total */
+            total: number;
+            /** Successcount */
+            successCount: number;
+            /** Errorcount */
+            errorCount: number;
+            /** Inputtokens */
+            inputTokens: number;
+            /** Outputtokens */
+            outputTokens: number;
+            /** Cachereadtokens */
+            cacheReadTokens: number;
+            /** Cachecreationtokens */
+            cacheCreationTokens: number;
+            /** Costticks */
+            costTicks: number;
+            /** Unpricedsuccess */
+            unpricedSuccess: number;
+            /** Cachehitrequests */
+            cacheHitRequests: number;
+            /** Affinityhits */
+            affinityHits: number;
+            /** Averagefirsttokenmilliseconds */
+            averageFirstTokenMilliseconds?: number | null;
+            /** Averagetotalmilliseconds */
+            averageTotalMilliseconds?: number | null;
+            /** Averagetokenspersecond */
+            averageTokensPerSecond?: number | null;
+            /**
+             * T
+             * Format: date-time
+             */
+            t: string;
         };
         /** CompatibilityFeatureData */
         CompatibilityFeatureData: {
@@ -4647,6 +5181,16 @@ export interface components {
             data: components["schemas"]["ChannelOrderData"];
             meta: components["schemas"]["ResponseMeta"];
         };
+        /** DataEnvelope[ClaudeResetPlanData] */
+        DataEnvelope_ClaudeResetPlanData_: {
+            data: components["schemas"]["ClaudeResetPlanData"];
+            meta: components["schemas"]["ResponseMeta"];
+        };
+        /** DataEnvelope[ClaudeResetResultData] */
+        DataEnvelope_ClaudeResetResultData_: {
+            data: components["schemas"]["ClaudeResetResultData"];
+            meta: components["schemas"]["ResponseMeta"];
+        };
         /** DataEnvelope[ConcurrencyData] */
         DataEnvelope_ConcurrencyData_: {
             data: components["schemas"]["ConcurrencyData"];
@@ -4702,6 +5246,11 @@ export interface components {
             data: components["schemas"]["ManagementOperationData"];
             meta: components["schemas"]["ResponseMeta"];
         };
+        /** DataEnvelope[McpCallResultData] */
+        DataEnvelope_McpCallResultData_: {
+            data: components["schemas"]["McpCallResultData"];
+            meta: components["schemas"]["ResponseMeta"];
+        };
         /** DataEnvelope[McpLogListData] */
         DataEnvelope_McpLogListData_: {
             data: components["schemas"]["McpLogListData"];
@@ -4722,6 +5271,11 @@ export interface components {
             data: components["schemas"]["MediaLogDetailData"];
             meta: components["schemas"]["ResponseMeta"];
         };
+        /** DataEnvelope[MediaLogSummaryData] */
+        DataEnvelope_MediaLogSummaryData_: {
+            data: components["schemas"]["MediaLogSummaryData"];
+            meta: components["schemas"]["ResponseMeta"];
+        };
         /** DataEnvelope[MediaModelMutationData] */
         DataEnvelope_MediaModelMutationData_: {
             data: components["schemas"]["MediaModelMutationData"];
@@ -4735,6 +5289,11 @@ export interface components {
         /** DataEnvelope[MediaSourcesData] */
         DataEnvelope_MediaSourcesData_: {
             data: components["schemas"]["MediaSourcesData"];
+            meta: components["schemas"]["ResponseMeta"];
+        };
+        /** DataEnvelope[MediaStatisticsData] */
+        DataEnvelope_MediaStatisticsData_: {
+            data: components["schemas"]["MediaStatisticsData"];
             meta: components["schemas"]["ResponseMeta"];
         };
         /** DataEnvelope[ModelStatsData] */
@@ -4822,6 +5381,11 @@ export interface components {
             data: components["schemas"]["OAuthSettingsData"];
             meta: components["schemas"]["ResponseMeta"];
         };
+        /** DataEnvelope[OpenAiResetCreditsData] */
+        DataEnvelope_OpenAiResetCreditsData_: {
+            data: components["schemas"]["OpenAiResetCreditsData"];
+            meta: components["schemas"]["ResponseMeta"];
+        };
         /** DataEnvelope[OpenAiWebSocketSettingsData] */
         DataEnvelope_OpenAiWebSocketSettingsData_: {
             data: components["schemas"]["OpenAiWebSocketSettingsData"];
@@ -4897,6 +5461,11 @@ export interface components {
             data: components["schemas"]["ScoringSettingsData"];
             meta: components["schemas"]["ResponseMeta"];
         };
+        /** DataEnvelope[SearchModelsData] */
+        DataEnvelope_SearchModelsData_: {
+            data: components["schemas"]["SearchModelsData"];
+            meta: components["schemas"]["ResponseMeta"];
+        };
         /** DataEnvelope[SearchSettingsData] */
         DataEnvelope_SearchSettingsData_: {
             data: components["schemas"]["SearchSettingsData"];
@@ -4915,6 +5484,11 @@ export interface components {
         /** DataEnvelope[StageUpdateOperationData] */
         DataEnvelope_StageUpdateOperationData_: {
             data: components["schemas"]["StageUpdateOperationData"];
+            meta: components["schemas"]["ResponseMeta"];
+        };
+        /** DataEnvelope[StatsCompareData] */
+        DataEnvelope_StatsCompareData_: {
+            data: components["schemas"]["StatsCompareData"];
             meta: components["schemas"]["ResponseMeta"];
         };
         /** DataEnvelope[StatsSummaryData] */
@@ -4977,6 +5551,11 @@ export interface components {
             data: components["schemas"]["TranslationSettingsData"];
             meta: components["schemas"]["ResponseMeta"];
         };
+        /** DataEnvelope[UpdateActivationPlanData] */
+        DataEnvelope_UpdateActivationPlanData_: {
+            data: components["schemas"]["UpdateActivationPlanData"];
+            meta: components["schemas"]["ResponseMeta"];
+        };
         /** DataEnvelope[UpdateCheckData] */
         DataEnvelope_UpdateCheckData_: {
             data: components["schemas"]["UpdateCheckData"];
@@ -4990,6 +5569,11 @@ export interface components {
         /** DataEnvelope[UpdateSettingsData] */
         DataEnvelope_UpdateSettingsData_: {
             data: components["schemas"]["UpdateSettingsData"];
+            meta: components["schemas"]["ResponseMeta"];
+        };
+        /** DataEnvelope[UpdateStateData] */
+        DataEnvelope_UpdateStateData_: {
+            data: components["schemas"]["UpdateStateData"];
             meta: components["schemas"]["ResponseMeta"];
         };
         /** DataEnvelope[WebUiSettingsData] */
@@ -5040,6 +5624,18 @@ export interface components {
         /** DataEnvelope[ZhipuViewData] */
         DataEnvelope_ZhipuViewData_: {
             data: components["schemas"]["ZhipuViewData"];
+            meta: components["schemas"]["ResponseMeta"];
+        };
+        /** DataEnvelope[list[CacheMissSampleData]] */
+        DataEnvelope_list_CacheMissSampleData__: {
+            /** Data */
+            data: components["schemas"]["CacheMissSampleData"][];
+            meta: components["schemas"]["ResponseMeta"];
+        };
+        /** DataEnvelope[list[RecentOutcomeData]] */
+        DataEnvelope_list_RecentOutcomeData__: {
+            /** Data */
+            data: components["schemas"]["RecentOutcomeData"][];
             meta: components["schemas"]["ResponseMeta"];
         };
         /** DataEnvelope[list[SearchAccountData]] */
@@ -5358,6 +5954,18 @@ export interface components {
             data: components["schemas"]["IngressDefaultData"];
             meta: components["schemas"]["ResponseMeta"];
         };
+        /**
+         * InitialProbeResultInput
+         * @description One wizard probe outcome (probeChannelDraft) carried into createChannel.
+         */
+        InitialProbeResultInput: {
+            /** Model */
+            model: string;
+            /** Ok */
+            ok: boolean;
+            /** Reason */
+            reason?: string | null;
+        };
         /** InvalidOAuthDeletionPlanRequest */
         InvalidOAuthDeletionPlanRequest: {
             /**
@@ -5660,6 +6268,8 @@ export interface components {
              * @default true
              */
             enabled: boolean;
+            /** Initialproberesults */
+            initialProbeResults?: components["schemas"]["InitialProbeResultInput"][];
             /**
              * Mode
              * @constant
@@ -5814,6 +6424,20 @@ export interface components {
             /** Outputtokens */
             outputTokens: number;
         };
+        /**
+         * McpCallResultData
+         * @description Stored result body of one MCP call (TG「📨 查看结果」).
+         */
+        McpCallResultData: {
+            /** Callid */
+            callId: string;
+            /** Createdat */
+            createdAt: number;
+            /** Body */
+            body?: string | null;
+            /** Purgedat */
+            purgedAt?: number | null;
+        };
         /** McpLogListData */
         McpLogListData: {
             /** Items */
@@ -5963,6 +6587,13 @@ export interface components {
             expiresAt?: string | null;
             /** Revision */
             revision: string;
+        };
+        /** MediaCacheOccupancyData */
+        MediaCacheOccupancyData: {
+            /** Files */
+            files: number;
+            /** Bytes */
+            bytes: number;
         };
         /**
          * MediaKind
@@ -6133,6 +6764,32 @@ export interface components {
             /** Paths */
             paths: string[];
         };
+        /**
+         * MediaLogSummaryData
+         * @description TG 多媒体日志汇总: GPT / Grok images, videos, outcomes, cost, OAuth top 3.
+         */
+        MediaLogSummaryData: {
+            /** Total */
+            total: number;
+            /** Openaiimages */
+            openaiImages: number;
+            /** Xaiimages */
+            xaiImages: number;
+            /** Videos */
+            videos: number;
+            /** Successcount */
+            successCount: number;
+            /** Failedcount */
+            failedCount: number;
+            /** Pendingcount */
+            pendingCount: number;
+            /** Expiredcount */
+            expiredCount: number;
+            /** Costusdticks */
+            costUsdTicks: number;
+            /** Topaccounts */
+            topAccounts: components["schemas"]["MediaTopAccountData"][];
+        };
         /** MediaModelAddRequest */
         MediaModelAddRequest: {
             /** Modelid */
@@ -6157,6 +6814,21 @@ export interface components {
         MediaModelRenameRequest: {
             /** Newmodelid */
             newModelId: string;
+        };
+        /** MediaModelStatisticData */
+        MediaModelStatisticData: {
+            /** Model */
+            model: string;
+            /** Completedcalls */
+            completedCalls: number;
+            /** Generatedcount */
+            generatedCount: number;
+            /** Unknowncountcalls */
+            unknownCountCalls: number;
+            /** Recordedbytes */
+            recordedBytes: number;
+            /** Unknownbytescalls */
+            unknownBytesCalls: number;
         };
         /** MediaOwnerData */
         MediaOwnerData: {
@@ -6204,10 +6876,32 @@ export interface components {
             sources: components["schemas"]["MediaSourceData"][];
         };
         /**
+         * MediaStatisticsData
+         * @description TG 模型中心 · 图片/视频: 当前缓存占用 + 各模型已生成数量.
+         */
+        MediaStatisticsData: {
+            cache: components["schemas"]["MediaCacheOccupancyData"];
+            /** Models */
+            models: components["schemas"]["MediaModelStatisticData"][];
+        };
+        /**
          * MediaStatus
          * @enum {string}
          */
         MediaStatus: "running" | "pending" | "success" | "failed" | "expired" | "cancelled";
+        /** MediaTopAccountData */
+        MediaTopAccountData: {
+            /** Accountkey */
+            accountKey: string;
+            /** Accountemail */
+            accountEmail?: string | null;
+            /** Provider */
+            provider: string;
+            /** Total */
+            total: number;
+            /** Costusdticks */
+            costUsdTicks: number;
+        };
         /** MetadataOperationEnvelope */
         MetadataOperationEnvelope: {
             data: components["schemas"]["ManagementOperationData"];
@@ -6375,6 +7069,23 @@ export interface components {
             editable: boolean;
             /** Revision */
             revision: string;
+            /** Statecode */
+            stateCode?: string | null;
+            /** Creditrates */
+            creditRates?: {
+                [key: string]: string[];
+            };
+            /** Sharedmetadata */
+            sharedMetadata?: {
+                [key: string]: unknown;
+            };
+            usage?: components["schemas"]["ModelUsageData"] | null;
+            /**
+             * Usageloading
+             * @default false
+             */
+            usageLoading: boolean;
+            schedule?: components["schemas"]["ModelScheduleData"] | null;
         };
         /** ModelDefaultEffortRequest */
         ModelDefaultEffortRequest: {
@@ -6533,6 +7244,8 @@ export interface components {
             defaultEfforts: {
                 [key: string]: string;
             };
+            /** Globaldefaulteffort */
+            globalDefaultEffort?: string | null;
         };
         /** ModelRegistryEnvelope */
         ModelRegistryEnvelope: {
@@ -6555,6 +7268,21 @@ export interface components {
             rules: components["schemas"]["RegistryRuleData"][];
             /** Dismissed */
             dismissed?: string[];
+        };
+        /**
+         * ModelScheduleData
+         * @description TG 「调度」: priority / order / smart; ``order`` = channel keys in scheduling order.
+         */
+        ModelScheduleData: {
+            /** Mode */
+            mode?: string | null;
+            /**
+             * Ownorder
+             * @default false
+             */
+            ownOrder: boolean;
+            /** Order */
+            order?: string[];
         };
         /** ModelSelectionRequest */
         ModelSelectionRequest: {
@@ -6605,6 +7333,17 @@ export interface components {
             constrainedBy: {
                 [key: string]: string[];
             };
+            /** Schedulerank */
+            scheduleRank?: number | null;
+            /** Displayorder */
+            displayOrder?: number | null;
+            /** Notscheduledreason */
+            notScheduledReason?: ("accountRestricted" | "containerDisabled" | "sourceDisabled" | "globalDisabled" | "unavailable") | null;
+            account?: components["schemas"]["OAuthSourceAccountData"] | null;
+            /** Channel */
+            channel?: {
+                [key: string]: unknown;
+            } | null;
         };
         /** ModelSourceRequest */
         ModelSourceRequest: {
@@ -6694,6 +7433,38 @@ export interface components {
          * @enum {string}
          */
         ModelStatus: "enabled" | "disabled" | "visible" | "hidden";
+        /**
+         * ModelUsageData
+         * @description TG model_center_usage: lifetime 累计用量 / 请求 / 成功率 / TPS.
+         */
+        ModelUsageData: {
+            /** Requestcount */
+            requestCount: number;
+            /** Successcount */
+            successCount: number;
+            /** Errorcount */
+            errorCount: number;
+            /** Inputtokens */
+            inputTokens: number;
+            /** Outputtokens */
+            outputTokens: number;
+            /** Cachecreationtokens */
+            cacheCreationTokens: number;
+            /** Cachereadtokens */
+            cacheReadTokens: number;
+            /** Prompttokens */
+            promptTokens: number;
+            /** Cachereadratio */
+            cacheReadRatio?: number | null;
+            /** Successrate */
+            successRate?: number | null;
+            /** Averagetokenspersecond */
+            averageTokensPerSecond?: number | null;
+            /** Maximumtokenspersecond */
+            maximumTokensPerSecond?: number | null;
+            /** Minimumtokenspersecond */
+            minimumTokensPerSecond?: number | null;
+        };
         /** MonitorChannelsData */
         MonitorChannelsData: {
             /** Enabled */
@@ -6981,6 +7752,30 @@ export interface components {
             enabled?: boolean | null;
             events?: components["schemas"]["NotificationEventsPatch"] | null;
         };
+        /** OAuthAccessData */
+        OAuthAccessData: {
+            /** State */
+            state?: ("ok" | "limited" | "blocked") | null;
+            /** Grokcode */
+            grokCode?: boolean | null;
+        };
+        /** OAuthAccountCardData */
+        OAuthAccountCardData: {
+            /** Statustag */
+            statusTag?: ("userDisabled" | "quotaDisabled" | "authFailed" | "providerRestricted") | null;
+            plan: components["schemas"]["OAuthPlanFactsData"];
+            /** Usagesections */
+            usageSections: components["schemas"]["OAuthUsageSectionData"][];
+            /** Usagefetchedat */
+            usageFetchedAt?: string | null;
+            localPeriod: components["schemas"]["OAuthLocalPeriodData"];
+            /** Windowstats */
+            windowStats: {
+                [key: string]: components["schemas"]["OAuthWindowStatsData"];
+            };
+            weeklyProjection?: components["schemas"]["OAuthWeeklyProjectionData"] | null;
+            cooldown: components["schemas"]["OAuthCooldownSummaryData"];
+        };
         /** OAuthAccountDetailData */
         OAuthAccountDetailData: {
             account: components["schemas"]["OAuthAccountSummaryData"];
@@ -7013,6 +7808,20 @@ export interface components {
             qoder?: {
                 [key: string]: unknown;
             } | null;
+            /** Usagesections */
+            usageSections?: components["schemas"]["OAuthUsageSectionData"][];
+            /** Usagefetchedat */
+            usageFetchedAt?: string | null;
+            /** Allowcredits */
+            allowCredits?: boolean | null;
+            plan?: components["schemas"]["OAuthPlanFactsData"] | null;
+            weeklyProjection?: components["schemas"]["OAuthWeeklyProjectionData"] | null;
+            /** Windowstats */
+            windowStats?: {
+                [key: string]: components["schemas"]["OAuthWindowStatsData"];
+            } | null;
+            /** Lastrefreshat */
+            lastRefreshAt?: string | null;
         };
         /**
          * OAuthAccountFilter
@@ -7070,11 +7879,35 @@ export interface components {
             credentialConfigured: boolean;
             /** Revision */
             revision: string;
+            card?: components["schemas"]["OAuthAccountCardData"] | null;
         };
         /** OAuthClearedCountData */
         OAuthClearedCountData: {
             /** Cleared */
             cleared: number;
+        };
+        /** OAuthCooldownSummaryData */
+        OAuthCooldownSummaryData: {
+            /** Accountpaused */
+            accountPaused: boolean;
+            /** Quotapausedmodels */
+            quotaPausedModels: number;
+            /** Permanentmodels */
+            permanentModels: number;
+            /** Coolingmodels */
+            coolingModels: number;
+        };
+        /** OAuthCreditObservationData */
+        OAuthCreditObservationData: {
+            /** Observedat */
+            observedAt?: string | null;
+            /** Source */
+            source?: ("official_usage" | "response_sample") | null;
+            /**
+             * Stale
+             * @default false
+             */
+            stale: boolean;
         };
         /** OAuthDeletedCountData */
         OAuthDeletedCountData: {
@@ -7156,6 +7989,29 @@ export interface components {
             /** Message */
             message: string;
         };
+        /**
+         * OAuthLocalPeriodData
+         * @description TG 「💎 本地自然月 / 套餐本期 / 本周 / 账单本期」 local statistics.
+         */
+        OAuthLocalPeriodData: {
+            /** Source */
+            source: string;
+            /** Label */
+            label: string;
+            /** Moneylabel */
+            moneyLabel: string;
+            /**
+             * Since
+             * Format: date-time
+             */
+            since: string;
+            stats?: components["schemas"]["OAuthLocalUsageStatsData"] | null;
+            /**
+             * Statsloading
+             * @default false
+             */
+            statsLoading: boolean;
+        };
         /** OAuthLocalStatsData */
         OAuthLocalStatsData: {
             /** Requestcount */
@@ -7166,6 +8022,88 @@ export interface components {
             outputTokens: number;
             /** Costusd */
             costUsd?: number | null;
+            /** Periodlabel */
+            periodLabel?: string | null;
+            /** Periodsource */
+            periodSource?: string | null;
+            /** Moneylabel */
+            moneyLabel?: string | null;
+            /** Since */
+            since?: string | null;
+            /** Total */
+            total?: number | null;
+            /** Successcount */
+            successCount?: number | null;
+            /** Errorcount */
+            errorCount?: number | null;
+            /** Cachecreationtokens */
+            cacheCreationTokens?: number | null;
+            /** Cachereadtokens */
+            cacheReadTokens?: number | null;
+            /** Prompttokens */
+            promptTokens?: number | null;
+            /** Cachereadratio */
+            cacheReadRatio?: number | null;
+            /** Averagetokenspersecond */
+            averageTokensPerSecond?: number | null;
+            /** Maximumtokenspersecond */
+            maximumTokensPerSecond?: number | null;
+            /** Minimumtokenspersecond */
+            minimumTokensPerSecond?: number | null;
+            /** Costticks */
+            costTicks?: number | null;
+            /** Actualcostticks */
+            actualCostTicks?: number | null;
+            /** Estimatedcostticks */
+            estimatedCostTicks?: number | null;
+            /** Actualcostedsuccess */
+            actualCostedSuccess?: number | null;
+            /** Costedsuccess */
+            costedSuccess?: number | null;
+            /** Unpricedsuccess */
+            unpricedSuccess?: number | null;
+        };
+        /**
+         * OAuthLocalUsageStatsData
+         * @description Field names follow StatsMetricData.
+         */
+        OAuthLocalUsageStatsData: {
+            /** Total */
+            total: number;
+            /** Successcount */
+            successCount: number;
+            /** Errorcount */
+            errorCount: number;
+            /** Inputtokens */
+            inputTokens: number;
+            /** Outputtokens */
+            outputTokens: number;
+            /** Cachecreationtokens */
+            cacheCreationTokens: number;
+            /** Cachereadtokens */
+            cacheReadTokens: number;
+            /** Prompttokens */
+            promptTokens: number;
+            /** Cachereadratio */
+            cacheReadRatio?: number | null;
+            /** Averagetokenspersecond */
+            averageTokensPerSecond?: number | null;
+            /** Maximumtokenspersecond */
+            maximumTokensPerSecond?: number | null;
+            /** Minimumtokenspersecond */
+            minimumTokensPerSecond?: number | null;
+            /** Costticks */
+            costTicks: number;
+            /** Actualcostticks */
+            actualCostTicks: number;
+            /** Estimatedcostticks */
+            estimatedCostTicks: number;
+            /** Actualcostedsuccess */
+            actualCostedSuccess: number;
+            /** Costedsuccess */
+            costedSuccess: number;
+            /** Unpricedsuccess */
+            unpricedSuccess: number;
         };
         /** OAuthLoginFlowData */
         OAuthLoginFlowData: {
@@ -7282,6 +8220,60 @@ export interface components {
             hasNext: boolean;
         };
         /**
+         * OAuthPlanFactsData
+         * @description Provider-specific plan line facts (TG 🏷️ 套餐 / 订阅 / 到期 …); others null.
+         */
+        OAuthPlanFactsData: {
+            /** Label */
+            label?: string | null;
+            /** Status */
+            status?: string | null;
+            /** Billingtype */
+            billingType?: string | null;
+            /** Startedat */
+            startedAt?: string | null;
+            /** Expiresat */
+            expiresAt?: string | null;
+            /** Tier */
+            tier?: string | null;
+            access?: components["schemas"]["OAuthAccessData"] | null;
+            /** Textmodelcount */
+            textModelCount?: number | null;
+            /** Imagemodelcount */
+            imageModelCount?: number | null;
+            /** Variantcount */
+            variantCount?: number | null;
+            /** Workspacelabel */
+            workspaceLabel?: string | null;
+            /** Resetcreditcount */
+            resetCreditCount?: number | null;
+            credits?: components["schemas"]["OAuthCreditObservationData"] | null;
+            /** Globaldisabledmodelcount */
+            globalDisabledModelCount?: number | null;
+            /** Organizationid */
+            organizationId?: string | null;
+            /** Projectid */
+            projectId?: string | null;
+            /** Site */
+            site?: string | null;
+            /** Credentialmode */
+            credentialMode?: string | null;
+            /** Entitlement */
+            entitlement?: string | null;
+            /** Managementstatus */
+            managementStatus?: string | null;
+            /** Setupincomplete */
+            setupIncomplete?: boolean | null;
+            /** Region */
+            region?: string | null;
+            /** Accounttype */
+            accountType?: string | null;
+            /** Authmethod */
+            authMethod?: string | null;
+            /** Devicechat */
+            deviceChat?: boolean | null;
+        };
+        /**
          * OAuthProvider
          * @enum {string}
          */
@@ -7311,6 +8303,8 @@ export interface components {
             provider: components["schemas"]["OAuthProvider"];
             /** Creditcount */
             creditCount?: number | null;
+            /** Creditid */
+            creditId?: string | null;
             /**
              * Expiresat
              * Format: date-time
@@ -7319,9 +8313,13 @@ export interface components {
         };
         /**
          * OAuthQuotaResetPlanRequest
-         * @description Explicit empty body; the current domain exposes one reset action.
+         * @description OpenAI may pick one reset card (creditId from listOAuthOpenAiResetCredits);
+         *     omitted → the upstream's default card. Other providers send ``{}``.
          */
-        OAuthQuotaResetPlanRequest: Record<string, never>;
+        OAuthQuotaResetPlanRequest: {
+            /** Creditid */
+            creditId?: string | null;
+        };
         /** OAuthReplaceConflictData */
         OAuthReplaceConflictData: {
             /** Accountid */
@@ -7349,6 +8347,18 @@ export interface components {
             cooldownUntil?: string | null;
             /** Cooldownpermanent */
             cooldownPermanent: boolean;
+            /**
+             * Errorcount
+             * @default 0
+             */
+            errorCount: number;
+            /**
+             * Kind
+             * @default fault
+             */
+            kind: string;
+            /** Pool */
+            pool?: ("cursor_models" | "other_models" | "unknown") | null;
         };
         /** OAuthSettingsData */
         OAuthSettingsData: {
@@ -7360,10 +8370,75 @@ export interface components {
             revision: string;
         };
         /**
+         * OAuthSourceAccountData
+         * @description Quota / balance / credits of the OAuth account behind a source (cached).
+         */
+        OAuthSourceAccountData: {
+            /** Statustag */
+            statusTag?: string | null;
+            /** Plan */
+            plan?: {
+                [key: string]: unknown;
+            };
+            /** Usagesections */
+            usageSections?: {
+                [key: string]: unknown;
+            }[];
+            /** Usagefetchedat */
+            usageFetchedAt?: string | null;
+            /** Cooldown */
+            cooldown?: {
+                [key: string]: unknown;
+            };
+            /** Plantype */
+            planType?: string | null;
+            /** Available */
+            available?: boolean | null;
+            /** Quotalimited */
+            quotaLimited?: boolean | null;
+            /** Invalid */
+            invalid?: boolean | null;
+            /** Disabledreason */
+            disabledReason?: string | null;
+            /** Disableduntil */
+            disabledUntil?: string | null;
+        };
+        /**
          * OAuthUsageDisplayMode
          * @enum {string}
          */
         OAuthUsageDisplayMode: "used" | "remaining";
+        /** OAuthUsageItemData */
+        OAuthUsageItemData: {
+            /** Label */
+            label: string;
+            /** Usedpercent */
+            usedPercent?: number | null;
+            /** Remainingpercent */
+            remainingPercent?: number | null;
+            /** Used */
+            used?: number | null;
+            /** Limit */
+            limit?: number | null;
+            /** Remaining */
+            remaining?: number | null;
+            /** Unit */
+            unit?: ("usd" | "credits" | "count") | null;
+            /** Resetsat */
+            resetsAt?: string | null;
+            /** Note */
+            note?: string | null;
+            local?: components["schemas"]["OAuthLocalUsageStatsData"] | null;
+        };
+        /** OAuthUsageSectionData */
+        OAuthUsageSectionData: {
+            /** Id */
+            id: string;
+            /** Title */
+            title: string;
+            /** Items */
+            items: components["schemas"]["OAuthUsageItemData"][];
+        };
         /** OAuthUsageWindowData */
         OAuthUsageWindowData: {
             /** Name */
@@ -7374,6 +8449,57 @@ export interface components {
             remainingPercent?: number | null;
             /** Resetsat */
             resetsAt?: string | null;
+        };
+        /** OAuthWeeklyProjectionData */
+        OAuthWeeklyProjectionData: {
+            /** Tokens */
+            tokens: number;
+            /** Costticks */
+            costTicks?: number | null;
+        };
+        /**
+         * OAuthWindowStatsData
+         * @description Local usage inside the current upstream 5h / 7d window (TG detail lines).
+         */
+        OAuthWindowStatsData: {
+            /**
+             * Since
+             * Format: date-time
+             */
+            since: string;
+            stats?: components["schemas"]["OAuthLocalUsageStatsData"] | null;
+            /**
+             * Statsloading
+             * @default false
+             */
+            statsLoading: boolean;
+        };
+        /** OpenAiResetCreditCardData */
+        OpenAiResetCreditCardData: {
+            /** Creditid */
+            creditId: string;
+            /** Status */
+            status?: string | null;
+            /** Resettype */
+            resetType?: string | null;
+            /** Grantedat */
+            grantedAt?: string | null;
+            /** Expiresat */
+            expiresAt?: string | null;
+        };
+        /** OpenAiResetCreditsData */
+        OpenAiResetCreditsData: {
+            /** Availablecount */
+            availableCount?: number | null;
+            /** Cards */
+            cards: components["schemas"]["OpenAiResetCreditCardData"][];
+            /**
+             * Source
+             * @enum {string}
+             */
+            source: "cache" | "live";
+            /** Fetchedat */
+            fetchedAt?: string | null;
         };
         /** OpenAiWebSocketSettingsData */
         OpenAiWebSocketSettingsData: {
@@ -7593,6 +8719,8 @@ export interface components {
              * @default true
              */
             enabled: boolean;
+            /** Initialproberesults */
+            initialProbeResults?: components["schemas"]["InitialProbeResultInput"][];
             /**
              * Mode
              * @constant
@@ -8158,6 +9286,22 @@ export interface components {
             /** Revision */
             revision: string;
         };
+        /**
+         * RecentOutcomeData
+         * @description Last finished outcomes (oldest first) of one channel / API key / model within 7 days.
+         */
+        RecentOutcomeData: {
+            /** Key */
+            key: string;
+            /** Outcomes */
+            outcomes: ("success" | "error" | "cancelled")[];
+            /** Successcount */
+            successCount: number;
+            /** Errorcount */
+            errorCount: number;
+            /** Lastat */
+            lastAt?: string | null;
+        };
         /** RefreshTokenOAuthCredential */
         RefreshTokenOAuthCredential: {
             /**
@@ -8320,6 +9464,90 @@ export interface components {
             billing: components["schemas"]["RequestLogBillingData"];
             /** Error */
             error?: string | null;
+            /** Httpstatus */
+            httpStatus?: number | null;
+            /** Channelname */
+            channelName?: string | null;
+            /** Channelprovider */
+            channelProvider?: string | null;
+            /** Channeltype */
+            channelType?: string | null;
+            /** Ingressprotocol */
+            ingressProtocol?: string | null;
+            /** Upstreamprotocol */
+            upstreamProtocol?: string | null;
+            /** Websocket */
+            websocket?: ("ingress" | "upstream") | null;
+            /**
+             * Isstream
+             * @default false
+             */
+            isStream: boolean;
+            /**
+             * Cachecreationtokens
+             * @default 0
+             */
+            cacheCreationTokens: number;
+            /**
+             * Cachereadtokens
+             * @default 0
+             */
+            cacheReadTokens: number;
+            /**
+             * Prompttokens
+             * @default 0
+             */
+            promptTokens: number;
+            /** Cachereadratio */
+            cacheReadRatio?: number | null;
+            /** Connectmilliseconds */
+            connectMilliseconds?: number | null;
+            /** Firsttokenmilliseconds */
+            firstTokenMilliseconds?: number | null;
+            /** Idlemilliseconds */
+            idleMilliseconds?: number | null;
+            /** Tokenspersecond */
+            tokensPerSecond?: number | null;
+            /** Reasoningeffort */
+            reasoningEffort?: string | null;
+            /** Servicetier */
+            serviceTier?: string | null;
+            /** Speedmode */
+            speedMode?: ("ultrafast" | "fast" | "tier") | null;
+            /**
+             * Affinityhit
+             * @default false
+             */
+            affinityHit: boolean;
+            /** Proxyname */
+            proxyName?: string | null;
+            /** Proxybytesup */
+            proxyBytesUp?: number | null;
+            /** Proxybytesdown */
+            proxyBytesDown?: number | null;
+            /**
+             * Localsearchcount
+             * @default 0
+             */
+            localSearchCount: number;
+            /** Usageobserved */
+            usageObserved?: boolean | null;
+            /** Errorsummary */
+            errorSummary?: string | null;
+            /** Upstreamactualmodel */
+            upstreamActualModel?: string | null;
+            modelSignalConflict?: components["schemas"]["RequestLogModelConflictData"] | null;
+            safetyReview?: components["schemas"]["RequestLogSafetyReviewData"] | null;
+            /** Clientip */
+            clientIp?: string | null;
+            /** Finalroundid */
+            finalRoundId?: string | null;
+            /** Requestelapsedmilliseconds */
+            requestElapsedMilliseconds?: number | null;
+            /** Stagemilliseconds */
+            stageMilliseconds?: {
+                [key: string]: number | null;
+            } | null;
             /** Revision */
             revision: string;
         };
@@ -8423,6 +9651,22 @@ export interface components {
             protocols: components["schemas"]["FilterOptionData"][];
             /** Revision */
             revision: string;
+        };
+        /** RequestLogModelConflictData */
+        RequestLogModelConflictData: {
+            /** Httpheader */
+            httpHeader: string[];
+            /** Eventheaders */
+            eventHeaders: string[];
+            /** Bodymodels */
+            bodyModels: string[];
+        };
+        /** RequestLogSafetyReviewData */
+        RequestLogSafetyReviewData: {
+            /** Flagged */
+            flagged: boolean;
+            /** Reason */
+            reason?: string | null;
         };
         /**
          * RequestLogSort
@@ -8608,10 +9852,42 @@ export interface components {
             preflightOk: boolean;
             /** Errors */
             errors: string[];
+            /** Items */
+            items?: components["schemas"]["RetentionPlanItemData"][];
             /** Revision */
             revision: string;
             /** Operationid */
             operationId?: string | null;
+        };
+        /** RetentionPlanItemData */
+        RetentionPlanItemData: {
+            /** Month */
+            month: string;
+            /** Database */
+            database: string;
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "delete_file" | "trim_and_vacuum" | "purge_bodies";
+            /** Totalrows */
+            totalRows: number;
+            /** Deletedrows */
+            deletedRows: number;
+            /** Deletedcallrows */
+            deletedCallRows: number;
+            /** Currentbytes */
+            currentBytes: number;
+            /** Releasablebytes */
+            releasableBytes?: number | null;
+            /** Willcompact */
+            willCompact: boolean;
+            /** Compactionrequiredbytes */
+            compactionRequiredBytes?: number | null;
+            /** Note */
+            note?: string | null;
+            /** Active */
+            active: boolean;
         };
         /**
          * RetentionSettingsData
@@ -9107,6 +10383,19 @@ export interface components {
          * @enum {string}
          */
         SearchLogPeriod: "today" | "month";
+        /** SearchModelsData */
+        SearchModelsData: {
+            /** Backendid */
+            backendId: string;
+            /** Supported */
+            supported: boolean;
+            /** Selected */
+            selected: string;
+            /** Default */
+            default: string;
+            /** Models */
+            models: string[];
+        };
         /** SearchPriorityRequest */
         SearchPriorityRequest: {
             /** Backendids */
@@ -9396,6 +10685,104 @@ export interface components {
             /** Key */
             key: string;
             metrics: components["schemas"]["StatsMetricData"];
+            /** Channels */
+            channels?: components["schemas"]["StatsModelChannelShareData"][] | null;
+            /** Revision */
+            revision: string;
+        };
+        /**
+         * StatsCompareData
+         * @description This window, the window before it covering the same elapsed time, and this window's sparkline.
+         * @example {
+         *       "bucketSeconds": 3600,
+         *       "current": {
+         *         "affinityHits": 300,
+         *         "averageFirstTokenMilliseconds": 420,
+         *         "averageTokensPerSecond": 75.7,
+         *         "averageTotalMilliseconds": 1800,
+         *         "cacheCreationTokens": 0,
+         *         "cacheHitRequests": 400,
+         *         "cacheReadTokens": 19000000,
+         *         "costTicks": 1500000,
+         *         "errorCount": 16,
+         *         "inputTokens": 21000000,
+         *         "outputTokens": 319000,
+         *         "successCount": 445,
+         *         "total": 461,
+         *         "unpricedSuccess": 0
+         *       },
+         *       "from": "2026-01-01T16:00:00Z",
+         *       "points": [
+         *         {
+         *           "affinityHits": 300,
+         *           "averageFirstTokenMilliseconds": 420,
+         *           "averageTokensPerSecond": 75.7,
+         *           "averageTotalMilliseconds": 1800,
+         *           "cacheCreationTokens": 0,
+         *           "cacheHitRequests": 400,
+         *           "cacheReadTokens": 19000000,
+         *           "costTicks": 1500000,
+         *           "errorCount": 16,
+         *           "inputTokens": 21000000,
+         *           "outputTokens": 319000,
+         *           "successCount": 445,
+         *           "t": "2026-01-01T16:00:00Z",
+         *           "total": 461,
+         *           "unpricedSuccess": 0
+         *         }
+         *       ],
+         *       "previous": {
+         *         "affinityHits": 300,
+         *         "averageFirstTokenMilliseconds": 420,
+         *         "averageTokensPerSecond": 75.7,
+         *         "averageTotalMilliseconds": 1800,
+         *         "cacheCreationTokens": 0,
+         *         "cacheHitRequests": 400,
+         *         "cacheReadTokens": 19000000,
+         *         "costTicks": 1500000,
+         *         "errorCount": 16,
+         *         "inputTokens": 21000000,
+         *         "outputTokens": 319000,
+         *         "successCount": 445,
+         *         "total": 49,
+         *         "unpricedSuccess": 0
+         *       },
+         *       "previousComplete": true,
+         *       "previousFrom": "2026-12-31T16:00:00Z",
+         *       "previousTo": "2026-01-01T07:00:00Z",
+         *       "revision": "rev_example",
+         *       "to": "2026-01-02T07:00:00Z"
+         *     }
+         */
+        StatsCompareData: {
+            /**
+             * From
+             * Format: date-time
+             */
+            from: string;
+            /**
+             * To
+             * Format: date-time
+             */
+            to: string;
+            /**
+             * Previousfrom
+             * Format: date-time
+             */
+            previousFrom: string;
+            /**
+             * Previousto
+             * Format: date-time
+             */
+            previousTo: string;
+            /** Previouscomplete */
+            previousComplete: boolean;
+            /** Bucketseconds */
+            bucketSeconds: number;
+            current: components["schemas"]["CompareMetricsData"];
+            previous: components["schemas"]["CompareMetricsData"];
+            /** Points */
+            points: components["schemas"]["ComparePointData"][];
             /** Revision */
             revision: string;
         };
@@ -9404,6 +10791,13 @@ export interface components {
          * @enum {string}
          */
         StatsDimension: "channel" | "model" | "apiKey";
+        /** StatsFamilyTopsData */
+        StatsFamilyTopsData: {
+            /** Channels */
+            channels: components["schemas"]["StatsTopRowData"][];
+            /** Models */
+            models: components["schemas"]["StatsTopModelRowData"][];
+        };
         /** StatsMetricData */
         StatsMetricData: {
             /**
@@ -9522,6 +10916,32 @@ export interface components {
             serviceTierCounts?: {
                 [key: string]: number;
             };
+            /**
+             * Prompttokens
+             * @default 0
+             */
+            promptTokens: number;
+            /** Cachereadratio */
+            cacheReadRatio?: number | null;
+            /** Successrate */
+            successRate?: number | null;
+            /** Cachehitrate */
+            cacheHitRate?: number | null;
+            /** Cachewriterate */
+            cacheWriteRate?: number | null;
+            /** Retriedrequestrate */
+            retriedRequestRate?: number | null;
+            /** Affinityhitrate */
+            affinityHitRate?: number | null;
+        };
+        /** StatsModelChannelShareData */
+        StatsModelChannelShareData: {
+            /** Key */
+            key: string;
+            /** Type */
+            type?: string | null;
+            /** Count */
+            count: number;
         };
         /**
          * StatsPeriod
@@ -9556,6 +10976,12 @@ export interface components {
             families: {
                 [key: string]: components["schemas"]["StatsMetricData"];
             };
+            /** Familytops */
+            familyTops?: {
+                [key: string]: components["schemas"]["StatsFamilyTopsData"];
+            };
+            /** Topapikeys */
+            topApiKeys?: components["schemas"]["StatsTopApiKeyRowData"][];
             /** Revision */
             revision: string;
         };
@@ -9602,7 +11028,7 @@ export interface components {
              * Bucket
              * @enum {string}
              */
-            bucket: "minute" | "hour" | "day";
+            bucket: "minute" | "10m" | "hour" | "day";
             /** Bucketseconds */
             bucketSeconds: number;
             /**
@@ -9621,6 +11047,30 @@ export interface components {
             series: components["schemas"]["TimeseriesSeriesData"][];
             /** Revision */
             revision: string;
+        };
+        /** StatsTopApiKeyRowData */
+        StatsTopApiKeyRowData: {
+            /** Key */
+            key: string;
+            metrics: components["schemas"]["StatsMetricData"];
+            /** Familytotals */
+            familyTotals?: {
+                [key: string]: number;
+            };
+        };
+        /** StatsTopModelRowData */
+        StatsTopModelRowData: {
+            /** Key */
+            key: string;
+            metrics: components["schemas"]["StatsMetricData"];
+            /** Channels */
+            channels?: components["schemas"]["StatsModelChannelShareData"][];
+        };
+        /** StatsTopRowData */
+        StatsTopRowData: {
+            /** Key */
+            key: string;
+            metrics: components["schemas"]["StatsMetricData"];
         };
         /** StatusAlertSettingsData */
         StatusAlertSettingsData: {
@@ -9858,7 +11308,7 @@ export interface components {
          * TimeseriesBucket
          * @enum {string}
          */
-        TimeseriesBucket: "minute" | "hour" | "day";
+        TimeseriesBucket: "minute" | "10m" | "hour" | "day";
         /**
          * TimeseriesGroup
          * @enum {string}
@@ -9984,6 +11434,11 @@ export interface components {
             prompt: string;
             /** Revision */
             revision: string;
+            /**
+             * Defaultprompt
+             * @default
+             */
+            defaultPrompt: string;
         };
         /** TranslationSettingsPatch */
         TranslationSettingsPatch: {
@@ -10059,6 +11514,17 @@ export interface components {
         TranslationTestRequest: {
             /** Text */
             text: string;
+        };
+        /** UpdateActivationPlanData */
+        UpdateActivationPlanData: {
+            /** Plantoken */
+            planToken: string;
+            /** Targetversion */
+            targetVersion: string;
+            /** Revision */
+            revision: string;
+            /** Expiresat */
+            expiresAt?: string | null;
         };
         /** UpdateBackupData */
         UpdateBackupData: {
@@ -10148,6 +11614,8 @@ export interface components {
             enabled?: boolean | null;
             /** Maxconcurrent */
             maxConcurrent?: number | null;
+            /** Allowcredits */
+            allowCredits?: boolean | null;
         };
         /** UpdateOAuthSettingsRequest */
         UpdateOAuthSettingsRequest: {
@@ -10261,6 +11729,31 @@ export interface components {
             intervalSeconds: number;
             /** Ignoredversions */
             ignoredVersions?: string[];
+        };
+        /** UpdateStateData */
+        UpdateStateData: {
+            /** Stage */
+            stage: string;
+            /** Mode */
+            mode: string;
+            /** Fromversion */
+            fromVersion?: string | null;
+            /** Toversion */
+            toVersion?: string | null;
+            /** Targetversion */
+            targetVersion?: string | null;
+            /** Message */
+            message?: string | null;
+            /** Repository */
+            repository: string;
+            /** Currentversion */
+            currentVersion: string;
+            /** Busy */
+            busy: boolean;
+            /** Activationavailable */
+            activationAvailable: boolean;
+            /** Revision */
+            revision: string;
         };
         /** UpdateTelegramOAuthPreferencesRequest */
         UpdateTelegramOAuthPreferencesRequest: {
@@ -15584,6 +17077,310 @@ export interface operations {
             };
         };
     };
+    listOAuthOpenAiResetCredits: {
+        parameters: {
+            query?: {
+                refresh?: boolean;
+            };
+            header?: never;
+            path: {
+                accountId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "availableCount": 1,
+                     *         "source": "cache",
+                     *         "fetchedAt": "2026-01-02T03:04:05Z",
+                     *         "cards": [
+                     *           {
+                     *             "creditId": "credit_example",
+                     *             "status": "available",
+                     *             "resetType": "codex_rate_limits",
+                     *             "grantedAt": "2026-01-01T00:00:00Z",
+                     *             "expiresAt": "2026-02-01T00:00:00Z"
+                     *           }
+                     *         ]
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_OpenAiResetCreditsData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED, UNSUPPORTED_VALUE */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: UPSTREAM_ERROR */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: UPSTREAM_TIMEOUT */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    planOAuthClaudeReset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                accountId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ClaudeResetPlanRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "available": true,
+                     *         "program": "cedar_ember",
+                     *         "planToken": "<one-time>",
+                     *         "expiresAt": "2026-01-02T03:14:05Z",
+                     *         "grantId": "grant_example",
+                     *         "status": {}
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_ClaudeResetPlanData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED, UNSUPPORTED_VALUE */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: UPSTREAM_ERROR */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: UPSTREAM_TIMEOUT */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    executeOAuthClaudeReset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                accountId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ClaudeResetExecuteRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "program": "cedar_ember",
+                     *         "grantId": "grant_example",
+                     *         "result": "reset"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_ClaudeResetResultData_"];
+                };
+            };
+            /** @description Management API error: INVALID_OPERATION_STATE */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: REVISION_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: UPSTREAM_ERROR */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: UPSTREAM_TIMEOUT */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     listChannels: {
         parameters: {
             query?: {
@@ -19220,6 +21017,78 @@ export interface operations {
             };
         };
     };
+    getStatsCompare: {
+        parameters: {
+            query?: {
+                period?: components["schemas"]["StatsPeriod"] | null;
+                from?: string | null;
+                to?: string | null;
+                model?: string | null;
+                channel?: string | null;
+                apiKey?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataEnvelope_StatsCompareData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     getStatsTimeseries: {
         parameters: {
             query: {
@@ -19299,6 +21168,8 @@ export interface operations {
                 descending?: boolean;
                 page?: number;
                 pageSize?: number;
+                family?: string | null;
+                channel?: string | null;
             };
             header?: never;
             path?: never;
@@ -19313,6 +21184,74 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RevisionedPagedEnvelope_StatsBreakdownData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    listRecentOutcomes: {
+        parameters: {
+            query: {
+                dimension: components["schemas"]["StatsDimension"];
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataEnvelope_list_RecentOutcomeData__"];
                 };
             };
             /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
@@ -19382,6 +21321,73 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DataEnvelope_ModelStatsData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    listCacheMissSamples: {
+        parameters: {
+            query?: {
+                period?: components["schemas"]["StatsPeriod"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataEnvelope_list_CacheMissSampleData__"];
                 };
             };
             /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
@@ -20447,6 +22453,71 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DataEnvelope_RequestLogDetailData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    getMediaLogSummary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataEnvelope_MediaLogSummaryData_"];
                 };
             };
             /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
@@ -22790,7 +24861,8 @@ export interface operations {
                      *         "conflicts": [],
                      *         "rules": [],
                      *         "dismissed": [],
-                     *         "defaultEfforts": {}
+                     *         "defaultEfforts": {},
+                     *         "globalDefaultEffort": "high"
                      *       },
                      *       "meta": {
                      *         "requestId": "request-example"
@@ -23481,6 +25553,202 @@ export interface operations {
             };
         };
     };
+    listModelChannelOrders: {
+        parameters: {
+            query?: {
+                source?: ("modelOverride" | "channelDefault") | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "orders": [
+                     *           {
+                     *             "modelId": "claude-sonnet-4-5",
+                     *             "order": [
+                     *               "oauth:example"
+                     *             ],
+                     *             "source": "modelOverride",
+                     *             "revision": "rev_example"
+                     *           }
+                     *         ],
+                     *         "revision": "rev_example"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["BulkOrderEnvelope"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: CAPABILITY_DENIED, ORIGIN_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    bulkReplaceModelChannelOrders: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BulkReplaceOrdersRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "orders": [
+                     *           {
+                     *             "modelId": "claude-sonnet-4-5",
+                     *             "order": [
+                     *               "oauth:example"
+                     *             ],
+                     *             "source": "modelOverride",
+                     *             "revision": "rev_example"
+                     *           }
+                     *         ],
+                     *         "revision": "rev_example"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["BulkOrderEnvelope"];
+                };
+            };
+            /** @description Management API error: CONFIRMATION_REQUIRED */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: CAPABILITY_DENIED, ORIGIN_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: REVISION_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     getModelChannelOrder: {
         parameters: {
             query?: never;
@@ -23688,115 +25956,6 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
-            };
-            /** @description Management API error: CONFIRMATION_REQUIRED */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Management API error: CAPABILITY_DENIED, ORIGIN_DENIED */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Management API error: RESOURCE_NOT_FOUND */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Management API error: REVISION_CONFLICT */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Management API error: VALIDATION_FAILED */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-            /** @description Management API error: SERVICE_NOT_READY */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
-                };
-            };
-        };
-    };
-    bulkReplaceModelChannelOrders: {
-        parameters: {
-            query?: never;
-            header?: {
-                "If-Match"?: string | null;
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["BulkReplaceOrdersRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    /**
-                     * @example {
-                     *       "data": {
-                     *         "orders": [
-                     *           {
-                     *             "modelId": "claude-sonnet-4-5",
-                     *             "order": [
-                     *               "oauth:example"
-                     *             ],
-                     *             "source": "modelOverride",
-                     *             "revision": "rev_example"
-                     *           }
-                     *         ],
-                     *         "revision": "rev_example"
-                     *       },
-                     *       "meta": {
-                     *         "requestId": "request-example"
-                     *       }
-                     *     }
-                     */
-                    "application/json": components["schemas"]["BulkOrderEnvelope"];
-                };
             };
             /** @description Management API error: CONFIRMATION_REQUIRED */
             400: {
@@ -27760,6 +29919,361 @@ export interface operations {
             };
         };
     };
+    getUpdateState: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "stage": "staged",
+                     *         "mode": "git",
+                     *         "fromVersion": "0.35.0",
+                     *         "targetVersion": "v0.36.0",
+                     *         "repository": "danger-dream/Parrot",
+                     *         "currentVersion": "0.35.0",
+                     *         "busy": false,
+                     *         "activationAvailable": true,
+                     *         "revision": "rev_example"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_UpdateStateData_"];
+                };
+            };
+            /** @description Management API error: INVALID_REQUEST, INVALID_OPERATION_STATE */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: REVISION_CONFLICT, STATE_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: OPERATION_ALREADY_RUNNING */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: UPSTREAM_ERROR */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SERVICE_NOT_READY, DEPENDENCY_UNAVAILABLE */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    getCachedUpdateCheck: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "currentVersion": "0.31.13",
+                     *         "candidateVersion": "0.32.0",
+                     *         "candidateName": "Parrot 0.32.0",
+                     *         "changelog": "Release notes",
+                     *         "publishedAt": "2026-01-02T03:04:05Z",
+                     *         "prerelease": false,
+                     *         "releaseUrl": "https://example.invalid/releases/0.32.0",
+                     *         "newer": true,
+                     *         "ignored": false,
+                     *         "revision": "rev_example"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_UpdateCheckData_"];
+                };
+            };
+            /** @description Management API error: INVALID_REQUEST, INVALID_OPERATION_STATE */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: REVISION_CONFLICT, STATE_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: OPERATION_ALREADY_RUNNING */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: UPSTREAM_ERROR */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SERVICE_NOT_READY, DEPENDENCY_UNAVAILABLE */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    createUpdateActivationPlan: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "planToken": "<one-time-stage-plan>",
+                     *         "targetVersion": "v0.36.0",
+                     *         "revision": "rev_example",
+                     *         "expiresAt": "2026-01-02T03:14:05Z"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_UpdateActivationPlanData_"];
+                };
+            };
+            /** @description Management API error: INVALID_REQUEST, INVALID_OPERATION_STATE */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: REVISION_CONFLICT, STATE_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: OPERATION_ALREADY_RUNNING */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: UPSTREAM_ERROR */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SERVICE_NOT_READY, DEPENDENCY_UNAVAILABLE */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     getImageSettings: {
         parameters: {
             query?: never;
@@ -29083,6 +31597,114 @@ export interface operations {
                      *     }
                      */
                     "application/json": components["schemas"]["DataEnvelope_MediaSourceData_"];
+                };
+            };
+            /** @description Management API error: CONFIRMATION_REQUIRED */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_CONFLICT, REVISION_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: UNSUPPORTED_VALUE, VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    getMediaStatistics: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                kind: components["schemas"]["MediaKind"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "cache": {
+                     *           "files": 3,
+                     *           "bytes": 1048576
+                     *         },
+                     *         "models": [
+                     *           {
+                     *             "model": "gpt-image-2",
+                     *             "completedCalls": 4,
+                     *             "generatedCount": 5,
+                     *             "unknownCountCalls": 0,
+                     *             "recordedBytes": 1048576,
+                     *             "unknownBytesCalls": 0
+                     *           }
+                     *         ]
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_MediaStatisticsData_"];
                 };
             };
             /** @description Management API error: CONFIRMATION_REQUIRED */
@@ -31656,6 +34278,100 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DataEnvelope_list_SearchAccountData__"];
+                };
+            };
+            /** @description Management API error: CONFIRMATION_REQUIRED */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_CONFLICT, REVISION_CONFLICT, STATE_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: OPERATION_ALREADY_RUNNING */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SERVICE_NOT_READY, DEPENDENCY_UNAVAILABLE */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    getSearchBackendModels: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                backendId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataEnvelope_SearchModelsData_"];
                 };
             };
             /** @description Management API error: CONFIRMATION_REQUIRED */
@@ -34368,6 +37084,100 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DataEnvelope_McpLogListData_"];
+                };
+            };
+            /** @description Management API error: CONFIRMATION_REQUIRED */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_CONFLICT, REVISION_CONFLICT, STATE_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: OPERATION_ALREADY_RUNNING */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SERVICE_NOT_READY, DEPENDENCY_UNAVAILABLE */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    getMcpCallResult: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                callId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataEnvelope_McpCallResultData_"];
                 };
             };
             /** @description Management API error: CONFIRMATION_REQUIRED */

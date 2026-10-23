@@ -186,7 +186,7 @@ def _assert_search_discovery(metadata, capabilities):
     assert search["actions"] == sorted(expected)
     assert {item["operationId"]: (item["method"], item["path"]) for item in search["actionDetails"]} == expected
     features = {item["id"]: item["actionCount"] for item in metadata["features"]}
-    assert features["management-search"] == 10
+    assert features["management-search"] == 11
     assert "antigravity-media" not in domains and "antigravity-media" not in features
     enums = {item["name"]: set(item["values"]) for item in metadata["enums"]}
     assert enums["SearchBackendCreate.type"] == {"anysearch", "tavily", "exa", "brave", "openai", "xai", "anthropic", "zhipu"}
@@ -199,7 +199,7 @@ def test_production_discovery_exactly_describes_routes_catalogs_and_enums(produc
     document = app.openapi()
     expected_operations = _openapi_operations(document)
     manifested = set(PRODUCTION_OPERATIONS.read_text(encoding="utf-8").splitlines())
-    assert len(expected_operations) == len(manifested) == 259
+    assert len(expected_operations) == len(manifested) == 273
     assert set(expected_operations) == manifested
 
     with TestClient(app) as client:
@@ -217,7 +217,7 @@ def test_production_discovery_exactly_describes_routes_catalogs_and_enums(produc
 
     assert _discovered_actions(capabilities) == expected_operations
     _assert_search_discovery(metadata, capabilities)
-    assert sum(feature["actionCount"] for feature in metadata["features"]) == 259
+    assert sum(feature["actionCount"] for feature in metadata["features"]) == 273
     assert {
         feature["id"]: feature["actionCount"] for feature in metadata["features"]
     } == {
@@ -352,7 +352,7 @@ def test_real_server_app_exposes_the_same_complete_discovery(production_app, mon
     _, runtime = production_app
     document = server.app.openapi()
     expected_operations = _openapi_operations(document)
-    assert len(expected_operations) == 259
+    assert len(expected_operations) == 273
     monkeypatch.setattr(server.app.state, "management_runtime", runtime, raising=False)
 
     client = TestClient(server.app)
@@ -371,7 +371,7 @@ def test_real_server_app_exposes_the_same_complete_discovery(production_app, mon
     assert capabilities_response.status_code == 200, capabilities_response.text
     assert sum(
         item["actionCount"] for item in metadata_response.json()["data"]["features"]
-    ) == 259
+    ) == 273
     assert _discovered_actions(capabilities_response.json()["data"]) == expected_operations
     _assert_search_discovery(metadata_response.json()["data"], capabilities_response.json()["data"])
 

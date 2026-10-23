@@ -93,6 +93,15 @@ class McpCallLogData(StrictSchema):
     outputTokens: int
 
 
+class McpCallResultData(StrictSchema):
+    """Stored result body of one MCP call (TG「📨 查看结果」)."""
+    callId: str
+    createdAt: float
+    body: str | None = None
+    # Set when the body was removed by logBodyRetention (vs. never stored).
+    purgedAt: float | None = None
+
+
 class McpLogListData(StrictSchema):
     items: list[McpCallLogData]
     page: int

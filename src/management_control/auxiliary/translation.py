@@ -6,6 +6,7 @@ from src import safe_diagnostics
 
 import asyncio
 import copy
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
@@ -80,6 +81,8 @@ class TranslationSettings:
     model_overrides: dict[str, dict[str, Any]]
     prompt: str
     revision: str
+    # Built-in prompt used when ``prompt`` is empty (TG shows it as 默认提示词).
+    default_prompt: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +121,24 @@ class TranslationGateway(Protocol):
     async def test_text(self, text: str) -> dict[str, Any]: ...
     def available_models(self) -> list[str]: ...
     def available_channels(self) -> list[TranslationChannel]: ...
+
+
+_SECRET_PATTERNS = (
+    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{6,}"), r"\1 [REDACTED]"),
+    (re.compile(r"\b(sk|ccp|xai|pk|rk|key|tok)[-_][A-Za-z0-9_-]{8,}"), "[REDACTED]"),
+    (re.compile(r"(?i)(api[_-]?key|token|secret|password|authorization)(\s*[=:]\s*)\S+"), r"\1\2[REDACTED]"),
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/@\s]+@"), r"\1"),
+)
+
+
+def public_reason(reason: Any) -> str | None:
+    """Translation test failure reason for the Operation error (redacted)."""
+    text = " ".join(str(reason or "").split())
+    if not text:
+        return None
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text[:300]
 
 
 class ModuleTranslationGateway:
@@ -265,7 +286,9 @@ class TranslationControl:
 
     def get_settings(self, context: ManagementContext) -> TranslationSettings:
         require(context, Capability.READ)
-        return self._dto(self._translation.settings())
+        import dataclasses
+        return dataclasses.replace(self._dto(self._translation.settings()),
+                                   default_prompt=str(getattr(self._translation, "default_prompt", "") or ""))
 
     def readiness(self, context: ManagementContext, *, enabled: bool = False) -> tuple[bool, str]:
         require(context, Capability.READ)
@@ -535,6 +558,7 @@ class TranslationControl:
                         message=ManagementErrorCode.UPSTREAM_ERROR.value,
                         retryable=True,
                         diagnostic=failures[-1] if failures else None,
+                        public_detail=public_reason(result.get("reason")),
                     )
             except Exception:
                 store.fail(

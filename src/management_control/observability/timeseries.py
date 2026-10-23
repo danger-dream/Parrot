@@ -32,6 +32,7 @@ class TimeseriesRange(str, Enum):
 
 class TimeseriesBucket(str, Enum):
     MINUTE = "minute"
+    TEN_MINUTES = "10m"
     HOUR = "hour"
     DAY = "day"
 
@@ -51,6 +52,7 @@ RANGE_SECONDS = {
 }
 BUCKET_SECONDS = {
     TimeseriesBucket.MINUTE: 60,
+    TimeseriesBucket.TEN_MINUTES: 600,
     TimeseriesBucket.HOUR: 3600,
     TimeseriesBucket.DAY: 86400,
 }
@@ -68,7 +70,8 @@ _SOURCE_GROUP = {
 }
 _ADDITIVE = (
     "total", "success_count", "error_count", "input_tokens", "output_tokens",
-    "cache_read_tokens", "cache_creation_tokens", "cost_ticks",
+    "cache_read_tokens", "cache_creation_tokens", "cost_ticks", "unpriced_success", "hit_requests",
+    "affinity_hits", "tps_num_tokens", "tps_denom_ms",
     "sum_first_token_ms", "cnt_first_token", "sum_total_ms", "cnt_total",
 )
 

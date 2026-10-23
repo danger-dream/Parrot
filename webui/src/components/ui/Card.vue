@@ -31,23 +31,18 @@ defineProps<{
   display: flex;
   flex-direction: column;
   min-width: 0;
+  height: 100%;
   background: var(--surface);
   border: 0.5px solid var(--border);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--card-highlight), var(--shadow-sm);
-  backdrop-filter: blur(20px) saturate(160%);
-  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-sm);
 }
 .card.interactive {
   cursor: pointer;
-  transition: background 0.2s, transform 0.2s var(--ease-out), border-color 0.2s;
+  transition: background 0.15s, border-color 0.15s, box-shadow 0.15s;
 }
 .card.interactive:hover {
-  background: var(--surface-hover);
-  border-color: var(--border-strong);
-}
-.card.interactive:active {
-  transform: scale(0.995);
+  box-shadow: var(--shadow-md);
 }
 .card-head {
   display: flex;
@@ -55,7 +50,7 @@ defineProps<{
   align-items: flex-start;
   justify-content: space-between;
   gap: 8px 12px;
-  padding: 14px 16px 0;
+  padding: 16px 18px 0;
 }
 .card-titles {
   min-width: 0;
@@ -63,19 +58,19 @@ defineProps<{
 .card-title {
   display: flex;
   align-items: center;
-  gap: 7px;
-  font-size: 13px;
-  font-weight: 600;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 650;
   letter-spacing: -0.01em;
 }
 .card-title :deep(svg) {
-  width: 15px;
-  height: 15px;
+  width: 16px;
+  height: 16px;
   color: var(--text-2);
 }
 .card-sub {
-  margin-top: 2px;
-  font-size: 11.5px;
+  margin-top: 3px;
+  font-size: 12px;
   color: var(--text-3);
 }
 .card-actions {
@@ -85,14 +80,16 @@ defineProps<{
   flex-shrink: 0;
 }
 .card-body {
-  padding: 14px 16px 16px;
+  padding: 14px 18px 18px;
   flex: 1;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 .card.flush .card-body {
   padding: 0;
 }
 .card.flush .card-head {
-  padding-bottom: 12px;
+  padding-bottom: 14px;
 }
 </style>

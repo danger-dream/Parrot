@@ -8,6 +8,8 @@ from typing import Annotated
 from fastapi import APIRouter, Body, Depends, Header, Path, Query, Request, Response, status
 
 from src.management_auth import Capability
+from src.management_auth.policy import has_capability
+from src.management_control.apikey.list_extras import all_keys_summary, history_totals, list_summary
 from src.management_control import ManagementContext, ManagementErrorCode
 from src.management_control.apikey import (
     ApiKeyControl,
@@ -39,6 +41,7 @@ from ..schemas.apikey import (
     ApiKeyLimiterData,
     ApiKeyLimiterEnvelope,
     ApiKeyListData,
+    ApiKeyListSummaryData,
     ApiKeyListEnvelope,
     ApiKeyListMeta,
     ApiKeyModelUsageData,
@@ -177,6 +180,10 @@ def _usage(value: ApiKeyUsage) -> ApiKeyUsageData:
         estimatedCostTicks=value.estimated_cost_ticks,
         costedSuccess=value.costed_success,
         unpricedSuccess=value.unpriced_success,
+        promptTokens=value.input_tokens + value.cache_creation_tokens + value.cache_read_tokens,
+        cacheReadRatio=(value.cache_read_tokens / prompt
+                        if (prompt := value.input_tokens + value.cache_creation_tokens + value.cache_read_tokens) else None),
+        successRate=value.success_count / value.total if value.total else None,
     )
 
 
@@ -229,7 +236,19 @@ def _key(value: ApiKeyView) -> ApiKeyData:
         monthStats=_usage(value.month_stats),
         modelStats=[_model_usage(item) for item in value.model_stats],
         revision=value.revision,
+        secret=value.secret,
     )
+
+
+def _camel(name: str) -> str:
+    head, *rest = name.split("_")
+    return head + "".join(part.title() for part in rest)
+
+
+def _secret_readable(context: ManagementContext) -> bool:
+    """Round 3: authenticated sessions that may manage secrets see the saved
+    key in list/detail (Telegram parity). Only these two reads request it."""
+    return has_capability(context.actor, Capability.SECRETS_WRITE)
 
 
 _COMMON_READ_ERRORS = (
@@ -266,6 +285,7 @@ _COMMON_WRITE_ERRORS = (*_COMMON_READ_ERRORS, ManagementErrorCode.REVISION_CONFL
 )
 def list_api_keys(
     request: Request,
+    response: Response,
     context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
     control: Annotated[ApiKeyControl, Depends(get_api_key_control)],
     page: Annotated[int, Query(ge=1)] = 1,
@@ -276,8 +296,10 @@ def list_api_keys(
     sort: ApiKeySort = ApiKeySort.ORDER_ASC,
 ) -> ApiKeyListEnvelope:
     reject_unknown_query_parameters(request, _API_KEY_LIST_QUERY_PARAMETERS)
+    response.headers["Cache-Control"] = "no-store"
     result = control.list_api_keys(
         context,
+        include_secret=_secret_readable(context),
         page=page,
         page_size=page_size,
         enabled=enabled,
@@ -285,8 +307,17 @@ def list_api_keys(
         name_contains=name,
         sort=sort,
     )
+    history, history_loading = history_totals(context, control.statistics_source)
+    unfiltered = enabled is ApiKeyEnabledFilter.ALL and source is None and name is None
+    header = (list_summary(result.items) if unfiltered and result.total == len(result.items)
+              else all_keys_summary(context, control))  # TG header counts all keys
     return ApiKeyListEnvelope(
-        data=ApiKeyListData(items=[_key(item) for item in result.items]),
+        data=ApiKeyListData(
+            items=[_key(item).model_copy(update={"historyTotal": None if history_loading else int(history.get(item.key_id, 0))})
+                   for item in result.items],
+            summary=ApiKeyListSummaryData(**{_camel(k): v for k, v in header.items()}),
+            historyLoading=history_loading,
+        ),
         meta=ApiKeyListMeta(
             requestId=management_request_id(request),
             page=result.page,
@@ -354,12 +385,15 @@ def create_api_key(
 )
 def get_api_key(
     request: Request,
+    response: Response,
     key_id: Annotated[KeyId, Path(alias="keyId")],
     context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
     control: Annotated[ApiKeyControl, Depends(get_api_key_control)],
 ) -> ApiKeyEnvelope:
     reject_unknown_query_parameters(request)
-    return ApiKeyEnvelope(data=_key(control.get_api_key(context, key_id)), meta=_meta(request))
+    response.headers["Cache-Control"] = "no-store"
+    view = control.get_api_key(context, key_id, include_secret=_secret_readable(context))
+    return ApiKeyEnvelope(data=_key(view), meta=_meta(request))
 
 
 @router.patch(
