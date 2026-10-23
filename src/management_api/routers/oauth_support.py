@@ -30,6 +30,8 @@ from ..error_mapping import error_response, management_error_responses
 from ..schemas.base import ResponseMeta
 from ..schemas.oauth import (
     JsonOAuthCredential,
+    OAuthAccountCardData,
+    OAuthPlanFactsData,
     ManualOAuthCredential,
     OAuthAccountDetailData,
     OAuthAccountSummaryData,
@@ -39,6 +41,8 @@ from ..schemas.oauth import (
     OAuthPageMeta,
     OAuthRequestMeta,
     OAuthRuntimeErrorData,
+    OAuthUsageItemData,
+    OAuthUsageSectionData,
     OAuthUsageWindowData,
     RefreshTokenOAuthCredential,
 )
@@ -223,6 +227,8 @@ def summary(value) -> OAuthAccountSummaryData:
         disabledModelCount=value.disabled_model_count,
         credentialConfigured=value.credential_configured,
         revision=value.revision,
+        card=(OAuthAccountCardData.model_validate(public_value(value.card, camel_case_keys=True))
+              if getattr(value, "card", None) else None),
     )
 
 
@@ -247,6 +253,10 @@ def detail(value) -> OAuthAccountDetailData:
             inputTokens=value.local_stats.input_tokens,
             outputTokens=value.local_stats.output_tokens,
             costUsd=value.local_stats.cost_usd,
+            **{key: item for key, item in public_value(
+                getattr(value.local_stats, "details", None) or {}, camel_case_keys=True).items()
+               if key in OAuthLocalStatsData.model_fields
+               and key not in {"requestCount", "inputTokens", "outputTokens", "costUsd"}},
         ),
         runtimeErrors=[
             OAuthRuntimeErrorData(
@@ -254,6 +264,9 @@ def detail(value) -> OAuthAccountDetailData:
                 message=sanitize_text(item.message) if item.message else None,
                 cooldownUntil=item.cooldown_until,
                 cooldownPermanent=item.cooldown_permanent,
+                errorCount=getattr(item, "error_count", 0),
+                kind=getattr(item, "kind", "fault"),
+                pool=getattr(item, "pool", None),
             )
             for item in value.runtime_errors
         ],
@@ -262,6 +275,22 @@ def detail(value) -> OAuthAccountDetailData:
         workbuddy=public_value(value.workbuddy, camel_case_keys=True) if value.workbuddy is not None else None,
         zhipu=public_value(value.zhipu, camel_case_keys=True) if value.zhipu is not None else None,
         qoder=public_value(value.qoder, camel_case_keys=True) if value.qoder is not None else None,
+        usageSections=[
+            OAuthUsageSectionData(
+                id=section["id"], title=section["title"],
+                items=[OAuthUsageItemData(**public_value(entry, camel_case_keys=True)) for entry in section["items"]],
+            )
+            for section in value.usage_sections
+        ],
+        usageFetchedAt=value.usage_fetched_at,
+        allowCredits=value.allow_credits,
+        plan=(OAuthPlanFactsData.model_validate(public_value(value.plan, camel_case_keys=True))
+              if getattr(value, "plan", None) else None),
+        weeklyProjection=public_value(value.weekly_projection, camel_case_keys=True)
+        if getattr(value, "weekly_projection", None) else None,
+        windowStats=public_value(value.window_stats, camel_case_keys=True)
+        if getattr(value, "window_stats", None) else None,
+        lastRefreshAt=getattr(value, "last_refresh_at", None),
     )
 
 

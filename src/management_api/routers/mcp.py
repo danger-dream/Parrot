@@ -5,10 +5,10 @@ from enum import Enum
 from threading import RLock
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, Query, Request, Response
+from fastapi import APIRouter, Depends, Header, Path, Query, Request, Response
 
 from src.management_auth import Capability
-from src.management_control import ManagementContext, ManagementErrorCode
+from src.management_control import ManagementContext, ManagementError, ManagementErrorCode
 from src.management_control.mcp import MCPControl
 
 from ..dependencies import (
@@ -22,6 +22,7 @@ from ..response_helpers import response_meta
 from ..schemas.base import DataEnvelope
 from ..schemas.mcp import (
     McpCallLogData,
+    McpCallResultData,
     McpLogListData,
     McpSettingsData,
     McpSettingsPatch,
@@ -122,6 +123,24 @@ def list_mcp_logs(
     value = control.logs(context, period=period.value, api_key_name=apiKeyName,
                          tool_name=toolName, page=page, page_size=pageSize)
     return DataEnvelope(data=McpLogListData(**value), meta=response_meta(request))
+
+
+@router.get(
+    "/mcp/logs/{callId}/result", operation_id="getMcpCallResult",
+    dependencies=[Depends(reject_unknown_query()), Depends(_no_store)],
+    response_model=DataEnvelope[McpCallResultData],
+)
+def get_mcp_call_result(
+    request: Request,
+    control: Control,
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.LOG_BODY_READ))],
+    callId: Annotated[str, Path(min_length=1, max_length=200)],
+):
+    """Stored result body of one call; 404 when the call or its body was never stored."""
+    value = control.result_body(context, callId)
+    if value is None:
+        raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+    return DataEnvelope(data=McpCallResultData(**value), meta=response_meta(request))
 
 
 @router.get(

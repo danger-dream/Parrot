@@ -19,6 +19,7 @@ from src.management_auth.principal import Capability
 from ..context import AuditSink, ManagementContext
 from ..errors import ManagementError, ManagementErrorCode
 from ..operations import ManagementOperation, OperationRegistry, OperationStore
+from .update_state import UpdateStateMixin
 from .common import (
     ConfigGateway,
     ModuleConfigGateway,
@@ -158,7 +159,7 @@ class ModuleUpdateGateway:
         return update_checker._has_newer(version)
 
     def check_latest(self) -> None:
-        update_checker._check_once(push=False, raise_on_error=True)
+        update_checker._check_once(push=False, raise_on_error=True, manual=True)
 
     def force_refresh(self) -> None:
         update_checker.force_refresh_sync()
@@ -216,7 +217,7 @@ def _actor_key(context: ManagementContext) -> str:
     return context.actor.session_id or context.actor.subject_id
 
 
-class UpdateControl:
+class UpdateControl(UpdateStateMixin):
     STAGE_KIND = "updates.stage"
     ACTIVATE_KIND = "updates.activate"
 

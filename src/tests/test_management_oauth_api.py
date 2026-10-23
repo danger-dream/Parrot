@@ -88,6 +88,9 @@ ROUTE_REQUESTS = [
     ("POST", "/oauth/actions/refresh-usage", None, {}),
     ("POST", f"/oauth/accounts/{ACCOUNT_ID}/actions/reset-quota-plan", {}, {}),
     ("POST", f"/oauth/accounts/{ACCOUNT_ID}/actions/reset-quota", {"planToken": "oquota_invalid.invalid"}, {}),
+    ("GET", f"/oauth/accounts/{ACCOUNT_ID}/openai/reset-credits", None, {}),
+    ("POST", f"/oauth/accounts/{ACCOUNT_ID}/claude-reset/plans", {"program": "cedar_ember"}, {}),
+    ("POST", f"/oauth/accounts/{ACCOUNT_ID}/claude-reset/execute", {"planToken": "claude_invalid.invalid"}, {}),
     ("POST", f"/oauth/accounts/{ACCOUNT_ID}/actions/clear-errors", None, {}),
     ("POST", f"/oauth/accounts/{ACCOUNT_ID}/actions/clear-affinity", None, {}),
     ("POST", "/oauth/actions/clear-errors", None, {}),
@@ -126,7 +129,7 @@ def test_oauth_openapi_matches_owned_manifest_and_declares_security_and_secrets(
         if line
     }
     assert set(operations) == manifested
-    assert len(operations) == len(ROUTE_REQUESTS) == 50
+    assert len(operations) == len(ROUTE_REQUESTS) == 53
     assert all(value.get("tags") == ["management-oauth"] for value in operations.values())
     assert all(value.get("security") == [{"ManagementSession": []}] for value in operations.values())
     no_content = {

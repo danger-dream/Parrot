@@ -14,6 +14,15 @@ from .sessions import AuthenticationRateLimited, AuthenticationRateLimiter
 from .store import ManagementStateStore, StoreCapacityError
 
 
+# Unambiguous uppercase alphabet: no 0/1/O/I so the code reads back reliably.
+CONFIRM_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+CONFIRM_CODE_LENGTH = 4
+
+
+def new_confirm_code() -> str:
+    return "".join(secrets.choice(CONFIRM_CODE_ALPHABET) for _ in range(CONFIRM_CODE_LENGTH))
+
+
 class ApprovalError(Exception):
     def __init__(self, reason: str) -> None:
         self.reason = reason
@@ -38,6 +47,9 @@ class ApprovalNotification:
     device_summary: str | None
     approve_callback: str
     deny_callback: str
+    # Shown both to the browser and in the Telegram message so the approver
+    # can confirm the request really originates from their own screen.
+    confirm_code: str = ""
 
 
 class ApprovalNotifier(Protocol):
@@ -50,6 +62,7 @@ class IssuedApproval:
     exchange_secret: str
     expires_at: datetime
     poll_after_seconds: int = 2
+    confirm_code: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +108,17 @@ class ApprovalService:
     def _verifier(secret: str) -> bytes:
         return hashlib.sha256(secret.encode("utf-8")).digest()
 
+    @property
+    def ttl_seconds(self) -> int:
+        return int(self._ttl)
+
+    def available(self) -> bool:
+        """Telegram is configured and at least one administrator id exists."""
+        try:
+            return bool(self._configured_admins())
+        except Exception:
+            return False
+
     def _configured_admins(self) -> tuple[int, ...]:
         if not self._telegram_configured_provider():
             return ()
@@ -131,6 +155,7 @@ class ApprovalService:
         now = self._clock()
         approval_id = f"map_{secrets.token_urlsafe(16)}"
         exchange_secret = f"max_{secrets.token_urlsafe(32)}"
+        confirm_code = new_confirm_code()
         expires_at = now + self._ttl
         try:
             self._store.insert_approval(
@@ -143,6 +168,7 @@ class ApprovalService:
                     "source_address": source_address,
                     "device_summary": device_summary,
                     "request_id": request_id,
+                    "confirm_code": confirm_code,
                 }
             )
         except StoreCapacityError as exc:
@@ -156,6 +182,7 @@ class ApprovalService:
             device_summary=device_summary,
             approve_callback=f"mauth:a:{approval_id}",
             deny_callback=f"mauth:d:{approval_id}",
+            confirm_code=confirm_code,
         )
         if len(notification.approve_callback.encode("utf-8")) > 64:
             self._store.deny_pending_approval(approval_id)
@@ -179,6 +206,7 @@ class ApprovalService:
             approval_id=approval_id,
             exchange_secret=exchange_secret,
             expires_at=self._at(expires_at),
+            confirm_code=confirm_code,
         )
 
     def get(self, approval_id: str, exchange_secret: str) -> ApprovalView:

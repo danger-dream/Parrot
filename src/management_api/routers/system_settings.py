@@ -25,6 +25,7 @@ from ..schemas.system import (
     RetrySettingsData, RetrySettingsPatch,
     ScoringSettingsData, ScoringSettingsPatch,
     TimeoutSettingsData, TimeoutSettingsPatch,
+    WebUiSettingsData, WebUiSettingsPatch,
 )
 from .system_support import (
     SystemNetworkControls,
@@ -72,6 +73,7 @@ _AK_CONCURRENCY = {"enabled": True, "defaultMaxConcurrent": 5, "defaultMaxQueue"
 _QUOTA = {"enabled": False, "intervalSeconds": 60, "thresholdPercent": 95, "revision": "rev_example"}
 _NOTIFICATIONS = {"enabled": True, "events": {"channelPermanent": True, "channelRecovered": True, "quotaDisabled": True, "quotaResumed": True, "quotaCooldown": True, "oauthRefreshed": True, "oauthRefreshFailed": True, "noChannels": True, "openaiStoreSaveFailed": True, "statusAlert": True, "appUpdate": True, "networkMonitor": True}, "revision": "rev_example"}
 _WS = {"responsesUpstreamWsForOAuth": False, "revision": "rev_example"}
+_WEB_UI = {"enabled": False, "revision": "rev_example"}
 
 
 @router.get("/settings/retry", operation_id="getRetrySettings", dependencies=[Depends(reject_unknown_query())], tags=["management-system"], response_model=DataEnvelope[RetrySettingsData], responses=_responses(_RETRY))
@@ -183,3 +185,13 @@ def get_openai_websocket_settings(request: Request, context: ReadContext, contro
 @router.patch("/settings/openai-websocket", operation_id="updateOpenAiWebSocketSettings", dependencies=[Depends(reject_unknown_query())], tags=["management-system"], response_model=DataEnvelope[OpenAiWebSocketSettingsData], responses=_responses(_WS))
 def update_openai_websocket_settings(body: OpenAiWebSocketSettingsPatch, request: Request, context: WriteContext, controls: Controls, if_match: IfMatch = None):
     return DataEnvelope(data=_data(OpenAiWebSocketSettingsData, controls.settings.update_websocket(context, body.model_dump(exclude_unset=True), expected_revision=if_match)), meta=response_meta(request))
+
+
+@router.get("/settings/web-ui", operation_id="getWebUiSettings", dependencies=[Depends(reject_unknown_query())], tags=["management-system"], response_model=DataEnvelope[WebUiSettingsData], responses=_responses(_WEB_UI))
+def get_web_ui_settings(request: Request, context: ReadContext, controls: Controls):
+    return DataEnvelope(data=_data(WebUiSettingsData, controls.settings.get(context, "web-ui")), meta=response_meta(request))
+
+
+@router.patch("/settings/web-ui", operation_id="updateWebUiSettings", dependencies=[Depends(reject_unknown_query())], tags=["management-system"], response_model=DataEnvelope[WebUiSettingsData], responses=_responses(_WEB_UI))
+def update_web_ui_settings(body: WebUiSettingsPatch, request: Request, context: WriteContext, controls: Controls, if_match: IfMatch = None):
+    return DataEnvelope(data=_data(WebUiSettingsData, controls.settings.update_web_ui(context, body.model_dump(exclude_unset=True), expected_revision=if_match)), meta=response_meta(request))

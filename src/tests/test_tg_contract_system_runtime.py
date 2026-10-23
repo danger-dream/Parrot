@@ -67,7 +67,15 @@ def _ws(e):
     e.callback("sys:ws_mode:toggle")
 
 
+def _webui(e):
+    # The single new TG surface for WebUI: show, enable, disable.
+    e.callback("sys:show:webui")
+    e.callback("sys:webui:toggle")
+    e.callback("sys:webui:toggle")
+
+
 RUNNERS = {
+    "webui": _webui,
     "concurrency_empty": _concurrency_empty,
     "concurrency_active": _concurrency_active,
     "limiter_empty": _limiter_empty,
@@ -110,7 +118,7 @@ CALLBACK_FAMILIES = {
     "sys:cc_toggle", "sys:edit:cc_queue_wait", "sys:edit:cc_default_max",
     "sys:show:aklim", "sys:aklim_toggle", "sys:edit:aklim_max",
     "sys:edit:aklim_queue", "sys:edit:aklim_wait", "sys:show:ws_mode",
-    "sys:ws_mode:toggle",
+    "sys:ws_mode:toggle", "sys:show:webui", "sys:webui:toggle",
     # Model-degraded alert mute buttons.
     "sys:mdg_mute:*", "sys:mdg_unmute:*", "sys:mdg_off",
     # Present UI helpers that v0.31.13's router no longer dispatches.

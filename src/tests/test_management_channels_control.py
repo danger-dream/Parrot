@@ -272,8 +272,9 @@ def test_existing_and_draft_probe_preserve_adjudicated_cooldown_and_affinity(mon
     draft_result = asyncio.run(control.probe_draft(ADMIN_CONTEXT, draft))
     draft_state = cooldown.get_state("api:Draft__wiz", "model-real")
     assert draft_result.ok is False
-    assert draft_state["error_count"] == 1
-    assert draft_state["last_error_message"] == "initial probe failed: fixed upstream failure"
+    # WebUI round 2: a draft never cools down the temporary ``__wiz`` key; the
+    # failure is carried into createChannel(initialProbeResults) instead.
+    assert draft_state is None
 
 
 def test_model_discovery_uses_catalog_static_fallback_and_does_not_persist():

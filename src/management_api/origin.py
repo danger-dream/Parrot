@@ -10,6 +10,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from src.management_control import ManagementError, ManagementErrorCode
 
 from .error_mapping import error_response, is_management_path
+from .origin_policy import origin_allowed
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _ALLOWED_METHODS = {"GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"}
 _ALLOWED_HEADERS = {
@@ -55,7 +56,12 @@ class ManagementOriginMiddleware:
         runtime = getattr(getattr(app, "state", None), "management_runtime", None)
         if runtime is not None:
             allowed = frozenset(getattr(runtime, "allowed_origins", ()))
-        if origin is not None and origin not in allowed:
+        if origin is not None and not origin_allowed(
+            origin,
+            allowed=allowed,
+            host=_header(scope, b"host"),
+            forwarded_host=_header(scope, b"x-forwarded-host"),
+        ):
             response = error_response(
                 ManagementError(ManagementErrorCode.ORIGIN_DENIED),
                 request_id=request_id,

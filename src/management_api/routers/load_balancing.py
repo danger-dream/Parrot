@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Header, Path, Request, Response
+from fastapi import APIRouter, Depends, Header, Path, Query, Request, Response
 
 from src.management_auth import Capability
 from src.management_control import ManagementContext, ManagementErrorCode
@@ -176,6 +176,29 @@ def replace_channel_order(
         context, body.order, expected_revision=if_match
     )
     return OrderEnvelope(data=_order(result), meta=_meta(request))
+
+
+@router.get(
+    "/load-balancing/model-orders",
+    operation_id="listModelChannelOrders",
+    tags=["management-load-balancing"],
+    response_model=BulkOrderEnvelope,
+    responses={**_success(200, {"orders": [_MODEL_ORDER_EXAMPLE], "revision": "rev_example"}),
+               **management_error_responses(*_RESOURCE_ERRORS)},
+)
+def list_model_channel_orders(
+    request: Request,
+    context: ReadContext,
+    control: Annotated[LoadBalancingControl, Depends(get_load_balancing_control)],
+    source: Annotated[Literal["modelOverride", "channelDefault"] | None, Query()] = None,
+) -> BulkOrderEnvelope:
+    """Batch form of getModelChannelOrder (one request instead of one per model)."""
+    reject_unknown_query_parameters(request, {"source"})
+    records, revision = control.list_model_orders(context, source=source)
+    return BulkOrderEnvelope(
+        data=BulkOrderData(orders=[_order(item) for item in records], revision=revision),
+        meta=_meta(request),
+    )
 
 
 @router.get(

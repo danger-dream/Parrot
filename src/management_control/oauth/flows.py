@@ -5,6 +5,7 @@ from __future__ import annotations
 from src.safe_diagnostics import diagnose, summary
 
 import asyncio
+import copy
 import hashlib
 import json
 import re
@@ -26,6 +27,7 @@ from .models import (
     OAuthProvider,
     RefreshTokenCredential,
 )
+from .browser_flows import BrowserFlowTracker
 from .plans import OneShotPlanStore
 from .workbuddy_flows import WorkBuddyFlows
 from .qoder_flows import QoderFlows
@@ -37,6 +39,8 @@ class CompletedCredential:
     entry: dict
     source: str
     add_attempt: add_context.AddAttempt | None = None
+    # {"target_key", "account"} when this login re-authenticates an account.
+    relogin: dict | None = None
 
 
 def _utc_text(value: datetime) -> str:
@@ -80,14 +84,21 @@ class OAuthFlowService:
         self._flows = flow_store or OneShotPlanStore(
             prefix="oflow", ttl_seconds=1800, clock=self._clock,
         )
+        self.browser = BrowserFlowTracker(
+            self._flows, clock=self._now, kind_for=lambda provider: f"login:{provider}",
+        )
 
     def device_for(self, flow_id: str):
-        """The reusable device-style flow owner a flow ID belongs to."""
+        """The flow owner (poll/cancel) a flow ID belongs to."""
         if flow_id.startswith("zhflow_"):
             return self.zhipu
         if flow_id.startswith("qdflow_"):
             return self.qoder
-        return self.workbuddy
+        if flow_id.startswith("wbflow_"):
+            return self.workbuddy
+        if self.browser.owns(flow_id):
+            return self.browser
+        raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
 
     def _now(self) -> datetime:
         value = self._clock()
@@ -95,10 +106,13 @@ class OAuthFlowService:
             raise ValueError("OAuth clock must be timezone-aware")
         return value
 
-    def start(self, actor_subject_id: str, provider: OAuthProvider, *, realm="cn", client_profile=None) -> OAuthLoginFlow:
+    def start(self, actor_subject_id: str, provider: OAuthProvider, *, realm="cn", client_profile=None,
+              relogin: dict | None = None) -> OAuthLoginFlow:
         if provider is OAuthProvider.WORKBUDDY:
             return self.workbuddy.start(actor_subject_id, realm=realm, client_profile=client_profile)
-        payload: dict = {"provider": provider.value, "add_attempt": add_context.current()}
+        payload: dict = {"provider": provider.value,
+                         "add_attempt": None if relogin else add_context.current(),
+                         "relogin": copy.deepcopy(relogin) if relogin else None}
         instruction: str | None = None
         auth_url: str | None
         if provider is OAuthProvider.CLAUDE:
@@ -152,6 +166,7 @@ class OAuthFlowService:
             revision="",
             payload=payload,
         )
+        self.browser.register(actor_subject_id, flow_id, flow_secret, provider.value, plan.expires_at)
         return OAuthLoginFlow(
             flow_id=flow_id,
             flow_secret=flow_secret,
@@ -196,18 +211,22 @@ class OAuthFlowService:
             actor_subject_id=actor_subject_id,
             kind=f"login:{provider.value}",
         )
+        self.browser.mark(flow_id, "confirmed")
         try:
             with add_context.bind(payload.get("add_attempt")):
                 entry = self._complete_provider(provider, payload, command)
         except ManagementError:
+            self.browser.mark(flow_id, "failed")
             raise
         except Exception as exc:
+            self.browser.mark(flow_id, "failed")
             raise ManagementError(
                 ManagementErrorCode.UPSTREAM_ERROR,
                 retryable=True,
             ) from exc
         return CompletedCredential(entry=entry, source=f"{provider.value} login",
-                                   add_attempt=payload.get("add_attempt"))
+                                   add_attempt=payload.get("add_attempt"),
+                                   relogin=payload.get("relogin"))
 
     def _antigravity_submission(self, payload: dict, command: CompleteOAuthLoginCommand):
         source = str(command.callback_url or command.code or "").strip()

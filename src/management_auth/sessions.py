@@ -57,6 +57,21 @@ class VerifiedSession:
     idle_expires_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class SessionDevice:
+    """Non-secret description of one active session for the device list."""
+
+    session_id: str
+    auth_method: AuthMethod
+    client_name: str | None
+    device_summary: str | None
+    source_address: str | None
+    issued_at: datetime
+    last_seen_at: datetime
+    expires_at: datetime
+    idle_expires_at: datetime
+
+
 class AuthenticationRateLimiter:
     """Bounded in-process global and per-source fixed-window limiter."""
 
@@ -143,6 +158,9 @@ class SessionService:
         auth_method: AuthMethod,
         roles: Iterable[Role],
         capabilities: Iterable[Capability],
+        client_name: str | None = None,
+        source_address: str | None = None,
+        device_summary: str | None = None,
     ) -> tuple[str, dict]:
         now = self._clock()
         selector = secrets.token_urlsafe(12)
@@ -159,6 +177,9 @@ class SessionService:
             "last_seen_at": now,
             "expires_at": now + self._policy.absolute_timeout_seconds,
             "generation": self._store.credential_generation(),
+            "client_name": client_name,
+            "source_address": source_address,
+            "device_summary": device_summary,
         }
         return credential, values
 
@@ -189,6 +210,8 @@ class SessionService:
         *,
         source: str,
         request_id: str,
+        client_name: str | None = None,
+        device_summary: str | None = None,
     ) -> IssuedSession:
         try:
             self._rate_limiter.consume(source)
@@ -217,6 +240,9 @@ class SessionService:
             auth_method=AuthMethod.MANAGEMENT_KEY,
             roles=(Role.ADMINISTRATOR,),
             capabilities=ADMINISTRATOR_CAPABILITIES,
+            client_name=client_name,
+            source_address=source,
+            device_summary=device_summary,
         )
         self._store.record_audit(
             actor="management-key",
@@ -234,12 +260,18 @@ class SessionService:
         auth_method: AuthMethod,
         roles: Iterable[Role],
         capabilities: Iterable[Capability],
+        client_name: str | None = None,
+        source_address: str | None = None,
+        device_summary: str | None = None,
     ) -> IssuedSession:
         credential, values = self._new_session_values(
             subject_id=subject_id,
             auth_method=auth_method,
             roles=roles,
             capabilities=capabilities,
+            client_name=client_name,
+            source_address=source_address,
+            device_summary=device_summary,
         )
         self._store.insert_session(values)
         return self._issued(credential, values)
@@ -333,6 +365,80 @@ class SessionService:
             result="succeeded",
             request_id=request_id,
         )
+
+    def list_devices(
+        self, principal: ManagementPrincipal, *, request_id: str,
+    ) -> tuple[SessionDevice, ...]:
+        """Active (unrevoked, unexpired, current-generation) sessions."""
+        authorize(principal, Capability.READ)
+        rows = self._store.list_active_sessions(
+            now=self._clock(),
+            idle_timeout_seconds=self._policy.idle_timeout_seconds,
+        )
+        self._store.record_audit(
+            actor=principal.subject_id,
+            action="session.list",
+            target="management-sessions",
+            result="succeeded",
+            request_id=request_id,
+        )
+        return tuple(
+            SessionDevice(
+                session_id=row["session_id"],
+                auth_method=AuthMethod(row["auth_method"]),
+                client_name=row.get("client_name"),
+                device_summary=row.get("device_summary"),
+                source_address=row.get("source_address"),
+                issued_at=self._at(row["issued_at"]),
+                last_seen_at=self._at(row["last_seen_at"]),
+                expires_at=self._at(row["expires_at"]),
+                idle_expires_at=self._at(
+                    min(
+                        row["expires_at"],
+                        row["last_seen_at"] + self._policy.idle_timeout_seconds,
+                    )
+                ),
+            )
+            for row in rows
+        )
+
+    def revoke_session(
+        self, principal: ManagementPrincipal, session_id: str, *, request_id: str,
+    ) -> bool:
+        """Revoke one active session by its public id; False if none matched."""
+        authorize(principal, Capability.WRITE)
+        active = {
+            row["session_id"]
+            for row in self._store.list_active_sessions(
+                now=self._clock(),
+                idle_timeout_seconds=self._policy.idle_timeout_seconds,
+            )
+        }
+        revoked = session_id in active and self._store.revoke_session(session_id)
+        self._store.record_audit(
+            actor=principal.subject_id,
+            action="session.revoke",
+            target=session_id if revoked else "management-session",
+            result="succeeded" if revoked else "not-found",
+            request_id=request_id,
+        )
+        return bool(revoked)
+
+    def revoke_others(
+        self, principal: ManagementPrincipal, *, request_id: str,
+    ) -> int:
+        """Revoke every session except the caller's own; returns the count."""
+        authorize(principal, Capability.WRITE)
+        keep = principal.session_id or ""
+        count = self._store.revoke_other_sessions(keep)
+        self._store.record_audit(
+            actor=principal.subject_id,
+            action="session.revoke-others",
+            target=keep or "management-sessions",
+            result="succeeded",
+            request_id=request_id,
+        )
+        return count
 
     def revoke_all(self, principal: ManagementPrincipal, *, request_id: str) -> int:
         authorize(principal, Capability.DESTRUCTIVE)

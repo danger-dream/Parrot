@@ -92,6 +92,14 @@ class SearchSettingsData(StrictSchema):
     revision: str
 
 
+class SearchModelsData(StrictSchema):
+    backendId: str
+    supported: bool
+    selected: str
+    default: str
+    models: list[str]
+
+
 class SearchAccountData(StrictSchema):
     id: str
     name: str

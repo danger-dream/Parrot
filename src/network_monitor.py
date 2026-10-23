@@ -458,7 +458,14 @@ def _core_check(name: str, timeout: float) -> CheckResult:
         return CheckResult(f"core:{name}", label, "core", False, str(exc)[:180])
 
 
-async def run_once(*, save: bool = True) -> list[CheckResult]:
+async def run_once(*, save: bool = True, manual: bool = False) -> list[CheckResult]:
+    """One monitoring round.
+
+    ``manual`` (TG「立即检测」/ API runNetworkMonitor) runs the configured
+    checks even while the master switch is off. Such a round is display-only:
+    the commit below is skipped while the switch is off, so it neither stores
+    results (no menu banner) nor notifies.
+    """
     if save:
         # Capture settings and generation atomically relative to update_settings.
         with _monitor_lifecycle_lock:
@@ -483,7 +490,8 @@ async def run_once(*, save: bool = True) -> list[CheckResult]:
                             "[network_monitor] stale cleanup failed: "
                             f"{type(exc).__name__}"
                         )
-        return []
+        if not manual:
+            return []
     timeout = float(c.get("timeoutSeconds", 5) or 5)
     out: list[CheckResult] = []
     # 本轮预期会被检测的 key 集合：跑完后用它清理 StateStore snapshots 里不再被检测的残留

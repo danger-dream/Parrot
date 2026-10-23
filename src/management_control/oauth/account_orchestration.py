@@ -13,6 +13,10 @@ from src.management_control.errors import ErrorField, ManagementError, Managemen
 from .models import OAuthProvider
 
 
+# Telegram's 「🔐 重新登录」 supports every provider (oauth_menu.on_relogin).
+_RELOGIN_PROVIDERS = frozenset(OAuthProvider)
+
+
 class OAuthAccountOrchestrationControlMixin:
     """Transport-neutral account validation and post-save business effects."""
 
@@ -40,26 +44,48 @@ class OAuthAccountOrchestrationControlMixin:
         if provider is OAuthProvider.QODER or pat is not None:
             return self._start_qoder_login(context, provider, realm=realm, pat=pat, relogin_account_id=relogin_account_id,
                                            login_method=login_method, proxy_target=proxy_target)
-        if login_method != "device" or proxy_target is not None:
+        if login_method != "device":
             raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
         relogin, realm, client_profile, site = self._prepare_login_context(
             provider, realm=realm, client_profile=client_profile, site=site,
             relogin_account_id=relogin_account_id,
         )
-        if provider is OAuthProvider.ZHIPU:
-            return self._flows.zhipu.start(context.actor.subject_id, site=site, **({"relogin": relogin} if relogin else {}))
-        try:
-            flow = (self._flows.workbuddy.start(context.actor.subject_id, realm=realm, client_profile=client_profile, relogin=relogin)
-                    if relogin else self._flows.start(context.actor.subject_id, provider, realm=realm, client_profile=client_profile)
-                    if provider is OAuthProvider.WORKBUDDY else self._flows.start(context.actor.subject_id, provider))
-        except ManagementError:
-            raise
-        except Exception as exc:
-            raise ManagementError(
-                ManagementErrorCode.UPSTREAM_ERROR, retryable=True,
-            ) from exc
+        from src.oauth import add_context
+        # TG parity: a new account may pin its proxy route from the add page;
+        # a relogin always keeps the existing account's routing.
+        attempt = self._login_proxy_attempt(provider, proxy_target, relogin)
+        with add_context.bind(None if relogin else attempt):
+            if provider is OAuthProvider.ZHIPU:
+                return self._flows.zhipu.start(context.actor.subject_id, site=site, **({"relogin": relogin} if relogin else {}))
+            try:
+                flow = (self._flows.workbuddy.start(context.actor.subject_id, realm=realm, client_profile=client_profile, relogin=relogin)
+                        if relogin and provider is OAuthProvider.WORKBUDDY
+                        else self._flows.start(context.actor.subject_id, provider, realm=realm, client_profile=client_profile)
+                        if provider is OAuthProvider.WORKBUDDY
+                        else self._flows.start(context.actor.subject_id, provider, relogin=relogin))
+            except ManagementError:
+                raise
+            except Exception as exc:
+                raise ManagementError(
+                    ManagementErrorCode.UPSTREAM_ERROR, retryable=True,
+                ) from exc
         self._audit(context, "oauth.login.start", provider.value)
         return flow
+
+    @staticmethod
+    def _login_proxy_attempt(provider, proxy_target, relogin):
+        """Validate an add-page proxy selection exactly like Telegram/Qoder."""
+        from src.oauth import add_context
+        if proxy_target is None:
+            return add_context.current()
+        from src.proxy import manager
+        manager.init()
+        names = manager.expand_target(proxy_target) if isinstance(proxy_target, str) else None
+        if relogin or not names or not all(manager.get_connector(name) is not None for name in names):
+            raise ManagementError(ManagementErrorCode.VALIDATION_FAILED,
+                fields=[ErrorField("proxyTarget", "INVALID_TARGET",
+                                   "Unknown proxy target, or proxy selection with relogin")])
+        return add_context.AddAttempt(target=proxy_target, provider=provider.value)
 
     def _prepare_login_context(self, provider: OAuthProvider, *, realm=None, client_profile=None,
                                site=None, relogin_account_id=None):
@@ -73,7 +99,7 @@ class OAuthAccountOrchestrationControlMixin:
             account = copy.deepcopy(self._account(relogin_account_id))
             if (self.backend.provider_of(account) != provider.value
                     or (provider is not OAuthProvider.QODER and not self.account_authentication_failed(account))
-                    or provider not in {OAuthProvider.WORKBUDDY, OAuthProvider.ZHIPU, OAuthProvider.QODER}
+                    or provider not in _RELOGIN_PROVIDERS
                     or (provider is OAuthProvider.ZHIPU and account.get("credential_mode") != "oauth")):
                 raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
             relogin = {"target_key": relogin_account_id, "account": account}
@@ -82,7 +108,7 @@ class OAuthAccountOrchestrationControlMixin:
                 client_profile = account.get("workbuddy_client_profile") or "cli"
             elif provider is OAuthProvider.QODER:
                 realm = account.get("realm") or "global"
-            else:
+            elif provider is OAuthProvider.ZHIPU:
                 site = account["site"]
         if provider is OAuthProvider.ZHIPU:
             if site not in {"bigmodel", "zai"} or realm is not None or client_profile is not None:
@@ -148,7 +174,11 @@ class OAuthAccountOrchestrationControlMixin:
         """Run a coroutine from sync Control code, even under a caller event loop."""
         try:
             asyncio.get_running_loop()
+            in_loop = True
         except RuntimeError:
+            in_loop = False
+        if not in_loop:
+            # Outside ``except``: never chain provider failures to the probe.
             return asyncio.run(factory())
         result: list[object] = []
         failure: list[BaseException] = []

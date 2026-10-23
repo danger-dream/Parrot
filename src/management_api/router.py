@@ -11,6 +11,7 @@ from .routers import (
     apikey,
     channels,
     content_blacklist,
+    live_events,
     load_balancing,
     logs,
     mapping,
@@ -31,6 +32,7 @@ from .routers import (
     system_settings,
     translation,
     updates,
+    web_auth,
 )
 from .routers.foundation import router as foundation_router
 
@@ -62,6 +64,8 @@ _BUILTIN_DOMAIN_ROUTERS: tuple[APIRouter, ...] = (
     content_blacklist.router,
     network.router,
     mcp.router,
+    web_auth.router,
+    live_events.router,
 )
 _registered: list[APIRouter] = []
 _lock = RLock()

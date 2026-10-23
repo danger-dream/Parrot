@@ -316,7 +316,9 @@ class SystemEnv:
         mp.setattr(nm, "set_channel_enabled", set_channel)
         mp.setattr(nm, "_channel_probe_url", lambda ch: ch.probe_url)
 
-        async def run_once(save=True):
+        async def run_once(save=True, manual=False):
+            # ``manual`` (round 2: a manual run ignores the master switch) is
+            # asserted by test_webui_round2; the archived event shape is kept.
             self.events.append({"event": "monitor.run", "save": save})
             if self.fake.get("monitorRunRaises"):
                 raise RuntimeError(self.fake["monitorRunRaises"])

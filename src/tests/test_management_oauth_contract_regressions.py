@@ -140,6 +140,10 @@ def test_public_times_are_rfc3339_utc_and_permanent_cooldown_is_explicit(tmp_pat
             "message": "fake failure",
             "cooldownUntil": None,
             "cooldownPermanent": True,
+            # Round 3: TG 累计失败次数 and fault / quota-pause / restriction kind.
+            "errorCount": 0,
+            "kind": "fault",
+            "pool": None,
         }
         models = request(client, "GET", f"/oauth/accounts/{ACCOUNT_ID}/models", None, headers)
         permanent = next(item for item in models.json()["data"]["items"] if item["modelId"] == "gpt-beta")

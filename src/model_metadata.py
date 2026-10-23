@@ -1685,7 +1685,18 @@ def clear_compression_model(model: str | None = None) -> bool:
     expected = normalize_model_name(model) or None
     if not current or (expected and current != expected):
         return False
-    config.update(lambda cfg: cfg.__setitem__("compressionModel", ""))
+
+    def mutate(cfg: dict) -> None:
+        cfg["compressionModel"] = ""
+        # The read-through below would otherwise resurrect a legacy
+        # modelMetadata.<model>.compressionModel flag after an explicit clear.
+        legacy = cfg.get("modelMetadata")
+        if isinstance(legacy, dict):
+            for raw in legacy.values():
+                if isinstance(raw, dict):
+                    raw.pop("compressionModel", None)
+
+    config.update(mutate)
     return True
 
 

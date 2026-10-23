@@ -395,7 +395,7 @@ def test_telegram_approval_create_runs_sync_notifier_off_event_loop(
     app, runtime, notifier = build_app(tmp_path)
     calls = []
 
-    async def tracked_to_thread(function, /, *args, **kwargs):
+    async def tracked_run_in_threadpool(function, /, *args, **kwargs):
         loop_thread = threading.get_ident()
         worker_threads = []
         results = []
@@ -410,7 +410,9 @@ def test_telegram_approval_create_runs_sync_notifier_off_event_loop(
         calls.append((function, loop_thread, worker_threads[0]))
         return results[0]
 
-    monkeypatch.setattr(foundation_router.asyncio, "to_thread", tracked_to_thread)
+    # Management routes offload with Starlette's threadpool (anyio workers),
+    # never the asyncio default executor shared with inference logging.
+    monkeypatch.setattr(foundation_router, "run_in_threadpool", tracked_run_in_threadpool)
     with TestClient(app) as client:
         created = client.post(
             "/api/management/v1/auth/telegram-approvals",

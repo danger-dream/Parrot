@@ -23,6 +23,45 @@ class ModelIdentityData(StrictSchema):
     owner: ModelOwnerData | None = None
 
 
+class ModelUsageData(StrictSchema):
+    """TG model_center_usage: lifetime 累计用量 / 请求 / 成功率 / TPS."""
+    requestCount: int
+    successCount: int
+    errorCount: int
+    inputTokens: int
+    outputTokens: int
+    cacheCreationTokens: int
+    cacheReadTokens: int
+    promptTokens: int
+    cacheReadRatio: float | None = None
+    successRate: float | None = None
+    averageTokensPerSecond: float | None = None
+    maximumTokensPerSecond: float | None = None
+    minimumTokensPerSecond: float | None = None
+
+
+class ModelScheduleData(StrictSchema):
+    """TG 「调度」: priority / order / smart; ``order`` = channel keys in scheduling order."""
+    mode: str | None = None
+    ownOrder: bool = False
+    order: list[str] = Field(default_factory=list)
+
+
+class OAuthSourceAccountData(StrictSchema):
+    """Quota / balance / credits of the OAuth account behind a source (cached)."""
+    statusTag: str | None = None
+    plan: dict[str, Any] = Field(default_factory=dict)
+    usageSections: list[dict[str, Any]] = Field(default_factory=list)
+    usageFetchedAt: str | None = None
+    cooldown: dict[str, Any] = Field(default_factory=dict)
+    planType: str | None = None
+    available: bool | None = None
+    quotaLimited: bool | None = None
+    invalid: bool | None = None
+    disabledReason: str | None = None
+    disabledUntil: str | None = None
+
+
 class ModelSourceData(StrictSchema):
     type: ModelSourceType
     id: str
@@ -37,6 +76,15 @@ class ModelSourceData(StrictSchema):
     effectiveMetadata: dict[str, Any]
     valueSource: dict[str, str]
     constrainedBy: dict[str, list[str]]
+    # ── Round 3 (getModel only; null in listModels) ──
+    # Position among scheduled sources (TG numbering); null when out of scheduling.
+    scheduleRank: int | None = None
+    # TG order: scheduled sources in scheduling order, then the rest.
+    displayOrder: int | None = None
+    notScheduledReason: Literal["accountRestricted", "containerDisabled", "sourceDisabled",
+                                "globalDisabled", "unavailable"] | None = None
+    account: OAuthSourceAccountData | None = None
+    channel: dict[str, Any] | None = None
 
 
 class ModelData(StrictSchema):
@@ -51,6 +99,16 @@ class ModelData(StrictSchema):
     sources: list[ModelSourceData] = Field(default_factory=list)
     editable: bool
     revision: str
+    # ── Round 3: TG list facts ──
+    # null = available; otherwise TG's concise list state as a code.
+    stateCode: str | None = None
+    creditRates: dict[str, list[str]] = Field(default_factory=dict)
+    # 容量/能力/价格 values shared by the scheduled sources (TG detail top block;
+    # also the list's 压缩阈值 / 最大输出 …).
+    sharedMetadata: dict[str, Any] = Field(default_factory=dict)
+    usage: ModelUsageData | None = None
+    usageLoading: bool = False
+    schedule: ModelScheduleData | None = None
 
 
 class ModelListMeta(ResponseMeta):
@@ -204,6 +262,8 @@ class ModelRegistryData(StrictSchema):
     rules: list[RegistryRuleData]
     dismissed: list[str]
     defaultEfforts: dict[str, str]
+    # Effort used by models without an entry in defaultEfforts.
+    globalDefaultEffort: str | None = None
 
 
 class ModelRegistryEnvelope(StrictSchema):

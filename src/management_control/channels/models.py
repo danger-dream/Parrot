@@ -184,6 +184,9 @@ class MonthlyStats:
     max_tps: float | None = None
     min_tps: float | None = None
     cost: str | None = None
+    cost_ticks: int = 0
+    costed_success: int = 0
+    unpriced_success: int = 0
 
 
 @dataclass(frozen=True, slots=True)

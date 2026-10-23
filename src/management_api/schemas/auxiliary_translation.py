@@ -33,6 +33,8 @@ class TranslationSettingsData(StrictSchema):
     modelOverrides: dict[str, TranslationModelOverrideSchema]
     prompt: str
     revision: str
+    # Read-only: the built-in prompt applied when ``prompt`` is empty.
+    defaultPrompt: str = ""
 
 
 class TranslationSettingsPatch(StrictSchema):

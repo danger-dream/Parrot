@@ -14,7 +14,7 @@ from ..response_helpers import response_meta
 from ..schemas.base import DataEnvelope
 from ..schemas.operations import ManagementOperationData
 from ..schemas.search import (
-    SearchAccountData, SearchBackendCreate, SearchBackendPatch, SearchCallLogData,
+    SearchAccountData, SearchModelsData, SearchBackendCreate, SearchBackendPatch, SearchCallLogData,
     SearchPriorityRequest, SearchSettingsData, SearchSettingsPatch, SearchSourceStatsData,
     SearchTestRequest,
 )
@@ -102,6 +102,12 @@ def delete_backend(backend_id: Annotated[str, Path(alias="backendId")], request:
 @router.get("/search/backends/{backendId}/accounts", operation_id="getSearchBackendAccounts", dependencies=_NO_QUERY, response_model=DataEnvelope[list[SearchAccountData]])
 def get_accounts(backend_id: Annotated[str, Path(alias="backendId")], request: Request, control: Control, context: ReadContext):
     return DataEnvelope(data=[SearchAccountData(**v) for v in control.accounts(context, backend_id)], meta=response_meta(request))
+
+
+@router.get("/search/backends/{backendId}/models", operation_id="getSearchBackendModels", dependencies=_NO_QUERY, response_model=DataEnvelope[SearchModelsData])
+def get_models(backend_id: Annotated[str, Path(alias="backendId")], request: Request, control: Control, context: ReadContext):
+    """Selectable models for an OAuth search source (SearchControl.models)."""
+    return DataEnvelope(data=SearchModelsData(**control.models(context, backend_id)), meta=response_meta(request))
 
 
 @router.put("/search/priority", operation_id="updateSearchPriority", dependencies=_NO_QUERY, response_model=DataEnvelope[SearchSettingsData])

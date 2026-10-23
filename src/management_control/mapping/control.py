@@ -27,6 +27,7 @@ from .contracts import (
     CatalogRecord, IngressDefaultRecord, InventoryRecord, MappingRecord,
     MetadataOverridePatch, MetadataRecord, MetadataSyncMode, MetadataSyncTarget,
 )
+from .metadata_scope import listed_scope
 from .sync import MetadataSyncMixin
 
 
@@ -460,14 +461,17 @@ class MappingControl(MetadataSyncMixin, DomainControl):
                 ))
         else:
             records.extend(
-                self._metadata_record(
-                    binding.client_visible_model,
-                    model_metadata.resolve_binding(
+                listed_scope(
+                    self._metadata_record(
                         binding.client_visible_model,
-                        scope_key=binding.scope_key,
-                        outbound_model=binding.outbound_model,
+                        model_metadata.resolve_binding(
+                            binding.client_visible_model,
+                            scope_key=binding.scope_key,
+                            outbound_model=binding.outbound_model,
+                        ),
+                        revision,
                     ),
-                    revision,
+                    binding,
                 )
                 for binding in bindings
             )
@@ -678,6 +682,13 @@ class MappingControl(MetadataSyncMixin, DomainControl):
             self._check_revision(expected_revision, self._metadata_revision())
             if not model_metadata.delete_binding(model_id, scope_key=scope_key):
                 raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+        if scope_key is None:
+            # 「恢复自动匹配」: a removed global binding is re-matched from the
+            # published catalog at once (scoped deletes simply inherit global).
+            try:
+                model_metadata.sync_auto_snapshots([(model_id, None, None)])
+            except Exception as exc:
+                print(f"[metadata] auto re-match after delete failed: {type(exc).__name__}")
         self._audit(actual, "model_metadata.binding.delete", model_id, "succeeded")
 
     def _override_scope(

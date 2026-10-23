@@ -61,7 +61,7 @@ def test_all_53_tg_capabilities_map_to_the_complete_production_api_surface():
         PRODUCTION_OPERATIONS.read_text(encoding="utf-8").splitlines()
     )
     actual_operations = _management_operation_ids()
-    assert len(mapped_operations) == len(expected_operations) == len(actual_operations) == 252
+    assert len(mapped_operations) == len(expected_operations) == len(actual_operations) == 273
     assert mapped_operations == expected_operations == actual_operations
 
 
@@ -83,10 +83,10 @@ def test_model_center_and_image_operations_have_explicit_capability_owners():
         "TG-IMG-01": {
             "getImageSettings", "updateImageSettings",
             "getImageAccountState", "updateImageAccountState",
-            "listMediaSources", "updateMediaSource",
+            "listMediaSources", "updateMediaSource", "getMediaStatistics",
         },
     }
-    assert sum(map(len, expected.values())) == 17
+    assert sum(map(len, expected.values())) == 18
     for capability_id, operations in expected.items():
         row = rows[capability_id]
         assert row["coverage"] == "shared"
@@ -106,7 +106,7 @@ def test_search_operations_have_explicit_system_capability_owner():
     # The frozen 53-capability TG baseline stays intact; the search child belongs
     # to the existing System Settings capability rather than a fabricated trace.
     assert assigned == {"TG-SYS-01": search_operations}
-    assert len(search_operations) == 10
+    assert len(search_operations) == 11
     owner = next(row for row in rows if row["capabilityId"] == "TG-SYS-01")
     assert owner["owner"] == "SettingsControl+SearchControl+MCPControl"
 

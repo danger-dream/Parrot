@@ -40,6 +40,10 @@ class ApiKeyUsageData(StrictSchema):
     estimatedCostTicks: int = Field(ge=0)
     costedSuccess: int = Field(ge=0)
     unpricedSuccess: int = Field(ge=0)
+    # Round 3: TG ↑ (input + cache write + cache read) and 缓存占比.
+    promptTokens: int = Field(default=0, ge=0)
+    cacheReadRatio: float | None = None
+    successRate: float | None = None
 
 
 class ApiKeyModelUsageData(StrictSchema):
@@ -88,10 +92,29 @@ class ApiKeyData(StrictSchema):
     monthStats: ApiKeyUsageData
     modelStats: list[ApiKeyModelUsageData]
     revision: str
+    # Round 3 (user requirement): the full saved secret, returned only by
+    # listApiKeys / getApiKey to sessions holding management.secrets.write.
+    # null elsewhere (mutation responses, read-only sessions).
+    secret: str | None = None
+    # Lifetime request count (TG 「闲置（历史 N 次）」); null while loading.
+    historyTotal: int | None = None
+
+
+class ApiKeyListSummaryData(StrictSchema):
+    """TG list header: 共 / 活跃 / 停用 / 闲置 | 本月 N 次 · ↑ · ↓ (all keys)."""
+    total: int
+    active: int
+    disabled: int
+    idle: int
+    monthRequests: int
+    monthPromptTokens: int
+    monthOutputTokens: int
 
 
 class ApiKeyListData(StrictSchema):
     items: list[ApiKeyData]
+    summary: ApiKeyListSummaryData | None = None
+    historyLoading: bool = False
 
 
 class ApiKeyListMeta(ResponseMeta):

@@ -216,7 +216,7 @@ async def stop() -> None:
         await asyncio.sleep(0.02)
 
 
-def _check_once(*, push: bool = True, raise_on_error: bool = False) -> None:
+def _check_once(*, push: bool = True, raise_on_error: bool = False, manual: bool = False) -> None:
     """Track the actual synchronous worker, not its cancellable asyncio wrapper."""
     global _workers
     with _workers_lock:
@@ -224,17 +224,24 @@ def _check_once(*, push: bool = True, raise_on_error: bool = False) -> None:
             return
         _workers += 1
     try:
-        _check_once_impl(push=push, raise_on_error=raise_on_error)
+        _check_once_impl(push=push, raise_on_error=raise_on_error, manual=manual)
     finally:
         with _workers_lock:
             _workers -= 1
 
 
-def _check_once_impl(*, push: bool = True, raise_on_error: bool = False) -> None:
-    """单次检查；API 可选择不推送并显式报告抓取失败，TG/后台默认不变。"""
+def _check_once_impl(*, push: bool = True, raise_on_error: bool = False, manual: bool = False) -> None:
+    """单次检查；API 可选择不推送并显式报告抓取失败，TG/后台默认不变。
+
+    ``manual``（TG「立即检查」/ API checkForUpdates）不受自动检查开关影响：
+    关闭自动检查只停后台轮询，手动检查照常联网。自动检查关闭时手动检查
+    不推送通知、不触发自动更新（结果直接显示在发起检查的页面上）。
+    """
     cfg = _cfg()
-    if not cfg["enabled"] or not cfg["repo"]:
+    if not cfg["repo"] or (not cfg["enabled"] and not manual):
         return
+    if not cfg["enabled"]:
+        push = False
     url = f"{cfg['apiBase']}/repos/{cfg['repo']}/releases?per_page=20"
     releases = _http_get_json(url)
     if _stopping:
@@ -354,12 +361,12 @@ def _format_release(tag: str, release: dict) -> str:
 
 
 def force_refresh_sync() -> None:
-    """供 TG「立即检查」按钮调用，同步阻塞拉一次。"""
+    """供 TG「立即检查」按钮调用，同步阻塞拉一次（不受自动检查开关影响）。"""
     try:
         _ensure_schema()
     except Exception:
         pass
-    _check_once(push=True)
+    _check_once(push=True, manual=True)
 
 
 async def update_loop() -> None:

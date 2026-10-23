@@ -40,6 +40,13 @@ class ChannelCompatibilityInput(StrictSchema):
     fast: CompatibilityFeatureInput = Field(default_factory=CompatibilityFeatureInput)
 
 
+class InitialProbeResultInput(StrictSchema):
+    """One wizard probe outcome (probeChannelDraft) carried into createChannel."""
+    model: str = Field(min_length=1, max_length=256)
+    ok: bool
+    reason: str | None = Field(default=None, max_length=500)
+
+
 class _ChannelCreateBase(StrictSchema):
     name: str = Field(min_length=1, max_length=64)
     apiKey: SecretStr = Field(
@@ -55,6 +62,9 @@ class _ChannelCreateBase(StrictSchema):
     omitTemperature: bool = False
     omitThinking: bool = False
     enabled: bool = True
+    # Telegram wizard parity: models whose initial probe failed are saved but
+    # put into cooldown ("不可用（已加入冷却）") on the newly created channel.
+    initialProbeResults: list[InitialProbeResultInput] = Field(default_factory=list, max_length=2000)
 
 
 class ManualChannelCreateRequest(_ChannelCreateBase):
@@ -200,6 +210,7 @@ class ChannelData(StrictSchema):
     health: ChannelHealth
     recentSuccessRate: float | None = None
     cooldownCount: int
+    permanentCooldownCount: int = 0
     affinityCount: int
     clientAffinityCount: int
     providerUsage: ProviderUsageData
@@ -217,6 +228,36 @@ class ChannelMonthStatsData(StrictSchema):
     maximumTokensPerSecond: float | None = None
     minimumTokensPerSecond: float | None = None
     cost: str | None = None
+    # Round 3: TG 💎 月度 line inputs.
+    promptTokens: int = 0
+    successRate: float | None = None
+    cacheReadRatio: float | None = None
+    costTicks: int = 0
+    costedSuccess: int = 0
+    unpricedSuccess: int = 0
+
+
+def month_stats_data(raw) -> "ChannelMonthStatsData":
+    """Build the month DTO from a tokens_for_channel-shaped dict (round 3)."""
+    get = (lambda key: raw.get(key)) if isinstance(raw, dict) else (lambda key: getattr(raw, key, None))
+    number = lambda key: int(get(key) or 0)
+    prompt = number("input") + number("cache_creation") + number("cache_read")
+    total = number("total")
+    cost = get("cost")
+    if cost is None and isinstance(raw, dict) and number("costed_success"):
+        from decimal import Decimal
+        cost = format(Decimal(number("cost_ticks")) / Decimal(10_000_000_000), "f")  # model_pricing.TICKS_PER_USD
+    return ChannelMonthStatsData(
+        total=total, successCount=number("success_count"), errorCount=number("error_count"),
+        inputTokens=number("input"), outputTokens=number("output"),
+        cacheCreationTokens=number("cache_creation"), cacheReadTokens=number("cache_read"),
+        averageTokensPerSecond=get("avg_tps"), maximumTokensPerSecond=get("max_tps"),
+        minimumTokensPerSecond=get("min_tps"), cost=cost, promptTokens=prompt,
+        successRate=number("success_count") / total if total else None,
+        cacheReadRatio=number("cache_read") / prompt if prompt else None,
+        costTicks=number("cost_ticks"), costedSuccess=number("costed_success"),
+        unpricedSuccess=number("unpriced_success"),
+    )
 
 
 class ChannelModelStatsData(StrictSchema):
@@ -240,6 +281,13 @@ class ChannelModelStatsData(StrictSchema):
     unpricedSuccess: int
 
 
+class ChannelListItemData(ChannelData):
+    # Round 3: TG 「💎 Parrot 月度」 per list row (null while the shared month
+    # snapshot is first computed → monthStatsLoading=true).
+    monthStats: ChannelMonthStatsData | None = None
+    monthStatsLoading: bool = False
+
+
 class ChannelDetailData(ChannelData):
     monthStats: ChannelMonthStatsData
     modelStats: list[ChannelModelStatsData]
@@ -255,7 +303,7 @@ class ChannelPageMeta(ResponseMeta):
 
 
 class ChannelListEnvelope(StrictSchema):
-    data: list[ChannelData]
+    data: list[ChannelListItemData]
     meta: ChannelPageMeta
 
 

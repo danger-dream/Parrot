@@ -252,13 +252,17 @@ def test_all_operations_happy_path_call_control_once_with_authenticated_actor(tm
         assert listed.json()["meta"]["requestId"] == "apikey-request"
         assert listed.json()["meta"]["total"] == 2
         assert len(listed.json()["data"]["items"]) == 1
-        assert "secret" not in listed.text and "alpha-secret" not in listed.text
+        # Round 3 (user requirement): list/detail return the saved secret to
+        # secrets-capable sessions, with no-store; mutation/error paths never do.
+        assert listed.json()["data"]["items"][0]["secret"] == "ccp-busy-secret"
+        assert listed.headers["cache-control"] == "no-store"
 
         detail = client.get("/api/management/v1/api-keys/alpha", headers=headers)
         assert detail.status_code == 200, detail.text
         alpha_revision = detail.json()["data"]["revision"]
         assert detail.json()["data"]["modelStats"][0]["model"] == "model-a"
-        assert "alpha-secret" not in detail.text
+        assert detail.json()["data"]["secret"] == "alpha-secret"
+        assert detail.headers["cache-control"] == "no-store"
 
         stats = client.get("/api/management/v1/api-keys/alpha/stats", headers=headers)
         assert stats.status_code == 200, stats.text

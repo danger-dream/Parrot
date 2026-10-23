@@ -128,8 +128,11 @@ EXPECTED_OPERATION_IDS = {
     "stageUpdate",
     "activateStagedUpdate",
     "cancelStagedUpdate",
+    "getUpdateState",
+    "getCachedUpdateCheck",
+    "createUpdateActivationPlan",
     "getImageSettings",
-    "getVideoSettings", "updateVideoSettings", "listMediaSources", "updateMediaSource",
+    "getVideoSettings", "updateVideoSettings", "listMediaSources", "updateMediaSource", "getMediaStatistics",
     "updateImageSettings",
     "getImageAccountState",
     "updateImageAccountState",
@@ -185,7 +188,7 @@ def _guard_allowed_names(decorator: ast.Call) -> set[str]:
 
 def test_auxiliary_manifest_has_exactly_one_pre_control_query_guard_per_operation(tmp_path):
     operation_ids = [item["operation_id"] for item in AUXILIARY_OPERATION_MANIFEST]
-    assert len(operation_ids) == 35  # Five AG image operations explicitly retired.
+    assert len(operation_ids) == 39  # Five AG image ops retired; WebUI round 2: 3 update-state reads + media statistics.
     assert len(set(operation_ids)) == len(operation_ids)
     assert set(operation_ids) == EXPECTED_OPERATION_IDS
 

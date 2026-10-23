@@ -42,6 +42,8 @@ SEARCH_MCP_BUTTON_ROW = [
     {"text": "🔎 搜索工具", "callback_data": "srch:show"},
     {"text": "🔌 MCP 服务", "callback_data": "mcp:show"},
 ]
+# WebUI（2026-10-22）在「重试设置 / 返回主菜单」之前单独新增一行入口。
+WEBUI_BUTTON_ROW = [{"text": "🖥 WebUI", "callback_data": "sys:show:webui"}]
 
 
 def test_exact_search_route_methods_paths_and_retired_ag_absence():
@@ -51,7 +53,7 @@ def test_exact_search_route_methods_paths_and_retired_ag_absence():
               for path, item in document["paths"].items() if path.startswith("/api/management/v1")
               for method, operation in item.items() if method in methods}
     search_ops = {key: value for key, value in actual.items() if value[1].startswith("/api/management/v1/search")}
-    assert len(SEARCH_ROWS) == len(SEARCH_OPERATIONS) == 10
+    assert len(SEARCH_ROWS) == len(SEARCH_OPERATIONS) == 11
     assert search_ops == SEARCH_OPERATIONS
     for path, item in document["paths"].items():
         if not path.startswith("/api/management/v1/search/backends/{"):
@@ -62,10 +64,10 @@ def test_exact_search_route_methods_paths_and_retired_ag_absence():
                 assert [p["name"] for p in operation.get("parameters", []) if p["in"] == "path"] == ["backendId"]
     assert set(RETIRED_AG_OPERATIONS).isdisjoint(actual)
     assert {path for _, path in RETIRED_AG_OPERATIONS.values()}.isdisjoint(document["paths"])
-    assert len({path for _, path in SEARCH_OPERATIONS.values()}) == 8
+    assert len({path for _, path in SEARCH_OPERATIONS.values()}) == 9
     assert len({path for _, path in RETIRED_AG_OPERATIONS.values()}) == 3
     manifest = (FIXTURES / "production-operation-ids.txt").read_text().splitlines()
-    assert len(manifest) == len(set(manifest)) == 252
+    assert len(manifest) == len(set(manifest)) == 273
     assert set(manifest) == set(actual)
 
 
@@ -128,9 +130,10 @@ def test_system_golden_difference_is_only_reviewed_entries(case_id, monkeypatch)
         assert keyboard[-1] == [{"text": "🔁 重试设置", "callback_data": "sys:show:retry"},
                                 {"text": "◀ 返回主菜单", "callback_data": "menu:main"}]
         keyboard.insert(7, copy.deepcopy(SEARCH_MCP_BUTTON_ROW))
+        keyboard.insert(8, copy.deepcopy(WEBUI_BUTTON_ROW))
         insertion_indices.append(index)
     assert insertion_indices
-    print(f"REVIEWED {case_id}: tgApi indices {insertion_indices}; only inline_keyboard[7] added")
+    print(f"REVIEWED {case_id}: tgApi indices {insertion_indices}; only inline_keyboard[7] and [8] added")
     scenario = archived["entry"]["scenario"]
     env = SystemEnv(archived, monkeypatch)
     (SETTINGS_RUNNERS | RUNTIME_RUNNERS)[scenario](env)

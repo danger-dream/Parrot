@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from . import config, model_metadata, model_pricing, model_reroute
+from . import request_events
 from .channel.base import UpstreamDispatchMetadata
 
 _BJT = timezone(timedelta(hours=8))
@@ -54,6 +55,27 @@ _last_retention_cleanup_key: tuple[int, str] | None = None
 # 空闲写连接，使 unlink 后磁盘空间能够立即回收，而不是等 worker 线程退出。
 _write_conn_registry_lock = threading.Lock()
 _write_conn_registry: dict[str, list[sqlite3.Connection]] = {}
+# Owner thread per registered connection. A thread-local connection outlives its thread only
+# through the registry, so connections of finished threads are closed when the next one opens
+# (worker pools retire idle threads; without this every new thread leaked a file descriptor).
+_write_conn_owner: dict[int, threading.Thread] = {}
+
+
+def _prune_finished_thread_connections_locked() -> None:
+    """Close registered connections whose owner thread has exited. Caller holds the registry lock."""
+    for path, conns in list(_write_conn_registry.items()):
+        keep = []
+        for conn in conns:
+            owner = _write_conn_owner.get(id(conn))
+            if owner is not None and not owner.is_alive():
+                _write_conn_owner.pop(id(conn), None)
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            else:
+                keep.append(conn)
+        _write_conn_registry[path] = keep
 _retired_log_paths: set[str] = set()
 
 _MONTH_LOG_NAME_RE = re.compile(r"^(?P<year>\d{4})-(?P<month>\d{2})\.db$")
@@ -920,7 +942,9 @@ def _get_conn_for_ref(ref: LogDbRef) -> sqlite3.Connection:
                 raise
             cache[ref.path] = conn
             with _write_conn_registry_lock:
+                _prune_finished_thread_connections_locked()
                 _write_conn_registry.setdefault(ref.path, []).append(conn)
+                _write_conn_owner[id(conn)] = threading.current_thread()
     # Legacy introspection compatibility only; write routing never reads these.
     _local.conn = conn
     _local.month = ref.month
@@ -1525,6 +1549,8 @@ def _close_cached_write_connections(path: str) -> None:
 
     with _write_conn_registry_lock:
         conns = list(_write_conn_registry.pop(path, []))
+        for conn in conns:
+            _write_conn_owner.pop(id(conn), None)
     for conn in conns:
         try:
             conn.close()
@@ -2004,6 +2030,7 @@ def insert_pending(
     created = time.time() if created_at is None else float(created_at)
     handle = RequestLogHandle(request_id=request_id, db=_db_ref_for_timestamp(created))
     store_bodies = _store_log_bodies()
+    fast_value = 1 if (extract_fast_mode(request_body, ingress_protocol, request_headers) if fast_mode is None else fast_mode) else 0
     with _write_lock:
         conn = _get_conn_for_ref(handle.db)
         conn.execute(
@@ -2020,7 +2047,7 @@ def insert_pending(
                 fingerprint[:16] if fingerprint else None,
                 ingress_protocol or "anthropic",
                 reasoning_effort,
-                1 if (extract_fast_mode(request_body, ingress_protocol, request_headers) if fast_mode is None else fast_mode) else 0,
+                fast_value,
             ),
         )
         conn.execute(
@@ -2036,7 +2063,27 @@ def insert_pending(
         _request_handles[request_id] = handle
         from . import drain
         drain.retain_log_handle(handle)
+    if request_events.active():
+        _publish_request_event("started", {
+            "id": request_id,
+            "createdAt": created,
+            "apiKeyName": api_key_name,
+            "requestedModel": requested_model,
+            "protocol": ingress_protocol or "anthropic",
+            "isStream": bool(is_stream),
+            "clientIp": client_ip,
+            "reasoningEffort": reasoning_effort,
+            "fastMode": bool(fast_value),
+        })
     return handle
+
+
+def _publish_request_event(kind: str, payload: dict[str, Any]) -> None:
+    """O(1), non-blocking, never-raising live-observer notification."""
+    try:
+        request_events.publish(kind, payload)
+    except Exception:
+        pass
 
 
 def update_pending(request_id: str | RequestLogHandle, **fields: Any) -> None:
@@ -2095,10 +2142,20 @@ def record_retry_attempt(
             ),
         )
         conn.commit()
-        return RowLogHandle(
+        row = RowLogHandle(
             table="retry_chain", row_id=int(cur.lastrowid),
             request_id=request.request_id, db=request.db,
         )
+    if request_events.active():
+        _publish_request_event("updated", {
+            "id": request.request_id,
+            "channelId": channel_key,
+            "model": model,
+            # attempt_order is 1-based; retries are the attempts beyond the first.
+            "retryCount": max(0, int(attempt_order) - 1),
+            **({"proxyName": proxy_name} if proxy_name else {}),
+        })
+    return row
 
 
 def _outbound_payload(request_body: Any) -> dict[str, Any] | None:
@@ -2658,10 +2715,13 @@ def record_proxy_attempt(
             ),
         )
         conn.commit()
-        return RowLogHandle(
+        row = RowLogHandle(
             table="proxy_chain", row_id=int(cur.lastrowid),
             request_id=request.request_id, db=request.db,
         )
+    if request_events.active():
+        _publish_request_event("updated", {"id": request.request_id})
+    return row
 
 
 def update_proxy_attempt(
@@ -3576,6 +3636,10 @@ def finish_success(
         conn.commit()
         if _request_handles.get(handle.request_id) == handle:
             _release_request_handle(handle.request_id)
+    if request_events.active():
+        _publish_request_event("finished", {
+            "id": handle.request_id, "month": handle.db.month,
+        })
 
     if actual_model or model_signal_conflict:
         _notify_upstream_observation(
@@ -3677,6 +3741,10 @@ def finish_error(
         conn.commit()
         if _request_handles.get(handle.request_id) == handle:
             _release_request_handle(handle.request_id)
+    if request_events.active():
+        _publish_request_event("finished", {
+            "id": handle.request_id, "month": handle.db.month,
+        })
 
     if actual_model or model_signal_conflict:
         _notify_upstream_observation(
@@ -5584,10 +5652,11 @@ def _replace_summary_tokens_with_attempts(
         target_overall["total_output_tokens"] += sign * vals[1]
         target_overall["total_cache_creation"] += sign * vals[2]
         target_overall["total_cache_read"] += sign * vals[3]
-        write_rows = int(row["cc_rows"] or 0) if "cc_rows" in row.keys() else int(vals[2] > 0)
-        hit_rows = int(row["cr_rows"] or 0) if "cr_rows" in row.keys() else int(vals[3] > 0)
-        target_overall["success_with_cache_write"] += sign * write_rows
-        target_overall["success_with_cache_hit"] += sign * hit_rows
+        # The attempt ledger corrects *token* totals only. Cache hit/write
+        # *request* counts stay request-level (successful requests whose
+        # response read/wrote cache, see the base SUM(CASE ...) columns):
+        # swapping root rows for attempt rows here counted every retried
+        # attempt (and failed requests) and could exceed successCount.
         for bucket in (
             target_channels.setdefault(row["channel_key"] or "?", _new_group_agg()),
             target_models.setdefault(row["model_key"] or "?", _new_group_agg()),
@@ -5597,8 +5666,6 @@ def _replace_summary_tokens_with_attempts(
             bucket["total_output_tokens"] += sign * vals[1]
             bucket["total_cache_creation"] += sign * vals[2]
             bucket["total_cache_read"] += sign * vals[3]
-            bucket["write_requests"] += sign * write_rows
-            bucket["hit_requests"] += sign * hit_rows
 
     all_targets = (overall, by_channel, by_model, by_apikey)
     for row in roots:
@@ -7692,6 +7759,51 @@ def management_logs_page(
                         conn.close()
                     except Exception:
                         pass
+
+
+def management_log_rows(
+    request_ids: list[str], *, month: str | None = None,
+) -> list[dict[str, Any]]:
+    """Read exact list-projection rows for known IDs from one monthly DB.
+
+    Rows are identical to ``management_logs_page`` items (same projection and
+    timing sanitation), so callers can reuse the list DTO mapping. Used by the
+    live event stream off the request path; never migrates a sealed month.
+    """
+
+    ids = list(dict.fromkeys(str(value) for value in request_ids if value))
+    if not ids:
+        return []
+    close = False
+    if _log_dir is None:
+        conn = _get_conn()
+    else:
+        current = _db_ref_for_timestamp()
+        if month and month != current.month:
+            conn = _get_conn_for_month(month)
+            if conn is None:
+                return []
+            close = True
+        else:
+            conn = _get_conn()
+    try:
+        projection = _compatible_recent_cols(conn)
+        rows: list[dict[str, Any]] = []
+        for start in range(0, len(ids), 256):
+            batch = ids[start:start + 256]
+            placeholders = ",".join("?" for _ in batch)
+            rows.extend(
+                _sanitize_request_timing(row)
+                for row in conn.execute(
+                    f"SELECT {projection} FROM request_log "
+                    f"WHERE request_id IN ({placeholders})",
+                    batch,
+                ).fetchall()
+            )
+        return rows
+    finally:
+        if close:
+            conn.close()
 
 
 def _management_filter_options_on_conn(

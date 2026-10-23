@@ -221,7 +221,9 @@ def test_audit_db_failure_does_not_hide_committed_key_secret(actual_management, 
         secret = changed.json()["data"]["secret"]
         assert secret != original
         assert config.get()["apiKeys"]["audit-key"]["key"] == secret
-        assert secret not in client.get(PREFIX + "/api-keys/audit-key").text
+        # Round 3: the detail read intentionally returns the saved secret to a
+        # secrets-capable session; logs must still never contain it.
+        assert client.get(PREFIX + "/api-keys/audit-key").json()["data"]["secret"] == secret
         assert "Management audit write failed (OperationalError)" in caplog.text
         assert secret not in caplog.text and original not in caplog.text
     finally:

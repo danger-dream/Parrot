@@ -1,0 +1,1 @@
+var e={none:`关闭`,disabled:`关闭`,enabled:`开启`,minimal:`最低`,low:`低`,medium:`中`,high:`高`,xhigh:`超高`,max:`最高`,ultra:`极限`};function t(t){return t?e[t]||t:`—`}function n(e){return(e||[]).map(t).join(` / `)}export{t as n,n as r,e as t};

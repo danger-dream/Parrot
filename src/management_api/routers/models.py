@@ -31,7 +31,12 @@ from ..dependencies import (
 )
 from ..error_mapping import management_error_responses
 from ..response_helpers import response_meta as _meta, success_response as _success
+from src.management_control.oauth.contracts import public_value
+
 from ..schemas.models import (
+    ModelScheduleData,
+    ModelUsageData,
+    OAuthSourceAccountData,
     ModelData,
     ModelEnvelope,
     ModelIdentityData,
@@ -116,9 +121,35 @@ def _filters(
     )
 
 
-def _model(item: ModelView) -> ModelData:
+def _source(source, facts: dict | None = None) -> ModelSourceData:
+    facts = facts or {}
+    return ModelSourceData(
+        type=source.type, id=source.id, label=source.label,
+        provider=source.provider, outboundModel=source.outbound_model,
+        sourceEnabled=source.source_enabled,
+        containerEnabled=source.container_enabled,
+        effectiveRoutable=source.effective_routable,
+        enabledOverride=source.enabled_override,
+        unavailableReason=source.unavailable_reason,
+        effectiveMetadata=dict(source.effective_metadata),
+        valueSource=dict(source.value_source),
+        constrainedBy={key: list(value) for key, value in source.constrained_by.items()},
+        scheduleRank=facts.get("schedule_rank"),
+        displayOrder=facts.get("display_order"),
+        notScheduledReason=facts.get("not_scheduled_reason"),
+        account=(OAuthSourceAccountData.model_validate(public_value(facts["account"], camel_case_keys=True))
+                 if facts.get("account") else None),
+        channel=(public_value(facts["channel"], camel_case_keys=True) if facts.get("channel") else None),
+    )
+
+
+def _model(item: ModelView, extra: dict | None = None) -> ModelData:
     identity = item.identity
     owner = identity.owner
+    extra = extra or {}
+    sources = ([_source(entry["source"], entry) for entry in extra["sources"]]
+               if "sources" in extra else [_source(source) for source in item.sources])
+    usage = extra.get("usage")
     return ModelData(
         resourceKey=item.resource_key,
         identity=ModelIdentityData(
@@ -132,23 +163,16 @@ def _model(item: ModelView) -> ModelData:
         visible=item.visible,
         sourceCount=len(item.sources),
         commonMetadata=dict(item.common_metadata),
-        sources=[
-            ModelSourceData(
-                type=source.type, id=source.id, label=source.label,
-                provider=source.provider, outboundModel=source.outbound_model,
-                sourceEnabled=source.source_enabled,
-                containerEnabled=source.container_enabled,
-                effectiveRoutable=source.effective_routable,
-                enabledOverride=source.enabled_override,
-                unavailableReason=source.unavailable_reason,
-                effectiveMetadata=dict(source.effective_metadata),
-                valueSource=dict(source.value_source),
-                constrainedBy={key: list(value) for key, value in source.constrained_by.items()},
-            )
-            for source in item.sources
-        ],
+        sources=sources,
         editable=item.editable,
         revision=item.revision,
+        stateCode=extra.get("state_code"),
+        creditRates=extra.get("credit_rates") or {},
+        sharedMetadata=extra.get("shared_metadata") or {},
+        usage=ModelUsageData.model_validate(public_value(usage, camel_case_keys=True)) if usage else None,
+        usageLoading=bool(extra.get("usage_loading")),
+        schedule=(ModelScheduleData(mode=extra["schedule"]["mode"], ownOrder=extra["schedule"]["own_order"],
+                                    order=list(extra["schedule"]["order"])) if extra.get("schedule") else None),
     )
 
 
@@ -197,8 +221,10 @@ def list_models(
         page=page,
         page_size=page_size,
     )
+    extra = control.presentation(context, result.items,
+                                 source=_source_ref(source_type, source_id))  # TG projects only that source
     return ModelListEnvelope(
-        data=[_model(item) for item in result.items],
+        data=[_model(item, extra.get(item.resource_key)) for item in result.items],
         meta=ModelListMeta(
             requestId=management_request_id(request), page=result.page,
             pageSize=result.page_size, total=result.total, hasNext=result.has_next,
@@ -280,7 +306,8 @@ def _stored_rule(rule: RegistryRuleData) -> dict:
     operation_id="getModelRegistry",
     response_model=ModelRegistryEnvelope,
     responses={**_success(200, {"enabled": True, "revision": "rev_example", "pending": [], "suggestions": [],
-                                "conflicts": [], "rules": [], "dismissed": [], "defaultEfforts": {}}),
+                                "conflicts": [], "rules": [], "dismissed": [], "defaultEfforts": {},
+                                "globalDefaultEffort": "high"}),
                **management_error_responses(*_COMMON_ERRORS)},
 )
 def get_model_registry(
@@ -304,6 +331,7 @@ def get_model_registry(
             rules=[_rule_data(rule) for rule in overview.rules],
             dismissed=list(overview.dismissed),
             defaultEfforts=dict(overview.defaults),
+            globalDefaultEffort=control.global_default_effort(context),
         ),
         meta=_meta(request),
     )
@@ -362,4 +390,6 @@ def get_model(
     control: Annotated[ModelCenterControl, Depends(get_model_control)],
 ) -> ModelEnvelope:
     reject_unknown_query_parameters(request)
-    return ModelEnvelope(data=_model(control.get_model(context, resource_key)), meta=_meta(request))
+    view = control.get_model(context, resource_key)
+    extra = control.presentation(context, [view], detail=True).get(view.resource_key)
+    return ModelEnvelope(data=_model(view, extra), meta=_meta(request))

@@ -27,11 +27,33 @@ BODY_RETENTION_OVERRIDE_CASE_IDS = (
     'TG-SYS-05.018-plan-empty-cancel',
     'TG-SYS-05.019-plan-preflight-failure',
 )
-SYSTEM_ADDITION_CASE_IDS = ('TG-SYS-05.body_retention',)
+BODY_RETENTION_ADDITION_CASE_IDS = ('TG-SYS-05.body_retention',)
+# webUi (2026-10-22): the system-settings home gained exactly one row holding
+# the 「🖥 WebUI」 entry; the new WebUI page is covered by reviewed additions.
+WEBUI_OVERRIDE_CASE_IDS = (
+    'TG-SYS-01.001-home-edit',
+    'TG-SYS-01.002-home-send',
+    'TG-SYS-08.002-concurrency-active',
+    'TG-SYS-08.004-limiter-active',
+    'TG-SYS-08.006-limiter-durations',
+)
+# Round 2: OpenAI-protocol API channels honour maxConcurrent (edit page label).
+WEBUI_CHANNEL_OVERRIDE_CASE_IDS = ('TG-CH-04.edit-fields-success',)
+WEBUI_OVERRIDE_IDS_BY_SEGMENT = {
+    'system.jsonl': WEBUI_OVERRIDE_CASE_IDS,
+    'channels_apikey.jsonl': WEBUI_CHANNEL_OVERRIDE_CASE_IDS,
+}
+WEBUI_ADDITION_CASE_IDS = ('TG-SYS-08.webui_wildcard', 'TG-SYS-08.webui_host')
+SYSTEM_ADDITION_CASE_IDS = BODY_RETENTION_ADDITION_CASE_IDS + WEBUI_ADDITION_CASE_IDS
 
 
 def _load_system_additions(segment: Path, existing: list[dict]) -> list[dict]:
-    additions = load_jsonl(segment.parents[2] / 'log-body-retention-2026-10-21/additions/system.jsonl')
+    body = load_jsonl(segment.parents[2] / 'log-body-retention-2026-10-21/additions/system.jsonl')
+    webui = load_jsonl(segment.parents[2] / 'webui-2026-10-22/additions/system.jsonl')
+    if (tuple(case['caseId'] for case in body) != BODY_RETENTION_ADDITION_CASE_IDS
+            or tuple(case['caseId'] for case in webui) != WEBUI_ADDITION_CASE_IDS):
+        raise AssertionError('current system addition case coverage differs')
+    additions = body + webui
     ids = tuple(case['caseId'] for case in additions)
     if ids != SYSTEM_ADDITION_CASE_IDS:
         raise AssertionError('current system addition case coverage differs')
@@ -83,6 +105,14 @@ def load_current_jsonl(segment: str | Path) -> list[dict]:
             raise AssertionError('unexpected body-retention overlay scope')
         replaced = set(BODY_RETENTION_OVERRIDE_CASE_IDS)
         overrides = [c for c in overrides if c['caseId'] not in replaced] + body_cases
+    webui_overlay = segment.parents[2] / 'webui-2026-10-22' / 'overrides' / segment.name
+    if webui_overlay.exists():
+        webui_cases = load_jsonl(webui_overlay)
+        expected_ids = WEBUI_OVERRIDE_IDS_BY_SEGMENT.get(segment.name)
+        if tuple(c['caseId'] for c in webui_cases) != expected_ids:
+            raise AssertionError('unexpected webui overlay scope')
+        replaced = set(expected_ids)
+        overrides = [c for c in overrides if c['caseId'] not in replaced] + webui_cases
     by_id = {case['caseId']: case for case in overrides}
     archived_ids = {case['caseId'] for case in archived}
     if len(by_id) != len(overrides):

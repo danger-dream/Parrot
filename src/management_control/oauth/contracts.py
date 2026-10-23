@@ -167,6 +167,17 @@ def audit_failures(action: str, *, target_arg: str | None = None, target: str = 
     return decorate
 
 
-def invalid_account(account: Mapping[str, Any]) -> bool:
-    """Frozen TG invalid-list predicate: email plus auth_error."""
-    return bool(account.get("email") or account.get("provider") == "zhipu") and account.get("disabled_reason") == "auth_error"
+# Providers whose identity is not an e-mail but still appear in TG's
+# 「移除失效账户」 list (src/telegram/menus/oauth_menu.py::_invalid_accounts).
+INVALID_LISTED_PROVIDERS = frozenset({"workbuddy", "zhipu", "qoder"})
+
+
+def invalid_account(account: Mapping[str, Any], provider: str | None = None) -> bool:
+    """TG's 「失效账户」 predicate: an auth_error account with an e-mail, or a
+    WorkBuddy / Zhipu / Qoder account (identified without an e-mail).
+
+    The single shared predicate for listInvalidOAuthAccounts, the summary
+    ``invalid`` flag and planInvalidOAuthAccountDeletion.
+    """
+    provider = provider if provider is not None else str(account.get("provider") or "")
+    return bool(account.get("email") or provider in INVALID_LISTED_PROVIDERS) and account.get("disabled_reason") == "auth_error"

@@ -29,6 +29,7 @@ from .models import (
     RetryTransient,
     ScoringSettings,
     TimeoutSettings,
+    WebUiSettings,
 )
 
 
@@ -237,12 +238,25 @@ class SettingsControl(DomainControl):
         raw = self._mapping(cfg.get("openai"))
         return _with_revision(OpenAiWebSocketSettings, responsesUpstreamWsForOAuth=bool(raw.get("responsesUpstreamWsForOAuth", False)))
 
+    def _web_ui(self, cfg: Mapping[str, Any]) -> WebUiSettings:
+        # Same fail-closed rule as config.web_ui_enabled: only an explicit True.
+        raw = self._mapping(self._mapping(cfg.get("management")).get("webUi"))
+        return _with_revision(WebUiSettings, enabled=raw.get("enabled") is True)
+
+    def web_ui_enabled(self) -> bool:
+        """Public, non-secret flag used by the unauthenticated login options."""
+        try:
+            return self._web_ui(self.config.get()).enabled
+        except Exception:
+            return False
+
     _READERS: dict[str, str] = {
         "retry": "_retry", "timeouts": "_timeouts", "error-cooldown": "_error_cooldown",
         "scoring": "_scoring", "affinity": "_affinity", "cch": "_cch",
         "concurrency": "_concurrency", "api-key-concurrency": "_api_key_concurrency",
         "quota-monitor": "_quota_monitor", "notifications": "_notifications",
         "openai-websocket": "_websocket",
+        "web-ui": "_web_ui",
     }
 
     def get(self, context: ManagementContext | None, resource: str):
@@ -463,6 +477,19 @@ class SettingsControl(DomainControl):
             target.pop("responsesUpstreamTransport", None)
             target.pop("responsesUpstreamWs", None)
         return self._update(context, "openai-websocket", patch, expected_revision, mutate)
+
+    def update_web_ui(self, context, patch, *, expected_revision=None) -> WebUiSettings:
+        """Toggle the browser WebUI; the single use case behind HTTP and Telegram."""
+        self._write(context, Capability.WRITE)
+        self._keys(patch, {"enabled"})
+        if "enabled" in patch: self._bool(patch["enabled"], "enabled")
+        def mutate(cfg):
+            management = cfg.setdefault("management", {})
+            target = management.setdefault("webUi", {})
+            if not isinstance(target, dict):
+                target = management["webUi"] = {}
+            if "enabled" in patch: target["enabled"] = patch["enabled"]
+        return self._update(context, "web-ui", patch, expected_revision, mutate)
 
 
 DEFAULT_SETTINGS_CONTROL = SettingsControl()

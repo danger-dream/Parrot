@@ -64,6 +64,8 @@ from .workbuddy_control import WorkBuddyControlMixin
 from .qoder_control import QoderControlMixin
 from .zhipu_control import ZhipuControlMixin
 from .claude_reset_control import ClaudeResetControlMixin
+from .webui_actions import OAuthWebUiActionsMixin
+from .account_card import OAuthAccountCardMixin
 
 
 def _page(items: list, spec: PageSpec) -> tuple[list, PageMeta]:
@@ -80,6 +82,8 @@ def _page(items: list, spec: PageSpec) -> tuple[list, PageMeta]:
 
 
 class OAuthControl(
+    OAuthAccountCardMixin,
+    OAuthWebUiActionsMixin,
     ClaudeResetControlMixin,
     WorkBuddyControlMixin,
     QoderControlMixin,
@@ -285,7 +289,7 @@ class OAuthControl(
             max_concurrent=max(0, int(account.get("maxConcurrent") or 0)),
             available=bool(account.get("enabled", True)) and not reason and (provider is not OAuthProvider.ZHIPU or bool((account.get("model_key") or account.get("project_key_id"))) and (account.get("credential_mode") == "api_key" or account.get("entitlement") == "available")),
             quota_limited=reason == "quota",
-            invalid=invalid_account(account),
+            invalid=invalid_account(account, provider.value),
             model_count=len(models),
             disabled_model_count=len(disabled),
             credential_configured=bool(
@@ -326,13 +330,13 @@ class OAuthControl(
             summaries.sort(key=lambda item: (not item.available, item.disabled_reason or "", item.account_id))
         visible, meta = _page(summaries, page)
         return OAuthAccountPage(
-            items=tuple(visible), meta=meta, revision=_revision(configured_ids),
+            items=tuple(self._with_cards(visible, context)), meta=meta, revision=_revision(configured_ids),
         )
 
     def get_account(self, context: ManagementContext, account_id: str) -> OAuthAccountDetail:
         self._require(context, Capability.READ)
         account = self._account(account_id)
-        summary = self._summary(account)
+        summary = self._with_cards([self._summary(account)], context, blocking=True)[0]
         row = self.backend.quota_load(account_id) or {}
         windows = []
         for name, used_key, reset_key in (
@@ -355,7 +359,7 @@ class OAuthControl(
             day=1, hour=0, minute=0, second=0, microsecond=0,
         )
         try:
-            stats = self.backend.tokens_for_channel(f"oauth:{account_id}", month_start.timestamp()) or {}
+            stats = self._month_channel_stats(context, account_id, month_start.timestamp())
         except Exception:
             stats = {}
         runtime_errors = []
@@ -375,7 +379,7 @@ class OAuthControl(
                     cooldown_permanent=until == -1,
                 )
             )
-        return OAuthAccountDetail(
+        return self._enrich_detail(OAuthAccountDetail(
             account=summary,
             workspace_id=sanitize_text(account.get("workspace_id") or account.get("project_id") or account.get("subject")) if (account.get("workspace_id") or account.get("project_id") or account.get("subject")) else None,
             workspace_name=sanitize_text(account.get("workspace_name") or account.get("cursor_profile_name")) if (account.get("workspace_name") or account.get("cursor_profile_name")) else None,
@@ -392,7 +396,7 @@ class OAuthControl(
             credential_configured=bool(account.get("refresh_token") or account.get("access_token") or (account.get("model_key") or account.get("project_key_id"))),
             last_model_sync=utc_datetime(account.get("last_model_sync")),
             **self._provider_snapshots(summary.provider, account_id),
-        )
+        ), account)
 
     def reorder_accounts_preserving_unlisted(
         self,
@@ -445,7 +449,7 @@ class OAuthControl(
         invalid = [
             self.backend.account_id(account)
             for account in self.backend.list_accounts()
-            if (account.get("email") or self.backend.provider_of(account) in {"workbuddy", "zhipu", "qoder"}) and account.get("disabled_reason") == "auth_error"
+            if invalid_account(account, self.backend.provider_of(account))
         ]
         selected = invalid if account_ids is None else list(account_ids)
         if not selected or len(selected) != len(set(selected)) or not set(selected).issubset(invalid):
@@ -558,12 +562,12 @@ class OAuthControl(
 
     @audit_failures("oauth.quota.reset-plan", target_arg="account_id")
     def plan_quota_reset(
-        self, context: ManagementContext, account_id: str,
+        self, context: ManagementContext, account_id: str, *, credit_id: str | None = None,
     ) -> OAuthQuotaResetPlan:
         self._require(context, Capability.DESTRUCTIVE)
         account = self._account(account_id)
         provider = OAuthProvider(self.backend.provider_of(account))
-        if provider in {OAuthProvider.CURSOR, OAuthProvider.XAI, OAuthProvider.ANTIGRAVITY, OAuthProvider.WORKBUDDY, OAuthProvider.ZHIPU, OAuthProvider.QODER}:
+        if provider in {OAuthProvider.CURSOR, OAuthProvider.XAI, OAuthProvider.ANTIGRAVITY, OAuthProvider.WORKBUDDY, OAuthProvider.ZHIPU, OAuthProvider.QODER} or (credit_id and provider is not OAuthProvider.OPENAI):
             raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
         row = copy.deepcopy(self.backend.quota_load(account_id) or {})
         credit_count = row.get("openai_reset_credit_count")
@@ -577,6 +581,7 @@ class OAuthControl(
                 "quota_revision": _revision(row),
                 "credit_observation": copy.deepcopy(credit_count),
                 "idempotency_key": secrets.token_urlsafe(24),
+                "credit_id": credit_id or None,
             },
         )
         result = OAuthQuotaResetPlan(
@@ -585,6 +590,7 @@ class OAuthControl(
             provider,
             int(credit_count) if isinstance(credit_count, (int, float)) else None,
             plan.expires_at,
+            credit_id or None,
         )
         self._audit(context, "oauth.quota.reset-plan", account_id)
         return result
@@ -659,6 +665,7 @@ class OAuthControl(
                 if plan.payload["provider"] == "openai":
                     raw_result = asyncio.run(self.backend.redeem_openai_reset_credit(
                         account_id, str(plan.payload["idempotency_key"]),
+                        **({"credit_id": plan.payload["credit_id"]} if plan.payload.get("credit_id") else {}),
                     ))
                 else:
                     raw_result = self.backend.reset_quota(account_id)

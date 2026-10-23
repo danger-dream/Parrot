@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Header, Path, Request, Response, status
+from starlette.concurrency import run_in_threadpool
 
 from src.management_auth import (
     ApprovalError,
@@ -29,6 +29,7 @@ from ..dependencies import (
 from ..discovery import build_discovery_snapshot, supported_capabilities
 from ..error_mapping import management_error_responses
 from ..response_helpers import response_meta as _meta
+from ..session_cookie import clear_session_cookie, has_session_cookie, set_session_cookie
 from ..schemas import (
     DataEnvelope,
     ManagementCapabilitiesData,
@@ -50,6 +51,16 @@ _SESSION_GRANT_EXAMPLES = {
     "managementKey": {
         "summary": "Exchange a configured management key",
         "value": {"grantType": "managementKey", "managementKey": "<write-only>"},
+    },
+    "browserCookie": {
+        "summary": "Browser login that stores the session in an HttpOnly cookie",
+        "value": {
+            "grantType": "managementKey",
+            "managementKey": "<write-only>",
+            "sessionTransport": "cookie",
+            "clientName": "Parrot WebUI",
+            "deviceSummary": "Chrome on macOS",
+        },
     },
     "telegramApproval": {
         "summary": "Exchange an approved Telegram challenge",
@@ -92,6 +103,7 @@ _APPROVAL_CREATED_EXAMPLE = {
         "exchangeSecret": "<one-time-exchange-secret>",
         "expiresAt": "2026-01-02T03:07:05Z",
         "pollAfterSeconds": 2,
+        "confirmCode": "7KQ2",
     },
     "meta": {"requestId": "request-example"},
 }
@@ -223,7 +235,7 @@ def _session_summary(issued_or_verified) -> SessionSummary:
         ),
     },
 )
-async def create_management_session(
+def create_management_session(
     grant: Annotated[SessionGrant, Body(openapi_examples=_SESSION_GRANT_EXAMPLES)],
     request: Request,
     response: Response,
@@ -234,10 +246,19 @@ async def create_management_session(
     try:
         if isinstance(grant, ManagementKeyGrant):
             source = request.client.host if request.client else "unknown"
+            device = {
+                key: value
+                for key, value in (
+                    ("client_name", grant.clientName),
+                    ("device_summary", grant.deviceSummary),
+                )
+                if value is not None
+            }
             issued = runtime.sessions.create_from_management_key(
                 grant.managementKey.get_secret_value(),
                 source=source,
                 request_id=request_id,
+                **device,
             )
         else:
             issued = runtime.sessions.create_from_telegram_approval(
@@ -253,9 +274,14 @@ async def create_management_session(
     except SessionAuthenticationError as exc:
         raise ManagementError(ManagementErrorCode.AUTHENTICATION_FAILED) from exc
     response.headers["Cache-Control"] = "no-store"
+    credential: str | None = issued.credential
+    if grant.sessionTransport == "cookie":
+        # Script-invisible: the credential exists only in the HttpOnly cookie.
+        set_session_cookie(request, response, issued.credential, issued.expires_at)
+        credential = None
     return DataEnvelope(
         data=SessionCredentialData(
-            credential=issued.credential,
+            credential=credential,
             session=_session_summary(issued),
         ),
         meta=_meta(request),
@@ -278,7 +304,7 @@ async def create_management_session(
         ),
     },
 )
-async def get_current_management_session(
+def get_current_management_session(
     request: Request,
     response: Response,
     authenticated: Annotated[AuthenticatedSession, Depends(get_authenticated_session)],
@@ -304,7 +330,7 @@ async def get_current_management_session(
         ),
     },
 )
-async def revoke_current_management_session(
+def revoke_current_management_session(
     request: Request,
     authenticated: Annotated[AuthenticatedSession, Depends(get_authenticated_session)],
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
@@ -314,7 +340,10 @@ async def revoke_current_management_session(
         authenticated.credential,
         request_id=management_request_id(request),
     )
-    return Response(status_code=status.HTTP_204_NO_CONTENT, headers={"Cache-Control": "no-store"})
+    response = Response(status_code=status.HTTP_204_NO_CONTENT, headers={"Cache-Control": "no-store"})
+    if has_session_cookie(request):
+        clear_session_cookie(request, response)
+    return response
 
 
 @router.post(
@@ -346,7 +375,7 @@ async def create_telegram_approval(
     reject_unknown_query_parameters(request)
     request_id = management_request_id(request)
     try:
-        issued = await asyncio.to_thread(
+        issued = await run_in_threadpool(
             runtime.approvals.create,
             client_name=body.clientName,
             source_address=request.client.host if request.client else "unknown",
@@ -369,6 +398,7 @@ async def create_telegram_approval(
             exchangeSecret=issued.exchange_secret,
             expiresAt=issued.expires_at,
             pollAfterSeconds=issued.poll_after_seconds,
+            confirmCode=issued.confirm_code,
         ),
         meta=_meta(request),
     )
@@ -389,7 +419,7 @@ async def create_telegram_approval(
         ),
     },
 )
-async def get_telegram_approval(
+def get_telegram_approval(
     approvalId: Annotated[str, Path(min_length=8, max_length=128)],
     request: Request,
     response: Response,
@@ -434,7 +464,7 @@ async def get_telegram_approval(
         ),
     },
 )
-async def get_management_metadata(
+def get_management_metadata(
     request: Request,
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
     context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
@@ -478,7 +508,7 @@ async def get_management_metadata(
         ),
     },
 )
-async def get_management_capabilities(
+def get_management_capabilities(
     request: Request,
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
     context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
@@ -522,7 +552,7 @@ async def get_management_capabilities(
         ),
     },
 )
-async def get_management_operation(
+def get_management_operation(
     operationId: Annotated[str, Path(min_length=4, max_length=128)],
     request: Request,
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
@@ -553,7 +583,7 @@ async def get_management_operation(
         ),
     },
 )
-async def cancel_management_operation(
+def cancel_management_operation(
     operationId: Annotated[str, Path(min_length=4, max_length=128)],
     request: Request,
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],

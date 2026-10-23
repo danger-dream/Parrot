@@ -491,11 +491,35 @@ class SearchControl(DomainControl):
             raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE) from None
         self._audit(context, "search.test", "search", "succeeded")
         # This is a management probe, not a second public search endpoint. No
-        # upstream body, query, result URLs or credential-bearing config in audit/DTO.
+        # upstream body, query or credential-bearing config in audit/DTO. The
+        # operation result (visible only to the requesting actor) previews the
+        # first results' title + URL so an operator can judge the answer.
         return {"backendId": backend_id, "operation": operation, "succeeded": True,
                 "resultCount": len(result.get("results") or []),
                 "contentChars": len(result.get("content") or ""),
-                "attemptCount": len(result.get("attempts") or [])}
+                "attemptCount": len(result.get("attempts") or []),
+                "results": self._result_preview(result.get("results"))}
+
+    TEST_PREVIEW_LIMIT = 5
+
+    @classmethod
+    def _result_preview(cls, results) -> list[dict]:
+        from urllib.parse import urlsplit, urlunsplit
+        preview = []
+        for item in (results if isinstance(results, list) else []):
+            if len(preview) >= cls.TEST_PREVIEW_LIMIT:
+                break
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "")[:2048]
+            try:
+                parts = urlsplit(url)
+                if parts.username or parts.password:  # never echo URL credentials
+                    url = urlunsplit((parts.scheme, parts.hostname or "", parts.path, parts.query, parts.fragment))
+            except ValueError:
+                url = ""
+            preview.append({"title": str(item.get("title") or "")[:300], "url": url})
+        return preview
 
     def start_test(self, context, backend_id, *, operation="search", query=None, url=None):
         self._write(context)

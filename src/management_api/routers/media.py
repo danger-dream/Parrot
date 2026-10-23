@@ -4,7 +4,7 @@ from typing import Annotated
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Path, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from src.management_auth import Capability
 from src.management_control import ManagementContext, ManagementErrorCode
@@ -20,6 +20,7 @@ from src.management_control.observability import (
 from ..dependencies import require_capability
 from ..error_mapping import management_error_responses
 from ..schemas import DataEnvelope
+from ..schemas.base import StrictSchema
 from ..schemas.observability import (
     MediaArtifactData,
     MediaLogData,
@@ -65,6 +66,40 @@ _ERRORS = management_error_responses(
     ManagementErrorCode.CAPABILITY_DENIED, ManagementErrorCode.VALIDATION_FAILED,
     ManagementErrorCode.RESOURCE_NOT_FOUND, ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
 )
+
+
+class MediaTopAccountData(StrictSchema):
+    accountKey: str
+    accountEmail: str | None = None
+    provider: str
+    total: int
+    costUsdTicks: int
+
+
+class MediaLogSummaryData(StrictSchema):
+    """TG 多媒体日志汇总: GPT / Grok images, videos, outcomes, cost, OAuth top 3."""
+    total: int
+    openaiImages: int
+    xaiImages: int
+    videos: int
+    successCount: int
+    failedCount: int
+    pendingCount: int
+    expiredCount: int
+    costUsdTicks: int
+    topAccounts: list[MediaTopAccountData]
+
+
+@router.get(
+    "/summary", operation_id="getMediaLogSummary",
+    response_model=DataEnvelope[MediaLogSummaryData], responses=_ERRORS,
+)
+def get_media_log_summary(
+    request: Request,
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
+) -> DataEnvelope[MediaLogSummaryData]:
+    reject_unknown_query(request, ())
+    return DataEnvelope(data=MediaLogSummaryData(**controls(request).media.summary(context)), meta=meta(request))
 
 
 @router.get(
@@ -142,16 +177,29 @@ def download_media_artifact(
     artifact_id: Annotated[str, Path(alias="artifactId", min_length=1, max_length=128)],
 ) -> StreamingResponse:
     reject_unknown_query(request, ())
-    artifact = controls(request).media.download(context, media_log_id, artifact_id)
+    try:
+        artifact = controls(request).media.download(
+            context, media_log_id, artifact_id, range_header=request.headers.get("range"),
+        )
+    except ValueError:
+        size = next((item["sizeBytes"] for item in controls(request).media.artifacts(context, media_log_id)
+                     if item["id"] == artifact_id), 0)
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{size}",
+                                                  "Accept-Ranges": "bytes", "Cache-Control": "private, no-store"})
     filename = quote(artifact.filename, safe="")
+    headers = {
+        "Content-Length": str(artifact.size),
+        "Content-Disposition": f"attachment; filename*=UTF-8''{filename}",
+        "Cache-Control": "private, no-store",
+        "Accept-Ranges": "bytes",
+    }
+    byte_range = getattr(artifact, "range", None)
+    if byte_range is not None:
+        start, end = byte_range
+        headers["Content-Range"] = f"bytes {start}-{end}/{artifact.total_size}"
     return StreamingResponse(
-        artifact.chunks,
-        media_type=artifact.content_type,
-        headers={
-            "Content-Length": str(artifact.size),
-            "Content-Disposition": f"attachment; filename*=UTF-8''{filename}",
-            "Cache-Control": "private, no-store",
-        },
+        artifact.chunks, status_code=206 if byte_range is not None else 200,
+        media_type=artifact.content_type, headers=headers,
     )
 
 

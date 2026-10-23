@@ -13,7 +13,7 @@ from src.management_control.models import ModelOwnerRef, ModelSourceType
 
 from ..dependencies import require_capability
 from ..error_mapping import management_error_responses
-from ..schemas.base import DataEnvelope
+from ..schemas.base import DataEnvelope, StrictSchema
 from ..schemas.auxiliary_media import (
     AntigravityMediaAccountOverrideData,
     AntigravityMediaModelAddRequest,
@@ -440,3 +440,46 @@ def update_media_source(kind: MediaKind, source_id: Annotated[str, Path(alias='s
     control = controls.images if kind is MediaKind.IMAGE else controls.videos
     value = control.update_source(context, source_id, enabled=body.enabled, expected_revision=if_match)
     return DataEnvelope(data=_source(value), meta=response_meta(request))
+
+
+class MediaModelStatisticData(StrictSchema):
+    model: str
+    completedCalls: int
+    generatedCount: int
+    unknownCountCalls: int
+    recordedBytes: int
+    unknownBytesCalls: int
+
+
+class MediaCacheOccupancyData(StrictSchema):
+    files: int
+    bytes: int
+
+
+class MediaStatisticsData(StrictSchema):
+    """TG 模型中心 · 图片/视频: 当前缓存占用 + 各模型已生成数量."""
+    cache: MediaCacheOccupancyData
+    models: list[MediaModelStatisticData]
+
+
+@router.get('/media/{kind}/statistics', operation_id='getMediaStatistics', tags=['media'],
+    dependencies=[Depends(reject_unknown_query())], response_model=DataEnvelope[MediaStatisticsData],
+    responses={**success_response(200, {'data': {'cache': {'files': 3, 'bytes': 1048576}, 'models': [{
+        'model': 'gpt-image-2', 'completedCalls': 4, 'generatedCount': 5, 'unknownCountCalls': 0,
+        'recordedBytes': 1048576, 'unknownBytesCalls': 0}]}, 'meta': {'requestId': 'request-example'}}),
+        **management_error_responses(*_ERRORS)})
+def get_media_statistics(kind: MediaKind, request: Request,
+    controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))]):
+    control = controls.images if kind is MediaKind.IMAGE else controls.videos
+    value = control.statistics(context)
+    number = lambda raw: int(raw or 0)
+    cache = value.get('cache') or {}
+    return DataEnvelope(data=MediaStatisticsData(
+        cache=MediaCacheOccupancyData(files=number(cache.get('files')), bytes=number(cache.get('bytes'))),
+        models=[MediaModelStatisticData(
+            model=str(row.get('model') or ''), completedCalls=number(row.get('completed_calls')),
+            generatedCount=number(row.get('generated_count')), unknownCountCalls=number(row.get('unknown_count_calls')),
+            recordedBytes=number(row.get('recorded_bytes')), unknownBytesCalls=number(row.get('unknown_bytes_calls')),
+        ) for row in value.get('models') or []],
+    ), meta=response_meta(request))

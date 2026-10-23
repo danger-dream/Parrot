@@ -122,6 +122,7 @@ def _settings(value) -> TranslationSettingsData:
         },
         prompt=value.prompt,
         revision=value.revision,
+        defaultPrompt=getattr(value, "default_prompt", "") or "",
     )
 
 

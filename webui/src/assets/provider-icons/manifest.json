@@ -1,0 +1,23 @@
+{
+  "alibaba-bailian": "alibaba-bailian.webp",
+  "anthropic": "claude.webp",
+  "antigravity": "antigravity.webp",
+  "baidu-qianfan": "baidu-qianfan.webp",
+  "claude": "claude.webp",
+  "ctyun-xirang": "ctyun-xirang.webp",
+  "cursor": "cursor.webp",
+  "deepseek": "deepseek.webp",
+  "jd-cloud": "jd-cloud.webp",
+  "kimi": "kimi.webp",
+  "minimax": "minimax.webp",
+  "ollama-cloud": "ollama-cloud.webp",
+  "openai": "openai.webp",
+  "openrouter": "openrouter.webp",
+  "qoder": "qoder.webp",
+  "tencent-cloud": "tencent-cloud.webp",
+  "volcengine-ark": "volcengine-ark.webp",
+  "workbuddy": "workbuddy.webp",
+  "xai": "xai.webp",
+  "xiaomi-mimo": "xiaomi-mimo.webp",
+  "zhipu": "zhipu.webp"
+}

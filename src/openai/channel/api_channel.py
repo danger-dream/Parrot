@@ -57,6 +57,12 @@ class OpenAIApiChannel(Channel):
         self.models: list[dict] = list(entry.get("models") or [])
         self.enabled = bool(entry.get("enabled", True))
         self.disabled_reason = entry.get("disabled_reason")
+        # 并发限制：与 Anthropic API 渠道同一语义。0 或缺省 → 用
+        # concurrency.defaultMaxConcurrent（仍 0 则不限）。
+        try:
+            self.max_concurrent = max(0, int(entry.get("maxConcurrent", 0) or 0))
+        except (TypeError, ValueError):
+            self.max_concurrent = 0
         self.protocol = entry.get("protocol", "openai-chat")
         if self.protocol not in ("openai-chat", "openai-responses"):
             raise ValueError(

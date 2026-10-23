@@ -347,8 +347,15 @@ async def recovery_loop() -> None:
             interval = int(recovery_cfg.get("intervalSeconds", 30))
         except Exception:
             interval = 30
+        from . import job_telemetry
+        job_telemetry.scheduled("cooldownProbe", interval)
         await asyncio.sleep(interval)
+        job_telemetry.started("cooldownProbe")
+        probe_error = None
         try:
             await recovery_run_once()
         except Exception as exc:
+            probe_error = type(exc).__name__
             print(f"[probe] recovery_run_once error: {exc}")
+        job_telemetry.finished("cooldownProbe", ok=probe_error is None, error=probe_error,
+                               next_delay_seconds=interval)

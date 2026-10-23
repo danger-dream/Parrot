@@ -1,0 +1,1 @@
+export { openRequest } from '@/links'

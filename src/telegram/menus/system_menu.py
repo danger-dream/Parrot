@@ -197,6 +197,7 @@ def _main_text_and_kb() -> tuple[str, dict]:
          ui.btn("🆕 版本更新", "menu:update")],
         [ui.btn("🔎 搜索工具", "srch:show"),
          ui.btn("🔌 MCP 服务", "mcp:show")],
+        [ui.btn("🖥 WebUI", "sys:show:webui")],
         [ui.btn("🔁 重试设置", "sys:show:retry"),
          ui.btn("◀ 返回主菜单", "menu:main")],
     ])
@@ -2632,6 +2633,10 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "sys:edit:aklim_queue":        _edit_aklim(chat_id, message_id, cb_id, "queue"); return True
     if data == "sys:edit:aklim_wait":         _edit_aklim(chat_id, message_id, cb_id, "wait"); return True
 
+    # WebUI 开关
+    if data == "sys:show:webui":              _show_webui(chat_id, message_id, cb_id); return True
+    if data == "sys:webui:toggle":            _on_webui_toggle(chat_id, message_id, cb_id); return True
+
     # WS 模式
     if data == "sys:show:ws_mode":            _show_ws_mode(chat_id, message_id, cb_id); return True
     if data == "sys:ws_mode:toggle":          _on_ws_mode_toggle(chat_id, message_id, cb_id); return True
@@ -2959,6 +2964,48 @@ def _show_ws_mode(chat_id: int, message_id: int, cb_id: str) -> None:
         [ui.btn("🔴 关闭 HTTP→WS 上游转换" if enabled else "🟢 开启 HTTP→WS 上游转换", "sys:ws_mode:toggle")],
         [ui.btn("◀ 返回设置", "menu:settings")],
     ]))
+
+
+def _webui_text_kb() -> tuple[str, dict]:
+    cfg = _runtime_control.config_snapshot()
+    enabled = _settings_control.web_ui_enabled()
+    listen = cfg.get("listen") or {}
+    host = str(listen.get("host") or "").strip()
+    port = listen.get("port") or ""
+    wildcard = host in {"", "0.0.0.0", "::", "[::]"}
+    shown_host = "&lt;服务器IP&gt;" if wildcard else ui.escape_html(
+        f"[{host}]" if ":" in host and not host.startswith("[") else host
+    )
+    lines = [
+        "🖥 <b>WebUI</b>",
+        "",
+        f"当前状态：<code>{'已开启' if enabled else '已关闭'}</code>",
+        f"访问地址：<code>http://{shown_host}:{ui.escape_html(str(port))}/ui/</code>",
+    ]
+    if wildcard:
+        lines.append(f"<i>当前监听 {ui.escape_html(host or '0.0.0.0')}，请将 &lt;服务器IP&gt; 替换为服务器的 IP 或域名</i>")
+    lines.extend(["", "登录需在 Telegram 中点击批准"])
+    kb = ui.inline_kb([
+        [ui.btn("🔴 关闭 WebUI" if enabled else "🟢 开启 WebUI", "sys:webui:toggle")],
+        [ui.btn("◀ 返回系统设置", "menu:settings")],
+    ])
+    return "\n".join(lines), kb
+
+
+def _show_webui(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    text, kb = _webui_text_kb()
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def _on_webui_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
+    enabled = _settings_control.web_ui_enabled()
+    _settings_control.update_web_ui(
+        _control_context(chat_id), {"enabled": not enabled},
+    )
+    ui.answer_cb(cb_id, "WebUI 已关闭" if enabled else "WebUI 已开启")
+    text, kb = _webui_text_kb()
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 def _on_ws_mode_toggle(chat_id: int, message_id: int, cb_id: str) -> None:

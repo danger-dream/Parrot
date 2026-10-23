@@ -1,10 +1,10 @@
 """WorkBuddy HTTP adapters; shared controls own all account/action behavior."""
 from __future__ import annotations
 
-import asyncio
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Header, Path, Query, Request, Response
+from starlette.concurrency import run_in_threadpool
 
 from src.management_auth import Capability
 from src.management_control import ManagementContext, ManagementErrorCode
@@ -47,7 +47,7 @@ def refresh_status(accountId: AccountId, request: Request, context: WriteContext
     response_model=DataEnvelope[WorkBuddyPlanData], responses=responses(200, {"planToken": "wbaction_example.secret", "accountId": "workbuddy:cn:fixture:p", "action": "checkin", "businessDate": "2026-09-07", "expiresAt": "2026-09-07T10:00:00Z", "allowUnknown": False, "freeTrialConfirmed": False, "retryFailed": False}, ManagementErrorCode.INVALID_OPERATION_STATE))
 async def plan_action(accountId: AccountId, body: Annotated[WorkBuddyPlanRequest, Body()], request: Request,
                       response: Response, context: WriteContext, control: Control):
-    value = await asyncio.to_thread(control.plan_workbuddy_action, context, accountId, body.action.replace("-", "_"),
+    value = await run_in_threadpool(control.plan_workbuddy_action, context, accountId, body.action.replace("-", "_"),
         allow_unknown=body.allowUnknown, free_trial_confirmed=body.freeTrialConfirmed, retry_failed=body.retryFailed)
     safe = public({key: item for key, item in value.items() if key != "plan_token"})
     safe["planToken"] = value["plan_token"]  # Explicit one-time capability response only.
