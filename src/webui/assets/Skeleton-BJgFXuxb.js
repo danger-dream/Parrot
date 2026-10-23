@@ -1,1 +1,0 @@
-import{Un as e,Yn as t,tr as n,vr as r}from"./vendor-BkjYmpox.js";import{s as i}from"./client-QfKjXhzW.js";var a=i(t({__name:`Skeleton`,props:{w:{},h:{},r:{}},setup(t){return(i,a)=>(n(),e(`span`,{class:`sk`,style:r({width:t.w||`100%`,height:t.h||`12px`,borderRadius:t.r||`6px`})},null,4))}}),[[`__scopeId`,`data-v-c05b5495`]]);export{a as t};

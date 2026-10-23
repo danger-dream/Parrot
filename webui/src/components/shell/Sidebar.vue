@@ -203,9 +203,10 @@ const pulse = computed(() => {
   display: grid;
   place-items: center;
 }
-.item:hover .foot {
+/* The footer spans the sidebar's full width, separated by a hairline like the collapsed rail. */
+.foot {
   flex-shrink: 0;
-  padding: 10px 10px 12px;
+  border-top: 0.5px solid var(--hairline);
 }
 .rail .foot {
   padding: 12px 0;
@@ -223,15 +224,12 @@ const pulse = computed(() => {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding: 10px 12px 9px;
-  border-radius: var(--radius-md);
-  background: var(--fill-3);
-  box-shadow: inset 0 0 0 0.5px var(--border);
+  padding: 10px 16px 12px;
   cursor: pointer;
   transition: background 0.15s;
 }
 .status-card:hover {
-  background: var(--fill-2);
+  background: var(--fill-3);
 }
 .sc-top {
   display: flex;
