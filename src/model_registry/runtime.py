@@ -45,10 +45,13 @@ def _catalog_index() -> CatalogIndex:
     return _catalog[1]
 
 
+NAMING_BUTTON = {"inline_keyboard": [[{"text": "🧩 统一命名", "callback_data": "nt:open:naming"}]]}
+
+
 def alert(text: str) -> None:
     from .. import notifier
     print(f"[model-registry] {text}")
-    notifier.notify_event("model_registry", "🧩 <b>模型命名</b>\n\n" + notifier.escape_html(text))
+    notifier.notify_event("model_registry", "🧩 <b>模型命名</b>\n\n" + notifier.escape_html(text), reply_markup=NAMING_BUTTON)
 
 
 def _valid_rules(rules: Iterable[Any]) -> list[dict]:
@@ -196,7 +199,7 @@ def _report_drift(registry: Registry, cfg: Mapping[str, Any]) -> None:
         return
     shown = lines[:12] + ([f"……另有 {len(lines) - 12} 条"] if len(lines) > 12 else [])
     notifier.notify_event("model_registry", "🧩 <b>模型命名变化</b>\n\n" + "\n".join(
-        "• " + notifier.escape_html(line) for line in shown) + "\n\n在模型中心「统一命名」里处理。")
+        "• " + notifier.escape_html(line) for line in shown) + "\n\n处理：在「统一命名」里确认或改名。", reply_markup=NAMING_BUTTON)
 
 
 def current() -> Registry | None:

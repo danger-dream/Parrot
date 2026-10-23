@@ -254,7 +254,7 @@ def test_tg_pending_message_updates_on_same_future_completion(onboarding, monkey
     for thread in threading.enumerate():
         if thread.name == "oauth-model-sync-ui":
             thread.join(3)
-    assert len(messages) == 2 and ("操作需要关注" if worker_timeout else "操作已完成") in messages[-1]
+    assert len(messages) == 2 and ("操作部分未完成" if worker_timeout else "操作已完成") in messages[-1]
     assert ("模型目录：未完成" if worker_timeout else "元数据：已完成") in messages[-1]
 
 

@@ -59,18 +59,20 @@ def test_vertical_delivery_view_close_per_recipient(env, monkeypatch):
     assert "OpenAI" in send["text"] and "A&lt;b&gt;" in send["text"]
     assert "Team" in send["text"] and "oauth:" not in send["text"]
     data = send["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+    before = len(calls)
     notification_menu.handle_callback(callback(rows[0], data))
-    assert opened == [(rows[0]["chat_id"], rows[0]["message_id"], oauth_ids.account_key(cfg["oauthAccounts"][0]))]
+    # The account page opens as a NEW message below; the notification stays the record.
+    page = next(i for i, (m, p) in enumerate(calls[before:], before) if m == "sendMessage")
+    assert opened == [(rows[0]["chat_id"], page + 101, oauth_ids.account_key(cfg["oauthAccounts"][0]))]
+    assert not any(m.startswith("edit") and p.get("message_id") == rows[0]["message_id"] for m, p in calls[before:])
     viewed = store.get("deliveries", rows[0]["id"])
-    assert viewed["message_owner"] == "management" and not viewed.get("panel_id")
+    assert viewed.get("message_owner") is None and not viewed.get("panel_id")
     deletes = lambda: [p for m, p in calls if m == "deleteMessage"]
-    # The notification became the account page: auto-delete/close must not remove it.
-    assert delivery.close(rows[0]["id"]) and not deletes()
-    assert store.get("deliveries", rows[0]["id"])["state"] == "sent"
+    assert delivery.close(rows[0]["id"]) is None and [p["message_id"] for p in deletes()] == [rows[0]["message_id"]]
     close = next("nt:v1:" + k for k,r in store.items("refs").items() if r["delivery_id"] == rows[1]["id"] and r["action"] == "close")
     notification_menu.handle_callback(callback(rows[1], close))
     assert store.get("deliveries", rows[1]["id"])["state"] == "closed"
-    assert [p["message_id"] for p in deletes()] == [rows[1]["message_id"]]
+    assert [p["message_id"] for p in deletes()] == [rows[0]["message_id"], rows[1]["message_id"]]
     assert cfg["oauthAccounts"][0]["enabled"] is True
 
 
@@ -297,15 +299,19 @@ def test_view_opens_oauth_account_detail_and_preserves_input(env, monkeypatch):
     states.set_state(11, 'unrelated_input', {'keep': 'original'})
     before = copy.deepcopy(states.get_state(11))
     sends = [p for m,p in env[3] if m == 'sendMessage']
-    assert sends[0]['reply_markup']['inline_keyboard'][0][0]['text'] == '👤 查看账户'
+    assert sends[0]['reply_markup']['inline_keyboard'][0][0]['text'] == '👤 账户详情'
     notification_menu.handle_callback(callback(row, data))
     key = event().subject.exact_id
-    assert rendered == [((row['chat_id'], row['message_id'], key, 1, oauth_menu._FILTER_ALL), {'refresh_quota': False, 'start_view': True})]
+    assert len(rendered) == 1 and rendered[0][1] == {'refresh_quota': False, 'start_view': True}
+    chat, page, *rest = rendered[0][0]
+    assert (chat, tuple(rest)) == (row['chat_id'], (key, 1, oauth_menu._FILTER_ALL)) and page != row['message_id']
     assert states.get_state(11) == before
     notification_menu.handle_callback(callback(row, data))
+    # Buttons on notifications sent before the redesign ("quota", "auth") still reach the account.
     notification_menu.handle_callback(callback(row, store.action_ref(row['id'], 'quota')))
-    assert len(rendered) == 3 and rendered[1] == rendered[2] == rendered[0]
-    assert len([p for m,p in env[3] if m == 'sendMessage']) == len(sends)
+    notification_menu.handle_callback(callback(row, store.action_ref(row['id'], 'auth')))
+    assert len(rendered) == 4 and {args[2:] for args, _ in rendered} == {(key, 1, oauth_menu._FILTER_ALL)}
+    assert len({args[1] for args, _ in rendered} | {row['message_id']}) == 5
     states.clear_all()
 
 
@@ -331,7 +337,7 @@ def test_real_operation_ledger_not_notification_list(env, controlled):
     ops.jobs[0]()
     text = '\n'.join(views.records(e, 11))
     assert 'refresh_usage' in text and 'succeeded' in text and 'op-0' in text
-    assert '额度达到暂停条件' not in text
+    assert '额度达到暂停线' not in text
 
 
 def test_callbacks_cancel_and_more_pagination(env, controlled):
@@ -448,12 +454,7 @@ def test_identity_conflict_legacy_restart_and_long_html(env, monkeypatch):
     assert len(html)<3900 and '<i>' not in html and '数值未取得' in html and '0%' not in html
 
 
-def test_store_and_request_details_read_only(env, monkeypatch):
+def test_store_details_read_only(env):
     from src.notifications import views
-    from src.management_control.observability.logs import LogsControl
-    monkeypatch.setattr(LogsControl,'detail',lambda self,ctx,rid:{'log':{'id':rid,'status':'success','requestedModel':'m'},'attempts':[{}]})
-    e=saved_event('request.model.changed',{'request_id':'rid','requested_model':'m','outbound_model':'m','actual_model':'n'})
-    assert '关联请求实际记录' in '\n'.join(views.request_lines(e,11))
-    assert 'rid' in '\n'.join(views.request_lines(e,11))
     text='\n'.join(views.storage_lines())
     assert '配置启用' in text and '本进程已初始化' in text

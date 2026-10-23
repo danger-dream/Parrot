@@ -1071,11 +1071,13 @@ def _record_failure(cfg: dict) -> None:
     if threshold > 0 and count == threshold:
         try:
             from . import notifier
-            notifier.notify(
-                f"⚠ <b>翻译层连续失败 {count} 次</b>\n"
-                f"主模型: <code>{cfg.get('model', '?')}</code>\n"
-                f"备用模型: <code>{cfg.get('fallbackModel', '?')}</code>\n"
-                "请检查翻译模型可用性。"
+            notifier.notify_event(
+                "translation_failed",
+                f"⚠️ <b>翻译层连续失败 {count} 次</b>\n"
+                f"主模型：<code>{notifier.escape_html(cfg.get('model', '?'))}</code>\n"
+                f"备用模型：<code>{notifier.escape_html(cfg.get('fallbackModel', '?'))}</code>\n\n"
+                "处理：在翻译设置里换一个可用的模型，或点「测试」确认。",
+                reply_markup={"inline_keyboard": [[{"text": "🌐 翻译设置", "callback_data": "nt:open:translation"}]]},
             )
         except Exception:
             pass

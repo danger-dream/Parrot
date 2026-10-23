@@ -866,6 +866,13 @@ def _edit_cached_detail(
     return True
 
 
+def open_detail(chat_id: int, message_id: int, name: str) -> bool:
+    """把指定消息替换为 Key 详情页（通知等外部入口复用）。"""
+    if not ui.is_admin(chat_id) or _get_entry(name) is None:
+        return False
+    return _edit_cached_detail(chat_id, message_id, name, 1, start_view=True)
+
+
 def on_view(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1) -> None:
     name = _name_of(short)
     if not name:

@@ -37,17 +37,24 @@ def request(method, payload):
         return None
 
 
-def keyboard(delivery_id, event):
+MAX_BUTTONS = 6
+
+
+def layout(event):
+    """(label, action) pairs for the notification itself: where to go and what to do, then mute/close."""
     from .actions import available
-    from .subjects import current
-    name = {"account": "👤 查看账户", "channel": "🔌 查看渠道"}.get(event["subject"]["kind"], "📋 查看事件详情") if current(event["subject"]) is not None else "📋 查看历史事件"
-    choices = [(name, "view")]
-    for action, label in available(event):
-        if action not in {"view", "close"}:
-            choices.append((label, action))
-            break
-    choices += [("⋯ 更多操作", "more"), ("🔕 暂停重复提醒", "mute"), ("✖ 关闭本条", "close")]
-    buttons = [{"text": label, "callback_data": store.action_ref(delivery_id, action)} for label, action in choices]
+    spec = CATALOG[event["event_type"]]
+    choices = [(label, action) for action, label in available(event)]
+    tail = [("🔕 暂停提醒", "mute")] if spec.repeat or (spec.phase == "opened" and not spec.episodic) else []
+    tail.append(("✖ 关闭", "close"))
+    room = MAX_BUTTONS - len(tail)
+    if len(choices) > room:
+        choices = choices[:room - 1] + [("⋯ 更多", "more")]
+    return choices + tail
+
+
+def keyboard(delivery_id, event):
+    buttons = [{"text": label, "callback_data": store.action_ref(delivery_id, action)} for label, action in layout(event)]
     return {"inline_keyboard": [buttons[i:i+2] for i in range(0, len(buttons), 2)]}
 
 

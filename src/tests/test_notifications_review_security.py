@@ -349,7 +349,6 @@ def test_review_refresh_protection_rechecked_after_queue(env, real_control, monk
 
 
 def test_review_api_channel_generation_and_local_view(env, real_control, monkeypatch):
-    from src.notifications import views
     from src import channel_state
     from src.telegram.menus import channel_menu
     opened = []
@@ -368,12 +367,13 @@ def test_review_api_channel_generation_and_local_view(env, real_control, monkeyp
     assert current['key'] == 'api:renamed-api'
     click(rows[0], 'view')
     assert opened == ['renamed-api']
-    assert 'fixture-api-private' not in '\n'.join(views.model_lines(sample))
+    labels = [label for label, _ in delivery.layout(sample)]
+    assert '🔌 渠道详情' in labels and '📋 账户模型' not in labels
     env[0]['channels'][0]['generationId'] = 'review-api-rebuilt'
     assert subjects.current(old) is None
     click(rows[1], 'view')
     assert opened == ['renamed-api']
-    assert '原对象已删除' in '\n'.join(views.model_lines(sample))
+    assert '原账户已删除' in [p for m, p in env[3] if m == 'editMessageText'][-1]['text']
     assert 'fixture-api-private' not in str(env[3])
 
 

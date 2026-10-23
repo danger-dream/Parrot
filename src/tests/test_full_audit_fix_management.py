@@ -320,7 +320,7 @@ def fake_status(monkeypatch):
     seen, notifications = set(), []
     monkeypatch.setattr(sm, '_load_seen', lambda p: seen.copy())
     monkeypatch.setattr(sm, '_mark_seen', lambda p, u, i, s: seen.add(u))
-    monkeypatch.setattr(sm.notifier, 'notify_event', lambda key, text: notifications.append(text) or True)
+    monkeypatch.setattr(sm.notifier, 'notify_event', lambda key, text, **kw: notifications.append(text) or True)
     monkeypatch.setattr(sm, '_cleanup_stale_mutes', lambda ids: 0)
     return sm, seen, notifications
 

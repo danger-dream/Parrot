@@ -56,12 +56,12 @@ def test_realtime_quota_notice_bjt_preserves_utc_reset(m, monkeypatch, provider,
     assert len(messages) == 1
     expected = "unknown" if reset is None else (
         datetime.fromisoformat(reset.replace("Z", "+00:00"))
-        .astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+        .astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
     )
     if reset:
-        assert expected in messages[0] and "北京时间" in messages[0]
+        assert "重置时间：" + expected in messages[0]
     else:
-        assert "上游给出的重置时间" not in messages[0]
+        assert "重置时间" not in messages[0]
     if reset:
         assert reset not in messages[0]
 

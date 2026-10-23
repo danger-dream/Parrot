@@ -56,7 +56,7 @@ def test_automatic_claim_notifies_once_and_cooldown_prevents_post(reset_env, mon
     actions.auto_claim(key, copy.deepcopy(om.get_account(key)), snapshot)
     posts = [(url, kw) for url, kw in state["calls"] if kw.get("method") == "POST"]
     assert len(posts) == 1 and posts[0][0].endswith("/opportunity")
-    assert len(notifications) == 1 and "未自动使用" in notifications[0]
+    assert len(notifications) == 1 and "不会自动使用" in notifications[0]
     assert om.get_account(key)["zhipu_reset_status"]["data"]
 
 

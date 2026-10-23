@@ -200,7 +200,7 @@ def test_metric_reset_certainty_and_zero_are_truthful(review):
     sample = replace(quota(review), facts={'metrics': [{'metric_id': 'calls', 'kind': 'requests', 'remaining': 0,
         'unit': '次', 'reset_at': '2026-10-18T00:00:00Z', 'reset_certainty': 'estimated'}]})
     text = content.render(sample.record(), detail=True)
-    assert '剩余 0次' in text and '预计重置时间' in text and '08:00:00 北京时间' in text
+    assert '剩余 0 次' in text and '预计 2026-10-18 08:00 重置' in text
     assert '上游给出的重置时间' not in text
 
 
@@ -210,7 +210,7 @@ def test_recovery_can_replace_unsubmitted_fault_at_exact_event_capacity(review, 
     recovered = quota(review, recovered=True); assert emit(recovered)
     review.drain()
     assert len(store.items('events')) <= 1
-    assert len(review.calls) == 2 and all('配额已恢复' in p['text'] for m, p in review.calls)
+    assert len(review.calls) == 2 and all('额度已恢复' in p['text'] for m, p in review.calls)
 
 
 @pytest.mark.parametrize('result', [{'status': 'succeeded'}, {'status': 'succeeded', 'quota_action': 'resumed'}])

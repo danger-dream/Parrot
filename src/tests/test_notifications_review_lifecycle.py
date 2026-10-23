@@ -213,7 +213,7 @@ def test_review_recovery_already_superseded_is_not_sent_as_current(review):
     assert emit(recovered)
     assert emit(quota(review))
     review.drain()
-    assert not any('· 配额已恢复' in p.get('text', '') for m, p in review.calls if m == 'sendMessage'), 'worker delivered recovery after a newer confirmed fault'
+    assert not any('· 额度已恢复' in p.get('text', '') for m, p in review.calls if m == 'sendMessage'), 'worker delivered recovery after a newer confirmed fault'
 
 
 def test_review_confirmed_pause_after_unknown_effect_is_new_decision(review):
@@ -290,7 +290,7 @@ def test_review_present_not_saved_with_completed_substeps_still_reports_result(r
     result = operations.present(11, 77, review.subject, operation='导入', saved=False,
         stages=[{'name': '凭据预检', 'status': 'succeeded'}, {'name': '写入账户', 'status': 'skipped'}])
     assert result['event_type'] == 'operation.attention'
-    assert review.calls and '未确认账户保存成功' in review.calls[-1][1]['text']
+    assert review.calls and '未确认保存成功' in review.calls[-1][1]['text']
 
 
 def test_review_metrics_are_registered_and_reset_unknown_is_not_lost(review):
@@ -313,7 +313,7 @@ def test_review_html_and_unknown_values_remain_truthful(review):
     rendered = content.render(event.record())
     assert 'Review &lt;&amp;&gt;' in rendered
     assert '数值未取得' in rendered and '0%' not in rendered
-    assert '当前影响尚未确认' in rendered and 'Parrot 已暂停此账号调用' not in rendered
+    assert '实际影响尚未确认' in rendered and '已暂停调用此账号' not in rendered
 
 
 def test_review_gc_preserves_unsubmitted_outbox_event(review, monkeypatch):
@@ -353,7 +353,7 @@ def test_review_capture_order_prevents_stale_fault_after_new_recovery(review):
     assert emit(quota(review, recovered=True, version=recovered_version))
     assert not emit(replace(quota(review, version=old_version), subject=old_subject))
     review.drain()
-    assert all('配额已恢复' in p['text'] for m, p in review.calls if m == 'sendMessage')
+    assert all('额度已恢复' in p['text'] for m, p in review.calls if m == 'sendMessage')
     assert not next(iter(store.items('incidents').values()))['active']
 
 
@@ -364,7 +364,7 @@ def test_review_operation_result_survives_auxiliary_persistence_failure(review, 
         continuation=[[{'text': '继续既有流程', 'callback_data': 'existing-workflow:synthetic-nonce'}]])
     assert event['event_type'] == 'operation.completed'
     assert len(review.calls) == 1 and review.calls[0][0] == 'editMessageText'
-    assert '账户已保存' in review.calls[0][1]['text']
+    assert '账号已保存' in review.calls[0][1]['text']
     assert all('synthetic-nonce' not in json.dumps(review.db.items(d)) for d in store.DOMAINS)
 
 

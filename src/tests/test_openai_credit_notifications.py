@@ -60,7 +60,7 @@ def test_credit_notification_is_shared_by_live_and_monitor_paths(m, account, mon
         monkeypatch.setattr(m["openai_provider"], "_mock_wham_payload", _payload)
         asyncio.run(m["oauth_manager"].quota_monitor_once())
     assert len(sent) == 1
-    assert "套餐额度耗尽，将使用积分" in sent[0]
+    assert "套餐额度用完，开始消耗积分" in sent[0] and "已用 100%" in sent[0]
     assert "credit-alert@quota.test" in sent[0]
     assert "暂停积分续用" in sent[0]
     assert m["oauth_manager"].get_account(key)["enabled"] is True
@@ -261,7 +261,7 @@ def test_tg_notification_has_independent_toggle(m, account, monkeypatch):
     system_menu._show_notif(42, 100, "show")
     page = recorder.last("editMessageText")
     buttons = [button for row in page["reply_markup"]["inline_keyboard"] for button in row]
-    assert [button["callback_data"] for button in buttons if "套餐额度耗尽，将使用积分" in button["text"]] == ["sys:notif_toggle:account.credits.started"]
+    assert [button["callback_data"] for button in buttons if "套餐额度用完，开始消耗积分" in button["text"]] == ["sys:notif_toggle:account.credits.started"]
     toggles = [button["text"][2:] for button in buttons if button["callback_data"].startswith("sys:notif_toggle:")]
     assert len(toggles) == len(set(toggles))
     assert not any(button["callback_data"] == "sys:notif_toggle:openai_credits_started" for button in buttons)

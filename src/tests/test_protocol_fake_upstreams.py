@@ -2656,11 +2656,11 @@ def test_zhipu_plan_excluded_notification_says_plan_not_quota(m, monkeypatch):
     assert len(calls) == 1
     event, alert, text, kwargs = calls[0]
     assert event == "model.entitlement.blocked"
-    assert "当前套餐未包含模型" in text
+    assert "套餐不含此模型" in text
     assert "1311" in text
     assert "周/月使用额度已达上限" not in text      # 不能沿用 1310 的措辞
     assert "2026-09-18 16:36:12" in text
-    assert "当前影响尚未确认" in text and "预计下次尝试" in text
+    assert "实际影响尚未确认" in text and "下次尝试" in text
     assert kwargs["subject"]["kind"] == "channel"
     assert kwargs["subject"]["exact_id"] == "api:智谱 Max"
 
@@ -2750,7 +2750,7 @@ def test_zhipu_quota_cooldown_notification_is_explicit_and_links_channel(m, monk
     assert alert == "glm-5.2"
     assert "周/月额度" in text
     assert "2026-07-26 10:01:10" in text
-    assert "指定模型" in text and "当前影响尚未确认" in text
+    assert "涉及模型" in text and "实际影响尚未确认" in text
     assert kwargs["subject"]["kind"] == "channel"
     assert kwargs["subject"]["exact_id"] == "api:智谱 Max"
     assert kwargs["effect"] == {"status": "unknown", "code": "model_paused"}  # direct reporting cannot fabricate an uncommitted pause

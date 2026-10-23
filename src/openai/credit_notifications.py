@@ -5,6 +5,7 @@ import math
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from .. import notifications
 from ..notifications.events import Effect
@@ -25,6 +26,13 @@ _states: dict[str, _State] = {}
 def forget(account_key: str) -> None:
     with _lock:
         _states.pop(account_key, None)
+
+
+def _window_label(name: str, minutes: float | None) -> str:
+    if minutes and minutes > 0:
+        duration = f"{minutes / 1440:g}天" if minutes % 1440 == 0 else f"{minutes / 60:g}小时" if minutes % 60 == 0 else f"{minutes:g}分钟"
+        return duration + "额度"
+    return "主额度窗口" if name == "primary" else "次额度窗口"
 
 
 def _number(value) -> float | None:
@@ -59,9 +67,11 @@ def _observe(account_key: str, *, usage: dict | None, snapshot: dict | None) -> 
     now = time.time()
     block = (usage or {}).get("openai") or {}
     windows = {}
+    lengths = {}
     if snapshot is not None:
         observed = manager._ms_timestamp(snapshot.get("fetched_at")) or int(now * 1000)
         for name in ("primary", "secondary"):
+            lengths[name] = _number(snapshot.get(f"{name}_window_min"))
             used = _number(snapshot.get(f"{name}_used_pct"))
             reset = _number(snapshot.get(f"{name}_reset_at"))
             after = _number(snapshot.get(f"{name}_reset_sec"))
@@ -75,6 +85,8 @@ def _observe(account_key: str, *, usage: dict | None, snapshot: dict | None) -> 
                        if item.get("limit_id") == "codex"), {})
         for name in ("primary", "secondary"):
             window = limits.get(name) or {}
+            seconds = _number(window.get("limit_window_seconds"))
+            lengths[name] = seconds / 60 if seconds else None
             used = _number(window.get("used_percent"))
             if used is not None:
                 windows[name] = (observed, used, _number(window.get("reset_at")))
@@ -113,6 +125,13 @@ def _observe(account_key: str, *, usage: dict | None, snapshot: dict | None) -> 
             return
         credits = ((snapshot or {}).get("credits") if snapshot is not None else block.get("credits")) or {}
         metrics = []
+        for name in sorted(hits):
+            _at, used, reset = state.windows[name]
+            metric = {"metric_id": "codex_" + name, "display_name": _window_label(name, lengths.get(name)),
+                      "kind": "percent", "used": used, "unit": "%"}
+            if reset is not None:
+                metric.update(reset_at=datetime.fromtimestamp(reset, timezone.utc).isoformat(), reset_certainty="upstream")
+            metrics.append(metric)
         balance = credits.get("balance")
         if isinstance(balance, (int, float)) and not isinstance(balance, bool):
             metrics.append({"metric_id": "credits", "display_name": "积分余额", "kind": "credits", "remaining": balance, "unit": "积分"})

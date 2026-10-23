@@ -350,6 +350,34 @@ def send_new(chat_id: int, *, origin: str = "menu:main", source: ModelSourceRef 
         _request_list_usage(chat_id, mid, menu_cache.begin_view(chat_id, mid))
 
 
+def open_model(chat_id: int, message_id: int, model_id: str) -> bool:
+    """Show one chat model's unified detail in an existing message (notification shortcuts)."""
+    if not ui.is_admin(chat_id):
+        return False
+    needle = str(model_id or "").strip().casefold()
+    try:
+        found = _CONTROL.list_models(
+            _ctx(chat_id), filters=ModelFilters(kinds=(ModelKind.CHAT,), text=model_id), page_size=200,
+        ).items
+    except ManagementError:
+        return False
+    view = next((item for item in found if item.model_id.casefold() == needle), None) or next(
+        (item for item in found if needle in {alias.casefold() for alias in item.aliases}), None)
+    if view is None:
+        return False
+    # The detail must describe every source, not whichever source the list was last filtered by.
+    s = _session(chat_id)
+    _clear_selection(s)
+    s.tab = "chat"
+    s.source = None
+    s.source_label = ""
+    s.source_provider = ""
+    _show_rendered(chat_id, message_id, None, lambda: _detail_render(
+        chat_id, view.resource_key, back_callback="mc:list",
+    ))
+    return True
+
+
 def _show_rendered(chat_id: int, message_id: int, cb_id: str | None, renderer) -> None:
     token = menu_cache.begin_view(chat_id, message_id)
     _session(chat_id).usage_views = None

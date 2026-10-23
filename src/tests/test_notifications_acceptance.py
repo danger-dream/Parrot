@@ -53,12 +53,12 @@ def test_every_scene_has_typed_facts_safe_buttons_and_effect(env, controlled, ki
     keyboard = delivery.keyboard(ids[0], record)
     buttons = [b for row in keyboard['inline_keyboard'] for b in row]
     assert 2 <= len(buttons) <= 6
-    assert buttons[-1]['text'] == '✖ 关闭本条'
-    assert '查看' in buttons[0]['text']
+    assert buttons[-1]['text'] == '✖ 关闭' and buttons[0]['text'] != '✖ 关闭'
     assert all(len(b['callback_data'].encode()) <= 64 for b in buttons)
     rendered = content.render(record)
-    assert content.effect_text(record['effect']) in rendered and '发生时间' in rendered
-    assert 'oauth:' not in rendered and 'api:' not in rendered
+    assert content.effect_text(record['effect']) in rendered
+    assert 'oauth:' not in rendered and 'api:' not in rendered and '本地编号' not in rendered
+    assert not any(code in rendered for code in ('_disabled', 'background', 'responses_ws'))
     assert len(rendered) < 3900
     with pytest.raises(ValueError):
         replace(scene(kind), facts={}).record()
@@ -93,8 +93,8 @@ def test_scene_specific_copy_and_long_fallback_truth(env):
     subject = replace(event().subject, scopes=tuple(('作用域'*50, '<&>'*200) for _ in range(60)))
     e = NotificationEvent('account.quota.blocked', subject, Effect('unknown', 'account_paused'), {'windows': []}).record()
     text = content.render(e)
-    assert '详细内容请查看' in text and '当前影响尚未确认' in text
-    assert 'Parrot 已暂停' not in text and '检查已通过' not in text and len(text) < 3900
+    assert '实际影响尚未确认' in text and '（待核实）' in text
+    assert '已暂停调用此账号' not in text and len(text) < 3900
 
 
 @pytest.mark.parametrize('kind,facts', [
@@ -123,7 +123,7 @@ def test_actual_disk_restart_dedup_receipts_refs_and_confirmation(env, controlle
     delivery.deliver(first)
     store.update_delivery(second, state='sending')
     row = store.get('deliveries', first)
-    ref = next('nt:v1:'+k for k,v in store.items('refs').items() if v['action']=='more')
+    ref = next('nt:v1:'+k for k,v in store.items('refs').items() if v['action']=='mute')
     paths = dict(db._paths)
     db.close()
     restarted = StateStore(paths['runtime'], paths['durable']); restarted.start()
@@ -193,8 +193,11 @@ def test_diagnostics_explicit_resend_once_never_business(env, controlled):
     assert len([v for v in store.items('deliveries').values() if v.get('resend_of')==failed['id']])==1
 
 
-def test_api_channel_exact_view_and_stale_generation(env):
+def test_api_channel_exact_view_and_stale_generation(env, monkeypatch):
     from src import channel_state
+    from src.telegram.menus import channel_menu
+    opened=[]
+    monkeypatch.setattr(channel_menu,'open_detail',lambda chat,mid,name: opened.append(name) or True)
     cfg=env[0]
     cfg['channels']=[{'name':'Exact API','generationId':'nt-api','models':[{'alias':'m','real':'upstream'}],'enabled':True}]
     subject=subjects.channel('api:Exact API')
@@ -202,40 +205,67 @@ def test_api_channel_exact_view_and_stale_generation(env):
     emit(sample);delivery.deliver(env[2][0])
     row=store.get('deliveries',env[2][0])
     send=next(p for m,p in env[3] if m=='sendMessage')
-    assert send['reply_markup']['inline_keyboard'][0][0]['text']=='🔌 查看渠道'
+    assert send['reply_markup']['inline_keyboard'][0][0]['text']=='🔌 渠道详情'
     notification_menu.handle_callback(callback(row,send['reply_markup']['inline_keyboard'][0][0]['callback_data']))
-    assert 'Exact API' in [p for m,p in env[3] if m=='editMessageText'][-1]['text']
+    assert opened==['Exact API']
     cfg['channels'][0]['generationId']='nt-api-rebuilt'
     assert subjects.current(subject) is None
     assert subjects.channel(subject.generation).generation == subject.generation
     assert subjects.current(subjects.channel(subject.generation)) is None
 
 
-def test_routing_exact_candidate_navigation_alias_and_input_preserved(env, controlled, monkeypatch):
-    from src.telegram import states
-    from src.telegram.menus import channel_menu
+def test_routing_buttons_open_log_model_and_key_below_notification(env, controlled, monkeypatch):
+    from src.telegram import states, ui
+    from src.telegram.menus import logs_menu, model_center_menu, apikey_menu
     opened = []
-    monkeypatch.setattr(channel_menu, 'open_detail', lambda chat, mid, name: opened.append((chat, mid, name)) or True)
-    cfg=env[0]
-    cfg['channels']=[{'name':'Route API','generationId':'nt-route-api','models':[{'alias':'m','real':'upstream'}]}]
-    sample=scene('routing.unavailable')
-    emit(sample);delivery.deliver(env[2][0])
-    row=store.get('deliveries',env[2][0])
-    states.set_state(11,'unrelated',{'value':'keep'})
+    monkeypatch.setattr(logs_menu, 'show_detail', lambda chat, mid, cb, short: opened.append(('log', mid, ui.resolve_code(short))))
+    monkeypatch.setattr(model_center_menu, 'open_model', lambda chat, mid, model: opened.append(('model', mid, model)) or True)
+    monkeypatch.setattr(apikey_menu, 'open_detail', lambda chat, mid, name: opened.append(('key', mid, name)) or name == 'msdev')
+    sample = scene('routing.unavailable')
+    sample = replace(sample, facts={**sample.facts, 'api_key_name': 'msdev', 'request_id': 'rid-1'})
+    emit(sample); delivery.deliver(env[2][0])
+    row = store.get('deliveries', env[2][0])
+    send = next(p for m, p in env[3] if m == 'sendMessage')
+    labels = [b['text'] for r in send['reply_markup']['inline_keyboard'] for b in r]
+    assert labels == ['📜 调用日志', '🧬 模型详情', '🔑 Key：msdev', '🔕 暂停提醒', '✖ 关闭']
+    refs = {b['text']: b['callback_data'] for r in send['reply_markup']['inline_keyboard'] for b in r}
+    states.set_state(11, 'unrelated', {'value': 'keep'})
     try:
-        ref=store.action_ref(row['id'],'routes')
-        notification_menu.handle_callback(callback(row,ref))
-        markup=[p for m,p in env[3] if m=='editMessageText'][-1]['reply_markup']
-        button=markup['inline_keyboard'][0][0]
-        assert 'Route API' in button['text']
-        panel=store.get('deliveries',row['id'])['panel_id']
-        row['message_id']=panel
-        notification_menu.handle_callback(callback(row,button['callback_data']))
-        assert opened==[(row['chat_id'],panel,'Route API')]
-        assert store.get('deliveries',row['id'])['panel_owner']=='management'
-        assert states.get_state(11)['data']=={'value':'keep'}
+        for label in labels[:3]:
+            notification_menu.handle_callback(callback(row, refs[label]))
+        # Buttons on notifications sent before the redesign reach the same pages.
+        for legacy in ('routes', 'request'):
+            notification_menu.handle_callback(callback(row, store.action_ref(row['id'], legacy)))
+        assert [(kind, value) for kind, mid, value in opened] == [
+            ('log', 'rid-1'), ('model', 'm'), ('key', 'msdev'), ('model', 'm'), ('log', 'rid-1')]
+        assert row['message_id'] not in {mid for _, mid, _ in opened} and len({mid for _, mid, _ in opened}) == 5
+        assert not any(m.startswith('edit') and p.get('message_id') == row['message_id'] for m, p in env[3])
+        assert states.get_state(11)['data'] == {'value': 'keep'}
+        env[0]['apiKeys'] = {}
+        monkeypatch.setattr(apikey_menu, 'open_detail', lambda chat, mid, name: False)
+        notification_menu.handle_callback(callback(row, refs['🔑 Key：msdev']))
+        assert '已被删除或改名' in [p for m, p in env[3] if m == 'editMessageText'][-1]['text']
     finally:
         states.clear_all()
+
+
+def test_routing_reasons_are_grouped_translated_and_advised(env):
+    exclusions = [{'subject': 'OpenAI · a@example.test（Personal）', 'reason': 'global_model_disabled'},
+                  {'subject': 'Antigravity · a@example.test', 'reason': 'source_model_disabled'},
+                  {'subject': 'Cursor · a@example.test', 'reason': 'global_model_disabled'},
+                  {'subject': 'Claude · c@example.test', 'reason': 'cooldown', 'detail': 'permanent'},
+                  {'subject': 'Claude · d@example.test', 'reason': 'disabled_reason', 'detail': 'quota'}]
+    sample = replace(scene('routing.unavailable'), facts={'model': 'gpt-x', 'ingress': 'responses', 'exclusions': exclusions,
+                                                          'api_key_name': 'msdev', 'request_id': 'rid'})
+    text = content.render(sample.record())
+    lines = text.splitlines()
+    assert lines[:3] == ['❌ <b>无可用渠道 · gpt-x</b>', '来源 Key：msdev', '入口：Responses API']
+    assert lines[4:7] == ['模型已在模型中心全局停用（2 个渠道）', '· OpenAI · a@example.test（Personal）', '· Cursor · a@example.test']
+    assert '· Claude · c@example.test（永久冻结）' in lines and '· Claude · d@example.test（额度用尽）' in lines
+    assert '处理：在模型详情中启用该模型，或让 msdev 改用其他模型。' in text
+    assert '_disabled' not in text and 'rid' not in text and '本地编号' not in text
+    none = replace(sample, facts={**sample.facts, 'exclusions': []})
+    assert '没有任何渠道提供此模型' in content.render(none.record())
 
 
 def test_more_operations_all_reachable_and_confirmation_cancel(env, controlled, monkeypatch):
@@ -312,7 +342,7 @@ def test_refresh_failure_actual_committed_truth(env, monkeypatch):
     info,effect=oauth_refresh_failure.apply(key,failure,expected_state_key=expected)
     assert info.auth_error and effect==Effect('failed','disable_failed') and len(calls)==1
     report=NotificationEvent('account.auth.refresh_failed',subjects.account(account),effect,{'error_code':info.code,'retryable':info.retryable,'auth_error':info.auth_error}).record()
-    assert '禁用状态保存失败' in content.render(report) and account['enabled']
+    assert '暂停账号时保存失败' in content.render(report) and account['enabled']
     calls.clear()
     info,effect=oauth_refresh_failure.apply(key,httpx.ReadTimeout('SECRET'),expected_state_key=expected)
     assert effect==Effect('unchanged','not_disabled') and not calls
@@ -445,3 +475,59 @@ def test_legacy_migration_cannot_erase_new_durable_notification_domains(env):
     before={domain:store.items(domain) for domain in ('events','incidents','deliveries','policy')}
     env[1].install_migration({'performance_stats':{},'workbuddy_actions':{}})
     assert before=={domain:store.items(domain) for domain in before}
+
+
+def test_system_notification_shortcut_opens_page_below_and_rejects_others(env, monkeypatch):
+    from src.telegram import bot, ui
+    dispatched, answers = [], []
+    monkeypatch.setattr(bot, '_handle_callback', dispatched.append)
+    monkeypatch.setattr(ui, 'answer_cb', lambda *args, **kwargs: answers.append(args))
+    cb = {'id': 'cb', 'from': {'id': 11}, 'data': 'nt:open:translation', 'message': {'chat': {'id': 11}, 'message_id': 5}}
+    notification_menu.handle_callback(cb)
+    page = [i for i, (m, p) in enumerate(env[3]) if m == 'sendMessage']
+    assert env[3][page[-1]][1]['text'] == '正在打开…'
+    assert dispatched[0]['data'] == 'tl:show' and dispatched[0]['message']['message_id'] == page[-1] + 101
+    notification_menu.handle_callback({**cb, 'data': 'nt:open:anything'})
+    notification_menu.handle_callback({**cb, 'from': {'id': 99}, 'message': {'chat': {'id': 99}, 'message_id': 5}})
+    assert len(dispatched) == 1 and len(answers) == 2
+
+
+def test_status_alert_is_translated_with_event_page_and_mute_buttons(monkeypatch):
+    from src import status_monitor as sm
+    from src.telegram import ui
+    monkeypatch.setattr(ui, 'register_code', lambda payload: 'abcd1234')
+    inc = {'id': 'inc1', 'name': 'Elevated errors', 'impact': 'minor', 'status': 'investigating',
+           'created_at': '2026-10-21T14:05:00Z', 'shortlink': 'https://stspg.io/x'}
+    text = sm._format_new_incident('openai', inc)
+    assert '影响：轻微' in text and '调查中' in text and '开始：2026-10-21 22:05' in text
+    assert 'minor' not in text and 'investigating' not in text and 'stspg.io' not in text
+    row = sm._incident_buttons('openai', inc)['inline_keyboard'][0]
+    assert row[0] == {'text': '🔗 事件页', 'url': 'https://stspg.io/x'}
+    assert row[1]['callback_data'] == 'stat:mute:abcd1234'
+    assert sm._incident_buttons('openai', inc, mute=False)['inline_keyboard'] == [[row[0]]]
+    resolved = sm._format_resolved('openai', {**inc, 'resolved_at': '2026-10-21T15:00:00Z'})
+    assert '已恢复：Elevated errors' in resolved and '恢复：2026-10-21 23:00' in resolved
+
+
+def test_translation_failure_alert_uses_switch_and_links_settings(monkeypatch):
+    from src import notifier, translation
+    sent = []
+    monkeypatch.setattr(notifier, 'notify_event', lambda key, text, **kw: sent.append((key, text, kw)) or True)
+    monkeypatch.setattr(translation, '_consecutive_failures', 0)
+    translation._record_failure({'failureAlertThreshold': 1, 'model': 'tr-<main>', 'fallbackModel': 'tr-backup'})
+    (key, text, kw), = sent
+    assert key == 'translation_failed' and 'tr-&lt;main&gt;' in text
+    assert kw['reply_markup']['inline_keyboard'][0][0]['callback_data'] == 'nt:open:translation'
+
+
+def test_apikey_detail_opens_only_existing_key_for_admin(monkeypatch):
+    from src.telegram import ui
+    from src.telegram.menus import apikey_menu
+    opened = []
+    monkeypatch.setattr(ui, 'is_admin', lambda chat: chat == 11)
+    monkeypatch.setattr(apikey_menu, '_get_entry', lambda name: {'name': name} if name == 'msdev' else None)
+    monkeypatch.setattr(apikey_menu, '_edit_cached_detail', lambda *args, **kwargs: opened.append((args, kwargs)) or True)
+    assert apikey_menu.open_detail(11, 7, 'msdev') is True
+    assert opened == [((11, 7, 'msdev', 1), {'start_view': True})]
+    assert apikey_menu.open_detail(11, 8, 'gone') is False and apikey_menu.open_detail(99, 9, 'msdev') is False
+    assert len(opened) == 1

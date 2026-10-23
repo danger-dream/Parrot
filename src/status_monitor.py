@@ -319,22 +319,60 @@ def _fetch_incidents(provider: str) -> Optional[list[dict]]:
 # ─── 推送格式 ────────────────────────────────────────────────────
 
 
+_IMPACT_TEXT = {"none": "无影响", "maintenance": "计划维护", "minor": "轻微", "major": "严重", "critical": "重大"}
+_STATUS_TEXT = {
+    "investigating": "调查中", "identified": "已定位原因", "monitoring": "修复后观察中",
+    "resolved": "已恢复", "postmortem": "已发布复盘", "scheduled": "已排期",
+    "in_progress": "维护中", "verifying": "验证中", "completed": "已完成",
+}
+
+
+def _when(value) -> str:
+    from .notifications.content import moment
+    return notifier.escape_html(moment(value)) if value else "未知"
+
+
+def _incident_link(provider: str, incident: dict) -> str:
+    link = incident.get("shortlink") or f"{_statuspage_base(provider)}/incidents/{incident.get('id', '')}"
+    return link if str(link).startswith(("https://", "http://")) else ""
+
+
+def _incident_buttons(provider: str, incident: dict, *, mute: bool = True) -> dict | None:
+    row = []
+    link = _incident_link(provider, incident)
+    if link:
+        row.append({"text": "🔗 事件页", "url": link})
+    iid = incident.get("id") or ""
+    if mute and iid:
+        name = (incident.get("name") or "").strip()[:40]
+        short = _ui_code(f"stat_mute:{provider}:{iid}|{name}")
+        if short:
+            row.append({"text": "🔕 不再提醒此事件", "callback_data": "stat:mute:" + short})
+    return {"inline_keyboard": [row]} if row else None
+
+
+def _ui_code(payload: str) -> str:
+    try:
+        from .telegram import ui
+        return ui.register_code(payload)
+    except Exception:
+        return ""
+
+
 def _format_new_incident(provider: str, incident: dict) -> str:
-    name = (incident.get("name") or "(未命名 incident)").strip()
+    name = (incident.get("name") or "(未命名事件)").strip()
     impact = (incident.get("impact") or "none").lower()
     status = (incident.get("status") or "investigating").lower()
     started = incident.get("started_at") or incident.get("created_at") or ""
-    short = incident.get("shortlink") or f"{_statuspage_base(provider)}/incidents/{incident.get('id','')}"
     icon = _IMPACT_ICON.get(impact, "📡")
     sicon = _STATUS_ICON.get(status, "")
-    text = (
-        f"{icon} <b>[{notifier.escape_html(_provider_label(provider))}]</b> "
-        f"{notifier.escape_html(name)}\n"
-        f"影响: <code>{impact}</code> · 状态: {sicon} <code>{status}</code>\n"
-        f"开始: <code>{notifier.escape_html(started)}</code>\n"
-        f"{notifier.escape_html(short)}"
+    return (
+        f"{icon} <b>[{notifier.escape_html(_provider_label(provider))}] "
+        f"{notifier.escape_html(name)}</b>\n"
+        f"影响：{notifier.escape_html(_IMPACT_TEXT.get(impact, impact))} · "
+        f"状态：{sicon} {notifier.escape_html(_STATUS_TEXT.get(status, status))}\n"
+        f"开始：{_when(started)}"
     )
-    return text
 
 
 def _format_update(provider: str, incident: dict, upd: dict) -> str:
@@ -344,27 +382,24 @@ def _format_update(provider: str, incident: dict, upd: dict) -> str:
     body = (upd.get("body") or "").strip()
     if len(body) > 600:
         body = body[:600].rstrip() + "..."
-    created = upd.get("created_at") or ""
-    text = (
-        f"{sicon} <b>[{notifier.escape_html(_provider_label(provider))}]</b> "
-        f"{notifier.escape_html(name)} — <code>{status}</code>\n"
-        f"<i>{notifier.escape_html(created)}</i>\n"
+    return (
+        f"{sicon} <b>[{notifier.escape_html(_provider_label(provider))}] "
+        f"{notifier.escape_html(name)}</b>\n"
+        f"状态：{notifier.escape_html(_STATUS_TEXT.get(status, status))} · {_when(upd.get('created_at'))}\n"
         f"{notifier.escape_html(body)}"
     )
-    return text
 
 
 def _format_resolved(provider: str, incident: dict) -> str:
     name = (incident.get("name") or "").strip()
     started = incident.get("started_at") or incident.get("created_at") or ""
     resolved = incident.get("resolved_at") or ""
-    text = (
-        f"✅ <b>[{notifier.escape_html(_provider_label(provider))}]</b> "
-        f"已恢复: {notifier.escape_html(name)}\n"
-        f"开始: <code>{notifier.escape_html(started)}</code>\n"
-        f"恢复: <code>{notifier.escape_html(resolved)}</code>"
+    return (
+        f"✅ <b>[{notifier.escape_html(_provider_label(provider))}] "
+        f"已恢复：{notifier.escape_html(name)}</b>\n"
+        f"开始：{_when(started)}\n"
+        f"恢复：{_when(resolved)}"
     )
-    return text
 
 
 # ─── 主轮询逻辑 ──────────────────────────────────────────────────
@@ -418,7 +453,8 @@ def _process_provider(provider: str, *, push: bool, raise_on_error: bool = False
                 continue
             try:
                 text = _format_update(provider, inc, upd)
-                notifier.notify_event("status_alert", text)
+                notifier.notify_event("status_alert", text, reply_markup=_incident_buttons(
+                    provider, inc, mute=(upd.get("status") or "").lower() != "resolved"))
             except Exception as exc:
                 print(f"[status_monitor] notify update failed: {exc}")
 
@@ -430,7 +466,8 @@ def _process_provider(provider: str, *, push: bool, raise_on_error: bool = False
             if _impact_rank(impact) < min_rank:
                 continue
             try:
-                notifier.notify_event("status_alert", _format_new_incident(provider, inc))
+                notifier.notify_event("status_alert", _format_new_incident(provider, inc),
+                                      reply_markup=_incident_buttons(provider, inc))
             except Exception as exc:
                 print(f"[status_monitor] notify headline failed: {exc}")
 
@@ -441,7 +478,8 @@ def _process_provider(provider: str, *, push: bool, raise_on_error: bool = False
             if iid and is_muted(provider, iid):
                 continue
             try:
-                notifier.notify_event("status_alert", _format_resolved(provider, inc))
+                notifier.notify_event("status_alert", _format_resolved(provider, inc),
+                                      reply_markup=_incident_buttons(provider, inc, mute=False))
             except Exception as exc:
                 print(f"[status_monitor] notify resolved failed: {exc}")
     return incidents

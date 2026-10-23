@@ -26,13 +26,13 @@ def present(chat_id, message_id, subject, *, operation, stages, saved=True, erro
             # Existing naming/credential-replacement workflow keeps its own nonce,
             # actor-bound plan and input state. Never persist those workflow secrets.
             buttons = [b for row in markup["inline_keyboard"] for b in row]
-            markup = {"inline_keyboard": list(continuation) + [[buttons[0], buttons[-1]]]}
+            markup = {"inline_keyboard": list(continuation) + [buttons[:1] + buttons[-1:] if len(buttons) > 1 else buttons]}
         store.update_delivery(key, state="sending", message_id=message_id, attempts=1)
     except Exception:
         # The operation result MUST still be visible when auxiliary persistence
         # fails. No unbound write buttons are synthesized in this fallback.
         markup = {"inline_keyboard": list(continuation or [])}
-    payload = {"chat_id": chat_id, "text": content.render(event, detail=True, current_status="操作阶段回执"),
+    payload = {"chat_id": chat_id, "text": content.render(event, detail=True),
                "parse_mode": "HTML", "reply_markup": markup}
     if message_id is not None:
         payload["message_id"] = message_id

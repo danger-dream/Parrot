@@ -62,8 +62,8 @@ def test_disabled_or_muted_does_not_consume_throttle(notifications, monkeypatch,
     assert model_reroute.notify_reroute(observation()) is True
     row = store.get("deliveries", pending.get_nowait())
     text = content.render(store.get("events", row["event_id"]))
-    assert "上游报告模型发生变化" in text and "模型降级" not in text
-    assert all(label in text for label in ("请求模型：", "出站模型：", "上游报告模型："))
+    assert "上游返回的模型与请求不同" in text and "模型降级" not in text
+    assert all(label in text for label in ("来源 Key：", "请求模型：", "发出模型：", "上游返回："))
     assert model_reroute.notify_reroute(observation()) is False
     assert pending.empty()
 
@@ -154,7 +154,7 @@ def test_conflict_is_persisted_notified_and_displayed_without_false_actual(monke
     assert json.loads(row["model_signal_conflict"]) == {"http_header": ["model-a"], "body_models": ["model-b"]}
     assert json.loads(row["safety_review"]) == {"reasons": ["policy"]}
     assert len(queued) == 1 and "模型信息不一致" in queued[0][1]
-    assert "上游报告模型:" not in queued[0][1] and "无法据此确定实际模型" in queued[0][1]
+    assert "上游报告模型:" not in queued[0][1] and "无法确定实际模型" in queued[0][1]
     rendered = ui.log_upstream_observation_lines(row)
     assert "模型信息不一致" in rendered[0] and "model-b" not in rendered[0]
     detail = "\n".join(logs_menu._upstream_observation_detail_lines(row))

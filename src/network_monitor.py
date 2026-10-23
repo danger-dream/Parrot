@@ -218,17 +218,22 @@ def _format_result(res: CheckResult) -> str:
     return f"❌ {res.label}{detail}"
 
 
+_NETWORK_BUTTON = {"inline_keyboard": [[{"text": "🩺 网络检测", "callback_data": "nt:open:network"}]]}
+
+
 def _notify_transition(res: CheckResult, prev: Optional[dict]) -> None:
     prev_ok = None if prev is None else bool(prev.get("ok"))
     if prev_ok is False and res.ok:
         notifier.notify_event(
             "network_monitor",
             f"✅ <b>网络检测恢复</b>\n{notifier.escape_html(_format_result(res))}",
+            reply_markup=_NETWORK_BUTTON,
         )
     elif prev_ok is not False and not res.ok:
         notifier.notify_event(
             "network_monitor",
             f"⚠️ <b>网络检测失败</b>\n{notifier.escape_html(_format_result(res))}",
+            reply_markup=_NETWORK_BUTTON,
         )
 
 

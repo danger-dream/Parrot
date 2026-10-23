@@ -115,7 +115,7 @@ def channel_recovered(subject, model, previous):
             key = store.incident_for(candidate, subject, scope="model", scope_ref=model)
             if (store.get("incidents", key) or {}).get("active"):
                 kind = candidate.replace("blocked", "recovered")
-                facts = {"models": [model], "count": 1} if candidate == "model.quota.blocked" else {"model": model, "previous": "本地套餐排除冷却（不据此推断套餐已升级）"}
+                facts = {"models": [model], "count": 1} if candidate == "model.quota.blocked" else {"model": model, "previous": "套餐不含此模型"}
                 break
     except Exception:
         pass

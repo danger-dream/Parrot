@@ -127,6 +127,6 @@ def test_explicit_recovery_can_clear_active_cooldown_and_notifies_once(
     assert deletes == [key, key]
     assert len(events) == 1
     assert events[0][0] == "channel.model.recovered"
-    assert "渠道模型限制已解除" in events[0][1]
+    assert "模型限制已解除" in events[0][1]
 
 from src.tests.notification_helpers import capture

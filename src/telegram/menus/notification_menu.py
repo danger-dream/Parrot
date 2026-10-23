@@ -101,23 +101,51 @@ def _panel(row, event, text, choices=(), *, force_new=False, _recreate=True):
     return True
 
 
-def _hand_off(cb, row, event):
-    """Replace the clicked notification/panel with the real management detail page."""
+# Buttons on notifications sent by older versions keep a sensible destination.
+LEGACY_ACTIONS = {"quota": "view", "auth": "view", "routes": "model", "request": "log"}
+
+
+def _opener(cb, event, action):
+    """(chat, message) -> opened, for the real management page behind a navigation button."""
+    from .. import ui
+    facts, kind = event["facts"], event["subject"]["kind"]
     target = subjects.current(event["subject"])
-    if not target or not target.get("account"):
-        return False
-    mid = (cb.get("message") or {}).get("message_id")
-    if event["subject"]["kind"] == "account":
-        from . import oauth_menu
-        opened = oauth_menu.open_detail(row["chat_id"], mid, target["key"])
-    else:
+    if action in {"view", "models"}:
+        if not target or not target.get("account"):
+            return None
+        if kind == "account" and action == "models":
+            from . import oauth_account_models_menu
+            return lambda chat, mid: oauth_account_models_menu.show(chat, mid, None, target["key"]) or True
+        if kind == "account":
+            from . import oauth_menu
+            return lambda chat, mid: oauth_menu.open_detail(chat, mid, target["key"])
         from . import channel_menu
-        opened = channel_menu.open_detail(row["chat_id"], mid, str(target["account"].get("name") or ""))
-    if not opened:
+        return lambda chat, mid: channel_menu.open_detail(chat, mid, str(target["account"].get("name") or ""))
+    if action == "log" and facts.get("request_id"):
+        from . import logs_menu
+        return lambda chat, mid: logs_menu.show_detail(chat, mid, cb["id"], ui.register_code(facts["request_id"])) or True
+    if action == "model" and (facts.get("model") or facts.get("requested_model")):
+        from . import model_center_menu
+        return lambda chat, mid: model_center_menu.open_model(chat, mid, facts.get("model") or facts["requested_model"])
+    if action == "key" and facts.get("api_key_name"):
+        from . import apikey_menu
+        return lambda chat, mid: apikey_menu.open_detail(chat, mid, facts["api_key_name"])
+    return None
+
+
+def _navigate(cb, row, event, action):
+    """Open the management page below the notification; the notification itself is never replaced."""
+    opener = _opener(cb, event, action)
+    if opener is None:
         return False
-    # The message now carries management buttons: later panels must not edit it,
-    # and auto-delete must not remove the page the admin is reading.
-    store.update_delivery(row["id"], **{"panel_owner" if mid == row.get("panel_id") else "message_owner": "management"})
+    result = delivery.request("sendMessage", {"chat_id": row["chat_id"], "text": "正在打开…", "parse_mode": "HTML"})
+    mid = ((result or {}).get("result") or {}).get("message_id") if result and result.get("ok") else None
+    if not mid:
+        raise ValueError("Telegram未确认新页面送达；原通知仍保留。")
+    if not opener(row["chat_id"], mid):
+        missing = {"view": "账户或渠道详情打不开，可能已被删除", "models": "账户模型页打不开，账户可能已被删除", "model": "模型中心里已找不到这个模型",
+                   "key": "这个 Key 已被删除或改名", "log": "调用日志已过期"}[action]
+        delivery.request("editMessageText", {"chat_id": row["chat_id"], "message_id": mid, "text": "⚠️ " + missing + "。"})
     return True
 
 
@@ -133,24 +161,16 @@ def _details(event, page, actor=None):
         s = event["subject"]
         return "\n".join([f'<b>{content.text(s["service"])} · {content.text(CATALOG[event["event_type"]].title)}</b>',
                           *content.identity(s), "当前状态：" + content.text(status)])
-    if page == "models":
-        return "\n".join(views.model_lines(event))
     if page == "records":
         return "\n".join(views.records(event, actor))
-    if page == "request":
-        return "\n".join(views.request_lines(event, actor))
     if page == "storage":
         return "\n".join(views.storage_lines())
-    if page == "routes":
-        return "\n".join(views.route_lines(event)[0])
     text = content.render(event, detail=True, current_status=status)
     if target and target.get("account"):
         from ... import state_db
         a = target["account"]
         extra = []
-        if page == "auth":
-            extra = ["当前到期：" + content.text(a.get("expired") or "未取得")]
-        elif page == "benefits":
+        if page == "benefits":
             extra = ["仅查看本地快照；查询/使用权益需要明确发起操作并按现有控制层确认。"]
             from ...notifications.providers import REGISTRY
             provider = REGISTRY.get(event["subject"]["provider"])
@@ -167,8 +187,37 @@ def _details(event, page, actor=None):
     return text if len(text) < 3900 else text[:0] + content.render(event, current_status=status) + "\n详细记录较长，请按子页查看。"
 
 
+def _naming_page(chat):
+    from . import model_center_menu
+    return model_center_menu._freeze(chat, "registry")
+
+
+# System notifications (notifier.notify_event) link pages with "nt:open:<page>".
+SHORTCUTS = {"naming": _naming_page, "translation": lambda chat: "tl:show",
+             "network": lambda chat: "sys:mon:show", "status": lambda chat: "menu:status_alert"}
+
+
+def _open_shortcut(cb):
+    """Open a system notification's page in a new message; the notification stays readable."""
+    from .. import bot, ui
+    message = cb.get("message") or {}
+    chat = (message.get("chat") or {}).get("id")
+    page = SHORTCUTS.get(cb["data"][len("nt:open:"):])
+    if page is None or not _allowed((cb.get("from") or {}).get("id")) or (cb.get("from") or {}).get("id") != chat:
+        ui.answer_cb(cb["id"], "入口无效或无权限", show_alert=True)
+        return
+    result = delivery.request("sendMessage", {"chat_id": chat, "text": "正在打开…", "parse_mode": "HTML"})
+    mid = ((result or {}).get("result") or {}).get("message_id") if result and result.get("ok") else None
+    if not mid:
+        ui.answer_cb(cb["id"], "Telegram未确认新页面送达", show_alert=True)
+        return
+    bot._handle_callback({**cb, "data": page(chat), "message": {**message, "message_id": mid}})
+
+
 def handle_callback(cb):
     cb = dict(cb)
+    if cb.get("data", "").startswith("nt:open:"):
+        return _open_shortcut(cb)
     # Neutral receipt only: not authorization or a claim of successful mutation.
     # Do not wait behind another panel's network/durable I/O for this ack.
     delivery.request("answerCallbackQuery", {"callback_query_id": cb["id"], "text": "正在核对通知…"})
@@ -179,7 +228,7 @@ def handle_callback(cb):
                 _open_diagnostics(cb)
                 return
             actor, ref, row, event = _validate(cb)
-            action = ref["action"]
+            action = LEGACY_ACTIONS.get(ref["action"], ref["action"])
             if ref.get("payload", {}).get("subject"):
                 from dataclasses import asdict
                 from ...notifications.events import NotificationEvent, Subject, Effect
@@ -229,12 +278,16 @@ def handle_callback(cb):
                 until = time.time() + (3600 if action == "mute1" else 86400)
                 key = f"mute:{actor}:{row['incident_id']}"
                 store.mutate("policy", lambda rows: rows.__setitem__(key, {"until": until, "at": time.time()}))
-                _answer(cb, "已暂停本人此问题重复提醒；未改变账号调度，恢复仍可通知。")
+                _answer(cb, "已暂停这条问题的重复提醒（" + ("1 小时" if action == "mute1" else "24 小时") + "）；账号调度不受影响，恢复时仍会通知。")
                 return
-            if action == "mute":
-                _panel(row, event, "暂停仅属于你的此问题重复提醒；不是暂停账号。", [("1小时", "mute1", {}), ("24小时", "mute24", {})])
+            if action in {"mute", "policy"}:
+                family = CATALOG[event["event_type"]].family
+                off = (store.get("policy", f"recipient:{actor}:{event['subject']['generation']}:{family}") or {}).get("disabled")
+                _panel(row, event, "只影响你自己收到的提醒，不会暂停账号或模型。\n「不再推送」只针对这个对象的这一类通知。",
+                    [("1 小时", "mute1", {}), ("24 小时", "mute24", {}),
+                     ("恢复推送此类通知", "policy_on", {}) if off else ("不再推送此类通知", "policy_off", {})])
             elif action == "more":
-                choices = [(label, name, {}) for name, label in actions.available(event)] + [("本问题家族通知设置", "policy", {})]
+                choices = [(label, name, {}) for name, label in actions.available(event)]
                 page = int(ref.get("payload", {}).get("page", 0))
                 visible = choices[page*4:page*4+4]
                 if page:
@@ -244,14 +297,11 @@ def handle_callback(cb):
                 if ref.get("payload", {}).get("subject"):
                     visible = [(label, name, {**payload, "subject": ref["payload"]["subject"]}) for label, name, payload in visible]
                 _panel(row, event, _details(event, "view", actor), visible)
-            elif action == "policy":
-                _panel(row, event, "只影响本人、此对象和此事件家族，不改变账户状态；关闭后也不单独推送恢复。",
-                    [("关闭此家族推送", "policy_off", {}), ("恢复此家族推送", "policy_on", {})])
             elif action in {"policy_off", "policy_on"}:
                 family = CATALOG[event["event_type"]].family
                 key = f"recipient:{actor}:{event['subject']['generation']}:{family}"
                 store.mutate("policy", lambda rows: rows.__setitem__(key, {"disabled": action == "policy_off", "at": time.time()}))
-                _answer(cb, "已更新本人此对象通知策略；未改变账号状态。")
+                _answer(cb, "已不再推送此类通知；账号状态不受影响。" if action == "policy_off" else "已恢复推送此类通知。")
                 return
             elif action == "reauthorize":
                 from .. import states
@@ -265,32 +315,26 @@ def handle_callback(cb):
                 if not value or value[0] < time.time():
                     raise ValueError("权益查询页面已过期，请重新查询")
                 _benefit_panel(row, event, value[1], value[2], int(ref["payload"].get("page", 0)))
-            # "quota" refs remain on notifications sent before the snapshot page was removed.
-            elif action in {"view", "quota"} and _hand_off(cb, row, event):
+            elif action in actions.NAVIGATE and _navigate(cb, row, event, action):
                 pass
             elif action in actions.READ:
-                if action != "view" and action not in dict(actions.available(event)):
+                # A "view" that cannot navigate (route/system subject on an older notification) shows the event.
+                page = "event" if action == "view" else action
+                # The operation ledger stays reachable from action results even when not on the notification.
+                always = {"event"} | ({"records"} if event["subject"]["kind"] == "account" else set())
+                if page not in always and action not in dict(actions.available(event)):
                     raise ValueError("此对象/能力已不可用")
-                choices = [("⋯ 更多操作", "more", {})]
-                if action == "routes":
-                    from ...notifications import views
-                    _, candidates = views.route_lines(event)
-                    choices = [("查看 " + (s.label or s.identity or s.service), "view", {"subject": {**s.__dict__, "scopes": [list(pair) for pair in s.scopes]}}) for s in candidates]
-                    page = int(ref.get("payload", {}).get("page", 0))
-                    visible = choices[page*4:page*4+4]
-                    if page:
-                        visible.append(("上一页", "routes", {"page": page-1}))
-                    if (page+1)*4 < len(choices):
-                        visible.append(("下一页", "routes", {"page": page+1}))
-                    choices = visible
+                choices = [("⋯ 更多", "more", {})]
                 if action == "benefits" and actions._control is not None:
                     choices.insert(0, ("明确查询权益/核对记录", "query_benefits", {}))
                 if ref.get("payload", {}).get("subject"):
                     choices = [(label, name, {**payload, "subject": ref["payload"]["subject"]}) for label, name, payload in choices]
-                _panel(row, event, _details(event, action, actor), choices)
+                _panel(row, event, _details(event, page, actor), choices)
             elif action in {"stop_credits", "clear_cooldown"}:
                 token = actions.prepare(event, action, actor)
-                _confirmation(row, event, token, action, _details(event, "view", actor) + "\n\n确认：" + actions.LABELS[action] + "。此操作改变本账号调用/积分策略，不是关闭通知。")
+                prompt = {"stop_credits": "确认暂停积分续用？套餐额度用完后将暂停调用此账号，不再消耗积分。",
+                          "clear_cooldown": "确认清除这个模型的冷却？之后会重新调度它，上游若仍异常可能再次冻结。"}[action]
+                _confirmation(row, event, token, action, _details(event, "view", actor) + "\n\n" + prompt)
             elif action == "cancel":
                 for key, value in list(_confirmations.items()):
                     stored = store.get("refs", key[6:])
@@ -371,7 +415,7 @@ def _execute(row, event, action, actor, token=None, payload=None):
             elif result.get("choices"):
                 _benefit_panel(row, event, text, result["choices"])
             else:
-                _panel(row, event, text, [("查看操作记录", "records", {}), ("更多操作", "more", {})])
+                _panel(row, event, text, [("📒 操作记录", "records", {}), ("⋯ 更多", "more", {})])
     # Panel progress is set BEFORE submission: even an immediate fake worker must
     # not have its terminal result overwritten by a late 'queued' UI update.
     _panel(row, event, _details(event, "view", actor) + "\n\n正在提交任务（不等于成功）")

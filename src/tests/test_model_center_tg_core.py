@@ -731,3 +731,16 @@ def test_input_cancel_stale_generation_and_direct_admin_gate(env, monkeypatch):
     menu.handle_callback(9, 10, "denied", menu._freeze(9, "set_state", scope=None))
     assert len(control.calls) == before
     assert answers[-1] == ("denied", "⛔ 无权限", True)
+
+
+def test_open_model_by_name_shows_unified_detail_for_notification_shortcuts(env):
+    _control, edits, _answers, _sends = env
+    session = menu._session(7)
+    session.source = ModelSourceRef(ModelSourceType.API, "api-a")
+    assert menu.open_model(7, 55, "model-11") is True
+    assert edits[-1][1] == 55 and "model-11" in edits[-1][2]
+    # A notification asks about the model, not whichever source the list was filtered by.
+    assert menu._session(7).source is None
+    assert menu.open_model(7, 56, "model-1") is False
+    assert menu.open_model(8, 57, "model-11") is False
+    assert {edit[1] for edit in edits} == {55}

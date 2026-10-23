@@ -490,7 +490,7 @@ def _maybe_auto_disable_by_codex_snapshot(account_key: str, email: str,
         minutes = snap.get(name + "_window_min")
         prefix = "主窗口" if name == "primary" else "次窗口"
         if type(minutes) not in (int, float) or minutes <= 0:
-            return prefix + "（时长未取得）"
+            return prefix
         if minutes == 43800:
             return prefix + "（月额度 · 730小时）"
         duration = f"{minutes / 1440:g}天" if minutes % 1440 == 0 else f"{minutes / 60:g}小时" if minutes % 60 == 0 else f"{minutes:g}分钟"

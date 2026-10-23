@@ -11,46 +11,61 @@ _lock = threading.RLock()
 _active = {}
 _plans = {}
 _listeners = {}
-LABELS = {"auth": "🔐 查看授权状态", "models": "📋 查看指定模型/目录", "records": "📒 查看操作记录", "event": "📋 查看当时事件",
-          "request": "📋 查看请求证据", "routes": "📋 查看筛选详情", "storage": "💾 查看存储状态", "benefits": "🎁 查看重置方式",
-          "refresh_usage": "🔄 更新额度并检查", "sync_models": "🔄 重试模型同步", "refresh_token": "🔄 重试授权续期", "reauthorize": "🔐 重新授权",
-          "stop_credits": "⏸ 暂停积分续用", "clear_cooldown": "🧹 清指定模型冷却"}
-READ = {"event", "view", "auth", "models", "records", "request", "routes", "storage", "benefits"}
+LABELS = {"view": "👤 账户详情", "log": "📜 调用日志", "model": "🧬 模型详情", "key": "🔑 Key 详情", "models": "📋 账户模型",
+          "records": "📒 操作记录", "storage": "💾 存储状态", "benefits": "🎁 重置方式",
+          "refresh_usage": "🔄 更新额度", "sync_models": "🔄 重试模型同步", "refresh_token": "🔄 重试续期", "reauthorize": "🔐 重新授权",
+          "stop_credits": "⏸ 暂停积分续用", "clear_cooldown": "🧹 清除冷却"}
+# Navigation opens the real management page in a new message; the notification stays as the record.
+NAVIGATE = {"view", "log", "model", "key", "models"}
+# "event"/"auth"/"request"/"routes"/"quota" only exist on notifications sent by older versions.
+READ = NAVIGATE | {"event", "auth", "request", "routes", "quota", "records", "storage", "benefits"}
 CONFIRM = {"stop_credits", "clear_cooldown"}
 
 
+def _label(action, event):
+    if action == "view" and event["subject"]["kind"] == "channel":
+        return "🔌 渠道详情"
+    if action == "key":
+        name = event["facts"]["api_key_name"]
+        return "🔑 Key：" + (name if len(name) <= 16 else name[:15] + "…")
+    return LABELS[action]
+
+
 def available(event):
-    target = subjects.current(event["subject"])
-    if target is None:
-        return []
-    s = event["subject"]
-    caps = capabilities(target["account"]) if s["kind"] == "account" else {"request", "routes", "storage", "models"}
-    caps |= {"request"} if event["facts"].get("request_id") else set()
+    """Buttons in the order the scene declares, limited to what the exact target supports now."""
+    s, facts = event["subject"], event["facts"]
+    target = subjects.current(s)
+    caps = set()
+    if target and target.get("account"):
+        caps.add("view")
+        if s["kind"] == "account":
+            caps |= capabilities(target["account"])
+    if facts.get("request_id"):
+        caps.add("log")
+    if facts.get("model") or facts.get("requested_model"):
+        caps.add("model")
+    if facts.get("api_key_name"):
+        caps.add("key")
+    if event["event_type"] == "system.responses_store.failed":
+        caps.add("storage")
     if _control is None or _operations is None:
         caps &= READ
     inc = store.get("incidents", event.get("incident_id", "")) or {}
     if inc.get("active") is False and not CATALOG[event["event_type"]].episodic:
         caps &= READ
-    if event["facts"].get("auth_error") or event["facts"].get("retryable") is False:
+    if facts.get("auth_error") or facts.get("retryable") is False:
         caps.discard("refresh_token")
     if s["kind"] != "account" or event["scope"] != "model" or not event["scope_ref"]:
         caps.discard("clear_cooldown")
-    if event["event_type"].startswith("operation.") and event["facts"].get("stages"):
-        incomplete = {s["name"] for s in event["facts"]["stages"] if s["status"] not in {"succeeded", "skipped", "not_modified"}}
+    if event["event_type"].startswith("operation.") and facts.get("stages"):
+        incomplete = {s["name"] for s in facts["stages"] if s["status"] not in {"succeeded", "skipped", "not_modified"}}
         if not incomplete & {"模型目录", "元数据"}:
             caps.discard("sync_models")
         if "额度快照" not in incomplete:
             caps.discard("refresh_usage")
         if not incomplete & {"模型Key配置", "权益查询"}:
             caps.discard("benefits")
-    candidates = list(CATALOG[event["event_type"]].actions)
-    caps.add("event")
-    candidates += ["event"]
-    if s["kind"] == "account":
-        caps.add("records")
-        if "records" not in candidates:
-            candidates.append("records")
-    return [(action, LABELS[action]) for action in candidates if action in caps]
+    return [(action, _label(action, event)) for action in CATALOG[event["event_type"]].actions if action in caps]
 
 
 def _context(actor):

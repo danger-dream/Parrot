@@ -427,7 +427,7 @@ def test_returned_future_failure_still_uses_async_warning(
     assert "正在同步模型，请稍候" in trace.events[0][2]
     assert "模型目录：未完成" in trace.events[1][3]
     assert "injected asynchronous refresh failure" not in trace.events[1][3]  # raw errors may contain credentials
-    assert "账户已保存" in trace.events[1][3]
+    assert "账号已保存" in trace.events[1][3]
 
 
 @pytest.fixture(autouse=True)

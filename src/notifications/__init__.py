@@ -75,13 +75,23 @@ def store_failed(*, model, api_key_name, response_id, error, source):
         scope="system", source=source))
 
 
+def _channel_title(subject):
+    # The same login often exists at several services: the service name is what tells them apart.
+    name = subject.label or subject.identity or "#" + subject.short_id
+    scope = next((value for _, value in subject.scopes if not value.startswith("未命名") and value.casefold() != name.casefold()), "")
+    return subject.service + " · " + name + ("（" + scope + "）" if scope else "")
+
+
 def routing_unavailable(*, ingress, model, exclusions, api_key_name, request_id=""):
     safe = []
     for item in exclusions or []:
         channel = item.get("channel")
-        subject = subjects.channel(channel) if channel else None
-        safe.append({"subject": (subject.label or subject.identity or subject.service) + " · #" + subject.short_id if subject else "全局模型",
-                     "reason": str(item.get("reason") or "unknown")})
+        entry = {"subject": _channel_title(subjects.channel(channel)) if channel else "全局模型",
+                 "reason": str(item.get("reason") or "unknown")}
+        if item.get("detail"):
+            # Scheduler details are local state (cooldown deadline, pause reason, guard text).
+            entry["detail"] = str(item["detail"])[:240]
+        safe.append(entry)
     return emit(NotificationEvent("routing.unavailable", subjects.system("请求路由", kind="route"), Effect("confirmed", "route_blocked"),
         {"ingress": ingress, "model": model, "exclusions": safe[:300], "api_key_name": str(api_key_name or ""), "request_id": str(request_id)},
         scope="route", scope_ref=ingress + ":" + model, source=ingress))

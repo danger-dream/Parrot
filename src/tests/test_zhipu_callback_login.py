@@ -257,7 +257,7 @@ def test_project_lookup_failure_reuses_credentials_without_reauthorizing(callbac
     assert states.get_state(42) is None and len(om.list_accounts()) == 1
     key = om.get_account_key(om.list_accounts()[0])
     assert len(lookups) == 1 and om.get_account(key), "default project setup runs after saving login"
-    assert "账户已保存" in messages[-1][0]
+    assert "账号已保存" in messages[-1][0]
     assert not om.get_account(key).get("model_key")
     short = ui.register_code(key)
     recovering[0] = True

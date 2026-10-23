@@ -1302,8 +1302,8 @@ def test_quota_monitor_notifies_when_openai_quota_really_resumes(m, monkeypatch)
     assert len(calls) == 1, calls
     assert calls[0][0] == "account.quota.recovered", calls
     assert calls[0][1]["subject"]["exact_id"] == key, calls
-    assert "OpenAI · 配额已恢复" in calls[0][2]
-    assert "套餐：Plus" in calls[0][2]
+    assert "OpenAI · 额度已恢复" in calls[0][2]
+    assert "套餐 Plus" in calls[0][2]
     print("  [PASS] quota_monitor resumes and sends notification after cooldown expires")
 
 

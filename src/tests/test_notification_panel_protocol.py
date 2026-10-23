@@ -272,7 +272,7 @@ def test_rebuild_send_failure_retains_failure_and_never_retries(env, protocol, u
     click(row, 'event')
     current = store.get('deliveries', row['id'])
     assert current['panel_id'] is None and current['panel_state'] == ('unknown' if unknown else 'failed')
-    assert sum('额度达到暂停条件' in p['text'] for p in attempts) == 1
+    assert sum('额度达到暂停线' in p['text'] for p in attempts) == 1
     assert (row['chat_id'], row['message_id']) in protocol.messages
 
 
