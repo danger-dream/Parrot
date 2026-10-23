@@ -3,7 +3,8 @@ import { computed, ref } from 'vue'
 import { ChevronDown, ChevronRight, DatabaseZap, Download, GripVertical, Upload } from '@lucide/vue'
 import { api, enc, type Schemas } from '@/api/client'
 import { compact, dateTime, integer } from '@/utils/format'
-import StatusBars from '@/components/ui/StatusBars.vue'
+import OutcomeStrip from '@/components/ui/OutcomeStrip.vue'
+import type { OutcomeItem } from '@/utils/outcomes'
 import { openModel } from '@/links'
 import { cost3, toUsage } from '@/pages/channels/meta'
 import KeySecret from './KeySecret.vue'
@@ -13,7 +14,8 @@ const props = defineProps<{
   k: ApiKey
   live?: { inFlight: number; waiting: number } | null
   history?: number | null
-  outcomes?: readonly string[]
+  outcome?: OutcomeItem | null
+  outcomeFrom?: string | null
   lastAt?: string | null
   selected?: boolean
   dragging?: boolean
@@ -102,8 +104,8 @@ async function toggle(): Promise<void> {
       </div>
 
       <div class="c-recent">
-        <StatusBars :outcomes="outcomes" :slots="10" :width="5" :gap="3" :height="18" />
-        <p class="sub num">{{ lastAt ? dateTime(lastAt).slice(0, 11) : '近 7 天无请求' }}</p>
+        <OutcomeStrip :item="outcome" :from="outcomeFrom" :width="3" :gap="1.5" :height="18" />
+        <p class="sub num">{{ lastAt ? dateTime(lastAt).slice(0, 11) : '24 小时内无请求' }}</p>
       </div>
 
       <div class="c-act" @click.stop>

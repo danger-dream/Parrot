@@ -32,6 +32,7 @@ from src.management_auth.principal import Capability
 from src.model_pricing import TICKS_PER_USD
 from src.providers.catalog import PROVIDER_CATALOG
 
+from ..channel_health import active_model_rates, rate_health
 from ..context import AuditSink, ManagementContext, audit_record
 from ..errors import ErrorField, ManagementError, ManagementErrorCode
 from ..operations import ManagementOperation, OperationRegistry, OperationStore
@@ -232,12 +233,8 @@ class ChannelControl(ChannelOperationWorkers):
         perfs = cls._performance(channel.key)
         cooldowns = cls._cooldowns(channel.key)
         enabled = bool(channel.enabled and not channel.disabled_reason)
-        rates = [
-            row.recent_success_count / row.recent_requests * 100
-            for row in perfs.values()
-            if row.recent_requests > 0
-        ]
-        recent_rate = min(rates) if rates else None
+        rates = active_model_rates(row for row in scorer.snapshot() if row.get("channel_key") == channel.key)
+        recent_rate = rates[0]["successRate"] if rates else None
         if not channel.enabled:
             health = ChannelHealth.DISABLED
         elif any(row.cooldown_until == -1 for row in cooldowns.values()):
@@ -246,14 +243,8 @@ class ChannelControl(ChannelOperationWorkers):
             health = ChannelHealth.QUOTA_COOLDOWN
         elif cooldowns:
             health = ChannelHealth.COOLDOWN
-        elif recent_rate is None:
-            health = ChannelHealth.UNKNOWN
-        elif recent_rate >= 80:
-            health = ChannelHealth.HEALTHY
-        elif recent_rate >= 50:
-            health = ChannelHealth.DEGRADED
         else:
-            health = ChannelHealth.UNHEALTHY
+            health = ChannelHealth(rate_health(recent_rate))
         secret = str(getattr(channel, "api_key", "") or "")
         server_affinity = sum(
             1 for value in affinity.snapshot().values()

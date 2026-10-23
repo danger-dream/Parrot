@@ -17,6 +17,7 @@ from src.management_control import (
     ManagementError,
     ManagementErrorCode,
 )
+from src.management_control.channels.model_facts import channel_model_facts
 from src.management_control.channels import (
     ChannelCompatibility,
     ChannelControl,
@@ -433,6 +434,7 @@ def _runtime_models(view) -> list[ChannelRuntimeModelData]:
             ),
             cooldownKind=cooldown_kind,
             errorCount=cd.error_count if cd else 0,
+            **channel_model_facts(view.id, model.alias, model.real),
         ))
     return rows
 

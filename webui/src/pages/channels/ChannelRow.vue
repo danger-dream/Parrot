@@ -5,7 +5,8 @@ import { channelProvider } from '@/utils/providers'
 import { compact, dateTime } from '@/utils/format'
 import { tps } from '@/pages/oauth/channelStats'
 import ProviderIcon from '@/components/ProviderIcon.vue'
-import StatusBars from '@/components/ui/StatusBars.vue'
+import OutcomeStrip from '@/components/ui/OutcomeStrip.vue'
+import type { OutcomeItem } from '@/utils/outcomes'
 import Switch from '@/components/ui/Switch.vue'
 import ProtocolTag from './ProtocolTag.vue'
 import UsageBlock from './UsageBlock.vue'
@@ -16,7 +17,8 @@ const props = defineProps<{
   priority: number
   providerName?: string
   presetName?: string
-  outcomes?: readonly string[]
+  outcome?: OutcomeItem | null
+  outcomeFrom?: string | null
   lastAt?: string | null
   selected?: boolean
   dragging?: boolean
@@ -70,8 +72,8 @@ const cacheShare = computed(() => {
     </div>
 
     <div class="c-recent">
-      <p class="num t">{{ lastAt ? dateTime(lastAt).slice(0, 11) : '近 7 天无请求' }}</p>
-      <StatusBars :outcomes="outcomes" :slots="10" :width="5" :gap="3" :height="18" />
+      <p class="num t">{{ lastAt ? dateTime(lastAt).slice(0, 11) : '24 小时内无请求' }}</p>
+      <OutcomeStrip :item="outcome" :from="outcomeFrom" :width="3" :gap="1.5" :height="18" />
     </div>
 
     <div class="c-use">

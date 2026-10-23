@@ -20,6 +20,8 @@ import ProviderIcon from '@/components/ProviderIcon.vue'
 import Skeleton from '@/components/ui/Skeleton.vue'
 import Switch from '@/components/ui/Switch.vue'
 import DetailSection from '@/components/DetailSection.vue'
+import ModelList from '@/components/ModelList.vue'
+import ModelListRow from '@/components/ModelListRow.vue'
 import SettingRow from '@/components/SettingRow.vue'
 import UsageTiles, { type UsageTile } from '@/components/UsageTiles.vue'
 import { deltas, loadCompare, type Compare } from '@/utils/compare'
@@ -200,13 +202,26 @@ function remaining(until: string | null | undefined): string {
   return left > 0 ? ` · 还剩 ${duration(left)}` : ' · 即将恢复'
 }
 type RuntimeModel = ChannelDetailData['runtimeModels'][number]
-function modelState(m: RuntimeModel): { text: string; tone: Tone } {
+/** Only problems get a badge, like the OAuth account model list. */
+function modelProblem(m: RuntimeModel): { text: string; tone: Tone } | null {
   if (m.cooldownKind === 'permanent') return { text: '永久冷却', tone: 'red' }
   if (m.cooldownKind === 'quota') return { text: '额度冷却', tone: 'orange' }
   if (m.cooldownKind === 'temporary') return { text: `冷却中${remaining(m.cooldownUntil)}`, tone: 'orange' }
-  if (m.recentRequests > 0 && m.recentSuccessRate != null) return { text: `近期 ${m.recentSuccessRate.toFixed(0)}%`, tone: rateTone(m.recentSuccessRate) }
-  return { text: '暂无数据', tone: 'neutral' }
+  if (m.recentRequests > 0 && m.recentSuccessRate != null && m.recentSuccessRate < 95) return { text: `近期成功 ${m.recentSuccessRate.toFixed(0)}%`, tone: rateTone(m.recentSuccessRate) }
+  return null
 }
+function modelMeta(m: RuntimeModel): string {
+  const parts: string[] = []
+  if (m.contextWindow) parts.push(`上下文 ${compact(m.contextWindow, 0)}`)
+  if (m.maxOutputTokens) parts.push(`输出 ${compact(m.maxOutputTokens, 0)}`)
+  return parts.join(' · ')
+}
+// Usable models first (problems on top), disabled ones last; same order as the OAuth account list.
+const sortedModels = computed(() =>
+  [...(c.value?.runtimeModels || [])].sort((a, b) =>
+    Number(a.disabled || a.globallyDisabled) - Number(b.disabled || b.globallyDisabled)
+    || Number(Boolean(modelProblem(b))) - Number(Boolean(modelProblem(a)))),
+)
 const provider = computed(() => (c.value ? channelProvider(c.value.id, c.value.providerId) : ''))
 
 // ---- diagnostic probes, run from the model rows (connectivity only; cooldowns stay as they are) ----
@@ -374,36 +389,40 @@ async function remove(): Promise<void> {
           <Btn size="sm" variant="ghost" :loading="probingAll" :disabled="probing && !probingAll" title="逐个测试连通性，不会修改冷却状态" @click="probeAll"><Play /> 测试全部</Btn>
           <Btn size="sm" variant="ghost" @click="modelsOpen = true"><Layers /> 管理模型</Btn>
         </template>
-        <ul class="models">
-          <li v-for="m in c.runtimeModels" :key="m.real">
-            <div class="m-top">
-              <button type="button" class="m-name mono truncate" :title="m.alias" @click="openModel(m.alias)">{{ m.alias }}</button>
-              <span v-if="m.real !== m.alias" class="m-real mono truncate" :title="m.real">→ {{ m.real }}</span>
-              <span class="grow" />
+        <ModelList>
+          <ModelListRow v-for="m in sortedModels" :id="m.alias" :key="m.real" :off="m.disabled || m.globallyDisabled" :meta="modelMeta(m)">
+            <template #badges>
+              <Badge v-if="m.globallyDisabled" tone="neutral" title="模型中心已全局停用这个模型">全局停用</Badge>
+              <Badge v-else-if="m.disabled" tone="neutral" title="模型中心里对这个渠道停用了这个模型">本渠道停用</Badge>
+              <Badge v-if="modelProblem(m)" :tone="modelProblem(m)!.tone">{{ modelProblem(m)!.text }}</Badge>
               <span v-if="probes[m.real]" class="probe" :class="probes[m.real].status">
                 <LoaderCircle v-if="probes[m.real].status === 'running'" class="spin" />
                 <CircleCheck v-else-if="probes[m.real].status === 'ok'" />
                 <CircleX v-else />
                 <span v-if="probes[m.real].ms != null" class="mono">{{ probes[m.real].ms }}ms</span>
               </span>
-              <Badge :tone="modelState(m).tone">{{ modelState(m).text }}</Badge>
-              <Btn icon size="sm" variant="ghost" :disabled="probing" :title="`测试 ${m.alias} 的连通性`" @click="probe(m.real)"><FlaskConical /></Btn>
-            </div>
-            <p v-if="probes[m.real]?.reason" class="m-line c-red">{{ probes[m.real].reason }}</p>
-            <p v-if="probes[m.real]?.note" class="m-line c-green">{{ probes[m.real].note }}</p>
+            </template>
+            <p v-if="m.real !== m.alias" class="sub mono">上游名 {{ m.real }}</p>
+            <p v-if="probes[m.real]?.reason" class="sub c-red">{{ probes[m.real].reason }}</p>
+            <p v-if="probes[m.real]?.note" class="sub c-green">{{ probes[m.real].note }}</p>
             <div v-if="m.cooldownKind === 'quota'" class="quota">
               <p>原因：周/月额度已用尽</p>
               <p v-if="m.cooldownUntil">恢复：{{ dateTime(m.cooldownUntil) }}（{{ remaining(m.cooldownUntil).replace(' · ', '') }}）</p>
               <p>调度：恢复前自动跳过本渠道这个模型</p>
             </div>
-            <p v-if="statsByModel[m.real]" class="m-line">本月 {{ integer(statsByModel[m.real].total) }} 次 · {{ localUsageLine(statsByModel[m.real]) }}</p>
-            <p v-else class="m-line faint">本月暂无调用</p>
-            <p v-if="m.totalRequests" class="m-line faint">
+            <p class="sub">
+              <template v-if="statsByModel[m.real]">本月 {{ integer(statsByModel[m.real].total) }} 次 · {{ localUsageLine(statsByModel[m.real]) }}</template>
+              <template v-else>本月暂无调用</template>
+            </p>
+            <p v-if="m.totalRequests" class="sub">
               近期 {{ integer(m.totalRequests) }} 次 · 连接 {{ ms(m.averageConnectMilliseconds) }} · 首字 {{ ms(m.averageFirstByteMilliseconds) }}<template v-if="m.score != null"> · 评分 {{ m.score.toFixed(2) }}</template>
               <template v-if="m.errorCount"> · <span class="c-orange">连续失败 {{ m.errorCount }}</span></template>
             </p>
-          </li>
-        </ul>
+            <template #side>
+              <Btn icon size="sm" variant="ghost" :disabled="probing" :title="`测试 ${m.alias} 的连通性`" @click="probe(m.real)"><FlaskConical /></Btn>
+            </template>
+          </ModelListRow>
+        </ModelList>
         <p v-if="otherModelStats.length" class="faint small">
           本月还有 {{ otherModelStats.length }} 个已不在列表中的模型产生过调用：
           <button v-for="m in otherModelStats" :key="m.finalModel" type="button" class="inline-link mono" @click="openModel(m.finalModel)">{{ m.finalModel }}</button>
@@ -491,56 +510,8 @@ async function remove(): Promise<void> {
   background: var(--fill-3);
   box-shadow: inset 0 0 0 0.5px var(--hairline);
 }
-.models {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  border-radius: var(--radius-md);
-  background: var(--fill-3);
-  box-shadow: inset 0 0 0 0.5px var(--hairline);
-}
-.models li {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  padding: 9px 12px;
-  border-bottom: 0.5px solid var(--hairline);
-}
-.models li:last-child {
-  border-bottom: 0;
-}
-.m-top {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-}
-.m-name {
-  min-width: 0;
-  text-align: left;
-  font-size: 12.5px;
-  font-weight: 600;
-}
-.m-real {
-  min-width: 0;
-  font-size: 11.5px;
-  color: var(--text-3);
-}
-.grow {
-  flex: 1;
-}
-.m-name:hover,
 .inline-link:hover {
   color: var(--accent);
-}
-.m-line {
-  font-size: 11.5px;
-  color: var(--text-2);
-  overflow-wrap: anywhere;
-}
-.m-line b {
-  color: var(--text);
-  font-weight: 600;
 }
 .quota {
   padding: 6px 8px;

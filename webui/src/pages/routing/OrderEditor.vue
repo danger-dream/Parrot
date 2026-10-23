@@ -58,7 +58,7 @@ defineExpose({ reset, dirty, draft })
         <ProviderIcon :provider="channelProvider(key)" :size="20" />
         <Badge v-if="key.startsWith('api:')" class="type" tone="teal">API</Badge>
         <button class="name truncate" :title="key" @click="openChannel(key)">{{ channelLabel(key) }}</button>
-        <Badge :tone="channelState(key).tone" dot class="st">{{ channelState(key).label }}</Badge>
+        <Badge :tone="channelState(key).tone" dot class="st" :title="channelState(key).title">{{ channelState(key).label }}</Badge>
         <span class="mv">
           <button title="置顶" :disabled="i === 0" @click="move(i, 0)"><ArrowUpToLine /></button>
           <button title="上移" :disabled="i === 0" @click="move(i, i - 1)"><ArrowUp /></button>

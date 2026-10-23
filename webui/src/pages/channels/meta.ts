@@ -42,7 +42,7 @@ const HEALTH: Record<string, { label: string; tone: Tone }> = {
   degraded: { label: '成功率下降', tone: 'orange' },
   cooldown: { label: '冷却中', tone: 'orange' },
   quotaCooldown: { label: '额度冷却', tone: 'orange' },
-  unhealthy: { label: '异常', tone: 'red' },
+  unhealthy: { label: '成功率低', tone: 'red' },
   permanentCooldown: { label: '永久冷却', tone: 'red' },
   disabled: { label: '已停用', tone: 'neutral' },
 }

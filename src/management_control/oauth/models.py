@@ -310,6 +310,7 @@ class OAuthModel:
     max_input_tokens: int | None = None
     max_output_tokens: int | None = None
     reasoning_efforts: tuple[str, ...] = ()
+    globally_disabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)

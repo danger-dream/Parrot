@@ -9,7 +9,7 @@ from concurrent.futures import Executor
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable
 
-from src import model_names
+from src import model_names, model_state
 from src.cooldown import ACCOUNT_SCOPE
 from src.model_pricing import TICKS_PER_USD
 from src.management_auth.policy import CapabilityDenied, authorize
@@ -716,11 +716,15 @@ class OAuthControl(
         selection = self.backend.account_model_selection(account)
         records = {str(item.get("id") or ""): item for item in selection.get("records") or []}
         disabled = set(selection.get("disabled_models") or [])
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         models = []
         for model_id in selection.get("models") or []:
             record = records.get(model_id) or {}
             state = self.backend.cooldown_state(f"oauth:{account_id}", model_id) or {}
             until = state.get("cooldown_until")
+            # The stored state outlives its cooldown; only a running one is reported.
+            if until != -1 and not (isinstance(until, (int, float)) and until > now_ms):
+                until = None
             models.append(
                 OAuthModel(
                     model_id=model_names.public_id(self.backend.provider_of(account), model_id),
@@ -740,6 +744,7 @@ class OAuthControl(
                         if self.backend.provider_of(account) == "cursor"
                         else None
                     ),
+                    globally_disabled=not model_state.is_global_enabled(model_id, source_key=f"oauth:{account_id}"),
                 )
             )
         visible, meta = _page(models, page)

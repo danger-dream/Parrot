@@ -15,7 +15,6 @@ import { loadCompare, type Compare } from '@/utils/compare'
 import FamilyCards from './FamilyCards.vue'
 import GroupTrend from './GroupTrend.vue'
 import RankingCard from './RankingCard.vue'
-import RecentCalls from './RecentCalls.vue'
 import CacheMisses from './CacheMisses.vue'
 import { DIMS, FOCI, parseDim, parseFocus, parsePeriod, PERIODS, periodStart, type Dim, type Focus, type Period } from './metrics'
 
@@ -107,14 +106,12 @@ async function loadRows(): Promise<void> {
 }
 
 const trend = ref<InstanceType<typeof GroupTrend> | null>(null)
-const recent = ref<InstanceType<typeof RecentCalls> | null>(null)
 const misses = ref<InstanceType<typeof CacheMisses> | null>(null)
 
 function refresh(): void {
   loadSummary()
   loadRows()
   trend.value?.reload()
-  recent.value?.reload()
   misses.value?.reload()
 }
 
@@ -138,7 +135,6 @@ onMounted(() => {
     if (document.visibilityState !== 'visible') return
     loadSummary()
     loadRows()
-    recent.value?.reload()
     misses.value?.reload()
   }, 60_000)
   tick = window.setInterval(() => (now.value = Date.now()), 15_000)
@@ -179,7 +175,6 @@ onBeforeUnmount(() => {
       <FamilyCards :families="summary?.families || null" :overall="summary?.overall || null" :loading="summaryLoading" />
       <div class="side">
         <CacheMisses ref="misses" :period="period" />
-        <RecentCalls ref="recent" />
       </div>
     </div>
   </Page>

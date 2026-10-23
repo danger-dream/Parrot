@@ -74,7 +74,7 @@ def _group_exprs(group: str | tuple[str, ...] | None) -> tuple[str, str, str, st
 
 def new_point() -> dict[str, int]:
     return {
-        "total": 0, "success_count": 0, "error_count": 0, "hit_requests": 0, "affinity_hits": 0,
+        "total": 0, "success_count": 0, "error_count": 0, "cancelled_count": 0, "hit_requests": 0, "affinity_hits": 0,
         "tps_num_tokens": 0, "tps_denom_ms": 0,
         "input_tokens": 0, "output_tokens": 0,
         "cache_read_tokens": 0, "cache_creation_tokens": 0,
@@ -106,6 +106,7 @@ def _accumulate_counts(conn, out, *, start, end, bucket_seconds, count, key_expr
                    COUNT(*) AS total,
                    SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success_count,
                    SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS error_count,
+                   SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) AS cancelled_count,
                    SUM(CASE WHEN status='success' AND cache_read_tokens > 0 THEN 1 ELSE 0 END) AS hit_requests,
                    SUM(CASE WHEN affinity_hit=1 THEN 1 ELSE 0 END) AS affinity_hits,
                    SUM(CASE WHEN {log_db._TPS_COND} THEN output_tokens ELSE 0 END) AS tps_num_tokens,
@@ -132,7 +133,7 @@ def _accumulate_counts(conn, out, *, start, end, bucket_seconds, count, key_expr
         if target is None:
             continue
         for name in (
-            "total", "success_count", "error_count", "hit_requests", "affinity_hits",
+            "total", "success_count", "error_count", "cancelled_count", "hit_requests", "affinity_hits",
             "tps_num_tokens", "tps_denom_ms", "input_tokens", "output_tokens",
             "cache_read_tokens", "cache_creation_tokens", "sum_first_token_ms",
             "cnt_first_token", "sum_total_ms", "cnt_total",
@@ -477,4 +478,53 @@ def recent_outcomes(
     for key, items in out.items():
         items.sort(key=lambda item: item[0])
         del items[:-int(per_key)]
+    return out
+
+
+def outcome_buckets(
+    *, origin: float, bucket_seconds: int, count: int, group: str,
+) -> dict[str, dict[int, dict[str, float]]]:
+    """Return ``{group_key: {bucket_index: {total, errors, cancelled, last}}}`` of finished requests.
+
+    Bucket ``i`` covers ``[origin + i * bucket_seconds, origin + (i + 1) * bucket_seconds)``.
+    """
+    if group not in _GROUP_EXPRS or group is None:
+        raise ValueError("unsupported outcome grouping")
+    key_expr = _GROUP_EXPRS[group][0]
+    out: dict[str, dict[int, dict[str, float]]] = {}
+    if log_db._log_dir is not None and not os.path.isdir(log_db._log_dir):
+        return out
+    conns = log_db._iter_month_conns(float(origin))
+    try:
+        for conn, _close in conns:
+            if "request_log" not in log_db._existing_tables(conn):
+                continue
+            # "+status": keep SQLite on the created_at index for a short window (see bucketed_stats).
+            rows = conn.execute(
+                f"""SELECT {key_expr} AS k,
+                           CAST((created_at - ?) / ? AS INTEGER) AS b,
+                           COUNT(*) AS total,
+                           SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS errors,
+                           SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) AS cancelled,
+                           MAX(created_at) AS last
+                      FROM request_log
+                     WHERE created_at >= ? AND created_at < ?
+                       AND +status IN ('success', 'error', 'cancelled')
+                     GROUP BY k, b""",
+                (float(origin), int(bucket_seconds), float(origin), float(origin) + int(bucket_seconds) * int(count)),
+            ).fetchall()
+            for row in rows:
+                cell = out.setdefault(str(row["k"] or "?"), {}).setdefault(int(row["b"]), {"total": 0, "errors": 0, "cancelled": 0, "last": 0.0})
+                cell["total"] += int(row["total"] or 0)
+                cell["errors"] += int(row["errors"] or 0)
+                cell["cancelled"] += int(row["cancelled"] or 0)
+                cell["last"] = max(cell["last"], float(row["last"] or 0))
+    except sqlite3.Error as exc:
+        raise log_db.HistoricalLogError(f"outcome bucket query failed: {exc}") from exc
+    finally:
+        for _conn, close in conns:
+            try:
+                close()
+            except Exception:
+                pass
     return out

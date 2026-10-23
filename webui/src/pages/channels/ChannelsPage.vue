@@ -19,6 +19,7 @@ import ChannelCard from './ChannelCard.vue'
 import ChannelRow from './ChannelRow.vue'
 import ChannelCreateModal from './ChannelCreateModal.vue'
 import { useCardDrag } from './useCardDrag'
+import { loadOutcomeTimeline, type OutcomeTimeline } from '@/utils/outcomes'
 import { channelBus, notifyChannelsChanged, type Catalog, type Channel, type ChannelListItem } from './meta'
 
 type Filter = 'all' | 'ok' | 'problem' | 'off'
@@ -49,7 +50,7 @@ async function loadAll(): Promise<ChannelListItem[]> {
   }
 }
 
-const outcomes = ref<Record<string, Schemas['RecentOutcomeData']>>({})
+const outcomes = ref<OutcomeTimeline | null>(null)
 const view = ref<'table' | 'cards'>(localStorage.getItem('parrot.channels.view') === 'cards' ? 'cards' : 'table')
 watch(view, (v) => localStorage.setItem('parrot.channels.view', v))
 const toggling = ref('')
@@ -74,9 +75,9 @@ async function load(silent = false): Promise<void> {
     // Each item carries its month snapshot (monthStats / monthStatsLoading); no extra stats call.
     const [list, recent] = await Promise.all([
       loadAll(),
-      api.get<Schemas['RecentOutcomeData'][]>('/stats/recent-outcomes', { dimension: 'channel', limit: 10 }).catch(() => null),
+      loadOutcomeTimeline('channel'),
     ])
-    if (recent) outcomes.value = Object.fromEntries(recent.data.map((o) => [o.key, o]))
+    if (recent) outcomes.value = recent
     channels.value = list
     if (!drag.dragging.value) order.value = list.map((c) => c.id)
     error.value = ''
@@ -259,8 +260,9 @@ onBeforeUnmount(() => window.clearInterval(timer))
           :priority="priorityOf.get(c.id) ?? 0"
           :provider-name="providerName(c)"
           :preset-name="presetName(c)"
-          :outcomes="outcomes[c.id]?.outcomes"
-          :last-at="outcomes[c.id]?.lastAt"
+          :outcome="outcomes?.items[c.id]"
+          :outcome-from="outcomes?.from"
+          :last-at="outcomes?.items[c.id]?.lastAt"
           :selected="selectedId === c.id"
           :dragging="drag.dragging.value === c.id"
           :draggable="!filtered && !savingOrder && channels.length > 1"

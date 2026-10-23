@@ -27,7 +27,7 @@ TG-AK-02	shared	ApiKeyControl	updateApiKey,deleteApiKey,planApiKeyRegeneration,r
 TG-AK-03	shared	ApiKeyControl	updateApiKey,getApiKeyStats	permissions, limits and model stats
 TG-AK-04	shared	ApiKeyControl	reorderApiKeys	API key ordering
 TG-CACHE-01	shared+adapter	StatsControl	getStatsSummary	query is shared; scheduler/view-token/message-lock remain Telegram adapter mechanics
-TG-STATS-01	shared	StatsControl	getStatsSummary,getStatsBreakdown,getModelStats,listRecentCalls,getStatsTimeseries,getStatsCompare,listCacheMissSamples,listRecentOutcomes	statistics queries
+TG-STATS-01	shared	StatsControl	getStatsSummary,getStatsBreakdown,getModelStats,listRecentCalls,getStatsTimeseries,getStatsCompare,listCacheMissSamples,listRecentOutcomes,getOutcomeTimeline	statistics queries
 TG-STATS-02	shared	StatsControl	getTelegramStatsPreferences,updateTelegramStatsPreferences	Telegram statistics visibility preferences
 TG-LOG-01	shared	LogsControl	listRequestLogs,getRequestLogFilterOptions	request-log list and filter options
 TG-LOG-02	shared	LogsControl	listRequestLogs,getRequestLogFilterOptions	request-log filter semantics

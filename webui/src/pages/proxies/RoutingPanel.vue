@@ -93,8 +93,18 @@ const SECTIONS: { key: Section; title: string; sub: string; empty: string; pick:
   { key: 'channels', title: '渠道规则', sub: '为指定 API 渠道选择出口', empty: '还没有渠道规则', pick: '选择渠道' },
   { key: 'models', title: '模型规则', sub: '按请求的模型选择出口', empty: '还没有模型规则', pick: '选择模型' },
 ]
+/** Rules whose account / channel / model is gone sort last. */
 function entries(sec: Section): [string, string][] {
-  return Object.entries((routing.value?.[sec] || {}) as Record<string, string>)
+  return Object.entries((routing.value?.[sec] || {}) as Record<string, string>).sort(
+    ([a], [b]) => Number(!exists(sec, a)) - Number(!exists(sec, b)),
+  )
+}
+function goneKeys(sec: Section): string[] {
+  return entries(sec).filter(([k]) => !exists(sec, k)).map(([k]) => k)
+}
+function cleanGone(sec: Section): void {
+  const keys = goneKeys(sec)
+  patch({ [sec]: Object.fromEntries(keys.map((k) => [k, null])) }, `clean:${sec}`, `已清理 ${keys.length} 条规则`)
 }
 function label(sec: Section, key: string): string {
   if (sec === 'accounts') return channelName(`oauth:${key}`)
@@ -182,14 +192,18 @@ async function addRule(sec: Section): Promise<void> {
     </div>
     <div class="cols three">
       <Card v-for="s in SECTIONS" :key="s.key" :title="s.title" :subtitle="s.sub">
-        <template #actions><span class="count">{{ entries(s.key).length }} 条</span></template>
+        <template #actions>
+          <Btn v-if="goneKeys(s.key).length" size="sm" variant="ghost" :loading="saving === `clean:${s.key}`" title="删除目标已不存在的规则" @click="cleanGone(s.key)">
+            <Trash2 /> 清理 {{ goneKeys(s.key).length }} 条已不存在
+          </Btn>
+          <span class="count">{{ entries(s.key).length }} 条</span>
+        </template>
         <div class="rules">
           <p v-if="!entries(s.key).length" class="empty">{{ s.empty }}</p>
-          <div v-for="[k, t] in entries(s.key)" :key="k" class="rule">
+          <div v-for="[k, t] in entries(s.key)" :key="k" class="rule" :class="{ gone: !exists(s.key, k) }">
             <ProviderIcon v-if="s.key !== 'models'" :provider="s.key === 'accounts' ? channelProvider(`oauth:${k}`) : channelProvider(k)" :size="18" />
-            <button type="button" class="r-key truncate" :class="{ mono: s.key === 'models', gone: !exists(s.key, k) }" :title="k" @click="open(s.key, k)">
-              {{ label(s.key, k) }}<span v-if="!exists(s.key, k)" class="gone-tag">已不存在</span>
-            </button>
+            <span v-if="!exists(s.key, k)" class="gone-tag">已不存在</span>
+            <button type="button" class="r-key truncate" :class="{ mono: s.key === 'models' }" :title="k" @click="open(s.key, k)">{{ label(s.key, k) }}</button>
             <button v-if="t !== 'direct'" type="button" class="to mono" :title="`查看 ${t}`" @click="openProxy(groups.some((g) => g.name === t) ? 'group' : 'proxy', t)">→</button>
             <span v-else class="to">→</span>
             <Select
@@ -298,13 +312,16 @@ async function addRule(sec: Section): Promise<void> {
 .r-key:hover {
   color: var(--accent);
 }
-.r-key.gone {
-  color: var(--text-3);
+.rule.gone > :not(.gone-tag):not(:last-child) {
+  opacity: 0.45;
 }
 .gone-tag {
-  margin-left: 6px;
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: 999px;
   font-size: 10.5px;
-  color: var(--orange);
+  color: var(--text-orange);
+  background: color-mix(in srgb, var(--orange) 12%, transparent);
 }
 .to {
   color: var(--text-3);

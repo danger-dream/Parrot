@@ -17,7 +17,6 @@ import AccountCard from './AccountCard.vue'
 import AccountRow from './AccountRow.vue'
 import StatTile from '@/components/ui/StatTile.vue'
 import ProviderIcon from '@/components/ProviderIcon.vue'
-import type { Schemas } from '@/api/client'
 import AddAccountModal from './AddAccountModal.vue'
 import ImportModal from './ImportModal.vue'
 import InvalidCleanupModal from './InvalidCleanupModal.vue'
@@ -25,6 +24,7 @@ import SettingsModal from './SettingsModal.vue'
 import { accountPath, errorToast, fetchAllPages, notifyChanged, oauthBus, runOperation } from './oauthApi'
 import { accountState, PROVIDER_ORDER, providerMeta, STATE_FILTERS, STATE_KEYS, type AccountSummary, type StateKey } from './meta'
 import { errorTitle } from '@/utils/errors'
+import { loadOutcomeTimeline, type OutcomeTimeline } from '@/utils/outcomes'
 
 const route = useRoute()
 
@@ -52,7 +52,7 @@ let statsRetry: number | undefined
  * One request renders every card: each list item carries the server-built `card` (plan line, usage,
  * local period stats, window stats, projection, cooldown summary). No per-account detail calls.
  */
-const outcomes = ref<Record<string, Schemas['RecentOutcomeData']>>({})
+const outcomes = ref<OutcomeTimeline | null>(null)
 const view = ref<'table' | 'cards'>(localStorage.getItem('parrot.oauth.view') === 'cards' ? 'cards' : 'table')
 watch(view, (v) => localStorage.setItem('parrot.oauth.view', v))
 // The table needs desktop width; phones always get the cards.
@@ -64,10 +64,10 @@ async function load(): Promise<void> {
   try {
     const [res, recent] = await Promise.all([
       fetchAllPages<AccountSummary>('/oauth/accounts'),
-      api.get<Schemas['RecentOutcomeData'][]>('/stats/recent-outcomes', { dimension: 'channel', limit: 10 }).catch(() => null),
+      loadOutcomeTimeline('channel'),
     ])
     if (seq !== loadSeq) return
-    if (recent) outcomes.value = Object.fromEntries(recent.data.map((o) => [o.key, o]))
+    if (recent) outcomes.value = recent
     accounts.value = res.items
     listRevision.value = res.revision
     error.value = ''
@@ -431,7 +431,7 @@ function onCreated(id: string | null): void {
 
     <template #toolbar>
       <div class="ptabs">
-        <button :class="{ on: !providerFilter }" @click="providerFilter = ''">全部 <i>{{ accounts.length }}</i></button>
+        <button :class="{ on: !providerFilter }" @click="providerFilter = ''">全部 <i v-if="accounts.length">{{ accounts.length }}</i></button>
         <button v-for="p in providers" :key="p.value" :class="{ on: providerFilter === p.value }" @click="providerFilter = p.value">
           <ProviderIcon :provider="p.value" :size="16" />{{ providerMeta(p.value).label }} <i>{{ p.count }}</i>
         </button>
@@ -453,13 +453,13 @@ function onCreated(id: string | null): void {
 
     <p v-if="refreshNote" class="progress"><span class="spin" /> {{ refreshNote }}</p>
 
-    <section v-if="accounts.length" class="kpis">
-      <StatTile dense label="账号总数" :icon="Users" tone="blue" :value="kpis.total" sub="已登录的订阅账号" />
-      <StatTile dense label="正常可用" :icon="ShieldCheck" tone="green" :value="kpis.ok" value-tone="green" sub="参与调度" @click="stateFilter = 'available'" />
-      <StatTile dense label="需要处理" :icon="CircleAlert" tone="red" :value="kpis.attention" :value-tone="kpis.attention ? 'red' : ''" sub="认证失效、平台限制" @click="stateFilter = 'invalid'" />
-      <StatTile dense label="额度风险" :icon="Gauge" tone="orange" :value="kpis.quota" :value-tone="kpis.quota ? 'orange' : ''" sub="额度暂停或受限" @click="stateFilter = 'quota'" />
-      <StatTile dense label="已停用" :icon="Ban" tone="indigo" :value="kpis.disabled" sub="手动停用" @click="stateFilter = 'disabled'" />
-      <StatTile dense label="冷却中的模型" :icon="Snowflake" tone="cyan" :value="kpis.models" :sub="summary.permanent ? `永久冻结 ${summary.permanent}` : '冷却 / 额度暂停'" />
+    <section v-if="accounts.length || loading" class="kpis">
+      <StatTile dense label="账号总数" :icon="Users" tone="blue" :value="accounts.length ? kpis.total : null" :loading="!accounts.length" sub="已登录的订阅账号" />
+      <StatTile dense label="正常可用" :icon="ShieldCheck" tone="green" :value="accounts.length ? kpis.ok : null" :loading="!accounts.length" value-tone="green" sub="参与调度" @click="stateFilter = 'available'" />
+      <StatTile dense label="需要处理" :icon="CircleAlert" tone="red" :value="accounts.length ? kpis.attention : null" :loading="!accounts.length" :value-tone="kpis.attention ? 'red' : ''" sub="认证失效、平台限制" @click="stateFilter = 'invalid'" />
+      <StatTile dense label="额度风险" :icon="Gauge" tone="orange" :value="accounts.length ? kpis.quota : null" :loading="!accounts.length" :value-tone="kpis.quota ? 'orange' : ''" sub="额度暂停或受限" @click="stateFilter = 'quota'" />
+      <StatTile dense label="已停用" :icon="Ban" tone="indigo" :value="accounts.length ? kpis.disabled : null" :loading="!accounts.length" sub="手动停用" @click="stateFilter = 'disabled'" />
+      <StatTile dense label="冷却中的模型" :icon="Snowflake" tone="cyan" :value="accounts.length ? kpis.models : null" :loading="!accounts.length" :sub="summary.permanent ? `永久冻结 ${summary.permanent}` : '冷却 / 额度暂停'" />
     </section>
     <p v-if="accounts.length" class="hint">{{ savingOrder ? '正在保存顺序…' : '拖动行或卡片调整调度顺序，排在前面的优先使用' }}</p>
 
@@ -467,8 +467,8 @@ function onCreated(id: string | null): void {
         <TriangleAlert /> 账号列表加载失败：{{ error }}
         <Btn size="sm" @click="load">重试</Btn>
       </div>
-      <div v-else-if="loading" class="grid">
-        <Skeleton v-for="i in 6" :key="i" h="168px" r="14px" />
+      <div v-else-if="loading" :class="effView === 'table' ? 'sk-rows' : 'grid'">
+        <Skeleton v-for="i in 6" :key="i" :h="effView === 'table' ? '92px' : '168px'" r="14px" />
       </div>
       <Empty v-else-if="!accounts.length" title="还没有 OAuth 账号" detail="登录 Claude、OpenAI、智谱等订阅账号后，Parrot 会用它们转发请求。">
         <template #icon><ShieldCheck /></template>
@@ -496,8 +496,9 @@ function onCreated(id: string | null): void {
             :data-account-id="a.accountId"
             :account="a"
             :priority="priorityOf.get(a.accountId) ?? 0"
-            :outcomes="outcomes[`oauth:${a.accountId}`]?.outcomes"
-            :last-at="outcomes[`oauth:${a.accountId}`]?.lastAt"
+            :outcome="outcomes?.items[`oauth:${a.accountId}`]"
+            :outcome-from="outcomes?.from"
+            :last-at="outcomes?.items[`oauth:${a.accountId}`]?.lastAt"
             :now="now"
             :selected="a.accountId === selectedId"
             :dragging="drag.active && drag.id === a.accountId"
@@ -676,6 +677,11 @@ function onCreated(id: string | null): void {
   .frow .search {
     width: 100%;
   }
+}
+.sk-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 .grid {
   display: grid;

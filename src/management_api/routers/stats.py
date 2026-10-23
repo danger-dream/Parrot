@@ -26,7 +26,7 @@ from ..schemas.observability import (
     TelegramStatsPreferencesData,
     TelegramStatsPreferencesPatch,
 )
-from ..schemas.webui import StatsCompareData, StatsTimeseriesData
+from ..schemas.webui import OutcomeTimelineData, StatsCompareData, StatsTimeseriesData
 from ._observability import controls, meta, paged_meta, reject_unknown_query
 
 
@@ -173,6 +173,24 @@ def list_recent_outcomes(
     reject_unknown_query(request, ("dimension", "limit"))
     items = controls(request).stats.recent_outcomes(context, dimension=dimension, limit=limit)
     return DataEnvelope(data=[RecentOutcomeData.model_validate(item) for item in items], meta=meta(request))
+
+
+@router.get(
+    "/stats/outcome-timeline", operation_id="getOutcomeTimeline",
+    response_model=DataEnvelope[OutcomeTimelineData], responses=_READ_ERRORS,
+)
+def get_outcome_timeline(
+    request: Request,
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
+    dimension: Annotated[StatsDimension, Query()],
+    bucketMinutes: Annotated[int, Query(ge=5, le=360)] = 60,
+    buckets: Annotated[int, Query(ge=1, le=96)] = 24,
+) -> DataEnvelope[OutcomeTimelineData]:
+    reject_unknown_query(request, ("dimension", "bucketMinutes", "buckets"))
+    data = controls(request).stats.outcome_timeline(
+        context, dimension=dimension, bucket_minutes=bucketMinutes, buckets=buckets,
+    )
+    return DataEnvelope(data=OutcomeTimelineData.model_validate(data), meta=meta(request))
 
 
 @router.get(

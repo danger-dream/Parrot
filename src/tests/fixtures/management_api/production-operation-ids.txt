@@ -255,6 +255,7 @@ listManagementSessions
 revokeManagementSession
 revokeOtherManagementSessions
 getStatsCompare
+getOutcomeTimeline
 getStatsTimeseries
 getWebUiSettings
 updateWebUiSettings

@@ -1,12 +1,12 @@
 // One batch for the whole overview: every card renders from the same snapshot, so the page paints
 // once instead of block by block (the old per-card loading made the layout jump several times).
 import { reactive } from 'vue'
-import { api, type Schemas } from '@/api/client'
+import { loadOutcomeTimeline, type OutcomeTimeline } from '@/utils/outcomes'
+import { api } from '@/api/client'
 import type { OAuthAccountSummaryData, StatsBreakdownData, StatsSummaryData, TimePoint, TimeSeriesData } from '@/api/types'
 import { refreshCatalog } from '@/stores/catalog'
 import { loadCompare, type Compare } from '@/utils/compare'
 
-export type Outcome = Schemas['RecentOutcomeData']
 
 export const ov = reactive({
   ready: false,
@@ -17,7 +17,7 @@ export const ov = reactive({
   tenMinutes: [] as TimePoint[],
   models: [] as StatsBreakdownData[],
   channels: [] as StatsBreakdownData[],
-  outcomes: {} as Record<string, Outcome>,
+  outcomes: null as OutcomeTimeline | null,
   accounts: [] as OAuthAccountSummaryData[],
   /** Today against yesterday up to the same time; also today's sparklines. */
   compare: null as Compare | null,
@@ -38,7 +38,7 @@ export async function loadOverview(): Promise<void> {
       api.get<TimeSeriesData>('/stats/timeseries', { range: '24h', bucket: '10m' }).catch(() => null),
       api.get<StatsBreakdownData[]>('/stats/breakdown', { dimension: 'model', period: 'today', sort: 'cost', pageSize: 8 }).catch(() => null),
       api.get<StatsBreakdownData[]>('/stats/breakdown', { dimension: 'channel', period: 'today', sort: 'tokens', pageSize: 200 }).catch(() => null),
-      api.get<Outcome[]>('/stats/recent-outcomes', { dimension: 'channel', limit: 20 }).catch(() => null),
+      loadOutcomeTimeline('channel'),
       api.get<{ items: OAuthAccountSummaryData[] }>('/oauth/accounts', { pageSize: 200 }).catch(() => null),
       refreshCatalog(true).catch(() => undefined),
       loadCompare({ period: 'today' }).catch(() => null),
@@ -48,7 +48,7 @@ export async function loadOverview(): Promise<void> {
     if (tenMinutes) ov.tenMinutes = totalSeries(tenMinutes)
     if (models) ov.models = models.data
     if (channels) ov.channels = channels.data
-    if (outcomes) ov.outcomes = Object.fromEntries(outcomes.data.map((o) => [o.key, o]))
+    if (outcomes) ov.outcomes = outcomes
     if (accounts) ov.accounts = accounts.data.items
     if (compare) ov.compare = compare
     ov.loadedAt = Date.now()

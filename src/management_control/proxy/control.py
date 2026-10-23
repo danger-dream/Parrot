@@ -601,16 +601,18 @@ class ProxyControl(DomainControl):
             raise self._validation(
                 "providers", "UNKNOWN_PROVIDER", ", ".join(sorted(unknown_providers))
             )
+        # Only a rule being set needs an existing target; removing one must work after the
+        # account, channel or model is gone, which is exactly when a stale rule is cleaned up.
         channel_by_key = {channel.key: channel for channel in registry.all_channels()}
-        for key in (patch.get("accounts") or {}):
-            if key not in channel_by_key or channel_by_key[key].type != "oauth":
+        for key, target in (patch.get("accounts") or {}).items():
+            if target is not None and (key not in channel_by_key or channel_by_key[key].type != "oauth"):
                 raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
-        for key in (patch.get("channels") or {}):
-            if key not in channel_by_key or channel_by_key[key].type != "api":
+        for key, target in (patch.get("channels") or {}).items():
+            if target is not None and (key not in channel_by_key or channel_by_key[key].type != "api"):
                 raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         known_models = set(registry.available_models())
-        for key in (patch.get("models") or {}):
-            if key not in known_models:
+        for key, target in (patch.get("models") or {}).items():
+            if target is not None and key not in known_models:
                 raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
 
         def mutate(candidate: dict) -> None:

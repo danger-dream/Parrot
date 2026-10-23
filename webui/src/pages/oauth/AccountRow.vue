@@ -3,7 +3,8 @@ import { computed } from 'vue'
 import { ChevronRight, GripVertical, RefreshCw } from '@lucide/vue'
 import { compact, dateTime, usd } from '@/utils/format'
 import ProviderIcon from '@/components/ProviderIcon.vue'
-import StatusBars from '@/components/ui/StatusBars.vue'
+import OutcomeStrip from '@/components/ui/OutcomeStrip.vue'
+import type { OutcomeItem } from '@/utils/outcomes'
 import Switch from '@/components/ui/Switch.vue'
 import { cacheShare, localUsageLine, promptTokens, tps } from './channelStats'
 import { accountAlerts, planText } from './facts'
@@ -12,7 +13,8 @@ import { accountState, countdown, num, providerMeta, quotaLabel, remainingAmount
 const props = defineProps<{
   account: AccountSummary
   priority: number
-  outcomes?: readonly string[]
+  outcome?: OutcomeItem | null
+  outcomeFrom?: string | null
   lastAt?: string | null
   now: number
   selected?: boolean
@@ -79,8 +81,8 @@ function tone(left: number | null): string {
     </div>
 
     <div class="c-recent">
-      <p class="num t">{{ lastAt ? dateTime(lastAt).slice(0, 11) : '近 7 天无请求' }}</p>
-      <StatusBars :outcomes="outcomes" :slots="10" :width="5" :gap="3" :height="18" />
+      <p class="num t">{{ lastAt ? dateTime(lastAt).slice(0, 11) : '24 小时内无请求' }}</p>
+      <OutcomeStrip :item="outcome" :from="outcomeFrom" :width="3" :gap="1.5" :height="18" />
     </div>
 
     <div class="c-use">

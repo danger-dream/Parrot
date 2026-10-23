@@ -332,21 +332,26 @@ const DISABLED_REASON: Record<string, string> = {
 const HEALTH_LABEL: Record<string, string> = {
   healthy: '正常',
   unknown: '暂无流量',
-  degraded: '降级',
+  degraded: '成功率下降',
   cooldown: '冷却中',
   quotaCooldown: '额度冷却',
-  unhealthy: '异常',
+  unhealthy: '成功率低',
   permanentCooldown: '永久冷却',
   disabled: '已停用',
 }
 
-export function channelState(id: string): { label: string; tone: Tone; exists: boolean } {
+export function channelState(id: string): { label: string; tone: Tone; exists: boolean; title: string } {
   const ch = catalog.status?.channels.find((c) => c.id === id)
-  if (!ch) return { label: catalog.status ? '已不存在' : '—', tone: catalog.status ? 'red' : 'neutral', exists: !catalog.status }
-  if (!ch.enabled) return { label: DISABLED_REASON[ch.disabledReason || ''] || '已停用', tone: ch.disabledReason === 'user' || !ch.disabledReason ? 'neutral' : 'red', exists: true }
+  if (!ch) return { label: catalog.status ? '已不存在' : '—', tone: catalog.status ? 'red' : 'neutral', exists: !catalog.status, title: '' }
+  if (!ch.enabled) return { label: DISABLED_REASON[ch.disabledReason || ''] || '已停用', tone: ch.disabledReason === 'user' || !ch.disabledReason ? 'neutral' : 'red', exists: true, title: '' }
   const tone: Tone =
     ch.health === 'healthy' ? 'green' : ch.health === 'unknown' ? 'neutral' : ch.health === 'unhealthy' || ch.health === 'permanentCooldown' ? 'red' : 'orange'
-  return { label: HEALTH_LABEL[ch.health] || '未知', tone, exists: true }
+  // Say which models: the channel health is the lowest per-model recent success rate.
+  const title = [
+    ...(ch.cooldowns || []).map((c) => `${c.model} ${c.state === 'permanent' ? '永久冷却' : c.quota ? '额度冷却' : '冷却中'}`),
+    ...(ch.weakModels || []).map((w) => `${w.model} 最近 ${w.recentRequests} 次成功 ${Math.round(w.successRate)}%`),
+  ].join('\n')
+  return { label: HEALTH_LABEL[ch.health] || '未知', tone, exists: true, title }
 }
 
 export function channelTypeLabel(id: string): string {

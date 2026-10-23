@@ -2,7 +2,6 @@
 import { computed, ref, watch } from 'vue'
 import { ListChecks, RefreshCw } from '@lucide/vue'
 import { api, ApiError } from '@/api/client'
-import { openModel } from '@/links'
 import { toast } from '@/stores/ui'
 import { compact, dateTime } from '@/utils/format'
 import Badge from '@/components/ui/Badge.vue'
@@ -12,6 +11,8 @@ import SearchField from '@/components/ui/SearchField.vue'
 import Skeleton from '@/components/ui/Skeleton.vue'
 import Switch from '@/components/ui/Switch.vue'
 import DetailSection from '@/components/DetailSection.vue'
+import ModelList from '@/components/ModelList.vue'
+import ModelListRow from '@/components/ModelListRow.vue'
 import { accountPath, errorToast, fetchAllPages, notifyChanged, runOperation } from './oauthApi'
 import { effortText, metadataSourceLabel, TIER_LABEL, type ModelData } from './meta'
 import { errorTitle } from '@/utils/errors'
@@ -46,16 +47,28 @@ async function load(): Promise<void> {
 }
 watch(() => props.accountId, load, { immediate: true })
 
-// Stable order by id (toggling must not make rows jump); cooldowns float up so problems are visible.
+const unusable = (m: ModelData) => m.disabled || Boolean(m.globallyDisabled)
+const cooling = (m: ModelData) => m.cooldownPermanent || Boolean(m.cooldownUntil && Date.parse(m.cooldownUntil) > Date.now())
+// Usable models first (cooling ones on top), disabled ones last. The grouping is taken when the list
+// loads, so flipping a switch does not make the row jump away from under the pointer.
+const loadedOff = ref(new Set<string>())
+watch(loading, (busy) => { if (!busy) loadedOff.value = new Set(items.value.filter(unusable).map((m) => m.modelId)) })
 const sorted = computed(() =>
-  [...items.value].sort((a, b) => Number(Boolean(b.cooldownUntil || b.cooldownPermanent)) - Number(Boolean(a.cooldownUntil || a.cooldownPermanent)) || a.modelId.localeCompare(b.modelId)),
+  [...items.value].sort((a, b) =>
+    Number(loadedOff.value.has(a.modelId)) - Number(loadedOff.value.has(b.modelId))
+    || Number(cooling(b)) - Number(cooling(a))
+    || a.modelId.localeCompare(b.modelId)),
 )
+function coolText(m: ModelData): string {
+  const t = dateTime(m.cooldownUntil!)
+  return new Date(m.cooldownUntil!).toDateString() === new Date().toDateString() ? t.slice(6) : t
+}
 const filtered = computed(() => {
   const s = q.value.trim().toLowerCase()
   return s ? sorted.value.filter((m) => m.modelId.toLowerCase().includes(s) || m.name.toLowerCase().includes(s)) : sorted.value
 })
 const shown = computed(() => (showAll.value || q.value ? filtered.value : filtered.value.slice(0, LIMIT)))
-const enabledCount = computed(() => items.value.filter((m) => !m.disabled).length)
+const enabledCount = computed(() => items.value.filter((m) => !unusable(m)).length)
 
 function applyList(data: { items: ModelData[]; revision: string }): void {
   // PATCH responses are paged; merge them into the full list we hold.
@@ -110,7 +123,7 @@ function startBulk(): void {
   selection.value = items.value.filter((m) => !m.disabled).map((m) => m.modelId)
   editing.value = true
 }
-const bulkOptions = computed(() => sorted.value.map((m) => ({ value: m.modelId, hint: m.name !== m.modelId ? m.name : undefined })))
+const bulkOptions = computed(() => sorted.value.map((m) => ({ value: m.modelId, hint: m.globallyDisabled ? '模型中心已全局停用' : m.name !== m.modelId ? m.name : undefined })))
 const bulkDiff = computed(() => {
   const sel = new Set(selection.value)
   return {
@@ -165,7 +178,7 @@ const hasMaxCtx = (m: ModelData) => Boolean(m.maxContextWindow && m.contextWindo
 </script>
 
 <template>
-  <DetailSection title="模型" :note="items.length ? `${enabledCount}/${items.length} 已启用` : ''">
+  <DetailSection title="模型" :note="items.length ? `${enabledCount}/${items.length} 可用` : ''">
     <template #actions>
       <Btn v-if="items.length && !editing" variant="ghost" size="sm" @click="startBulk"><ListChecks /> 批量</Btn>
       <Btn variant="ghost" size="sm" :loading="syncing" @click="sync"><RefreshCw /> 同步模型</Btn>
@@ -187,25 +200,29 @@ const hasMaxCtx = (m: ModelData) => Boolean(m.maxContextWindow && m.contextWindo
 
     <template v-else>
       <SearchField v-if="items.length > LIMIT" v-model="q" placeholder="搜索模型" width="100%" />
-      <ul class="models">
-        <li v-for="m in shown" :key="m.modelId" :class="{ off: m.disabled }">
-          <div class="main">
-            <p class="line">
-              <button type="button" class="mid mono truncate" :title="`查看模型 ${m.modelId}`" @click="openModel(m.modelId)">{{ m.modelId }}</button>
-              <Badge v-if="m.cooldownPermanent" tone="red">永久冻结</Badge>
-              <Badge v-else-if="m.cooldownUntil" tone="orange">冷却至 {{ dateTime(m.cooldownUntil).slice(6) }}</Badge>
-            </p>
-            <p class="meta truncate" :title="metadataSourceLabel(m.metadataSource)">
-              <template v-if="m.name && m.name !== m.modelId">{{ m.name }} · </template>{{ ctx(m) || '暂无元数据' }}
-            </p>
-            <button v-if="hasMaxCtx(m)" type="button" class="maxctx" :disabled="busyId === m.modelId" @click="setMaxContext(m, !m.maxContextDefault)">
-              默认最大上下文：<b :class="m.maxContextDefault ? 'c-green' : ''">{{ m.maxContextDefault ? '开' : '关' }}</b>
-              <span class="faint">（点击切换；请求里显式指定时以请求为准）</span>
-            </button>
-          </div>
-          <Switch :model-value="!m.disabled" :loading="busyId === m.modelId" :label="m.disabled ? '启用模型' : '停用模型'" @update:model-value="toggle(m, $event)" />
-        </li>
-      </ul>
+      <ModelList>
+        <ModelListRow
+          v-for="m in shown"
+          :id="m.modelId"
+          :key="m.modelId"
+          :off="unusable(m)"
+          :meta="[m.name && m.name !== m.modelId ? m.name : '', ctx(m)].filter(Boolean).join(' · ')"
+          :meta-title="metadataSourceLabel(m.metadataSource)"
+        >
+          <template #badges>
+            <Badge v-if="m.globallyDisabled" tone="neutral" title="模型中心已全局停用这个模型，这里的开关只决定账号自己是否提供它">全局停用</Badge>
+            <Badge v-if="m.cooldownPermanent" tone="red">永久冻结</Badge>
+            <Badge v-else-if="cooling(m)" tone="orange">冷却至 {{ coolText(m) }}</Badge>
+          </template>
+          <button v-if="hasMaxCtx(m)" type="button" class="maxctx" :disabled="busyId === m.modelId" @click="setMaxContext(m, !m.maxContextDefault)">
+            默认最大上下文：<b :class="m.maxContextDefault ? 'c-green' : ''">{{ m.maxContextDefault ? '开' : '关' }}</b>
+            <span class="faint">（点击切换；请求里显式指定时以请求为准）</span>
+          </button>
+          <template #side>
+            <Switch :model-value="!m.disabled" :loading="busyId === m.modelId" :label="m.disabled ? '启用模型' : '停用模型'" @update:model-value="toggle(m, $event)" />
+          </template>
+        </ModelListRow>
+      </ModelList>
       <button v-if="!q && filtered.length > LIMIT" type="button" class="more" @click="showAll = !showAll">
         {{ showAll ? '收起' : `展开全部 ${filtered.length} 个模型` }}
       </button>
@@ -215,54 +232,6 @@ const hasMaxCtx = (m: ModelData) => Boolean(m.maxContextWindow && m.contextWindo
 </template>
 
 <style scoped>
-.models {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  border-radius: var(--radius-md);
-  background: var(--fill-3);
-  box-shadow: inset 0 0 0 0.5px var(--hairline);
-}
-.models li {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-height: 40px;
-  padding: 6px 10px;
-  border-bottom: 0.5px solid var(--hairline);
-}
-.models li:last-child {
-  border-bottom: 0;
-}
-.models li.off .main {
-  opacity: 0.5;
-}
-.main {
-  flex: 1;
-  min-width: 0;
-}
-.line {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-}
-.mid {
-  font-size: 12px;
-  color: var(--text);
-  text-align: left;
-  max-width: 100%;
-}
-.mid:hover {
-  color: var(--accent);
-  text-decoration: underline;
-}
-.meta {
-  font-size: 11px;
-  color: var(--text-3);
-}
 .maxctx {
   margin-top: 2px;
   font-size: 11px;

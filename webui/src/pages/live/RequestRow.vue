@@ -342,11 +342,11 @@ const costKind = computed(() => {
   background: var(--accent-soft);
 }
 .p-blue i {
-  animation: blink 1s ease-in-out infinite;
+  animation: blink 2.4s ease-in-out infinite;
 }
 @keyframes blink {
   50% {
-    opacity: 0.25;
+    opacity: 0.35;
   }
 }
 .c-tok .main em {

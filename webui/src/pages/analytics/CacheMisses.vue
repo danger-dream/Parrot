@@ -6,7 +6,7 @@ import { channelName } from '@/stores/catalog'
 import { inspector } from '@/stores/ui'
 import { compact, dateTime } from '@/utils/format'
 import { errorTitle } from '@/utils/errors'
-import { openApiKey, openChannel, openModel, openRequest } from '@/links'
+import { openRequest } from '@/links'
 import Btn from '@/components/ui/Btn.vue'
 import Card from '@/components/ui/Card.vue'
 import Skeleton from '@/components/ui/Skeleton.vue'
@@ -73,7 +73,7 @@ defineExpose({ reload: load })
         @keydown.enter="openRequest(s.id)"
       >
         <p class="l1">
-          <button v-if="s.model" type="button" class="lk mono truncate" @click.stop="openModel(s.model)">{{ s.model }}</button>
+          <span v-if="s.model" class="mono truncate">{{ s.model }}</span>
           <span v-else class="faint">—</span>
           <span class="time mono">{{ dateTime(s.createdAt) }}</span>
         </p>
@@ -82,8 +82,8 @@ defineExpose({ reload: load })
           <span class="faint">{{ s.messageCount }} 条消息<template v-if="s.toolCount"> · {{ s.toolCount }} 个工具</template></span>
         </p>
         <p class="l3">
-          <button v-if="s.channelId" type="button" class="lk truncate" :title="s.channelId" @click.stop="openChannel(s.channelId)">{{ channelName(s.channelId) }}</button>
-          <button v-if="s.apiKeyName" type="button" class="lk key truncate" @click.stop="openApiKey(s.apiKeyName)">{{ s.apiKeyName }}</button>
+          <span v-if="s.channelId" class="truncate" :title="s.channelId">{{ channelName(s.channelId) }}</span>
+          <span v-if="s.apiKeyName" class="key truncate">{{ s.apiKeyName }}</span>
         </p>
       </li>
     </ul>
@@ -158,12 +158,6 @@ li.sel {
 .l3 {
   font-size: 11.5px;
   color: var(--text-2);
-}
-.lk {
-  text-align: left;
-}
-.lk:hover {
-  color: var(--accent);
 }
 .key {
   color: var(--text-3);

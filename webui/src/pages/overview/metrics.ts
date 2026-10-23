@@ -25,6 +25,30 @@ export function successRateOf(m: Metrics | null | undefined): number | null {
   return m.successRate ?? rate(m.successCount, m.total)
 }
 
+type Outcomes = { total: number; successCount: number; errorCount: number; pendingCount?: number; cancelledCount?: number }
+
+/** Client-cancelled requests. Summaries carry pendingCount, comparisons cancelledCount; the other is the remainder. */
+export function cancelledOf(m: Outcomes | null | undefined): number {
+  if (!m) return 0
+  return m.cancelledCount ?? Math.max(0, m.total - m.successCount - m.errorCount - (m.pendingCount || 0))
+}
+export function pendingOf(m: Outcomes | null | undefined): number {
+  if (!m) return 0
+  if (m.pendingCount != null) return m.pendingCount
+  // Without either count the remainder is already reported as cancelled.
+  return m.cancelledCount != null ? Math.max(0, m.total - m.successCount - m.errorCount - m.cancelledCount) : 0
+}
+
+/** "成功 6,305 · 失败 33 · 取消 24 · 进行中 1": every request of `total` accounted for. */
+export function outcomeLine(m: Outcomes): string {
+  const parts = [`成功 ${m.successCount.toLocaleString()}`, `失败 ${m.errorCount.toLocaleString()}`]
+  const cancelled = cancelledOf(m)
+  const pending = pendingOf(m)
+  if (cancelled) parts.push(`取消 ${cancelled.toLocaleString()}`)
+  if (pending) parts.push(`进行中 ${pending.toLocaleString()}`)
+  return parts.join(' · ')
+}
+
 /** 命中请求 / 成功请求. */
 export function cacheHitRateOf(m: Metrics | null | undefined): number | null {
   if (!m) return null

@@ -1471,6 +1471,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/management/v1/stats/outcome-timeline": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Outcome Timeline */
+        get: operations["getOutcomeTimeline"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/management/v1/stats/models/{modelId}": {
         parameters: {
             query?: never;
@@ -4782,6 +4799,20 @@ export interface components {
             cooldownKind?: ("permanent" | "quota" | "temporary") | null;
             /** Errorcount */
             errorCount: number;
+            /**
+             * Disabled
+             * @default false
+             */
+            disabled: boolean;
+            /**
+             * Globallydisabled
+             * @default false
+             */
+            globallyDisabled: boolean;
+            /** Contextwindow */
+            contextWindow?: number | null;
+            /** Maxoutputtokens */
+            maxOutputTokens?: number | null;
         };
         /**
          * ChannelSort
@@ -4817,6 +4848,8 @@ export interface components {
             cooldowns: components["schemas"]["ChannelCooldownData"][];
             /** Problemreasons */
             problemReasons: string[];
+            /** Weakmodels */
+            weakModels?: components["schemas"]["WeakModelData"][];
         };
         /** ChannelUpdateRequest */
         ChannelUpdateRequest: {
@@ -4950,6 +4983,11 @@ export interface components {
             unpricedSuccess: number;
             /** Cachehitrequests */
             cacheHitRequests: number;
+            /**
+             * Cancelledcount
+             * @default 0
+             */
+            cancelledCount: number;
             /** Affinityhits */
             affinityHits: number;
             /** Averagefirsttokenmilliseconds */
@@ -4981,6 +5019,11 @@ export interface components {
             unpricedSuccess: number;
             /** Cachehitrequests */
             cacheHitRequests: number;
+            /**
+             * Cancelledcount
+             * @default 0
+             */
+            cancelledCount: number;
             /** Affinityhits */
             affinityHits: number;
             /** Averagefirsttokenmilliseconds */
@@ -5389,6 +5432,11 @@ export interface components {
         /** DataEnvelope[OpenAiWebSocketSettingsData] */
         DataEnvelope_OpenAiWebSocketSettingsData_: {
             data: components["schemas"]["OpenAiWebSocketSettingsData"];
+            meta: components["schemas"]["ResponseMeta"];
+        };
+        /** DataEnvelope[OutcomeTimelineData] */
+        DataEnvelope_OutcomeTimelineData_: {
+            data: components["schemas"]["OutcomeTimelineData"];
             meta: components["schemas"]["ResponseMeta"];
         };
         /** DataEnvelope[OverviewData] */
@@ -7616,6 +7664,8 @@ export interface components {
             networkMonitor: boolean;
             /** Modelregistry */
             modelRegistry: boolean;
+            /** Translationfailed */
+            translationFailed: boolean;
             /** Accountauthrefreshed */
             accountAuthRefreshed: boolean;
             /** Accountauthrefreshfailed */
@@ -7695,6 +7745,8 @@ export interface components {
             networkMonitor?: boolean | null;
             /** Modelregistry */
             modelRegistry?: boolean | null;
+            /** Translationfailed */
+            translationFailed?: boolean | null;
             /** Accountauthrefreshed */
             accountAuthRefreshed?: boolean | null;
             /** Accountauthrefreshfailed */
@@ -8179,6 +8231,11 @@ export interface components {
             maxOutputTokens?: number | null;
             /** Reasoningefforts */
             reasoningEfforts?: string[];
+            /**
+             * Globallydisabled
+             * @default false
+             */
+            globallyDisabled: boolean;
         };
         /** OAuthModelListData */
         OAuthModelListData: {
@@ -8550,6 +8607,45 @@ export interface components {
         OrderEnvelope: {
             data: components["schemas"]["OrderData"];
             meta: components["schemas"]["ResponseMeta"];
+        };
+        /** OutcomeBucketData */
+        OutcomeBucketData: {
+            /** Total */
+            total: number;
+            /** Errorcount */
+            errorCount: number;
+            /** Cancelledcount */
+            cancelledCount: number;
+        };
+        /**
+         * OutcomeTimelineData
+         * @description Finished requests per channel / API key / model in fixed buckets; the last bucket is the current one.
+         */
+        OutcomeTimelineData: {
+            /**
+             * From
+             * Format: date-time
+             */
+            from: string;
+            /** Bucketseconds */
+            bucketSeconds: number;
+            /** Items */
+            items: components["schemas"]["OutcomeTimelineItemData"][];
+        };
+        /** OutcomeTimelineItemData */
+        OutcomeTimelineItemData: {
+            /** Key */
+            key: string;
+            /** Buckets */
+            buckets: components["schemas"]["OutcomeBucketData"][];
+            /** Total */
+            total: number;
+            /** Errorcount */
+            errorCount: number;
+            /** Cancelledcount */
+            cancelledCount: number;
+            /** Lastat */
+            lastAt?: string | null;
         };
         /**
          * OverviewData
@@ -11807,6 +11903,17 @@ export interface components {
              * @default 10800
              */
             jobTtlSeconds: number;
+        };
+        /** WeakModelData */
+        WeakModelData: {
+            /** Model */
+            model: string;
+            /** Successrate */
+            successRate: number;
+            /** Recentrequests */
+            recentRequests: number;
+            /** Recentsuccesscount */
+            recentSuccessCount: number;
         };
         /** WebUiSettingsData */
         WebUiSettingsData: {
@@ -21252,6 +21359,75 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DataEnvelope_list_RecentOutcomeData__"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    getOutcomeTimeline: {
+        parameters: {
+            query: {
+                dimension: components["schemas"]["StatsDimension"];
+                bucketMinutes?: number;
+                buckets?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataEnvelope_OutcomeTimelineData_"];
                 };
             };
             /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */

@@ -348,6 +348,36 @@ class StatsControl:
         return cached(("recent-outcomes", dimension.value, int(limit)), load,
                       source=self.log_db if self.timeseries_source is log_timeseries_module else None)
 
+    def outcome_timeline(
+        self, context: ManagementContext, *, dimension: StatsDimension | str, bucket_minutes: int = 60, buckets: int = 24,
+    ) -> dict[str, Any]:
+        """Finished requests per key in clock-aligned buckets ending with the current one."""
+        require(context)
+        dimension = StatsDimension(dimension)
+        group = {"channel": "channel", "apiKey": "apikey", "model": "model"}[dimension.value]
+        step = int(bucket_minutes) * 60
+        origin = (int(self._now()) // step - (int(buckets) - 1)) * step
+
+        def load() -> dict[str, Any]:
+            raw = self.timeseries_source.outcome_buckets(origin=origin, bucket_seconds=step, count=int(buckets), group=group)
+            items = []
+            for key, cells in raw.items():
+                row = [cells.get(i) or {"total": 0, "errors": 0, "cancelled": 0, "last": 0.0} for i in range(int(buckets))]
+                last = max((cell["last"] for cell in row), default=0.0)
+                items.append({
+                    "key": key,
+                    "buckets": [{"total": int(c["total"]), "errorCount": int(c["errors"]), "cancelledCount": int(c["cancelled"])} for c in row],
+                    "total": sum(int(c["total"]) for c in row),
+                    "errorCount": sum(int(c["errors"]) for c in row),
+                    "cancelledCount": sum(int(c["cancelled"]) for c in row),
+                    "lastAt": datetime.fromtimestamp(last, tz=timezone.utc) if last else None,
+                })
+            items.sort(key=lambda item: item["key"])
+            return {"from": datetime.fromtimestamp(origin, tz=timezone.utc), "bucketSeconds": step, "items": items}
+
+        return cached(("outcome-timeline", dimension.value, step, int(buckets), origin), load,
+                      source=self.log_db if self.timeseries_source is log_timeseries_module else None)
+
     def breakdown(self, context: ManagementContext, query: StatsBreakdownQuery) -> PageResult[dict[str, Any]]:
         snapshot = self.period_snapshot(context, query.period)
         key = {

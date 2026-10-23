@@ -48,6 +48,8 @@ export interface ScopeMetrics {
   cacheCreationTokens: number
   costTicks: number
   unpricedSuccess: number
+  pendingCount?: number
+  cancelledCount?: number
 }
 
 export interface ScopeResult {

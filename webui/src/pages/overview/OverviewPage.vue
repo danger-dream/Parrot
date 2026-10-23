@@ -2,12 +2,12 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { Activity, CircleCheck, Coins, DatabaseZap, Inbox, Layers, RefreshCw, Timer, Zap } from '@lucide/vue'
 import { onEvent } from '@/api/events'
-import type { ChannelStatusData, RequestLogData } from '@/api/types'
+import type { RequestLogData } from '@/api/types'
 import { catalog } from '@/stores/catalog'
 import { live, qps, seedQps } from '@/stores/live'
 import { api } from '@/api/client'
 import type { TimeSeriesData } from '@/api/types'
-import { goLogs, goPage, openChannel } from '@/links'
+import { goPage } from '@/links'
 import { clock, compact, integer, ms, usd } from '@/utils/format'
 import StatTile from '@/components/ui/StatTile.vue'
 import Btn from '@/components/ui/Btn.vue'
@@ -19,7 +19,7 @@ import ChannelHealth from './ChannelHealth.vue'
 import AccountQuota from './AccountQuota.vue'
 import FamilyTable from './FamilyTable.vue'
 import { loadOverview, ov } from './data'
-import { cacheShare, pctText, promptOf, successRateOf, tpsText, type Metrics } from './metrics'
+import { cacheShare, outcomeLine, pctText, promptOf, successRateOf, tpsText, type Metrics } from './metrics'
 import { deltas, sparks as compareSparks } from '@/utils/compare'
 
 // Requests finished since the last summary snapshot (the summary is cached ~15 s server-side).
@@ -115,55 +115,18 @@ const minuteSpark = computed(() => {
 })
 const waiting = computed(() => live.snapshot?.channelTotals.waiting ?? catalog.status?.concurrency.channelTotals.waiting ?? 0)
 
-// ---- status line ----
-const problems = computed(() => (catalog.status?.problemChannels || []).filter((c) => c.enabled))
-const HEALTH_TEXT: Record<string, string> = {
-  permanentCooldown: '永久冷却',
-  quotaCooldown: '额度冷却',
-  cooldown: '冷却中',
-  unhealthy: '有模型成功率低',
-  degraded: '有模型成功率下降',
-}
-/** Health is the lowest per-model recent success rate (same rule as Telegram), so say "有模型". */
-function problemText(c: ChannelStatusData): string {
-  const base = HEALTH_TEXT[c.health] || (c.problemReasons[0] === 'auth_error' ? '认证失效' : c.problemReasons[0]) || '异常'
-  if ((c.health === 'unhealthy' || c.health === 'degraded') && c.recentSuccessRate != null) return `${base}（最低 ${Math.round(c.recentSuccessRate)}%）`
-  if (c.cooldownCount) return `${base} · ${c.cooldownCount} 个模型`
-  return base
-}
-const quotaWarnings = computed(() => catalog.status?.quotaWarnings || [])
-const lastHourErrors = computed(() => ov.tenMinutes.slice(-6).reduce((a, p) => a + p.errorCount, 0))
-const lastHourTotal = computed(() => ov.tenMinutes.slice(-6).reduce((a, p) => a + p.total, 0))
 </script>
 
 <template>
   <div class="ov">
-    <section class="strip">
-      <div class="st-main" :class="problems.length ? 'warn' : 'ok'">
-        <i class="dot" />
-        <b>{{ problems.length ? `${problems.length} 个渠道异常` : '运行正常' }}</b>
-      </div>
-      <div class="st-items">
-        <button v-for="c in problems.slice(0, 2)" :key="c.id" class="chip warn" :title="`${c.name} · ${problemText(c)}`" @click="openChannel(c.id)">
-          {{ c.name }} · {{ problemText(c) }}
-        </button>
-        <button v-if="problems.length > 2" class="chip" @click="goPage('/channels')">另外 {{ problems.length - 2 }} 个</button>
-        <button v-if="quotaWarnings.length" class="chip warn" @click="goPage('/oauth')">{{ quotaWarnings.length }} 个账号额度紧张</button>
-        <button class="chip" :class="{ bad: lastHourErrors > 0 }" @click="goLogs({ status: 'error', from: Date.now() - 3600_000 })">
-          最近 1 小时 {{ integer(lastHourTotal) }} 次请求 · 失败 {{ integer(lastHourErrors) }}
-        </button>
-        <span class="chip plain">进行中 {{ live.inFlight.size }} · 排队 {{ waiting }}</span>
-      </div>
-      <div class="st-right">
-        <span class="clock num">{{ clock(now) }}</span>
-        <Btn size="sm" variant="secondary" :loading="ov.loading && ov.ready" @click="refresh"><RefreshCw /> 刷新</Btn>
-      </div>
-    </section>
-
-    <h3 class="sec">今日概览</h3>
+    <div class="sec-row">
+      <h3 class="sec">今日概览</h3>
+      <span class="clock num">{{ clock(now) }}</span>
+      <Btn size="sm" variant="secondary" :loading="ov.loading && ov.ready" @click="refresh"><RefreshCw /> 刷新</Btn>
+    </div>
     <section class="kpis">
       <StatTile label="今日请求" :icon="Inbox" tone="blue" :loading="!ov.ready" :value="m ? integer(m.total) : null"
-        :sub="m ? `成功 ${integer(m.successCount)} · 失败 ${integer(m.errorCount)}` : ''" :spark="sparks.requests" :delta="change.requests" />
+        :sub="m ? outcomeLine(m) : ''" :spark="sparks.requests" :delta="change.requests" />
       <StatTile label="成功率" :icon="CircleCheck" tone="green" :loading="!ov.ready" :value="m ? pctText(success, 2) : null"
         :value-tone="successTone" :sub="m ? `${integer(m.successCount)} / ${integer(m.total)}` : ''" :spark="sparks.success" :delta="change.success" />
       <StatTile label="Token" :icon="Layers" tone="purple" :loading="!ov.ready" :value="m ? compact(promptOf(m) + m.outputTokens) : null"
@@ -205,82 +168,15 @@ const lastHourTotal = computed(() => ov.tenMinutes.slice(-6).reduce((a, p) => a 
   flex-direction: column;
   gap: 16px;
 }
-.strip {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 10px 16px;
-  padding: 12px 16px;
-  background: var(--surface);
-  border: 0.5px solid var(--border);
-  border-radius: var(--radius-xl);
-  box-shadow: var(--shadow-sm);
-}
-.st-main {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 14px;
-}
-.dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  background: var(--green);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 22%, transparent);
-}
-.st-main.warn .dot {
-  background: var(--orange);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--orange) 22%, transparent);
-}
-.st-main.ok b {
-  color: var(--text-green);
-}
-.st-main.warn b {
-  color: var(--text-orange);
-}
-.st-items {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-.chip {
-  max-width: 340px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  height: 26px;
-  padding: 0 10px;
-  border-radius: 999px;
-  font-size: 12.5px;
-  color: var(--text-2);
-  background: var(--surface-sunken);
-  border: 0.5px solid var(--border);
-  white-space: nowrap;
-}
-button.chip:hover {
-  border-color: var(--accent-line);
-  color: var(--accent);
-}
-.chip.warn {
-  color: var(--text-orange);
-  background: color-mix(in srgb, var(--orange) 9%, transparent);
-  border-color: color-mix(in srgb, var(--orange) 30%, transparent);
-}
-.chip.bad {
-  color: var(--text-red);
-  background: color-mix(in srgb, var(--red) 8%, transparent);
-  border-color: color-mix(in srgb, var(--red) 26%, transparent);
-}
-.chip.plain {
-  display: inline-flex;
-  align-items: center;
-}
-.st-right {
+.sec-row {
   display: flex;
   align-items: center;
   gap: 12px;
+  margin-top: 4px;
+}
+.sec-row .sec {
+  flex: 1;
+  margin-top: 0;
 }
 .clock {
   font-size: 15px;

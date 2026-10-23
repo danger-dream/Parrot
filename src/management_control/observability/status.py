@@ -27,6 +27,7 @@ from src import state_db as state_db_module
 from src import status_monitor as status_monitor_module
 from src import update_checker as update_checker_module
 from src.channel import registry as registry_module
+from src.management_control.channel_health import HEALTHY_RATE, active_model_rates, rate_health
 from src.management_control.context import ManagementContext
 from src.management_control.stats_cache import cached
 
@@ -370,13 +371,8 @@ class StatusControl:
     ) -> dict[str, Any]:
         raw_enabled = bool(getattr(channel, "enabled", False))
         disabled_reason = sanitize_credentials(getattr(channel, "disabled_reason", None))
-        rates = [
-            int(row.get("recent_success_count") or 0)
-            / int(row.get("recent_requests") or 0) * 100
-            for row in performance
-            if int(row.get("recent_requests") or 0) > 0
-        ]
-        recent_rate = min(rates) if rates else None
+        rates = active_model_rates(performance)
+        recent_rate = rates[0]["successRate"] if rates else None
         cooldown_rows: list[dict[str, Any]] = []
         for row in sorted(cooldowns, key=lambda item: str(item.get("model") or "")):
             until = int(row.get("cooldown_until") or 0)
@@ -400,14 +396,8 @@ class StatusControl:
             health = "quotaCooldown"
         elif cooldown_rows:
             health = "cooldown"
-        elif recent_rate is None:
-            health = "unknown"
-        elif recent_rate >= 80:
-            health = "healthy"
-        elif recent_rate >= 50:
-            health = "degraded"
         else:
-            health = "unhealthy"
+            health = rate_health(recent_rate)
 
         problem_reasons: list[str] = []
         if not raw_enabled:
@@ -434,6 +424,7 @@ class StatusControl:
             "permanentCooldownCount": sum(row["state"] == "permanent" for row in cooldown_rows),
             "cooldowns": cooldown_rows,
             "problemReasons": problem_reasons,
+            "weakModels": [row for row in rates if row["successRate"] < HEALTHY_RATE],
         }
 
     def runtime_status(self, context: ManagementContext) -> dict[str, Any]:

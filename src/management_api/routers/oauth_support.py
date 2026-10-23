@@ -341,6 +341,7 @@ def models(value, request: Request) -> OAuthModelListEnvelope:
                     maxInputTokens=item.max_input_tokens,
                     maxOutputTokens=item.max_output_tokens,
                     reasoningEfforts=list(item.reasoning_efforts),
+                    globallyDisabled=item.globally_disabled,
                 )
                 for item in value.items
             ],

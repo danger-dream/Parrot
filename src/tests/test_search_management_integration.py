@@ -67,7 +67,7 @@ def test_exact_search_route_methods_paths_and_retired_ag_absence():
     assert len({path for _, path in SEARCH_OPERATIONS.values()}) == 9
     assert len({path for _, path in RETIRED_AG_OPERATIONS.values()}) == 3
     manifest = (FIXTURES / "production-operation-ids.txt").read_text().splitlines()
-    assert len(manifest) == len(set(manifest)) == 273
+    assert len(manifest) == len(set(manifest)) == 274
     assert set(manifest) == set(actual)
 
 

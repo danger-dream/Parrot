@@ -184,6 +184,11 @@ class ChannelRuntimeModelData(StrictSchema):
     cooldownUntil: datetime | None = None
     cooldownKind: Literal["permanent", "quota", "temporary"] | None = None
     errorCount: int
+    # Disabled for this channel / in the model center (and not re-enabled for this channel).
+    disabled: bool = False
+    globallyDisabled: bool = False
+    contextWindow: int | None = None
+    maxOutputTokens: int | None = None
 
 
 class ChannelData(StrictSchema):

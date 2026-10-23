@@ -491,3 +491,23 @@ def test_proxy_validation_missing_and_unknown_target(domain_client):
     assert client.get(
         "/api/management/v1/proxy-groups/missing", headers=admin
     ).status_code == 404
+
+
+def test_routing_rule_of_a_vanished_target_can_be_removed_but_not_set(domain_client):
+    client, _runtime, admin, *_ = domain_client
+    path = "/api/management/v1/proxy-routing"
+
+    def stale(cfg):
+        routing = cfg.setdefault("network", {}).setdefault("routing", {})
+        routing.setdefault("accounts", {})["oauth:openai:gone@example.test:ws"] = "direct"
+        routing.setdefault("channels", {})["api:Gone"] = "direct"
+        routing.setdefault("models", {})["gone-model"] = "direct"
+    config.update(stale)
+    for section, key in (("accounts", "openai:gone@example.test:ws"), ("channels", "api:Gone"), ("models", "gone-model")):
+        assert client.patch(path, headers=admin, json={section: {key: "direct"}}).status_code == 404
+        removed = client.patch(path, headers=admin, json={section: {key: None}})
+        assert removed.status_code == 200, removed.text
+        assert key not in removed.json()["data"][section]
+    routing = config.get()["network"]["routing"]
+    assert "oauth:openai:gone@example.test:ws" not in routing.get("accounts", {})
+    assert "api:Gone" not in routing.get("channels", {}) and "gone-model" not in routing.get("models", {})

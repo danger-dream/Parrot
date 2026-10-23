@@ -137,6 +137,7 @@ def _metrics(raw: dict[str, int] | None) -> dict[str, Any]:
     out.pop("t")
     out["unpricedSuccess"] = int((raw or {}).get("unpriced_success") or 0)
     out["cacheHitRequests"] = int((raw or {}).get("hit_requests") or 0)
+    out["cancelledCount"] = int((raw or {}).get("cancelled_count") or 0)
     out["affinityHits"] = int((raw or {}).get("affinity_hits") or 0)
     # Same weighting as the summary: generated tokens over generation time.
     denom = int((raw or {}).get("tps_denom_ms") or 0)

@@ -73,6 +73,8 @@ class CompareMetricsData(StrictSchema):
     costTicks: int = Field(ge=0)
     unpricedSuccess: int = Field(ge=0)
     cacheHitRequests: int = Field(ge=0)
+    # Client-cancelled requests; with success and error they leave only in-flight ones out of total.
+    cancelledCount: int = Field(default=0, ge=0)
     affinityHits: int = Field(ge=0)
     averageFirstTokenMilliseconds: float | None = None
     averageTotalMilliseconds: float | None = None
@@ -89,6 +91,29 @@ _COMPARE_METRICS_EXAMPLE = {
     "costTicks": 1500000, "unpricedSuccess": 0, "cacheHitRequests": 400, "affinityHits": 300,
     "averageFirstTokenMilliseconds": 420.0, "averageTotalMilliseconds": 1800.0, "averageTokensPerSecond": 75.7,
 }
+
+
+class OutcomeBucketData(StrictSchema):
+    total: int = Field(ge=0)
+    errorCount: int = Field(ge=0)
+    cancelledCount: int = Field(ge=0)
+
+
+class OutcomeTimelineItemData(StrictSchema):
+    key: str
+    # Oldest first, one per bucket of the timeline (empty buckets included).
+    buckets: list[OutcomeBucketData]
+    total: int = Field(ge=0)
+    errorCount: int = Field(ge=0)
+    cancelledCount: int = Field(ge=0)
+    lastAt: datetime | None = None
+
+
+class OutcomeTimelineData(StrictSchema):
+    """Finished requests per channel / API key / model in fixed buckets; the last bucket is the current one."""
+    from_: datetime = Field(alias="from")
+    bucketSeconds: int = Field(ge=60)
+    items: list[OutcomeTimelineItemData]
 
 
 class StatsCompareData(StrictSchema):

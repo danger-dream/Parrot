@@ -24,6 +24,8 @@ class OAuthModelData(StrictSchema):
     maxInputTokens: int | None = None
     maxOutputTokens: int | None = None
     reasoningEfforts: list[str] = Field(default_factory=list)
+    # Disabled in the model center and not re-enabled for this account.
+    globallyDisabled: bool = False
 
 
 class OAuthModelListData(StrictSchema):

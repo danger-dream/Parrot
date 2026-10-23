@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import Card from '@/components/ui/Card.vue'
-import StatusBars from '@/components/ui/StatusBars.vue'
+import OutcomeStrip from '@/components/ui/OutcomeStrip.vue'
 import ProviderIcon from '@/components/ProviderIcon.vue'
 import { catalog } from '@/stores/catalog'
 import { channelProvider } from '@/utils/providers'
@@ -12,31 +12,45 @@ import { promptOf } from './metrics'
 
 defineProps<{ ready: boolean }>()
 
-const HEALTH: Record<string, { label: string; tone: string }> = {
-  permanentCooldown: { label: '永久冷却', tone: 'r' },
-  quotaCooldown: { label: '额度冷却', tone: 'o' },
-  cooldown: { label: '冷却中', tone: 'o' },
-  unhealthy: { label: '有模型成功率低', tone: 'r' },
-  degraded: { label: '有模型成功率下降', tone: 'o' },
+type Status = NonNullable<typeof catalog.status>['channels'][number]
+
+/** What is wrong, naming the models: cooldowns first, then models whose recent success rate is low. */
+function problemOf(c: Status): { label: string; tone: string } | null {
+  const cool = c.cooldowns || []
+  if (cool.length) {
+    const permanent = cool.some((x) => x.state === 'permanent')
+    const kind = permanent ? '永久冷却' : cool.every((x) => x.quota) ? '额度冷却' : '冷却中'
+    const names = cool.map((x) => x.model).filter(Boolean)
+    return { label: `${kind} · ${names.slice(0, 2).join('、')}${names.length > 2 ? ` 等 ${names.length} 个` : ''}`, tone: permanent ? 'r' : 'o' }
+  }
+  const weak = c.weakModels || []
+  if (weak.length) {
+    const w = weak[0]
+    const more = weak.length > 1 ? `，另 ${weak.length - 1} 个模型偏低` : ''
+    return {
+      label: `${w.model} 成功率 ${Math.round(w.successRate)}%（最近 ${w.recentRequests} 次）${more}`,
+      tone: w.successRate < 50 ? 'r' : 'o',
+    }
+  }
+  return null
 }
 
-// Enabled channels/accounts with requests in the last 7 days: problems first, then by today's traffic.
+// Enabled channels/accounts with requests in the last 24 hours: problems first, then by today's traffic.
 const all = computed(() => {
   const today = new Map(ov.channels.map((r) => [r.key, r.metrics]))
   return (catalog.status?.channels || [])
     .filter((c) => c.enabled)
     .map((c) => {
-      const o = ov.outcomes[c.id]
+      const o = ov.outcomes?.items[c.id]
       const m = today.get(c.id)
-      const n = o ? o.outcomes.length : 0
+      const n = o?.total ?? 0
       return {
         id: c.id,
         name: c.name,
-        health: HEALTH[c.health] ?? null,
-        outcomes: o?.outcomes ?? [],
-        ok: o?.successCount ?? 0,
+        health: problemOf(c),
+        outcome: o ?? null,
+        errors: o?.errorCount ?? 0,
         n,
-        rate: n ? o!.successCount / n : null,
         today: m?.total ?? 0,
         tokens: m ? promptOf(m) + m.outputTokens : 0,
       }
@@ -48,28 +62,28 @@ const quiet = computed(() => all.value.length - rows.value.length)
 </script>
 
 <template>
-  <Card title="渠道健康" subtitle="最近 20 次请求，一格一次：绿成功、红失败，右侧最新">
+  <Card title="渠道健康" subtitle="近 24 小时，一格一小时：绿全部成功、橙有失败、红失败占两成以上，右侧最新">
     <template #actions>
       <button class="more" @click="goPage('/channels')">全部渠道</button>
     </template>
     <div class="head">
       <span>渠道 / 账号</span>
-      <span>最近 20 次</span>
-      <span class="r">成功</span>
+      <span>近 24 小时</span>
+      <span class="r">失败</span>
     </div>
     <div class="list">
       <button v-for="r in rows" :key="r.id" class="item" @click="openChannel(r.id)">
         <ProviderIcon :provider="channelProvider(r.id)" :size="22" />
         <div class="main">
           <span class="name truncate">{{ r.name }}</span>
-          <span v-if="r.health" class="sub" :class="r.health.tone">{{ r.health.label }}</span>
+          <span v-if="r.health" class="sub truncate" :class="r.health.tone" :title="r.health.label">{{ r.health.label }}</span>
           <span v-else class="sub">今日 {{ integer(r.today) }} 次 · {{ compact(r.tokens) }} Token</span>
         </div>
-        <StatusBars :outcomes="r.outcomes" :slots="20" :width="3" :gap="2" :height="16" />
-        <span class="rate num" :class="r.rate == null ? '' : r.rate >= 0.99 ? 'g' : r.rate >= 0.9 ? 'o' : 'r'">{{ r.ok }}/{{ r.n }}</span>
+        <OutcomeStrip :item="r.outcome" :from="ov.outcomes?.from" :width="3" :gap="1" :height="16" />
+        <span class="rate num" :class="r.errors ? (r.errors / r.n >= 0.2 ? 'r' : 'o') : 'g'" :title="`近 24 小时 ${integer(r.n)} 次`">{{ r.errors ? `失败 ${integer(r.errors)}` : '无失败' }}</span>
       </button>
-      <p v-if="ready && !rows.length" class="empty">最近 7 天没有请求</p>
-      <p v-if="quiet" class="quiet">另有 {{ quiet }} 个启用的渠道最近 7 天没有请求</p>
+      <p v-if="ready && !rows.length" class="empty">近 24 小时没有请求</p>
+      <p v-if="quiet" class="quiet">另有 {{ quiet }} 个启用的渠道近 24 小时没有请求</p>
     </div>
   </Card>
 </template>
@@ -77,7 +91,7 @@ const quiet = computed(() => all.value.length - rows.value.length)
 <style scoped>
 .head {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 98px 48px;
+  grid-template-columns: minmax(0, 1fr) 96px 56px;
   gap: 10px;
   padding: 0 0 6px 32px;
   font-size: 11.5px;

@@ -26,6 +26,7 @@ import { deltas, loadCompare, sparks, type Compare } from '@/utils/compare'
 import KeyCreateModal from './KeyCreateModal.vue'
 import SecretModal from './SecretModal.vue'
 import { keyBus, type ApiKey } from './meta'
+import { loadOutcomeTimeline, type OutcomeTimeline } from '@/utils/outcomes'
 
 type Filter = 'all' | 'active' | 'idle' | 'disabled'
 
@@ -45,16 +46,13 @@ const listSummary = ref<Schemas['ApiKeyListSummaryData'] | null>(null)
 const historyLoading = ref(false)
 let timer: number | undefined
 
-const outcomes = ref<Record<string, Schemas['RecentOutcomeData']>>({})
+const outcomes = ref<OutcomeTimeline | null>(null)
 const view = ref<'table' | 'cards'>(localStorage.getItem('parrot.keys.view') === 'cards' ? 'cards' : 'table')
 watch(view, (v) => localStorage.setItem('parrot.keys.view', v))
 
 async function load(silent = false): Promise<void> {
   if (!silent) loading.value = true
-  api
-    .get<Schemas['RecentOutcomeData'][]>('/stats/recent-outcomes', { dimension: 'apiKey', limit: 10 })
-    .then((r) => (outcomes.value = Object.fromEntries(r.data.map((o) => [o.key, o]))))
-    .catch(() => undefined)
+  loadOutcomeTimeline('apiKey').then((t) => t && (outcomes.value = t))
   loadCompare({ period: 'month' })
     .then((x) => (compare.value = x))
     .catch(() => undefined)
@@ -239,8 +237,9 @@ onBeforeUnmount(() => {
           :k="k"
           :live="runtime[k.name]"
           :history="historyLoading ? null : k.historyTotal ?? null"
-          :outcomes="outcomes[k.name]?.outcomes"
-          :last-at="outcomes[k.name]?.lastAt"
+          :outcome="outcomes?.items[k.name]"
+          :outcome-from="outcomes?.from"
+          :last-at="outcomes?.items[k.name]?.lastAt"
           :selected="selectedId === k.keyId"
           :dragging="drag.dragging.value === k.keyId"
           :draggable="!filtered && !savingOrder && keys.length > 1"

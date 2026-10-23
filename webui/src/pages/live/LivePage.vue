@@ -15,7 +15,7 @@ import { compact, dateTime, integer, usd } from '@/utils/format'
 import { openRequest } from './openRequest'
 import { rowChannelName, type LogRow } from './logView'
 import { loadScope, periodStart, PERIODS, type Period, type ScopeResult } from './scopeStats'
-import { pctText } from '@/pages/overview/metrics'
+import { cancelledOf, pctText, pendingOf } from '@/pages/overview/metrics'
 import { deltas, previousLabel, sparks } from '@/utils/compare'
 import RequestRow from './RequestRow.vue'
 import Segmented from '@/components/ui/Segmented.vue'
@@ -207,7 +207,7 @@ function applyRouteQuery(): void {
   if (q.mode !== 'history') return
   const str = (v: unknown) => (typeof v === 'string' ? v : '')
   Object.assign(hist, {
-    status: str(q.status) as StatusFilter,
+    status: (str(q.status) === 'pending' ? '' : str(q.status)) as StatusFilter,
     model: str(q.model),
     channel: str(q.channel),
     apiKey: str(q.apiKey),
@@ -244,7 +244,8 @@ async function loadHistory(): Promise<void> {
   loadScopeStats()
   try {
     const res = await api.get<RequestLogData[]>('/logs', {
-      status: hist.status || undefined,
+      // History lists finished requests only; running ones live in the 实时 tab.
+      status: hist.status || FINISHED,
       apiKey: hist.apiKey || undefined,
       model: hist.model || undefined,
       channel: hist.channel || undefined,
@@ -331,8 +332,8 @@ const statusSelect: Opt[] = [
   { value: 'success', label: '成功' },
   { value: 'error', label: '失败' },
   { value: 'cancelled', label: '已取消' },
-  { value: 'pending', label: '进行中' },
 ]
+const FINISHED = ['success', 'error', 'cancelled']
 const modelOptions = computed(() => optionsOf(filterOptions.value?.models, hist.model, '全部模型'))
 const channelOptions = computed(() => optionsOf(filterOptions.value?.channels, hist.channel, '全部渠道', channelName))
 const keyOptions = computed(() => optionsOf(filterOptions.value?.apiKeys, hist.apiKey, '全部 Key'))
@@ -375,6 +376,13 @@ const offFinished = onEvent('request.finished', ({ log }: { log: RequestLogData 
   liveDelta.cacheRead += log.cacheReadTokens
   liveDelta.cost += log.billing?.costTicks ?? log.costTicks
 })
+/** Where the requests that are neither 成功 nor 失败 went, so the three tiles add up. */
+function requestNote(k: { rate: number | null; cancelled: number; pending: number }): string {
+  const parts: string[] = []
+  if (k.cancelled) parts.push(`取消 ${integer(k.cancelled)}`)
+  if (k.pending) parts.push(`进行中 ${integer(k.pending)}`)
+  return parts.length ? parts.join(' · ') : `成功率 ${pctText(k.rate)}`
+}
 const kpi = computed(() => {
   const m = scope.value?.metrics
   if (!m) return null
@@ -386,6 +394,9 @@ const kpi = computed(() => {
   return {
     total,
     success,
+    // From the snapshot only: live deltas carry no cancellations.
+    cancelled: cancelledOf(m),
+    pending: pendingOf(m),
     error: m.errorCount + d.error,
     rate: total ? success / total : null,
     prompt,
@@ -460,7 +471,7 @@ const scopeNote = computed(() => {
     </section>
 
     <section class="kpis">
-      <StatTile dense label="请求" :icon="Inbox" tone="blue" :loading="scopeLoading" :value="kpi ? integer(kpi.total) : null" :sub="kpi ? `成功率 ${pctText(kpi.rate)}` : scopeNote" :delta="change.requests" :spark="trend.requests" />
+      <StatTile dense label="请求" :icon="Inbox" tone="blue" :loading="scopeLoading" :value="kpi ? integer(kpi.total) : null" :sub="kpi ? requestNote(kpi) : scopeNote" :delta="change.requests" :spark="trend.requests" />
       <StatTile dense label="成功" :icon="CircleCheck" tone="green" :loading="scopeLoading" :value="kpi ? integer(kpi.success) : null" value-tone="green" :sub="kpi ? `成功率 ${pctText(kpi.rate, 2)}` : ''" :delta="change.success" :spark="trend.success" />
       <StatTile dense label="失败" :icon="CircleX" tone="red" :loading="scopeLoading" :value="kpi ? integer(kpi.error) : null" :value-tone="kpi && kpi.error ? 'red' : ''" :sub="kpi && kpi.total ? pctText(kpi.error / kpi.total, 2) : ''" :delta="change.errors" :spark="trend.errors" />
       <StatTile dense label="金额" :icon="Coins" tone="orange" :loading="scopeLoading" :value="kpi ? usd(kpi.cost) : null" :sub="kpi?.unpriced ? `未计价 ${integer(kpi.unpriced)} 次` : ''" :delta="change.cost" :spark="trend.cost" />

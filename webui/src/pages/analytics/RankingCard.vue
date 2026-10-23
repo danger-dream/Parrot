@@ -34,6 +34,7 @@ type ColKey =
   | 'success'
   | 'input'
   | 'output'
+  | 'cacheShare'
   | 'cacheRead'
   | 'cacheWrite'
   | 'cache'
@@ -59,7 +60,8 @@ const COLS: Col[] = [
   { key: 'success', label: '成功率', get: (r) => successRate(r.metrics), fmt: (r) => pct(successRate(r.metrics)) },
   { key: 'input', label: '读入 ↑', title: '读入 Token（含缓存读写，与其他页面一致）', get: (r) => promptOf(r.metrics), fmt: (r) => compact(promptOf(r.metrics)) },
   { key: 'output', label: '写出 ↓', title: '输出 Token', get: (r) => r.metrics.outputTokens, fmt: (r) => compact(r.metrics.outputTokens) },
-  { key: 'cacheRead', label: '缓存读', title: '缓存读取 Token 及其占读入的比例', get: (r) => r.metrics.cacheReadTokens, fmt: (r) => `${compact(r.metrics.cacheReadTokens)} · ${pct(cacheShare(r.metrics))}` },
+  { key: 'cacheShare', label: '缓存占比', title: '缓存读取占读入的比例', get: (r) => cacheShare(r.metrics), fmt: (r) => pct(cacheShare(r.metrics)) },
+  { key: 'cacheRead', label: '缓存读', title: '缓存读取 Token', get: (r) => r.metrics.cacheReadTokens, fmt: (r) => compact(r.metrics.cacheReadTokens) },
   { key: 'cacheWrite', label: '缓存写', title: '缓存写入 Token', get: (r) => r.metrics.cacheCreationTokens, fmt: (r) => compact(r.metrics.cacheCreationTokens) },
   { key: 'cache', label: '命中率', title: '成功请求中命中缓存的比例', get: (r) => cacheRate(r.metrics), fmt: (r) => pct(cacheRate(r.metrics)) },
   { key: 'actual', label: '实际费用', title: '按上游返回的真实账单结算', get: (r) => r.metrics.actualCostTicks, fmt: (r) => usd(r.metrics.actualCostTicks) },
@@ -239,7 +241,7 @@ const DIM_NAME: Record<Dim, string> = { model: '模型', channel: '渠道', apiK
 <style scoped>
 .table {
   container-type: inline-size;
-  --cols: minmax(190px, 2.2fr) repeat(11, minmax(58px, 0.75fr)) 128px;
+  --cols: minmax(190px, 2.2fr) repeat(12, minmax(58px, 0.75fr)) 128px;
   border-top: 0.5px solid var(--hairline);
 }
 .head,
@@ -375,7 +377,7 @@ const DIM_NAME: Record<Dim, string> = { model: '模型', channel: '渠道', apiK
 }
 @container (max-width: 1240px) {
   .table {
-    --cols: minmax(180px, 2.2fr) repeat(9, minmax(58px, 0.75fr)) 128px;
+    --cols: minmax(180px, 2.2fr) repeat(10, minmax(58px, 0.75fr)) 128px;
   }
   .table .c-cacheRead,
   .table .c-cacheWrite {
@@ -384,7 +386,7 @@ const DIM_NAME: Record<Dim, string> = { model: '模型', channel: '渠道', apiK
 }
 @container (max-width: 1000px) {
   .table {
-    --cols: minmax(170px, 2fr) repeat(7, minmax(58px, 0.8fr)) 118px;
+    --cols: minmax(170px, 2fr) repeat(8, minmax(58px, 0.8fr)) 118px;
   }
   .table .c-input,
   .table .c-output {

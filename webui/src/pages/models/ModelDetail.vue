@@ -4,7 +4,9 @@ import { Info, ListFilter, PencilLine, RefreshCw, TriangleAlert } from '@lucide/
 import { api, ApiError, enc, type Schemas } from '@/api/client'
 import type { StatsPeriod } from '@/api/types'
 import { goLogs, openChannel, openModel } from '@/links'
-import { refreshCatalog } from '@/stores/catalog'
+import { channelName, refreshCatalog } from '@/stores/catalog'
+import { channelProvider } from '@/utils/providers'
+import ProviderIcon from '@/components/ProviderIcon.vue'
 import { confirmAction } from '@/stores/dialogs'
 import { toast } from '@/stores/ui'
 import { integer, percent } from '@/utils/format'
@@ -29,7 +31,6 @@ import {
   META_FIELDS,
   META_GROUP_LABEL,
   capabilityTags,
-  channelLabel,
   effortLabel,
   findModel,
   formatMeta,
@@ -273,9 +274,16 @@ function toggleEditor(key: string): void {
 // ---- metadata (model-common values) ----
 /** TG head block: values shared by the scheduled sources (sharedMetadata); the common record otherwise. */
 const hasShared = computed(() => Object.keys(model.value?.sharedMetadata || {}).length > 0)
-const headValues = computed(() =>
-  hasShared.value ? (model.value?.sharedMetadata as unknown as Schemas['MetadataValues']) : meta.value?.effective,
-)
+// sharedMetadata only holds fields every routable source agrees on; the bound metadata fills the
+// rest, so a source that matches it is not listed as different.
+const headValues = computed(() => {
+  const eff = meta.value?.effective as Record<string, unknown> | undefined
+  if (!hasShared.value) return eff as Schemas['MetadataValues'] | undefined
+  const shared = model.value!.sharedMetadata as Record<string, unknown>
+  if (!eff) return shared as unknown as Schemas['MetadataValues']
+  const cost = { ...((eff.cost as object) || {}), ...((shared.cost as object) || {}) }
+  return { ...eff, ...shared, cost } as unknown as Schemas['MetadataValues']
+})
 const summary = computed(() => {
   const eff = headValues.value
   if (!eff) return [] as { g: string; rows: { key: string; label: string; value: string; manual: boolean }[] }[]
@@ -469,7 +477,10 @@ const unpriced = computed(() => stats.value?.metrics.unpricedSuccess || 0)
         </p>
         <div v-if="stats.channels.length" class="chs">
           <button v-for="c in stats.channels" :key="c.key" class="ch-row" @click="openChannel(c.key)">
-            <span class="ch-name truncate">{{ channelLabel(c.key) }}</span>
+            <span class="ch-name">
+              <ProviderIcon :provider="channelProvider(c.key)" :size="16" />
+              <span class="truncate">{{ channelName(c.key) }}</span>
+            </span>
             <span class="bar"><i :style="{ width: `${(c.count / maxChannel) * 100}%` }" /></span>
             <span class="mono ch-n">{{ integer(c.count) }}</span>
             <span class="mono faint ch-p">{{ percent(c.count, stats.metrics.total, 0) }}</span>
@@ -682,6 +693,12 @@ const unpriced = computed(() => stats.value?.metrics.unpricedSuccess || 0)
   border-radius: 6px;
   font-size: 12.5px;
   text-align: left;
+}
+.ch-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
 }
 .ch-row:hover {
   background: var(--fill-3);

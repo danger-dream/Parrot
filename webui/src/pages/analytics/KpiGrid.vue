@@ -5,7 +5,7 @@ import { compact, integer, ms, usd } from '@/utils/format'
 import Skeleton from '@/components/ui/Skeleton.vue'
 import Spark from '@/components/ui/Spark.vue'
 import { deltas, sparks, type Compare, type ComparePeriod, type Delta } from '@/utils/compare'
-import { cacheShare, promptOf } from '@/pages/overview/metrics'
+import { cacheShare, cancelledOf, promptOf } from '@/pages/overview/metrics'
 import { cacheRate, pct, successRate, totalTokens, tps, type Focus, type Metric } from './metrics'
 
 /** `compare` is this period against the one before it (absent for 累计). */
@@ -51,6 +51,7 @@ const cells = computed<Cell[]>(() => {
       lines: [
         { k: '成功', v: integer(m.successCount), tone: 'green' },
         { k: '失败', v: integer(m.errorCount), tone: m.errorCount ? 'red' : '' },
+        { k: '取消', v: integer(cancelledOf(m)) },
         { k: '进行中', v: integer(m.pendingCount) },
       ],
     },

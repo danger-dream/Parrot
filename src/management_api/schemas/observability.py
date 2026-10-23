@@ -122,6 +122,13 @@ class ChannelCooldownData(StrictSchema):
     message: str | None = None
 
 
+class WeakModelData(StrictSchema):
+    model: str
+    successRate: float = Field(ge=0, le=100)
+    recentRequests: int = Field(ge=0)
+    recentSuccessCount: int = Field(ge=0)
+
+
 class ChannelStatusData(StrictSchema):
     id: str
     name: str
@@ -138,6 +145,8 @@ class ChannelStatusData(StrictSchema):
     permanentCooldownCount: int = Field(ge=0)
     cooldowns: list[ChannelCooldownData]
     problemReasons: list[str]
+    # Models still in use whose recent success rate is below 80 %, lowest first.
+    weakModels: list[WeakModelData] = Field(default_factory=list)
 
 
 class FastestChannelData(StrictSchema):

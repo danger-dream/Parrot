@@ -69,7 +69,7 @@ _SOURCE_GROUP = {
     TimeseriesGroup.API_KEY: "apikey",
 }
 _ADDITIVE = (
-    "total", "success_count", "error_count", "input_tokens", "output_tokens",
+    "total", "success_count", "error_count", "cancelled_count", "input_tokens", "output_tokens",
     "cache_read_tokens", "cache_creation_tokens", "cost_ticks", "unpriced_success", "hit_requests",
     "affinity_hits", "tps_num_tokens", "tps_denom_ms",
     "sum_first_token_ms", "cnt_first_token", "sum_total_ms", "cnt_total",
