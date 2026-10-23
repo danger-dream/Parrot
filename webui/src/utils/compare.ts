@@ -1,7 +1,7 @@
 // Period-over-period change for metric tiles (GET /stats/compare). Both windows are aggregated by
 // the backend with one set of rules and always cover the same elapsed time.
 import { api, type Schemas } from '@/api/client'
-import { compact, dateTime, integer, ms, usd } from '@/utils/format'
+import { compact, dateTime, integer, ms, pct, tps, usd } from '@/utils/format'
 
 export type Compare = Schemas['StatsCompareData']
 export type CompareMetrics = Schemas['CompareMetricsData']
@@ -46,10 +46,8 @@ export interface Delta {
   title: string
 }
 
-const pctFmt = (v: number) => {
-  const a = Math.abs(v)
-  return a >= 1000 ? integer(Math.round(a)) : a.toFixed(1)
-}
+// Relative change, one decimal like every other percentage.
+const pctFmt = (v: number) => Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 })
 
 /** Relative change of a quantity; `better` judges the direction (omit for neutral counts). */
 export function changeDelta(
@@ -77,7 +75,7 @@ export function pointDelta(
   better: 'higher' | 'lower' = 'higher',
 ): Delta | null {
   if (cur == null || prev == null) return null
-  const title = `对比${against}：${(prev * 100).toFixed(2)}%`
+  const title = `对比${against}：${pct(prev)}`
   const pp = (cur - prev) * 100
   if (Math.abs(pp) < 0.05) return { text: '持平', tone: 'flat', title }
   const up = pp > 0
@@ -113,7 +111,7 @@ export function deltas(c: Compare | null, period?: ComparePeriod | null) {
     hit: prev.successCount ? pointDelta(hitOf(cur), hitOf(prev), a) : null,
     cost: changeDelta(cur.costTicks, prev.costTicks, a, usd(prev.costTicks)),
     firstToken: changeDelta(cur.averageFirstTokenMilliseconds, prev.averageFirstTokenMilliseconds, a, ms(prev.averageFirstTokenMilliseconds), 'lower'),
-    tps: changeDelta(cur.averageTokensPerSecond, prev.averageTokensPerSecond, a, `${(prev.averageTokensPerSecond ?? 0).toFixed(1)} t/s`, 'higher'),
+    tps: changeDelta(cur.averageTokensPerSecond, prev.averageTokensPerSecond, a, tps(prev.averageTokensPerSecond), 'higher'),
     affinity: prev.total ? pointDelta(affinityOf(cur), affinityOf(prev), a) : null,
   }
 }

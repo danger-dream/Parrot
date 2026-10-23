@@ -70,12 +70,7 @@ export function errorLabel(code: string | null | undefined): string {
   return ERROR_LABEL[code] || code
 }
 
-export function usdFloat(v: number | null | undefined): string {
-  if (!v) return '$0'
-  if (v >= 100) return `$${v.toFixed(0)}`
-  if (v >= 1) return `$${v.toFixed(2)}`
-  return `$${v.toFixed(4)}`
-}
+export { dollars as usdFloat } from '@/utils/format'
 
 export function tsDate(sec: number | null | undefined): Date | null {
   return sec ? new Date(sec * 1000) : null

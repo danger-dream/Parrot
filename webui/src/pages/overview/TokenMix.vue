@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import Card from '@/components/ui/Card.vue'
-import { compact } from '@/utils/format'
+import { compact, pct } from '@/utils/format'
 import type { Metrics } from './metrics'
 
 const props = defineProps<{ m: Metrics | null; ready: boolean }>()
@@ -30,7 +30,7 @@ const parts = computed(() => {
         <div class="line">
           <span class="lab"><i :style="{ background: r.color }" />{{ r.label }}</span>
           <span class="val num">{{ compact(r.value) }}</span>
-          <span class="pct num">{{ (r.share * 100).toFixed(1) }}%</span>
+          <span class="pct num">{{ pct(r.share) }}</span>
         </div>
         <div class="bar"><span :style="{ width: `${Math.max(r.share * 100, r.value ? 1 : 0)}%`, background: r.color }" /></div>
       </div>

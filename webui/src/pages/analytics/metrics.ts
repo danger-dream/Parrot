@@ -1,6 +1,8 @@
 import type { Schemas } from '@/api/client'
 import { channelName } from '@/stores/catalog'
 import { goLogs, openApiKey, openChannel, openModel, type LogFilter } from '@/links'
+import { pct, tps } from '@/utils/format'
+export { pct, tps }
 
 export type Period = 'today' | '3d' | '7d' | 'month' | 'lifetime'
 export type Dim = 'model' | 'channel' | 'apiKey'
@@ -32,7 +34,7 @@ export const DIMS: { value: Dim; label: string }[] = [
 
 export const FOCI: { value: Focus; label: string }[] = [
   { value: 'requests', label: '请求数' },
-  { value: 'cost', label: '费用' },
+  { value: 'cost', label: '金额' },
   { value: 'latency', label: '首字耗时' },
   { value: 'cache', label: '缓存命中' },
 ]
@@ -74,17 +76,7 @@ export function successRate(m: Partial<Metric>): number | null {
   return t ? (m.successCount ?? 0) / t : null
 }
 
-export function pct(v: number | null | undefined, digits = 1): string {
-  if (v === null || v === undefined || !Number.isFinite(v)) return '—'
-  const p = v * 100
-  if (p >= 99.95 && v < 1) return '99.9%'
-  return `${p.toFixed(digits)}%`
-}
 
-export function tps(v: number | null | undefined): string {
-  if (v === null || v === undefined || !Number.isFinite(v)) return '—'
-  return v >= 100 ? `${Math.round(v)}/s` : `${v.toFixed(1)}/s`
-}
 
 export const UNKNOWN_KEYS = new Set(['?', '', '__other__'])
 

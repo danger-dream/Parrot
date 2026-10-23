@@ -9,7 +9,7 @@ import type { Schemas } from '@/api/client'
 import { openApiKey } from '@/links'
 import { live } from '@/stores/live'
 import { inspector, toast } from '@/stores/ui'
-import { integer } from '@/utils/format'
+import { integer, usd } from '@/utils/format'
 import { errorDetail, errorTitle } from '@/utils/errors'
 import Btn from '@/components/ui/Btn.vue'
 import Empty from '@/components/ui/Empty.vue'
@@ -17,7 +17,7 @@ import Page from '@/components/ui/Page.vue'
 import SearchField from '@/components/ui/SearchField.vue'
 import Segmented from '@/components/ui/Segmented.vue'
 import Skeleton from '@/components/ui/Skeleton.vue'
-import { cost3, tokens } from '@/pages/channels/meta'
+import { tokens } from '@/pages/channels/meta'
 import { useCardDrag } from '@/pages/channels/useCardDrag'
 import KeyCard from './KeyCard.vue'
 import KeyRow from './KeyRow.vue'
@@ -205,7 +205,7 @@ onBeforeUnmount(() => {
     <section v-if="keys.length" class="kpis">
       <StatTile dense label="本月请求" :icon="Inbox" tone="blue" :value="integer(summary.calls)" :sub="`${summary.active} 个活跃 · ${summary.idle} 个闲置`" :delta="change.requests" :spark="trend.requests" />
       <StatTile dense label="读入 ↑ / 写出 ↓" :icon="Layers" tone="purple" :value="`${tokens(summary.prompt)} / ${tokens(summary.output)}`" sub="本月 Token" :delta="change.tokens" :spark="trend.tokens" />
-      <StatTile dense label="本月费用" :icon="Coins" tone="orange" :value="cost3(summary.cost)" :sub="`共 ${summary.all} 个 Key`" :delta="change.cost" :spark="trend.cost" />
+      <StatTile dense label="本月金额" :icon="Coins" tone="orange" :value="usd(summary.cost)" :sub="`共 ${summary.all} 个 Key`" :delta="change.cost" :spark="trend.cost" />
       <StatTile dense label="进行中" :icon="Activity" tone="green" :value="summary.inFlight" :sub="summary.disabled ? `${summary.disabled} 个已停用` : '实时'" />
     </section>
 
@@ -226,7 +226,7 @@ onBeforeUnmount(() => {
         <span>本月调用 · 成功/失败</span>
         <span>成功率</span>
         <span>Token</span>
-        <span>费用</span>
+        <span>金额</span>
         <span>最近状态</span>
         <span class="r">操作</span>
       </div>

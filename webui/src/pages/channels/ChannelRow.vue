@@ -2,7 +2,7 @@
 import { computed } from 'vue'
 import { ChevronRight, Coins, Database, GripVertical, Layers, Zap } from '@lucide/vue'
 import { channelProvider } from '@/utils/providers'
-import { compact, dateTime } from '@/utils/format'
+import { compact, dateTime, pct, usd } from '@/utils/format'
 import { tps } from '@/pages/oauth/channelStats'
 import ProviderIcon from '@/components/ProviderIcon.vue'
 import OutcomeStrip from '@/components/ui/OutcomeStrip.vue'
@@ -10,7 +10,7 @@ import type { OutcomeItem } from '@/utils/outcomes'
 import Switch from '@/components/ui/Switch.vue'
 import ProtocolTag from './ProtocolTag.vue'
 import UsageBlock from './UsageBlock.vue'
-import { channelStatus, cost3, toUsage, type ChannelListItem } from './meta'
+import { channelStatus, toUsage, type ChannelListItem } from './meta'
 
 const props = defineProps<{
   channel: ChannelListItem
@@ -34,8 +34,7 @@ const cacheShare = computed(() => {
   const u = usage.value
   const r = u ? u.cacheReadRatio ?? (u.prompt ? u.cacheRead / u.prompt : null) : null
   if (r == null) return '—'
-  const v = r * 100
-  return `${v >= 99.95 && v < 100 ? '99.9' : v.toFixed(1)}%`
+  return pct(r)
 })
 </script>
 
@@ -81,7 +80,7 @@ const cacheShare = computed(() => {
         <span class="wide" title="读入（含缓存）/ 写出 Token"><Layers class="i-purple" /><b class="num">↑{{ compact(usage.prompt) }} ↓{{ compact(usage.output) }}</b></span>
         <span title="缓存读取占读入"><Database class="i-teal" /><b class="num">{{ cacheShare }}</b></span>
         <span title="平均输出速度"><Zap class="i-blue" /><b class="num">{{ tps(usage.avgTps) }}</b></span>
-        <span class="wide" title="本月金额"><Coins class="i-orange" /><b class="num">{{ cost3(usage.costTicks) }}</b></span>
+        <span class="wide" title="本月金额"><Coins class="i-orange" /><b class="num">{{ usd(usage.costTicks) }}</b></span>
       </template>
       <p v-else class="sub">{{ channel.monthStatsLoading && !channel.monthStats ? '统计初始化中…' : '本月暂无调用' }}</p>
     </div>

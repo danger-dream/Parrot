@@ -4,7 +4,7 @@ import type { Schemas } from '@/api/client'
 import Card from '@/components/ui/Card.vue'
 import ProviderIcon from '@/components/ProviderIcon.vue'
 import { goPage, openAccount } from '@/links'
-import { compact, integer, relative, usd } from '@/utils/format'
+import { compact, dollars, integer, pctValue, relative, usd } from '@/utils/format'
 import { ov } from './data'
 import { promptOf } from './metrics'
 import { quotaLabel, remainingAmount } from '@/pages/oauth/meta'
@@ -34,7 +34,7 @@ function remaining(i: Item): number | null {
 function valueText(i: Item): string {
   const v = i.remaining ?? i.used
   if (v == null) return i.note || ''
-  if (i.unit === 'usd') return `$${v.toFixed(2)}`
+  if (i.unit === 'usd') return dollars(v)
   return compact(v)
 }
 
@@ -87,9 +87,9 @@ const rows = computed(() => {
             </div>
             <span class="plan truncate">{{ r.a.card?.plan.label || r.a.provider }}</span>
           </div>
-          <div class="use num">
+          <div class="use num" title="今日用量">
             <b>{{ usd(r.cost) }}</b>
-            <span>{{ integer(r.requests) }} 次 · {{ compact(r.tokens) }}</span>
+            <span>今日 {{ integer(r.requests) }} 次 · {{ compact(r.tokens) }} Token</span>
           </div>
         </div>
         <div v-if="r.bars.length || r.values.length" class="quota">
@@ -101,7 +101,7 @@ const rows = computed(() => {
                 :class="(remaining(q) ?? 0) < 15 ? 'r' : (remaining(q) ?? 0) < 40 ? 'o' : 'g'"
               />
             </span>
-            <span class="qv num">剩 {{ Math.round(remaining(q) ?? 0) }}%</span>
+            <span class="qv num">剩 {{ pctValue(remaining(q) ?? 0) }}</span>
             <span class="qr">{{ resetText(q.resetsAt) || remainingAmount(q) }}</span>
           </div>
           <div v-if="r.values.length" class="vals">

@@ -6,7 +6,9 @@ import type { Schemas } from '@/api/client'
 import type { RequestLogData } from '@/api/types'
 import { channelName } from '@/stores/catalog'
 import { channelProvider } from '@/utils/providers'
-import { compact, TICKS_PER_USD } from '@/utils/format'
+import { compact, price } from '@/utils/format'
+import { pct, tps } from '@/utils/format'
+export { pct, tps }
 
 export type LogRow = RequestLogData
 type ModelConflict = Schemas['RequestLogModelConflictData']
@@ -78,34 +80,9 @@ export function rowTps(r: LogRow): number | null {
   return null
 }
 
-export function tps(v: number | null | undefined): string {
-  if (v == null || !Number.isFinite(v)) return '—'
-  if (v >= 1000) return `${(v / 1000).toFixed(1)}K t/s`
-  if (v >= 99.95) return `${Math.round(v)} t/s`
-  return `${v.toFixed(1)} t/s`
-}
 
-export function pct(v: number | null | undefined, digits = 1): string {
-  if (v == null || !Number.isFinite(v)) return '—'
-  let text = (v * 100).toFixed(digits)
-  // 99.96% must not read as a full 100%.
-  if (v < 1 && Number(text) >= 100) text = (100 - 10 ** -digits).toFixed(digits)
-  return `${text}%`
-}
 
-/** TG `fmt_usd(decimal_places=3)` — exact amount, half-up. */
-export function usdExact(ticks: number | null | undefined, places = 3): string {
-  const v = Math.max(0, Number(ticks || 0)) / TICKS_PER_USD
-  return `$${v.toLocaleString('en-US', { minimumFractionDigits: places, maximumFractionDigits: places })}`
-}
 
-/** TG `_fmt_bytes`. */
-export function tgBytes(n: number | null | undefined): string {
-  const v = Math.max(0, Number(n || 0))
-  if (v < 1024) return `${v}B`
-  if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)}KB`
-  return `${(v / (1024 * 1024)).toFixed(1)}MB`
-}
 
 export function tok(n: number | null | undefined): string {
   return compact(n ?? 0)
@@ -295,11 +272,10 @@ const BILLING_TTL = [
   ['cacheReadTokens', 'cache_read_per_token', '缓存读取'],
 ] as const
 
-function perMillion(price: unknown): string | null {
-  const v = Number(price)
-  if (price === null || price === undefined || !Number.isFinite(v) || v < 0) return null
-  const m = Math.round(v * 1_000_000 * 1e9) / 1e9
-  return `$${m.toLocaleString('en-US', { maximumFractionDigits: 9 })}/M`
+function perMillion(perToken: unknown): string | null {
+  const v = Number(perToken)
+  if (perToken === null || perToken === undefined || !Number.isFinite(v) || v < 0) return null
+  return `${price(Math.round(v * 1_000_000 * 1e9) / 1e9)}/M`
 }
 
 /** Estimated-cost formula of one billed attempt: "输入 1,234 × $3/M + …". */

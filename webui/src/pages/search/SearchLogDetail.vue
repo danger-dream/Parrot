@@ -1,14 +1,14 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { Schemas } from '@/api/client'
-import { compact, dateTime, integer, ms } from '@/utils/format'
+import { compact, dateTime, integer, ms, TICKS_PER_USD, usdOne } from '@/utils/format'
 import { openAccount, openModel, openRequest } from '@/links'
 import { openInspector } from '@/stores/ui'
 import Badge from '@/components/ui/Badge.vue'
 import CopyText from '@/components/ui/CopyText.vue'
 import DetailSection from '@/components/DetailSection.vue'
 import BackendDetail from './BackendDetail.vue'
-import { COST_SOURCE, CREDENTIAL_KIND, errorLabel, OPERATION_LABEL, ORIGIN_LABEL, STATUS_LABEL, usdFloat } from './labels'
+import { COST_SOURCE, CREDENTIAL_KIND, errorLabel, OPERATION_LABEL, ORIGIN_LABEL, STATUS_LABEL } from './labels'
 
 const props = defineProps<{ log: Schemas['SearchCallLogData'] }>()
 const l = computed(() => props.log)
@@ -53,11 +53,11 @@ function openSource(): void {
       <div><dt>轮次</dt><dd class="mono">{{ l.roundNo }}</dd></div>
     </dl>
 
-    <DetailSection title="用量与费用">
+    <DetailSection title="用量与金额">
       <dl class="kv">
         <div><dt>输入 / 输出</dt><dd class="mono">{{ compact(l.inputTokens) }} / {{ compact(l.outputTokens) }}</dd></div>
         <div><dt>缓存读 / 写</dt><dd class="mono">{{ compact(l.cacheReadTokens) }} / {{ compact(l.cacheCreationTokens) }}</dd></div>
-        <div><dt>费用</dt><dd class="mono">{{ usdFloat(l.costUsd) }}</dd></div>
+        <div><dt>金额</dt><dd class="mono">{{ usdOne((l.costUsd ?? 0) * TICKS_PER_USD) }}</dd></div>
         <div><dt>计价方式</dt><dd>{{ COST_SOURCE[l.costSource] || l.costSource }}</dd></div>
         <div v-if="l.pricingModel" class="full"><dt>计价模型</dt><dd class="mono">{{ l.pricingModel }}</dd></div>
       </dl>

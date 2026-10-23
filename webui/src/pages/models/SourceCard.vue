@@ -65,7 +65,7 @@ function short(f: MetaField, v: unknown): string {
   if (v === null || v === undefined) return '未提供'
   if (f.kind === 'tokens' && typeof v === 'number') return tokens(v)
   if (f.kind === 'bool') return v ? '支持' : '不支持'
-  if (f.kind === 'price' && typeof v === 'number') return price(v, true)
+  if (f.kind === 'price' && typeof v === 'number') return price(v)
   if (Array.isArray(v)) return v.length ? v.map((x) => (f.key === 'reasoningEfforts' ? effortLabel(String(x)) : String(x))).join('/') : '无'
   return String(v)
 }

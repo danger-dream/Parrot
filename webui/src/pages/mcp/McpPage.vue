@@ -3,7 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { ChartBar, ChevronLeft, ChevronRight, KeyRound, Plug, Puzzle, RefreshCw, ScrollText, TriangleAlert } from '@lucide/vue'
 import { api, ApiError, type Schemas } from '@/api/client'
 import { inspector, openInspector, toast } from '@/stores/ui'
-import { dateTime, integer, ms, relative } from '@/utils/format'
+import { dateTime, integer, ms, percent, relative } from '@/utils/format'
 import { errorDetail, errorTitle } from '@/utils/errors'
 import { goPage, openApiKey } from '@/links'
 import Page from '@/components/ui/Page.vue'
@@ -321,7 +321,7 @@ onMounted(() => {
             <span class="s2 faint">
               <span>成功 {{ integer(r.success) }}</span>
               <span>失败 <b :class="{ 'c-red': r.failed }">{{ integer(r.failed) }}</b></span>
-              <span>成功率 {{ r.calls ? ((r.success / r.calls) * 100).toFixed(1) : '—' }}%</span>
+              <span>成功率 {{ percent(r.success, r.calls) }}</span>
               <span>平均 {{ ms(r.avgElapsedMs) }}</span>
               <span>最近 {{ relative(r.lastAt * 1000, now) }}</span>
             </span>

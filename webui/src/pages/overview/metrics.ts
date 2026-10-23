@@ -3,6 +3,8 @@
 // The backend now ships the derived values (docs/15-webui.md R3-5); these read them and only fall
 // back to computing when a value is absent.
 import type { StatsMetricData } from '@/api/types'
+import { pct as pctText, tps as tpsText } from '@/utils/format'
+export { pctText, tpsText }
 
 export type Metrics = StatsMetricData
 
@@ -64,14 +66,4 @@ export function rate(part: number, whole: number): number | null {
   return whole > 0 ? part / whole : null
 }
 
-export function pctText(v: number | null | undefined, digits = 1): string {
-  if (v == null || !Number.isFinite(v)) return '—'
-  return `${(v * 100).toFixed(digits)}%`
-}
 
-export function tpsText(v: number | null | undefined): string {
-  if (v == null || !Number.isFinite(v)) return '—'
-  if (v >= 1000) return `${(v / 1000).toFixed(1)}K t/s`
-  if (v >= 99.95) return `${Math.round(v)} t/s`
-  return `${v.toFixed(1)} t/s`
-}

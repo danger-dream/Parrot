@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { Shapes } from '@lucide/vue'
-import { compact, integer, ms, usd } from '@/utils/format'
+import { compact, integer, ms, pctValue, usd } from '@/utils/format'
 import Card from '@/components/ui/Card.vue'
 import Empty from '@/components/ui/Empty.vue'
 import Skeleton from '@/components/ui/Skeleton.vue'
@@ -38,7 +38,7 @@ const rows = computed(() => {
             <p v-if="FAMILY_HINT[r.key]" class="hint">{{ FAMILY_HINT[r.key] }}</p>
           </div>
           <div class="share">
-            <span class="mono">{{ r.share.toFixed(1) }}%</span>
+            <span class="mono">{{ pctValue(r.share) }}</span>
             <span class="faint">请求占比</span>
           </div>
         </header>
@@ -50,12 +50,12 @@ const rows = computed(() => {
           <div><dt>Token</dt><dd>{{ compact(totalTokens(r.m)) }}</dd></div>
           <div><dt>读入 ↑ / 写出 ↓</dt><dd>{{ compact(promptOf(r.m)) }} / {{ compact(r.m.outputTokens) }}</dd></div>
           <div><dt>缓存读 / 写</dt><dd>{{ compact(r.m.cacheReadTokens) }}（{{ pct(cacheShare(r.m)) }}）/ {{ compact(r.m.cacheCreationTokens) }}</dd></div>
-          <div><dt>缓存命中</dt><dd>{{ pct(cacheRate(r.m)) }}</dd></div>
-          <div><dt>实际费用</dt><dd>{{ usd(r.m.actualCostTicks) }}</dd></div>
-          <div><dt>估算费用</dt><dd>{{ usd(r.m.estimatedCostTicks) }}</dd></div>
+          <div><dt>缓存命中率</dt><dd>{{ pct(cacheRate(r.m)) }}</dd></div>
+          <div><dt>实际金额</dt><dd>{{ usd(r.m.actualCostTicks) }}</dd></div>
+          <div><dt>估算金额</dt><dd>{{ usd(r.m.estimatedCostTicks) }}</dd></div>
           <div><dt>首字耗时</dt><dd>{{ ms(r.m.averageFirstTokenMilliseconds) }}</dd></div>
           <div><dt>输出速度</dt><dd>{{ tps(r.m.averageTokensPerSecond) }}</dd></div>
-          <div><dt>重试 / 亲和</dt><dd>{{ integer(r.m.totalRetries) }} 次 / {{ pct(r.m.total ? r.m.affinityHits / r.m.total : null, 0) }}</dd></div>
+          <div><dt>重试 / 亲和</dt><dd>{{ integer(r.m.totalRetries) }} 次 / {{ pct(r.m.total ? r.m.affinityHits / r.m.total : null) }}</dd></div>
         </dl>
       </section>
     </div>

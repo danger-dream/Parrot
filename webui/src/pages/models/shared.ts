@@ -3,6 +3,8 @@ import { reactive } from 'vue'
 import { api, type Schemas } from '@/api/client'
 import { catalog, channelName } from '@/stores/catalog'
 import { channelProvider } from '@/utils/providers'
+import { capacity as tokens, pctValue, price } from '@/utils/format'
+export { tokens, price }
 
 // Shared state and Chinese labels for the model center and routing pages.
 
@@ -349,7 +351,7 @@ export function channelState(id: string): { label: string; tone: Tone; exists: b
   // Say which models: the channel health is the lowest per-model recent success rate.
   const title = [
     ...(ch.cooldowns || []).map((c) => `${c.model} ${c.state === 'permanent' ? '永久冷却' : c.quota ? '额度冷却' : '冷却中'}`),
-    ...(ch.weakModels || []).map((w) => `${w.model} 最近 ${w.recentRequests} 次成功 ${Math.round(w.successRate)}%`),
+    ...(ch.weakModels || []).map((w) => `${w.model} 最近 ${w.recentRequests} 次成功 ${pctValue(w.successRate)}`),
   ].join('\n')
   return { label: HEALTH_LABEL[ch.health] || '未知', tone, exists: true, title }
 }
@@ -371,19 +373,7 @@ export function channelLabel(id: string | null | undefined): string {
 
 // ---- metadata formatting ----
 
-export function tokens(n: number | null | undefined): string {
-  if (n === null || n === undefined) return '—'
-  if (n >= 1_000_000) return `${+(n / 1_000_000).toFixed(2)}M`
-  if (n >= 1000) return `${+(n / 1000).toFixed(1)}K`
-  return String(n)
-}
 
-export function price(v: number | null | undefined, precise = false): string {
-  if (v === null || v === undefined) return '—'
-  if (v === 0) return '免费'
-  if (precise) return `$${+v.toFixed(6)}`
-  return `$${+v.toFixed(v >= 1 ? 2 : 3)}`
-}
 
 export function priceSummary(v: MetadataValues | null | undefined): string {
   const c = v?.cost
@@ -454,7 +444,7 @@ export function formatMeta(field: MetaField, value: unknown): string {
       return arr.map((x) => labels[x] || x).join('、')
     }
     case 'price':
-      return typeof value === 'number' ? price(value, true) : String(value)
+      return typeof value === 'number' ? price(value) : String(value)
     default:
       return String(value)
   }

@@ -7,7 +7,7 @@ import { goLogs, openChannel, openModel } from '@/links'
 import { channelName, refreshCatalog } from '@/stores/catalog'
 import { confirmAction } from '@/stores/dialogs'
 import { closeInspector, toast } from '@/stores/ui'
-import { dateTime, integer } from '@/utils/format'
+import { dateTime, integer, pctValue, usd } from '@/utils/format'
 import { errorDetail, errorTitle } from '@/utils/errors'
 import Btn from '@/components/ui/Btn.vue'
 import Meter from '@/components/ui/Meter.vue'
@@ -18,7 +18,7 @@ import { channelProvider } from '@/utils/providers'
 import Switch from '@/components/ui/Switch.vue'
 import DetailSection from '@/components/DetailSection.vue'
 import UsageTiles, { type UsageTile } from '@/components/UsageTiles.vue'
-import { cacheText, cost3, toUsage, tokens, tps } from '@/pages/channels/meta'
+import { cacheText, toUsage, tokens, tps } from '@/pages/channels/meta'
 import { deltas, loadCompare, type Compare } from '@/utils/compare'
 import KeyChannelsModal from './KeyChannelsModal.vue'
 import KeyLimitsModal from './KeyLimitsModal.vue'
@@ -92,8 +92,8 @@ const tiles = computed<UsageTile[]>(() => {
   return [
     { k: '读入 ↑（含缓存）', v: tokens(u.prompt), delta: d.prompt },
     { k: '写出 ↓', v: tokens(u.output), delta: d.output },
-    { k: '金额', v: cost3(u.costTicks), delta: d.cost },
-    { k: '缓存读取', v: tokens(u.cacheRead), s: share !== null ? `占读入 ${share >= 99.95 && share < 100 ? '99.9' : share.toFixed(1)}%` : '', delta: d.cacheRead },
+    { k: '金额', v: usd(u.costTicks), delta: d.cost },
+    { k: '缓存读取', v: tokens(u.cacheRead), s: share !== null ? `占读入 ${pctValue(share)}` : '', delta: d.cacheRead },
     { k: '平均速度', v: tps(u.avgTps), s: u.maxTps !== null ? `峰值 ${tps(u.maxTps)} · 最低 ${tps(u.minTps)}` : '' },
     { k: '请求', v: integer(u.total), s: u.error ? `失败 ${integer(u.error)}` : '全部成功', bad: Boolean(u.error), delta: d.requests },
   ]
@@ -268,7 +268,7 @@ const mcpText = computed(() => {
             <li v-for="m in byModel" :key="m.model">
               <div class="m-top">
                 <button type="button" class="m-name mono truncate" :title="m.model" @click="openModel(m.model)">{{ m.model }}</button>
-                <span class="m-v num">{{ cost3(m.usage.costTicks) }}</span>
+                <span class="m-v num">{{ usd(m.usage.costTicks) }}</span>
               </div>
               <p class="m-line num">
                 {{ integer(m.usage.total) }} 次 · <span class="c-green">✓ {{ integer(m.usage.successCount) }}</span> · <span :class="m.usage.errorCount ? 'c-red' : 'faint'">✗ {{ integer(m.usage.errorCount) }}</span>

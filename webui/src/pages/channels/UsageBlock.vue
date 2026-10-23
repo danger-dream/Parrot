@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { Schemas } from '@/api/client'
-import { dateTime, relative } from '@/utils/format'
+import { dateTime, pctValue, relative } from '@/utils/format'
 import Meter from '@/components/ui/Meter.vue'
 import { tokens } from './meta'
 import { windowName } from '@/pages/oauth/meta'
@@ -43,8 +43,8 @@ function pct(m: Metric): number | null {
 }
 function windowCore(m: Metric): string {
   const p = pct(m)
-  if (m.used != null && m.total != null && (m.id === 'mcp_month' || p === null)) return `已用 ${num(m.used)} / ${num(m.total)}${p !== null ? `（${p.toFixed(p < 10 ? 1 : 0)}%）` : ''}`
-  if (p !== null) return `已用 ${p.toFixed(p < 10 ? 1 : 0)}%`
+  if (m.used != null && m.total != null && (m.id === 'mcp_month' || p === null)) return `已用 ${num(m.used)} / ${num(m.total)}${p !== null ? `（${pctValue(p)}）` : ''}`
+  if (p !== null) return `已用 ${pctValue(p)}`
   return m.status || '已获取'
 }
 function resetText(m: Metric): string {
@@ -161,7 +161,7 @@ const scopeMismatch = computed(() => (snap.value?.notices || []).includes('model
         <div v-if="modelCalls" class="line"><span class="lbl">模型调用</span><span class="val num">{{ num(modelCalls.value) }} 次</span></div>
         <div v-if="trendTokens" class="line"><span class="lbl">Token 用量</span><span class="val num">{{ num(trendTokens.value, true) }}</span></div>
         <div v-if="distribution.length" class="dist">
-          <span v-for="d in distribution" :key="d.label" class="chip">{{ d.label }} <b class="num">{{ d.pct.toFixed(1) }}%</b></span>
+          <span v-for="d in distribution" :key="d.label" class="chip">{{ d.label }} <b class="num">{{ pctValue(d.pct) }}</b></span>
         </div>
         <p v-if="scopeMismatch" class="sub">上游趋势总量与模型分项为不同统计口径，未直接相加。</p>
       </template>

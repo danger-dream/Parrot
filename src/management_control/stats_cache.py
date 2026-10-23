@@ -4,8 +4,12 @@ Statistics are computed with the unchanged ``log_db`` aggregation code; this
 module only decides *when* to recompute:
 
 * a value younger than ``fresh_seconds`` is returned as is;
-* an older value (up to ``max_stale_seconds``) is returned immediately while
-  one background thread recomputes it (single flight per key);
+* an older value whose last computation was quick (under ``slow_seconds``) is
+  recomputed on the spot, so cheap live windows (today, recent outcomes) are
+  never served stale and pages agree with one another;
+* an older value of a slow computation (up to ``max_stale_seconds``) is
+  returned immediately while one background thread recomputes it (single
+  flight per key);
 * without a usable value the caller computes it, and concurrent callers for
   the same key wait for that single computation instead of repeating it.
 
@@ -33,6 +37,7 @@ from typing import Any, Callable, Hashable
 class _Entry:
     value: Any
     stored_at: float
+    cost: float = 0.0
 
 
 class _Flight:
@@ -63,12 +68,14 @@ class StatsCache:
         *,
         fresh_seconds: float = 15.0,
         max_stale_seconds: float = 600.0,
+        slow_seconds: float = 1.0,
         max_entries: int = 256,
         max_concurrent: int = 2,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.fresh_seconds = float(fresh_seconds)
         self.max_stale_seconds = float(max_stale_seconds)
+        self.slow_seconds = float(slow_seconds)
         self.max_entries = int(max_entries)
         # PARROT_STATS_CACHE=0 disables caching (operations knob; the test
         # suite sets it because tests read statistics right after writing).
@@ -80,9 +87,9 @@ class StatsCache:
         self._slots = threading.BoundedSemaphore(max(1, int(max_concurrent)))
 
     # ── internals ───────────────────────────────────────────────────
-    def _store(self, key: Hashable, value: Any) -> None:
+    def _store(self, key: Hashable, value: Any, cost: float = 0.0) -> None:
         with self._lock:
-            self._entries[key] = _Entry(value, self._clock())
+            self._entries[key] = _Entry(value, self._clock(), cost)
             self._entries.move_to_end(key)
             while len(self._entries) > self.max_entries:
                 self._entries.popitem(last=False)
@@ -90,8 +97,10 @@ class StatsCache:
     def _run(self, key: Hashable, loader: Callable[[], Any], flight: _Flight) -> None:
         try:
             with self._slots:
+                started = time.monotonic()
                 value = loader()
-            self._store(key, value)
+                cost = time.monotonic() - started
+            self._store(key, value, cost)
             flight.value = value
         except BaseException as exc:  # delivered to waiters; background errors keep the stale value
             flight.error = exc
@@ -119,7 +128,8 @@ class StatsCache:
             age = None if entry is None else now - entry.stored_at
         if entry is not None and age is not None and age < self.fresh_seconds:
             return copy.deepcopy(entry.value)
-        if entry is not None and age is not None and age < self.max_stale_seconds:
+        if (entry is not None and age is not None and age < self.max_stale_seconds
+                and entry.cost >= self.slow_seconds):
             self._start_background(key, loader)
             return copy.deepcopy(entry.value)
         with self._lock:

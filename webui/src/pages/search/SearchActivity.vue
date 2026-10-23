@@ -3,7 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { ChartBar, ChevronLeft, ChevronRight, RefreshCw, ScrollText, X } from '@lucide/vue'
 import { api, type Schemas } from '@/api/client'
 import { inspector, openInspector } from '@/stores/ui'
-import { compact, dateTime, integer, ms, relative } from '@/utils/format'
+import { compact, dateTime, integer, ms, pctValue, relative, TICKS_PER_USD, usdOne } from '@/utils/format'
 import { errorTitle } from '@/utils/errors'
 import Card from '@/components/ui/Card.vue'
 import Btn from '@/components/ui/Btn.vue'
@@ -134,7 +134,7 @@ const selected = computed(() => (inspector.open && inspector.key.startsWith('sea
         <div class="sum">
           <div><p class="k">调用</p><p class="v">{{ integer(totals.attempts) }}</p></div>
           <div><p class="k">成功</p><p class="v">{{ integer(totals.success) }}</p></div>
-          <div><p class="k">费用</p><p class="v">{{ usdFloat(totals.cost) }}</p></div>
+          <div><p class="k">金额</p><p class="v">{{ usdFloat(totals.cost) }}</p></div>
         </div>
         <button
           v-for="r in stats"
@@ -148,18 +148,18 @@ const selected = computed(() => (inspector.open && inspector.key.startsWith('sea
           <span class="s1">
             <span class="sn truncate">{{ r.sourceName }}</span>
             <span class="mono">{{ integer(r.attempts) }} 次</span>
-            <span class="mono rate" :class="{ 'c-red': (rate(r) ?? 100) < 80 }">{{ rate(r) === null ? '—' : `${rate(r)!.toFixed(1)}%` }}</span>
+            <span class="mono rate" :class="{ 'c-red': (rate(r) ?? 100) < 80 }">{{ pctValue(rate(r)) }}</span>
           </span>
           <Meter :value="rate(r)" :warn="101" :danger="101" />
           <span class="s2 faint">
             <span>成功 {{ integer(r.success) }} · 失败 <b :class="{ 'c-red': r.failed }">{{ integer(r.failed) }}</b><template v-if="r.running"> · 进行中 {{ r.running }}</template></span>
             <span>平均 {{ r.averageMs !== null && r.averageMs !== undefined ? ms(r.averageMs) : '—' }}</span>
             <span>{{ integer(r.resultCount) }} 条结果</span>
-            <span>{{ r.usageObserved ? `${compact(r.inputTokens + r.outputTokens)} Token · ${usdFloat(r.costUsd)}` : '按次计费' }}</span>
+            <span>{{ r.usageObserved ? `${compact(r.inputTokens + r.outputTokens)} Token · ${usdOne((r.costUsd ?? 0) * TICKS_PER_USD)}` : '按次计费' }}</span>
             <span>最近 {{ relative(r.lastAt * 1000, now) }}</span>
           </span>
         </button>
-        <p class="note faint">费用只统计 OAuth 来源真实模型调用的 Token 结算；API Key 来源按次计费，不在 Token 用量中。</p>
+        <p class="note faint">金额只统计 OAuth 来源真实模型调用的 Token 结算；API Key 来源按次计费，不在 Token 用量中。</p>
       </div>
     </Card>
 

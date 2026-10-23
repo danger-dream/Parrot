@@ -63,9 +63,9 @@ const COLS: Col[] = [
   { key: 'cacheShare', label: '缓存占比', title: '缓存读取占读入的比例', get: (r) => cacheShare(r.metrics), fmt: (r) => pct(cacheShare(r.metrics)) },
   { key: 'cacheRead', label: '缓存读', title: '缓存读取 Token', get: (r) => r.metrics.cacheReadTokens, fmt: (r) => compact(r.metrics.cacheReadTokens) },
   { key: 'cacheWrite', label: '缓存写', title: '缓存写入 Token', get: (r) => r.metrics.cacheCreationTokens, fmt: (r) => compact(r.metrics.cacheCreationTokens) },
-  { key: 'cache', label: '命中率', title: '成功请求中命中缓存的比例', get: (r) => cacheRate(r.metrics), fmt: (r) => pct(cacheRate(r.metrics)) },
-  { key: 'actual', label: '实际费用', title: '按上游返回的真实账单结算', get: (r) => r.metrics.actualCostTicks, fmt: (r) => usd(r.metrics.actualCostTicks) },
-  { key: 'estimated', label: '估算费用', title: '按价格表估算', get: (r) => r.metrics.estimatedCostTicks, fmt: (r) => usd(r.metrics.estimatedCostTicks) },
+  { key: 'cache', label: '缓存命中率', title: '成功请求中命中缓存的比例', get: (r) => cacheRate(r.metrics), fmt: (r) => pct(cacheRate(r.metrics)) },
+  { key: 'actual', label: '实际金额', title: '按上游返回的真实账单结算', get: (r) => r.metrics.actualCostTicks, fmt: (r) => usd(r.metrics.actualCostTicks) },
+  { key: 'estimated', label: '估算金额', title: '按价格表估算', get: (r) => r.metrics.estimatedCostTicks, fmt: (r) => usd(r.metrics.estimatedCostTicks) },
   { key: 'latency', label: '首字', title: '平均首字耗时', get: (r) => r.metrics.averageFirstTokenMilliseconds ?? null, fmt: (r) => ms(r.metrics.averageFirstTokenMilliseconds) },
   { key: 'tps', label: '速度', title: '平均输出速度（Token/秒）', get: (r) => r.metrics.averageTokensPerSecond ?? null, fmt: (r) => tps(r.metrics.averageTokensPerSecond) },
 ]

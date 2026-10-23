@@ -7,7 +7,7 @@ import { useResource, useSection } from '@/composables/useResource'
 import { catalog, channelName, refreshCatalog } from '@/stores/catalog'
 import { confirmAction } from '@/stores/dialogs'
 import { toast } from '@/stores/ui'
-import { integer } from '@/utils/format'
+import { bytes, integer, percent } from '@/utils/format'
 import { errorDetail, errorTitle } from '@/utils/errors'
 import { openChannel, openModel } from '@/links'
 import Page from '@/components/ui/Page.vue'
@@ -243,7 +243,7 @@ onMounted(loadCache)
 const hitRate = computed(() => {
   const c = cache.value
   if (!c || !(c.hits + c.misses)) return '—'
-  return `${((c.hits / (c.hits + c.misses)) * 100).toFixed(1)}%`
+  return percent(c.hits, c.hits + c.misses)
 })
 async function clearCache(): Promise<void> {
   const ok = await confirmAction({
@@ -405,7 +405,7 @@ const langName = computed(() => langs.value.find((l) => l.id === res.data.value?
           <div v-else-if="!cache" class="skl"><Skeleton h="40px" r="8px" /></div>
           <dl v-else class="cache">
             <div><dt>缓存条目</dt><dd>{{ integer(cache.entries) }}</dd></div>
-            <div><dt>内存中</dt><dd>{{ integer(cache.memoryEntries) }} 条 · {{ (cache.memoryBytes / 1024 / 1024).toFixed(2) }} MB</dd></div>
+            <div><dt>内存中</dt><dd>{{ integer(cache.memoryEntries) }} 条 · {{ bytes(cache.memoryBytes) }}</dd></div>
             <div><dt>命中 / 未命中</dt><dd>{{ integer(cache.hits) }} / {{ integer(cache.misses) }}</dd></div>
             <div><dt>命中率</dt><dd>{{ hitRate }}</dd></div>
           </dl>

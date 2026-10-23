@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { EyeOff, Minimize2 } from '@lucide/vue'
-import { compact, integer } from '@/utils/format'
+import { compact, integer, pct, tps } from '@/utils/format'
 import Badge from '@/components/ui/Badge.vue'
 import ProviderIcon from '@/components/ProviderIcon.vue'
 import { displayStatus, groupSources, priceSummary, rateSummary, sourceProvider, sourceRate, tokens, type MetadataValues, type ModelData, type ModelMetadata, type ModelSource, type ModelUsage } from './shared'
@@ -62,18 +62,17 @@ const prompt = computed(() => u.value?.promptTokens ?? 0)
 const cacheText = computed(() => {
   const r = u.value?.cacheReadRatio
   if (r == null) return ''
-  const v = r * 100
-  return `缓存 ${v >= 99.95 && v < 100 ? '99.9' : v.toFixed(1)}%`
+  return `缓存占比 ${pct(r)}`
 })
 const usageTitle = computed(() => {
   const m = u.value
   if (!m) return ''
   const parts = [
     `累计请求 ${integer(m.requestCount)} 次，失败 ${integer(m.errorCount)} 次（当前保留日志范围）`,
-    `输入 ${compact(prompt.value)}（缓存读取占 ${m.cacheReadRatio != null ? (m.cacheReadRatio * 100).toFixed(0) + '%' : '—'}） · 输出 ${compact(m.outputTokens)}`,
+    `读入 ${compact(prompt.value)}（缓存占比 ${pct(m.cacheReadRatio)}） · 输出 ${compact(m.outputTokens)}`,
   ]
   if (m.averageTokensPerSecond != null)
-    parts.push(`输出速度 平均 ${m.averageTokensPerSecond.toFixed(1)} · 峰值 ${(m.maximumTokensPerSecond ?? 0).toFixed(0)} · 最低 ${(m.minimumTokensPerSecond ?? 0).toFixed(1)} tok/s`)
+    parts.push(`输出速度 平均 ${tps(m.averageTokensPerSecond)} · 峰值 ${tps(m.maximumTokensPerSecond)} · 最低 ${tps(m.minimumTokensPerSecond)}`)
   return parts.join('\n')
 })
 </script>
@@ -120,7 +119,7 @@ const usageTitle = computed(() => {
     <span class="c-use" :title="usageTitle">
       <template v-if="u && u.requestCount">
         <span class="mono">↑{{ compact(prompt) }} ↓{{ compact(u.outputTokens) }}</span>
-        <span class="mono faint use2">{{ [cacheText, u.averageTokensPerSecond != null ? `${u.averageTokensPerSecond.toFixed(0)} t/s` : ''].filter(Boolean).join(' · ') || '—' }}</span>
+        <span class="mono faint use2">{{ [cacheText, u.averageTokensPerSecond != null ? tps(u.averageTokensPerSecond) : ''].filter(Boolean).join(' · ') || '—' }}</span>
       </template>
       <span v-else class="faint">{{ usageLoading ? '统计中' : '—' }}</span>
     </span>

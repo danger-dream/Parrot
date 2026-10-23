@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { api, enc, type Schemas } from '@/api/client'
 import { channelName } from '@/stores/catalog'
-import { integer } from '@/utils/format'
+import { integer, percent } from '@/utils/format'
 import { errorTitle } from '@/utils/errors'
 import { goLogs, openChannel } from '@/links'
 import Badge from '@/components/ui/Badge.vue'
@@ -47,7 +47,7 @@ const PROTO: Record<string, string> = {
         <Badge v-if="c.upstreamProtocol">{{ PROTO[c.upstreamProtocol] || c.upstreamProtocol }}</Badge>
         <span class="spacer" />
         <span class="mono n">{{ integer(c.count) }} 次</span>
-        <span class="mono p">{{ total ? ((c.count / total) * 100).toFixed(0) : 0 }}%</span>
+        <span class="mono p">{{ percent(c.count, total) }}</span>
         <button type="button" class="lk" @click="goLogs({ model, channel: c.key, from: periodStart(period) })">查看请求</button>
       </li>
     </ul>

@@ -3,7 +3,7 @@ import { computed } from 'vue'
 import { ArrowRight, Brain, DatabaseZap, Globe, Repeat, ShieldAlert, Star, TriangleAlert, Zap } from '@lucide/vue'
 import ProviderIcon from '@/components/ProviderIcon.vue'
 import StatusBars from '@/components/ui/StatusBars.vue'
-import { clock, dateTime, ms, usd } from '@/utils/format'
+import { clock, dateTime, ms, usdOne } from '@/utils/format'
 import { statusLabel, statusTone } from './status'
 import {
   cacheRatio,
@@ -150,7 +150,7 @@ const costKind = computed(() => {
     </span>
 
     <span class="c-cost">
-      <span class="main num" :class="{ cost: showCost }">{{ showCost ? usd(billing?.costTicks ?? row.costTicks, { precise: true }) : '—' }}</span>
+      <span class="main num" :class="{ cost: showCost }">{{ showCost ? usdOne(billing?.costTicks ?? row.costTicks) : '—' }}</span>
       <span class="sub">{{ showCost ? costKind : '' }}</span>
     </span>
 

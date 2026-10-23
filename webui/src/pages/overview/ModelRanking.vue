@@ -35,7 +35,7 @@ const list = computed(() => {
           <div class="meta">
             <span>{{ integer(r.metrics.total) }} 次 · {{ pctText(successRateOf(r.metrics)) }}</span>
             <span>↑{{ compact(promptOf(r.metrics)) }} ↓{{ compact(r.metrics.outputTokens) }}</span>
-            <span>缓存 {{ pctText(cacheShare(r.metrics), 0) }}</span>
+            <span>缓存占比 {{ pctText(cacheShare(r.metrics)) }}</span>
             <span>{{ tpsText(r.metrics.averageTokensPerSecond) }}</span>
             <span v-if="r.owner" class="owner">
               <ProviderIcon :provider="channelProvider(r.owner.key)" :size="13" />

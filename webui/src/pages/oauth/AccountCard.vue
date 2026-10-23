@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { ChevronDown, ChevronUp, GripVertical } from '@lucide/vue'
-import { compact, usd } from '@/utils/format'
+import { compact, pctValue, usd } from '@/utils/format'
 import Badge from '@/components/ui/Badge.vue'
 import ProviderIcon from '@/components/ProviderIcon.vue'
 import UsageView from './UsageView.vue'
@@ -88,7 +88,7 @@ const projection = computed(() => card.value?.weeklyProjection || null)
         <template v-if="stats && stats.total">
           <span class="mono">↑{{ compact(promptTokens(stats)) }}</span>
           <span class="mono">↓{{ compact(stats.outputTokens) }}</span>
-          <span v-if="cacheShare(stats) !== null" class="u">缓存 <span class="mono">{{ cacheShare(stats)! >= 99.95 && cacheShare(stats)! < 100 ? '99.9' : cacheShare(stats)!.toFixed(1) }}%</span></span>
+          <span v-if="cacheShare(stats) !== null" class="u">缓存占比 <span class="mono">{{ pctValue(cacheShare(stats)) }}</span></span>
           <span v-if="stats.averageTokensPerSecond" class="u">均 <span class="mono">{{ tps(stats.averageTokensPerSecond) }}</span></span>
           <span class="cost mono">{{ cost }}</span>
         </template>

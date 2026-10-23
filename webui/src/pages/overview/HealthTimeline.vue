@@ -3,11 +3,11 @@ import { computed } from 'vue'
 import type { TimePoint } from '@/api/types'
 import Card from '@/components/ui/Card.vue'
 import { goLogs } from '@/links'
-import { integer } from '@/utils/format'
+import { integer, pct } from '@/utils/format'
 
 const props = defineProps<{ points: TimePoint[]; ready: boolean }>()
 
-type Cell = { key: string; state: 'none' | 'ok' | 'warn' | 'bad' | 'future'; from: number; total: number; errors: number }
+type Cell = { key: string; state: 'none' | 'ok' | 'warn' | 'bad' | 'future'; from: number; total: number; success: number; errors: number }
 
 const grid = computed(() => {
   const now = Date.now()
@@ -23,11 +23,12 @@ const grid = computed(() => {
       const from = start + h * 3600_000 + r * 600_000
       const p = byStart.get(from)
       const total = p?.total ?? 0
+      const success = p?.successCount ?? 0
       const errors = p?.errorCount ?? 0
       let state: Cell['state'] = 'none'
       if (from > now) state = 'future'
       else if (total) state = errors === 0 ? 'ok' : errors / total < 0.05 ? 'warn' : 'bad'
-      row.push({ key: `${r}-${h}`, state, from, total, errors })
+      row.push({ key: `${r}-${h}`, state, from, total, success, errors })
     }
     rows.push(row)
   }
@@ -36,9 +37,11 @@ const grid = computed(() => {
 
 const totals = computed(() => {
   let total = 0
+  let success = 0
   let errors = 0
-  for (const row of grid.value) for (const c of row) (total += c.total), (errors += c.errors)
-  return { total, errors, ok: total - errors, rate: total ? (total - errors) / total : null }
+  for (const row of grid.value) for (const c of row) (total += c.total), (success += c.success), (errors += c.errors)
+  // Same success rate as every other card: successes over all requests (cancelled and running are not successes).
+  return { total, errors, ok: success, other: total - success - errors, rate: total ? success / total : null }
 })
 
 function label(c: Cell): string {
@@ -59,13 +62,14 @@ function open(c: Cell): void {
   <Card title="请求健康时间线（今日）" subtitle="按 10 分钟聚合，点格子查看该时段的请求">
     <template #actions>
       <span v-if="totals.rate != null" class="rate" :class="totals.rate >= 0.99 ? 'g' : totals.rate >= 0.95 ? 'o' : 'r'">
-        {{ (totals.rate * 100).toFixed(1) }}%
+        {{ pct(totals.rate) }}
       </span>
     </template>
     <div class="wrap">
       <div class="counts">
         <span><i class="ok" />成功 {{ integer(totals.ok) }}</span>
         <span><i class="bad" />失败 {{ integer(totals.errors) }}</span>
+        <span v-if="totals.other" class="faint">取消 / 进行中 {{ integer(totals.other) }}</span>
       </div>
       <div class="hm">
         <div class="hours">

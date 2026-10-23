@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { dateTime } from '@/utils/format'
+import { dateTime, pctValue } from '@/utils/format'
 import Meter from '@/components/ui/Meter.vue'
 import { localUsageLine } from './channelStats'
 import { countdown, noteLabel, num, quotaLabel, remainingAmount, sectionTitle, usageValue, WINDOW_LABEL, windowName, type UsageItem, type UsageSection, type UsageWindow } from './meta'
@@ -82,7 +82,7 @@ function localLine(it: UsageItem): string {
         <div v-if="r.pct !== null" class="win">
           <div class="wh">
             <span class="k truncate" :title="r.label">{{ r.label }}</span>
-            <span class="v">剩余 <b class="mono" :class="tone(100 - r.pct)">{{ Math.round(100 - r.pct) }}%</b><template v-if="remainingAmount(r.item)"> · {{ remainingAmount(r.item) }}</template><template v-if="reset(r.item)"> · {{ reset(r.item) }}</template></span>
+            <span class="v">剩余 <b class="mono" :class="tone(100 - r.pct)">{{ pctValue(100 - r.pct) }}</b><template v-if="remainingAmount(r.item)"> · {{ remainingAmount(r.item) }}</template><template v-if="reset(r.item)"> · {{ reset(r.item) }}</template></span>
           </div>
           <Meter :value="100 - r.pct" remaining />
           <p v-if="localLine(r.item)" class="loc mono">{{ localLine(r.item) }}</p>
@@ -102,7 +102,7 @@ function localLine(it: UsageItem): string {
           <div v-if="num(it.usedPercent) !== null" class="win">
             <div class="wh">
               <span class="k" :title="it.label">{{ windowName(it.label) }}</span>
-              <span class="v" :title="it.resetsAt ? dateTime(it.resetsAt) : ''">剩余 <b class="mono" :class="tone(100 - (it.usedPercent ?? 0))">{{ Math.round(100 - (it.usedPercent ?? 0)) }}%</b><template v-if="remainingAmount(it)"> · {{ remainingAmount(it) }}</template><template v-if="reset(it)"> · {{ reset(it) }}</template></span>
+              <span class="v" :title="it.resetsAt ? dateTime(it.resetsAt) : ''">剩余 <b class="mono" :class="tone(100 - (it.usedPercent ?? 0))">{{ pctValue(100 - (it.usedPercent ?? 0)) }}</b><template v-if="remainingAmount(it)"> · {{ remainingAmount(it) }}</template><template v-if="reset(it)"> · {{ reset(it) }}</template></span>
             </div>
             <Meter :value="100 - (it.usedPercent ?? 0)" remaining />
             <p v-if="localLine(it)" class="loc mono">{{ localLine(it) }}</p>

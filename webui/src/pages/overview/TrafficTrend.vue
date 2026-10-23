@@ -4,7 +4,7 @@ import type { TimePoint } from '@/api/types'
 import { chartColors, tooltipBase } from '@/components/charts/palette'
 import EChart from '@/components/charts/EChart.vue'
 import Card from '@/components/ui/Card.vue'
-import { compact, integer, usd } from '@/utils/format'
+import { axisNumber, compact, integer, usd } from '@/utils/format'
 
 const props = defineProps<{ points: TimePoint[]; ready: boolean }>()
 
@@ -44,12 +44,12 @@ const option = computed(() => {
       {
         type: 'value',
         splitLine: { lineStyle: { color: c.grid, type: 'dashed' } },
-        axisLabel: { color: c.axis, fontSize: 11, formatter: (v: number) => compact(v) },
+        axisLabel: { color: c.axis, fontSize: 11, formatter: (v: number) => axisNumber(v) },
       },
       {
         type: 'value',
         splitLine: { show: false },
-        axisLabel: { color: c.axis, fontSize: 11, formatter: (v: number) => compact(v) },
+        axisLabel: { color: c.axis, fontSize: 11, formatter: (v: number) => axisNumber(v) },
       },
     ],
     series: [

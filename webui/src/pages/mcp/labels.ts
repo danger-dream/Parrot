@@ -1,5 +1,6 @@
 import { Clapperboard, FileText, Globe, ImagePlus, Paintbrush, Film } from '@lucide/vue'
 import type { Component } from 'vue'
+export { bytes } from '@/utils/format'
 
 export const TOOLS: { name: string; label: string; desc: string; icon: Component; subject: [string, string] }[] = [
   { name: 'web_search', label: '网络搜索', desc: '按搜索词检索网页，使用「搜索」页配置的来源', icon: Globe, subject: ['query', '搜索词'] },
@@ -60,14 +61,3 @@ export function subjectOf(log: { toolName: string; params?: unknown }): { label:
   return { label, value: '' }
 }
 
-export function bytes(n: number | null | undefined): string {
-  if (!n) return '0 B'
-  const u = ['B', 'KB', 'MB', 'GB']
-  let v = n
-  let i = 0
-  while (v >= 1024 && i < u.length - 1) {
-    v /= 1024
-    i++
-  }
-  return i ? `${v.toFixed(1)} ${u[i]}` : `${v} B`
-}

@@ -3,7 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { ListChecks, RefreshCw } from '@lucide/vue'
 import { api, ApiError } from '@/api/client'
 import { toast } from '@/stores/ui'
-import { compact, dateTime } from '@/utils/format'
+import { capacity, dateTime } from '@/utils/format'
 import Badge from '@/components/ui/Badge.vue'
 import Btn from '@/components/ui/Btn.vue'
 import CheckList from '@/components/ui/CheckList.vue'
@@ -167,9 +167,9 @@ async function sync(): Promise<void> {
 function ctx(m: ModelData): string {
   const parts: string[] = []
   const c = m.maxContextDefault && m.maxContextWindow ? m.maxContextWindow : m.contextWindow
-  if (c) parts.push(`上下文 ${compact(c, 0)}`)
-  if (m.maxContextWindow && m.contextWindow && m.maxContextWindow > m.contextWindow && !m.maxContextDefault) parts.push(`最大 ${compact(m.maxContextWindow, 0)}`)
-  if (m.maxOutputTokens) parts.push(`输出 ${compact(m.maxOutputTokens, 0)}`)
+  if (c) parts.push(`上下文 ${capacity(c)}`)
+  if (m.maxContextWindow && m.contextWindow && m.maxContextWindow > m.contextWindow && !m.maxContextDefault) parts.push(`最大 ${capacity(m.maxContextWindow)}`)
+  if (m.maxOutputTokens) parts.push(`输出 ${capacity(m.maxOutputTokens)}`)
   if (m.reasoningEfforts?.length) parts.push(`推理 ${effortText(m.reasoningEfforts)}`)
   if (m.serviceTier) parts.push(TIER_LABEL[m.serviceTier] || m.serviceTier)
   return parts.join(' · ')

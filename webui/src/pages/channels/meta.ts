@@ -2,6 +2,8 @@ import { reactive } from 'vue'
 import { api, ApiError, type Schemas } from '@/api/client'
 import { waitOperation, type Operation } from '@/api/operations'
 import { errorDetail, errorTitle } from '@/utils/errors'
+import { compact as tokens, pct, pctValue, tps } from '@/utils/format'
+export { tokens, tps }
 
 export type Channel = Schemas['ChannelData']
 /** listChannels item: ChannelData plus the shared month snapshot (monthStats / monthStatsLoading). */
@@ -74,25 +76,10 @@ export function channelStatus(c: Pick<Channel, 'enabled' | 'health' | 'cooldownC
   if (c.health === 'cooldown') return { text: `冷却中 · ${c.cooldownCount} 个模型`, tone: 'orange' }
   const r = c.recentSuccessRate
   if (r === null || r === undefined) return { text: '暂无数据', tone: 'neutral' }
-  return { text: `近期成功率 ${r.toFixed(0)}%`, tone: rateTone(r) }
+  return { text: `近期成功率 ${pctValue(r)}`, tone: rateTone(r) }
 }
 
-/** Token counts like the bot: 1.2K / 3.4M / 5.6B. */
-export function tokens(n: number | null | undefined): string {
-  const v = Number(n || 0)
-  if (v >= 1e9) return `${(v / 1e9).toFixed(1)}B`
-  if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`
-  if (v >= 1e3) return `${(v / 1e3).toFixed(1)}K`
-  return String(Math.round(v))
-}
 
-/** Generation speed like the bot: 42.3 t/s, 512 t/s, 1.2K t/s. */
-export function tps(v: number | null | undefined): string {
-  if (v === null || v === undefined || !Number.isFinite(v)) return '—'
-  if (v >= 1000) return `${(v / 1000).toFixed(1)}K t/s`
-  if (v >= 100) return `${v.toFixed(0)} t/s`
-  return `${v.toFixed(1)} t/s`
-}
 
 export function promptTotal(input?: number | null, cacheCreation?: number | null, cacheRead?: number | null): number {
   return Number(input || 0) + Number(cacheCreation || 0) + Number(cacheRead || 0)
@@ -187,11 +174,6 @@ export interface DiscoveryResult {
   retry_available: boolean
 }
 
-/** USD with three decimals, the precision the bot uses for channel and key stats. */
-export function cost3(ticks: number | null | undefined): string {
-  const v = Number(ticks || 0) / 1e10
-  return `$${v.toLocaleString('en-US', { minimumFractionDigits: 3, maximumFractionDigits: 3 })}`
-}
 
 /** Normalised monthly usage, fed by a channel's monthStats or an API key's usage. */
 export interface Usage {
@@ -238,7 +220,7 @@ export function toUsage(m: ChannelMonth | KeyUsage | null | undefined): Usage | 
 /** "51.7K（60.8%）" from a server-side ratio (0–1). */
 export function cacheText(cacheRead: number, ratio: number | null | undefined, prompt: number): string {
   const r = ratio ?? (prompt ? cacheRead / prompt : 0)
-  return `${tokens(cacheRead)}（${(r * 100).toFixed(1)}%）`
+  return `${tokens(cacheRead)}（${pct(r)}）`
 }
 
 let catalogPromise: Promise<Catalog> | null = null

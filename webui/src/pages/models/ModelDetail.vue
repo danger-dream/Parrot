@@ -9,7 +9,7 @@ import { channelProvider } from '@/utils/providers'
 import ProviderIcon from '@/components/ProviderIcon.vue'
 import { confirmAction } from '@/stores/dialogs'
 import { toast } from '@/stores/ui'
-import { integer, percent } from '@/utils/format'
+import { integer, percent, tps } from '@/utils/format'
 import { errorDetail, errorTitle } from '@/utils/errors'
 import Badge from '@/components/ui/Badge.vue'
 import Btn from '@/components/ui/Btn.vue'
@@ -470,10 +470,9 @@ const unpriced = computed(() => stats.value?.metrics.unpricedSuccess || 0)
         <StatsMini :metrics="stats.metrics" :compare="compare" :period="period === 'lifetime' ? null : (period as ComparePeriod)" />
         <p class="faint small">
           <template v-if="stats.metrics.averageTokensPerSecond != null">
-            输出速度 平均 {{ stats.metrics.averageTokensPerSecond.toFixed(1) }} · 峰值 {{ (stats.metrics.maximumTokensPerSecond ?? 0).toFixed(0) }} · 最低
-            {{ (stats.metrics.minimumTokensPerSecond ?? 0).toFixed(1) }} tok/s
+            输出速度 平均 {{ tps(stats.metrics.averageTokensPerSecond) }} · 峰值 {{ tps(stats.metrics.maximumTokensPerSecond) }} · 最低 {{ tps(stats.metrics.minimumTokensPerSecond) }}
           </template>
-          <template v-if="unpriced"> · {{ integer(unpriced) }} 次成功请求没有价格，未计入费用</template>
+          <template v-if="unpriced"> · {{ integer(unpriced) }} 次成功请求没有价格，未计入金额</template>
         </p>
         <div v-if="stats.channels.length" class="chs">
           <button v-for="c in stats.channels" :key="c.key" class="ch-row" @click="openChannel(c.key)">
@@ -483,7 +482,7 @@ const unpriced = computed(() => stats.value?.metrics.unpricedSuccess || 0)
             </span>
             <span class="bar"><i :style="{ width: `${(c.count / maxChannel) * 100}%` }" /></span>
             <span class="mono ch-n">{{ integer(c.count) }}</span>
-            <span class="mono faint ch-p">{{ percent(c.count, stats.metrics.total, 0) }}</span>
+            <span class="mono faint ch-p">{{ percent(c.count, stats.metrics.total) }}</span>
           </button>
         </div>
         <p v-else class="faint small">这段时间没有请求</p>

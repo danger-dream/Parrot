@@ -2,7 +2,22 @@ export const TICKS_PER_USD = 10_000_000_000
 
 const TZ = 'Asia/Shanghai'
 
-export function compact(n: number | null | undefined, digits = 1): string {
+/*
+ * Number display rules — one per kind of value, used on every page:
+ *   次数        integer   6,639
+ *   Token 用量  compact   6.3B · 36.7M · 785.2M · 1.0K（缩写时固定 1 位小数；不足 1000 写整数）
+ *   容量上限    capacity  1.05M · 1M · 262.1K · 128K（上下文 / 输出上限按原值，最多 2 位，去掉末尾 0）
+ *   百分比      pct       99.1% · 100.0%（固定 1 位；没到 100% 时最多显示 99.9%）
+ *   金额        usd       $3,258.42 · $0.69 · $0.00（汇总金额固定 2 位，千分位；大于 0 但不足 1 分写 <$0.01）
+ *   单次金额    usdOne    $0.0042 · $1.2345（单次请求 / 单条日志的金额固定 4 位，否则大多只剩 <$0.01）
+ *   单价        price     $0.15 · $0.003（每百万 Token，至少 2 位、最多 4 位）
+ *   耗时        ms        983ms · 3.89s · 14.50s · 1m05s（不足 1 秒写毫秒，1 分钟内固定 2 位）
+ *   速度        tps       53.9 t/s · 112.0 t/s · 4.2K t/s（固定 1 位）
+ *   容量大小    bytes     86.4 MB · 1.5 GB（固定 1 位）
+ *   任务进度    整数百分比 37%（进度条旁的完成度，不是统计值）
+ */
+
+export function compact(n: number | null | undefined): string {
   if (n === null || n === undefined || !Number.isFinite(n)) return '—'
   const abs = Math.abs(n)
   const units: [number, string][] = [
@@ -12,12 +27,21 @@ export function compact(n: number | null | undefined, digits = 1): string {
     [1e3, 'K'],
   ]
   for (const [size, unit] of units) {
-    if (abs >= size) {
-      const v = n / size
-      return `${v.toFixed(v >= 100 ? 0 : digits).replace(/\.0+$/, '')}${unit}`
-    }
+    if (abs >= size) return `${(n / size).toFixed(1)}${unit}`
   }
   return Math.round(n).toLocaleString('en-US')
+}
+
+/** Chart axis ticks are round numbers: “350M”, “1.8K”, “900”. */
+export function axisNumber(n: number): string {
+  return compact(n).replace(/\.0(?=[KMBT]$)/, '')
+}
+
+export function capacity(n: number | null | undefined): string {
+  if (n === null || n === undefined || !Number.isFinite(n)) return '—'
+  if (n >= 1_000_000) return `${+(n / 1_000_000).toFixed(2)}M`
+  if (n >= 1000) return `${+(n / 1000).toFixed(1)}K`
+  return String(n)
 }
 
 export function integer(n: number | null | undefined): string {
@@ -25,32 +49,64 @@ export function integer(n: number | null | undefined): string {
   return Math.round(n).toLocaleString('en-US')
 }
 
-export function usd(ticks: number | null | undefined, opts: { precise?: boolean } = {}): string {
-  if (ticks === null || ticks === undefined || !Number.isFinite(ticks)) return '—'
-  const v = ticks / TICKS_PER_USD
-  if (v === 0) return '$0'
-  const abs = Math.abs(v)
-  if (abs >= 10_000 && !opts.precise) return `$${compact(v, 1)}`
-  if (abs >= 100) return `$${v.toLocaleString('en-US', { maximumFractionDigits: opts.precise ? 2 : 0 })}`
-  if (abs >= 1) return `$${v.toFixed(2)}`
-  if (abs >= 0.01) return `$${v.toFixed(3)}`
-  return `$${v.toPrecision(2)}`
+/** A 0–1 ratio as a percentage. */
+export function pct(ratio: number | null | undefined): string {
+  if (ratio === null || ratio === undefined || !Number.isFinite(ratio)) return '—'
+  let text = (ratio * 100).toFixed(1)
+  // 99.96 % must not read as a full 100 %.
+  if (ratio < 1 && Number(text) >= 100) text = '99.9'
+  return `${text}%`
 }
 
-export function percent(part: number, whole: number, digits = 1): string {
-  if (!whole) return '—'
-  const v = (part / whole) * 100
-  if (v >= 99.95 && part !== whole) return `${(99.9).toFixed(digits)}%`
-  return `${v.toFixed(digits)}%`
+/** A value already on the 0–100 scale. */
+export function pctValue(value: number | null | undefined): string {
+  return value === null || value === undefined ? '—' : pct(value / 100)
+}
+
+export function percent(part: number, whole: number): string {
+  return whole ? pct(part / whole) : '—'
+}
+
+export function usd(ticks: number | null | undefined): string {
+  if (ticks === null || ticks === undefined || !Number.isFinite(ticks)) return '—'
+  return dollars(ticks / TICKS_PER_USD)
+}
+
+/** The cost of one request or log entry. */
+export function usdOne(ticks: number | null | undefined): string {
+  if (ticks === null || ticks === undefined || !Number.isFinite(ticks)) return '—'
+  return `$${(ticks / TICKS_PER_USD).toLocaleString('en-US', { minimumFractionDigits: 4, maximumFractionDigits: 4 })}`
+}
+
+/** A dollar amount (not ticks), same rule as usd(). */
+export function dollars(v: number | null | undefined): string {
+  if (v === null || v === undefined || !Number.isFinite(v)) return '—'
+  if (v > 0 && v < 0.005) return '<$0.01'
+  const text = Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  return `${v < 0 ? '-' : ''}$${text}`
+}
+
+/** Unit price per million tokens. */
+export function price(v: number | null | undefined): string {
+  if (v === null || v === undefined || !Number.isFinite(v)) return '—'
+  if (v === 0) return '免费'
+  const two = v.toFixed(2)
+  return `$${Math.abs(Number(two) - v) < 1e-9 ? two : String(+v.toFixed(4))}`
 }
 
 export function ms(value: number | null | undefined): string {
   if (value === null || value === undefined || !Number.isFinite(value)) return '—'
   if (value < 1000) return `${Math.round(value)}ms`
-  if (value < 60_000) return `${(value / 1000).toFixed(value < 10_000 ? 2 : 1)}s`
+  if (value < 60_000) return `${(value / 1000).toFixed(2)}s`
   const m = Math.floor(value / 60_000)
   const s = Math.round((value % 60_000) / 1000)
   return `${m}m${s.toString().padStart(2, '0')}s`
+}
+
+/** Generation speed in tokens per second. */
+export function tps(v: number | null | undefined): string {
+  if (v === null || v === undefined || !Number.isFinite(v)) return '—'
+  return v >= 1000 ? `${(v / 1000).toFixed(1)}K t/s` : `${v.toFixed(1)} t/s`
 }
 
 export function duration(seconds: number | null | undefined): string {
@@ -161,7 +217,7 @@ export function humanSeconds(value: number | null | undefined): string {
   return sec ? `${m} 分 ${sec} 秒` : `${m} 分钟`
 }
 
-/** Binary byte size: “1.2 GB”. */
+/** Binary byte size: “86.4 MB”, “1.5 GB”. */
 export function bytes(value: number | null | undefined): string {
   if (value === null || value === undefined || !Number.isFinite(value)) return '—'
   let n = Math.max(0, value)
@@ -171,7 +227,7 @@ export function bytes(value: number | null | undefined): string {
     n /= 1024
     i += 1
   }
-  return i === 0 ? `${n} B` : `${n.toFixed(n >= 100 ? 0 : 1)} ${units[i]}`
+  return i === 0 ? `${Math.round(n)} B` : `${n.toFixed(1)} ${units[i]}`
 }
 
 /** Full Beijing date-time, “2026-10-22 16:54”. */

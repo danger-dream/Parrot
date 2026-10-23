@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { ChevronRight, GripVertical, RefreshCw } from '@lucide/vue'
-import { compact, dateTime, usd } from '@/utils/format'
+import { compact, dateTime, pctValue, usd } from '@/utils/format'
 import ProviderIcon from '@/components/ProviderIcon.vue'
 import OutcomeStrip from '@/components/ui/OutcomeStrip.vue'
 import type { OutcomeItem } from '@/utils/outcomes'
@@ -89,8 +89,8 @@ function tone(left: number | null): string {
       <dl v-if="stats && stats.total" class="use">
         <dt>Token</dt>
         <dd title="读入（含缓存）/ 写出">↑{{ compact(promptTokens(stats)) }} ↓{{ compact(stats.outputTokens) }}</dd>
-        <dt>缓存</dt>
-        <dd title="缓存读取占读入">{{ share != null ? `${share >= 99.95 && share < 100 ? '99.9' : share.toFixed(1)}%` : '—' }}</dd>
+        <dt>缓存占比</dt>
+        <dd title="缓存读取占读入">{{ pctValue(share) }}</dd>
         <dt>速度</dt>
         <dd title="平均输出速度">{{ tps(stats.averageTokensPerSecond) }}</dd>
         <dt>金额</dt>
@@ -105,7 +105,7 @@ function tone(left: number | null): string {
         <div v-for="(q, i) in quotas.bars" :key="i" class="q">
           <div class="qh">
             <span class="ql">{{ q.label }}</span>
-            <span class="qv">剩余 <b class="num" :class="tone(remaining(q))">{{ Math.round(remaining(q) ?? 0) }}%</b><template v-if="remainingAmount(q)"> · {{ remainingAmount(q) }}</template><template v-if="q.resetsAt"> · {{ countdown(q.resetsAt, now) }}</template></span>
+            <span class="qv">剩余 <b class="num" :class="tone(remaining(q))">{{ pctValue(remaining(q) ?? 0) }}</b><template v-if="remainingAmount(q)"> · {{ remainingAmount(q) }}</template><template v-if="q.resetsAt"> · {{ countdown(q.resetsAt, now) }}</template></span>
           </div>
           <div class="bar"><span :class="tone(remaining(q))" :style="{ width: `${Math.max(0, Math.min(100, remaining(q) ?? 0))}%` }" /></div>
           <p v-if="localUsageLine(q.local)" class="qf num">{{ localUsageLine(q.local) }}</p>

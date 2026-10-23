@@ -8,7 +8,7 @@ import { goLogs, openChannel, openModel } from '@/links'
 import { refreshCatalog } from '@/stores/catalog'
 import { confirmAction } from '@/stores/dialogs'
 import { closeInspector, toast } from '@/stores/ui'
-import { compact, dateTime, duration, integer, ms } from '@/utils/format'
+import { capacity, compact, dateTime, duration, integer, ms, pctValue, usd } from '@/utils/format'
 import { channelProvider } from '@/utils/providers'
 import { errorDetail, errorTitle } from '@/utils/errors'
 import Badge from '@/components/ui/Badge.vue'
@@ -31,23 +31,7 @@ import ChannelModelsModal from './ChannelModelsModal.vue'
 import CompatModal from './CompatModal.vue'
 import ProtocolTag from './ProtocolTag.vue'
 import UsageBlock from './UsageBlock.vue'
-import {
-  channelStatus,
-  cost3,
-  dotTone,
-  loadCatalog,
-  notifyChannelsChanged,
-  protocolInfo,
-  rateTone,
-  runOperation,
-  toUsage,
-  tps,
-  type Catalog,
-  type Channel,
-  type ChannelDetailData,
-  type ProbeResult,
-  type Tone,
-} from './meta'
+import { channelStatus, dotTone, loadCatalog, notifyChannelsChanged, protocolInfo, rateTone, runOperation, toUsage, tps, type Catalog, type Channel, type ChannelDetailData, type ProbeResult, type Tone } from './meta'
 
 const props = defineProps<{ id: string }>()
 
@@ -183,8 +167,8 @@ const tiles = computed<UsageTile[]>(() => {
   return [
     { k: '读入 ↑（含缓存）', v: compact(u.prompt), delta: d.prompt },
     { k: '写出 ↓', v: compact(u.output), delta: d.output },
-    { k: '金额', v: cost3(u.costTicks), delta: d.cost },
-    { k: '缓存读取', v: compact(u.cacheRead), s: share !== null ? `占读入 ${share >= 99.95 && share < 100 ? '99.9' : share.toFixed(1)}%` : '', delta: d.cacheRead },
+    { k: '金额', v: usd(u.costTicks), delta: d.cost },
+    { k: '缓存读取', v: compact(u.cacheRead), s: share !== null ? `占读入 ${pctValue(share)}` : '', delta: d.cacheRead },
     { k: '平均速度', v: tps(u.avgTps), s: u.maxTps !== null ? `峰值 ${tps(u.maxTps)} · 最低 ${tps(u.minTps)}` : '' },
     { k: '请求', v: integer(u.total), s: u.error ? `失败 ${integer(u.error)}` : '全部成功', bad: Boolean(u.error), delta: d.requests },
   ]
@@ -207,13 +191,13 @@ function modelProblem(m: RuntimeModel): { text: string; tone: Tone } | null {
   if (m.cooldownKind === 'permanent') return { text: '永久冷却', tone: 'red' }
   if (m.cooldownKind === 'quota') return { text: '额度冷却', tone: 'orange' }
   if (m.cooldownKind === 'temporary') return { text: `冷却中${remaining(m.cooldownUntil)}`, tone: 'orange' }
-  if (m.recentRequests > 0 && m.recentSuccessRate != null && m.recentSuccessRate < 95) return { text: `近期成功 ${m.recentSuccessRate.toFixed(0)}%`, tone: rateTone(m.recentSuccessRate) }
+  if (m.recentRequests > 0 && m.recentSuccessRate != null && m.recentSuccessRate < 95) return { text: `近期成功 ${pctValue(m.recentSuccessRate)}`, tone: rateTone(m.recentSuccessRate) }
   return null
 }
 function modelMeta(m: RuntimeModel): string {
   const parts: string[] = []
-  if (m.contextWindow) parts.push(`上下文 ${compact(m.contextWindow, 0)}`)
-  if (m.maxOutputTokens) parts.push(`输出 ${compact(m.maxOutputTokens, 0)}`)
+  if (m.contextWindow) parts.push(`上下文 ${capacity(m.contextWindow)}`)
+  if (m.maxOutputTokens) parts.push(`输出 ${capacity(m.maxOutputTokens)}`)
   return parts.join(' · ')
 }
 // Usable models first (problems on top), disabled ones last; same order as the OAuth account list.

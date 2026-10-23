@@ -81,7 +81,8 @@ def _cache(**kwargs) -> StatsCache:
 
 def test_item0_stats_cache_fresh_stale_and_single_flight():
     now = [0.0]
-    cache = _cache(fresh_seconds=10, max_stale_seconds=100, clock=lambda: now[0])
+    # slow_seconds=0: every computation counts as slow, so the stale-while-revalidate path is exercised.
+    cache = _cache(fresh_seconds=10, max_stale_seconds=100, slow_seconds=0, clock=lambda: now[0])
     calls = []
 
     def loader():
@@ -119,6 +120,25 @@ def test_item0_stats_cache_fresh_stale_and_single_flight():
     for t in threads:
         t.join()
     assert results == ["v"] * 5 and len(slow_calls) == 1
+
+
+def test_stats_cache_recomputes_a_cheap_value_instead_of_serving_it_stale():
+    now = [0.0]
+    cache = _cache(fresh_seconds=10, max_stale_seconds=100, slow_seconds=1, clock=lambda: now[0])
+    calls = []
+
+    def loader():
+        calls.append(1)
+        return len(calls)
+
+    assert cache.get("k", loader) == 1
+    now[0] = 50  # stale, but the last computation was quick: recompute on the spot
+    assert cache.get("k", loader) == 2 and not cache._flights
+    cache._store("slow", "old", cost=5.0)
+    started = []
+    cache._start_background = lambda key, fn: started.append(key)
+    now[0] = 70  # a slow computation keeps being served stale while it refreshes
+    assert cache.get("slow", lambda: "new") == "old" and started == ["slow"]
 
 
 def test_item0_stats_cache_errors_disabled_and_keys():

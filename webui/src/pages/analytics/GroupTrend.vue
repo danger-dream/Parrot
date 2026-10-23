@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ChartLine, ExternalLink } from '@lucide/vue'
 import { api } from '@/api/client'
 import type { TimeRange, TimeSeries, TimeSeriesData, TimePoint } from '@/api/types'
-import { clock, compact, dayLabel, integer, ms, TICKS_PER_USD, usd } from '@/utils/format'
+import { axisNumber, clock, compact, dayLabel, integer, ms, pctValue, TICKS_PER_USD, usd } from '@/utils/format'
 import { errorTitle } from '@/utils/errors'
 import { goLogs } from '@/links'
 import { axisBase, chartColors, tooltipBase } from '@/components/charts/palette'
@@ -98,7 +98,7 @@ function fmt(v: number | null | undefined): string {
   if (v === null || v === undefined) return '—'
   if (metric.value === 'cost') return usd(v * TICKS_PER_USD)
   if (metric.value === 'latency') return ms(v)
-  if (metric.value === 'cache') return `${v.toFixed(1)}%`
+  if (metric.value === 'cache') return pctValue(v)
   if (metric.value === 'tokens') return compact(v)
   return integer(v)
 }
@@ -185,7 +185,7 @@ const option = computed(() => {
       axisLabel: {
         ...base.axisLabel,
         formatter: (v: number) =>
-          metric.value === 'cost' ? `$${compact(v)}` : metric.value === 'latency' ? ms(v) : metric.value === 'cache' ? `${v}%` : compact(v),
+          metric.value === 'cost' ? `$${axisNumber(v)}` : metric.value === 'latency' ? ms(v) : metric.value === 'cache' ? `${v}%` : axisNumber(v),
       },
     },
     series,
@@ -250,9 +250,9 @@ function toggle(key: string): void {
           { value: 'requests', label: '请求' },
           { value: 'errors', label: '失败' },
           { value: 'tokens', label: 'Token' },
-          { value: 'cost', label: '费用' },
+          { value: 'cost', label: '金额' },
           { value: 'latency', label: '首字' },
-          { value: 'cache', label: '缓存' },
+          { value: 'cache', label: '缓存占比' },
         ]"
       />
       <div class="spacer" />

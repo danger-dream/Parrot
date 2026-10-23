@@ -146,7 +146,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <Page title="统计分析" subtitle="按时间范围查看用量、费用、缓存与速度，并按模型、渠道或 Key 拆分。">
+  <Page title="统计分析" subtitle="按时间范围查看用量、金额、缓存与速度，并按模型、渠道或 Key 拆分。">
     <template #actions>
       <span v-if="loadedAt" class="faint upd">更新于 {{ relative(loadedAt, now) }}</span>
       <Btn :loading="summaryLoading || rowsLoading" @click="refresh"><RefreshCw /> 刷新</Btn>

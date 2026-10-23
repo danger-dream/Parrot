@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { integer } from '@/utils/format'
-import { cacheText, cost3, tokens, tps, type Usage } from './meta'
+import { integer, pctValue, usd } from '@/utils/format'
+import { cacheText, tokens, tps, type Usage } from './meta'
 
 // Monthly usage lines with the same content as the Telegram channel / API key pages:
 // requests · success rate · failures, ↑ prompt · ↓ output · cache, TPS avg / peak / min, cost.
@@ -18,7 +18,7 @@ const rate = computed(() => (props.usage?.successRate == null ? null : props.usa
         <dd>
           <b class="num">{{ integer(usage.total) }}</b> 次
           <span class="sep">·</span>
-          <span v-if="rate !== null" :class="rate < 80 ? (rate < 50 ? 'c-red' : 'c-orange') : 'c-green'">成功率 {{ rate.toFixed(1) }}%</span>
+          <span v-if="rate !== null" :class="rate < 80 ? (rate < 50 ? 'c-red' : 'c-orange') : 'c-green'">成功率 {{ pctValue(rate) }}</span>
           <template v-if="usage.error"><span class="sep">·</span><span class="c-red">失败 {{ integer(usage.error) }}</span></template>
         </dd>
       </div>
@@ -37,8 +37,8 @@ const rate = computed(() => (props.usage?.successRate == null ? null : props.usa
         </dd>
       </div>
       <div class="r">
-        <dt>费用</dt>
-        <dd class="num"><b>{{ cost3(usage.costTicks) }}</b></dd>
+        <dt>金额</dt>
+        <dd class="num"><b>{{ usd(usage.costTicks) }}</b></dd>
       </div>
     </template>
     <div v-else class="r">

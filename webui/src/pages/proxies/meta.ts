@@ -1,5 +1,6 @@
 import { reactive } from 'vue'
 import type { Schemas } from '@/api/client'
+export { bytes } from '@/utils/format'
 
 export type Proxy = Schemas['ProxyData']
 export type ProxyGroup = Schemas['ProxyGroupData']
@@ -27,17 +28,6 @@ export function typeLabel(t: string): string {
   return t === 'socks5' ? 'SOCKS5' : t === 'ss2022' ? 'Shadowsocks' : '未知类型'
 }
 
-export function bytes(n: number | null | undefined): string {
-  if (!n) return '0 B'
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
-  let v = n
-  let i = 0
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024
-    i++
-  }
-  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`
-}
 
 export interface ProbeItem {
   ok: boolean

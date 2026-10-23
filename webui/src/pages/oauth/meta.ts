@@ -1,6 +1,6 @@
 import { effortList } from '@/utils/effort'
 import type { Schemas } from '@/api/client'
-import { duration, toDate, usd, TICKS_PER_USD } from '@/utils/format'
+import { dollars, duration, toDate } from '@/utils/format'
 
 export type Provider = Schemas['OAuthProvider']
 export type AccountSummary = Schemas['OAuthAccountSummaryData']
@@ -109,10 +109,6 @@ export function countdown(value: string | null | undefined, now = Date.now()): s
   return `${duration(s).replace(/ \d+秒$/, '')}后重置`
 }
 
-export function costText(costUsd: number | null | undefined): string {
-  if (costUsd === null || costUsd === undefined) return '未计价'
-  return usd(Math.round(costUsd * TICKS_PER_USD))
-}
 
 export function effortText(list: string[] | null | undefined): string {
   return effortList(list)
@@ -299,19 +295,13 @@ export function remainingAmount(it: UsageItem): string {
   const used = num(it.used)
   const remaining = num(it.remaining) ?? (limit !== null && used !== null ? Math.max(0, limit - used) : null)
   if (remaining === null || limit === null) return ''
-  const fmt = (v: number) => {
-    const text = v.toLocaleString('en-US', { maximumFractionDigits: Math.abs(v) >= 100 ? 0 : 2 })
-    return it.unit === 'usd' ? `$${text}` : text
-  }
+  const fmt = (v: number) => (it.unit === 'usd' ? dollars(v) : v.toLocaleString('en-US', { maximumFractionDigits: 2 }))
   const suffix = it.unit === 'credits' ? ' 积分' : it.unit === 'count' ? ' 次' : ''
   return `${fmt(remaining)} / ${fmt(limit)}${suffix}`
 }
 
 export function usageValue(it: UsageItem): string {
-  const fmt = (v: number) => {
-    if (it.unit === 'usd') return `$${v.toLocaleString('en-US', { maximumFractionDigits: 2 })}`
-    return v.toLocaleString('en-US', { maximumFractionDigits: 2 })
-  }
+  const fmt = (v: number) => (it.unit === 'usd' ? dollars(v) : v.toLocaleString('en-US', { maximumFractionDigits: 2 }))
   const suffix = it.unit === 'credits' ? ' 积分' : ''
   const used = num(it.used)
   const limit = num(it.limit)

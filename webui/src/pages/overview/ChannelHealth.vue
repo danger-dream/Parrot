@@ -6,7 +6,7 @@ import ProviderIcon from '@/components/ProviderIcon.vue'
 import { catalog } from '@/stores/catalog'
 import { channelProvider } from '@/utils/providers'
 import { goPage, openChannel } from '@/links'
-import { compact, integer } from '@/utils/format'
+import { compact, integer, pctValue } from '@/utils/format'
 import { ov } from './data'
 import { promptOf } from './metrics'
 
@@ -28,7 +28,7 @@ function problemOf(c: Status): { label: string; tone: string } | null {
     const w = weak[0]
     const more = weak.length > 1 ? `，另 ${weak.length - 1} 个模型偏低` : ''
     return {
-      label: `${w.model} 成功率 ${Math.round(w.successRate)}%（最近 ${w.recentRequests} 次）${more}`,
+      label: `${w.model} 成功率 ${pctValue(w.successRate)}（最近 ${w.recentRequests} 次）${more}`,
       tone: w.successRate < 50 ? 'r' : 'o',
     }
   }

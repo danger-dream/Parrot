@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { Download, ExternalLink, Film, ImageOff, Maximize2, RefreshCw, TriangleAlert } from '@lucide/vue'
 import { api, API_BASE, enc, type Schemas } from '@/api/client'
-import { dateTime, ms, usd } from '@/utils/format'
+import { dateTime, ms, usdOne } from '@/utils/format'
 import { errorTitle } from '@/utils/errors'
 import { openAccount, openModel, openRequest } from '@/links'
 import Badge from '@/components/ui/Badge.vue'
@@ -96,7 +96,7 @@ const rows = computed(() => {
   if (d.progress !== null && d.progress !== undefined && d.status !== 'success') out.push({ k: '进度', v: `${Math.round(d.progress)}%` })
   out.push(
     { k: '耗时', v: ms(d.durationMilliseconds) },
-    { k: '费用', v: d.costTicks ? usd(d.costTicks, { precise: true }) : '未记录' },
+    { k: '金额', v: d.costTicks ? usdOne(d.costTicks) : '未记录' },
     { k: '数据量', v: bytes(d.trafficBytes) },
     { k: '缓存', v: d.cacheStatus ? CACHE_LABEL[d.cacheStatus] || d.cacheStatus : '—', tone: d.cacheStatus === 'failed' ? 'red' : '' },
     { k: '创建时间', v: dateTime(d.createdAt) },

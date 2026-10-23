@@ -127,7 +127,7 @@ const waiting = computed(() => live.snapshot?.channelTotals.waiting ?? catalog.s
     <section class="kpis">
       <StatTile label="今日请求" :icon="Inbox" tone="blue" :loading="!ov.ready" :value="m ? integer(m.total) : null"
         :sub="m ? outcomeLine(m) : ''" :spark="sparks.requests" :delta="change.requests" />
-      <StatTile label="成功率" :icon="CircleCheck" tone="green" :loading="!ov.ready" :value="m ? pctText(success, 2) : null"
+      <StatTile label="成功率" :icon="CircleCheck" tone="green" :loading="!ov.ready" :value="m ? pctText(success) : null"
         :value-tone="successTone" :sub="m ? `${integer(m.successCount)} / ${integer(m.total)}` : ''" :spark="sparks.success" :delta="change.success" />
       <StatTile label="Token" :icon="Layers" tone="purple" :loading="!ov.ready" :value="m ? compact(promptOf(m) + m.outputTokens) : null"
         :sub="m ? `读入 ${compact(promptOf(m))} · 写出 ${compact(m.outputTokens)}` : ''" :spark="sparks.tokens" :delta="change.tokens" />

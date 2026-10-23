@@ -7,39 +7,9 @@ import type { RequestLogDetailData } from '@/api/types'
 import { channelName } from '@/stores/catalog'
 import { goLogs, openApiKey, openChannel, openModel, openProxy } from '@/links'
 import { channelProvider } from '@/utils/providers'
-import { compact, ms, relative } from '@/utils/format'
+import { bytes, compact, ms, relative, usdOne } from '@/utils/format'
 import { protocolLabel, statusLabel, statusTone } from './status'
-import {
-  ATTEMPT_KEYS,
-  SAFETY_REVIEW_TEXT,
-  cacheRatio,
-  chainLabel,
-  chainMark,
-  conflictLines,
-  costFormula,
-  effortText,
-  errorSummary,
-  hasBilling,
-  modelChanged,
-  outboundModel,
-  pct,
-  pricedAttempts,
-  promptTokens,
-  requestStageMetrics,
-  rerouteLabel,
-  rowChannelName,
-  rowProvider,
-  rowTps,
-  speedBadge,
-  stageMetrics,
-  tgBytes,
-  timingMetrics,
-  tps,
-  usdExact,
-  type Json,
-  type LogRow,
-  type Metric,
-} from './logView'
+import { ATTEMPT_KEYS, SAFETY_REVIEW_TEXT, cacheRatio, chainLabel, chainMark, conflictLines, costFormula, effortText, errorSummary, hasBilling, modelChanged, outboundModel, pct, pricedAttempts, promptTokens, requestStageMetrics, rerouteLabel, rowChannelName, rowProvider, rowTps, speedBadge, stageMetrics, timingMetrics, tps, type Json, type LogRow, type Metric } from './logView'
 import Badge from '@/components/ui/Badge.vue'
 import CopyText from '@/components/ui/CopyText.vue'
 import ProviderIcon from '@/components/ProviderIcon.vue'
@@ -308,7 +278,7 @@ function bodyPurgedText(at: string | null | undefined): string {
         </template>
         <div class="m" :class="{ wide: log.status !== 'success' }">
           <p class="k">金额</p>
-          <p class="v">{{ usdExact(totalCost) }}</p>
+          <p class="v">{{ usdOne(totalCost) }}</p>
           <p v-if="log.billing?.unpricedSuccess && !totalCost" class="s">未定价</p>
         </div>
       </section>
@@ -316,11 +286,11 @@ function bodyPurgedText(at: string | null | undefined): string {
       <section v-if="showBilling && (singleFormula || billed.length > 1 || isCursor)" class="sec">
         <p class="sec-title">计费</p>
         <div class="box">
-          <p v-if="singleFormula" class="line mono">{{ usdExact(totalCost) }} = {{ singleFormula }}</p>
+          <p v-if="singleFormula" class="line mono">{{ usdOne(totalCost) }} = {{ singleFormula }}</p>
           <template v-else-if="billed.length > 1">
-            <p class="line mono">{{ usdExact(totalCost) }}</p>
+            <p class="line mono">{{ usdOne(totalCost) }}</p>
             <p v-for="(b, i) in billed" :key="i" class="line mono sub-line">
-              尝试 {{ b.attemptOrder ?? i + 1 }}: {{ usdExact(num(b.costTicks)) }}<template v-if="costFormula(b)"> = {{ costFormula(b) }}</template>
+              尝试 {{ b.attemptOrder ?? i + 1 }}: {{ usdOne(num(b.costTicks)) }}<template v-if="costFormula(b)"> = {{ costFormula(b) }}</template>
             </p>
           </template>
           <p v-if="isCursor" class="line faint">准确计价以官方为准</p>
@@ -384,7 +354,7 @@ function bodyPurgedText(at: string | null | undefined): string {
                   </p>
                   <p v-if="roundView(p).timing.length" class="r-line">业务计时：{{ metricText(roundView(p).timing) }}</p>
                   <p v-if="roundView(p).stages.length" class="r-line">可靠阶段（可能重叠，不相加）：{{ metricText(roundView(p).stages) }}</p>
-                  <p v-if="roundView(p).bytes" class="r-line">流量 {{ tgBytes(roundView(p).bytes) }}</p>
+                  <p v-if="roundView(p).bytes" class="r-line">流量 {{ bytes(roundView(p).bytes) }}</p>
                   <p v-if="p.errorDetail" class="t-err">{{ errorSummary(str(p.errorDetail)) }}</p>
                 </li>
               </ul>
@@ -410,7 +380,7 @@ function bodyPurgedText(at: string | null | undefined): string {
               </p>
               <p v-if="roundView(p).timing.length" class="r-line">业务计时：{{ metricText(roundView(p).timing) }}</p>
               <p v-if="roundView(p).stages.length" class="r-line">可靠阶段（可能重叠，不相加）：{{ metricText(roundView(p).stages) }}</p>
-              <p v-if="roundView(p).bytes" class="r-line">流量 {{ tgBytes(roundView(p).bytes) }}</p>
+              <p v-if="roundView(p).bytes" class="r-line">流量 {{ bytes(roundView(p).bytes) }}</p>
               <p v-if="p.errorDetail" class="t-err">{{ errorSummary(str(p.errorDetail)) }}</p>
             </li>
           </ul>
@@ -419,7 +389,7 @@ function bodyPurgedText(at: string | null | undefined): string {
 
       <!-- local search log -->
       <section v-if="searches.length" class="sec">
-        <p class="sec-title">搜索日志 <span class="faint">{{ searches.length }} 次<template v-if="searchTotals.results"> · 共 {{ searchTotals.results }} 条</template><template v-if="searchTotals.bytes"> · 共 {{ tgBytes(searchTotals.bytes) }}</template></span></p>
+        <p class="sec-title">搜索日志 <span class="faint">{{ searches.length }} 次<template v-if="searchTotals.results"> · 共 {{ searchTotals.results }} 条</template><template v-if="searchTotals.bytes"> · 共 {{ bytes(searchTotals.bytes) }}</template></span></p>
         <ul class="searches">
           <li v-for="(s, i) in searches" :key="i" :class="searchMark(s)">
             <p class="s-head">
@@ -427,7 +397,7 @@ function bodyPurgedText(at: string | null | undefined): string {
               <b>{{ i + 1 }}.</b> <span class="mono">{{ s.toolName || '?' }}</span>
               <span class="faint">· round {{ s.roundNo ?? '?' }}</span>
               <span v-if="num(s.resultCount)" class="faint">· 返回 {{ s.resultCount }} 条</span>
-              <span v-if="num(s.contentBytes)" class="faint">· {{ tgBytes(num(s.contentBytes)) }}</span>
+              <span v-if="num(s.contentBytes)" class="faint">· {{ bytes(num(s.contentBytes)) }}</span>
             </p>
             <p v-if="s.query" class="s-line"><span class="faint">查：</span><i>{{ s.query }}</i></p>
             <p v-if="s.url" class="s-line url"><span class="faint">URL：</span><a :href="str(s.url)" target="_blank" rel="noreferrer noopener">{{ s.url }}</a></p>

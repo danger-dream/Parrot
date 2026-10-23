@@ -4,7 +4,7 @@ import { useRoute } from 'vue-router'
 import { ChartBar, ChevronLeft, ChevronRight, Coins, Film, Image as ImageIcon, ImagePlay, RefreshCw, Settings2, Users, X } from '@lucide/vue'
 import { api, type Schemas } from '@/api/client'
 import { inspector, openInspector } from '@/stores/ui'
-import { dateTime, integer, ms, relative, usd } from '@/utils/format'
+import { dateTime, integer, ms, relative, usd, usdOne } from '@/utils/format'
 import { errorTitle } from '@/utils/errors'
 import { goPage, openAccount, openModel } from '@/links'
 import Page from '@/components/ui/Page.vue'
@@ -248,7 +248,7 @@ const pages = computed(() => Math.max(1, Math.ceil(total.value / PAGE)))
         width="128px"
         :options="[
           { value: 'createdAt', label: '按时间排序' },
-          { value: 'cost', label: '按费用排序' },
+          { value: 'cost', label: '按金额排序' },
           { value: 'duration', label: '按耗时排序' },
           { value: 'status', label: '按状态排序' },
         ]"
@@ -272,7 +272,7 @@ const pages = computed(() => Math.max(1, Math.ceil(total.value / PAGE)))
               <span class="k"><Film /> 视频</span><span class="v">{{ integer(summary.videos) }}</span>
             </div>
             <div class="kind">
-              <span class="k"><Coins /> 已记录费用</span><span class="v">{{ summary.costUsdTicks ? usd(summary.costUsdTicks) : '—' }}</span>
+              <span class="k"><Coins /> 已记录金额</span><span class="v">{{ summary.costUsdTicks ? usd(summary.costUsdTicks) : '—' }}</span>
             </div>
           </div>
           <div class="chips">
@@ -314,7 +314,7 @@ const pages = computed(() => Math.max(1, Math.ceil(total.value / PAGE)))
     <section class="table">
       <div class="head">
         <span class="c-time">时间</span><span class="c-status">状态</span><span class="c-type">类型</span><span class="c-model">模型</span>
-        <span class="c-dims">规格</span><span class="c-dur">耗时</span><span class="c-cost">费用</span>
+        <span class="c-dims">规格</span><span class="c-dur">耗时</span><span class="c-cost">金额</span>
       </div>
       <template v-if="loading && !items.length">
         <div v-for="i in 8" :key="i" class="skl"><Skeleton h="14px" /></div>
@@ -353,7 +353,7 @@ const pages = computed(() => Math.max(1, Math.ceil(total.value / PAGE)))
           </span>
           <span class="c-dims mono">{{ dims(l) }}</span>
           <span class="c-dur mono">{{ elapsed(l) }}</span>
-          <span class="c-cost mono">{{ l.costTicks ? usd(l.costTicks) : '—' }}</span>
+          <span class="c-cost mono">{{ l.costTicks ? usdOne(l.costTicks) : '—' }}</span>
           <p v-if="l.error" class="c-err truncate" :title="l.error">{{ l.error }}</p>
         </div>
       </div>

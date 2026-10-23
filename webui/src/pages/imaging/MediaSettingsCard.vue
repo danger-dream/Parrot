@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { bytes, pct } from '@/utils/format'
 import { computed, onMounted, ref } from 'vue'
 import { api, type Schemas } from '@/api/client'
 import { useResource } from '@/composables/useResource'
@@ -62,19 +63,8 @@ function statText(st: ModelStat | undefined): string {
   const parts: string[] = []
   if (st.generatedCount) parts.push(`已生成 ${st.generatedCount} ${unit.value}`)
   if (st.unknownCountCalls) parts.push(st.generatedCount ? `另有 ${st.unknownCountCalls} 次未记录数量` : `完成 ${st.completedCalls} 次（未记录数量）`)
-  if (st.recordedBytes) parts.push(`已记录 ${bytesText(st.recordedBytes)}`)
+  if (st.recordedBytes) parts.push(`已记录 ${bytes(st.recordedBytes)}`)
   return parts.join(' · ')
-}
-function bytesText(n: number): string {
-  if (!n) return '0 B'
-  const u = ['B', 'KB', 'MB', 'GB', 'TB']
-  let v = n
-  let i = 0
-  while (v >= 1024 && i < u.length - 1) {
-    v /= 1024
-    i++
-  }
-  return i ? `${v.toFixed(v >= 100 ? 0 : 1)} ${u[i]}` : `${v} B`
 }
 
 const d = computed(() => res.draft.value)
@@ -101,10 +91,8 @@ const defaultOptions = computed(() => {
 
 const providers = computed(() => Object.entries(res.data.value?.models || {}).filter(([, list]) => list.length))
 
-function sizeText(bytes: number): string {
-  if (!bytes) return '不限'
-  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(bytes % 1024 ** 3 ? 1 : 0)} GB`
-  return `${Math.round(bytes / MB)} MB`
+function sizeText(n: number): string {
+  return n ? bytes(n) : '不限'
 }
 </script>
 
@@ -150,8 +138,8 @@ function sizeText(bytes: number): string {
         <span v-if="statsError" class="faint">{{ statsError }}</span>
         <span v-else-if="!stats" class="faint">读取中…</span>
         <template v-else>
-          <span class="num">{{ stats.cache.files }} 个文件 · {{ bytesText(stats.cache.bytes) }}</span>
-          <span v-if="res.data.value?.cacheMaxBytes" class="bar" :title="`占容量上限 ${((stats.cache.bytes / res.data.value.cacheMaxBytes) * 100).toFixed(1)}%`">
+          <span class="num">{{ stats.cache.files }} 个文件 · {{ bytes(stats.cache.bytes) }}</span>
+          <span v-if="res.data.value?.cacheMaxBytes" class="bar" :title="`占容量上限 ${pct(stats.cache.bytes / res.data.value.cacheMaxBytes)}`">
             <i :style="{ width: `${Math.min(100, (stats.cache.bytes / res.data.value.cacheMaxBytes) * 100)}%` }" />
           </span>
         </template>

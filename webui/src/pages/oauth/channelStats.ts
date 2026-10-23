@@ -1,6 +1,7 @@
 import { api } from '@/api/client'
-import { compact, usd } from '@/utils/format'
+import { compact, pctValue, tps, usd } from '@/utils/format'
 import type { StatsMetricData } from '@/api/types'
+export { tps }
 
 export type StatsPeriod = 'today' | '3d' | '7d' | 'month' | 'lifetime'
 export const MODEL_PERIODS: { value: StatsPeriod; label: string }[] = [
@@ -49,12 +50,6 @@ export function cacheShare(m: AnyStats): number | null {
   return p && m.cacheReadTokens ? (m.cacheReadTokens / p) * 100 : null
 }
 
-export function tps(v: number | null | undefined): string {
-  if (v === null || v === undefined || !Number.isFinite(v)) return '—'
-  if (v >= 1000) return `${(v / 1000).toFixed(1)}K t/s`
-  if (v >= 99.95) return `${Math.round(v)} t/s`
-  return `${v.toFixed(1)} t/s`
-}
 
 type LocalUsage = AnyStats & {
   outputTokens?: number | null
@@ -70,8 +65,8 @@ export function localUsageLine(l: LocalUsage | null | undefined): string {
   // An idle window still gets its line (all zeros) so every bar in a list has the same shape.
   const parts = [`↑${compact(prompt)} ↓${compact(output)}`]
   const share = cacheShare(l)
-  parts.push(`缓存 ${compact(l.cacheReadTokens || 0)}${share != null ? ` (${share >= 99.95 && share < 100 ? '99.9' : share.toFixed(1)}%)` : ''}`)
+  parts.push(`缓存 ${compact(l.cacheReadTokens || 0)}${share != null ? `（${pctValue(share)}）` : ''}`)
   parts.push(`均 ${l.averageTokensPerSecond ? tps(l.averageTokensPerSecond) : '—'}`)
-  parts.push(l.costTicks ? usd(l.costTicks, { precise: true }) : '$0')
+  parts.push(usd(l.costTicks || 0))
   return parts.join(' · ')
 }

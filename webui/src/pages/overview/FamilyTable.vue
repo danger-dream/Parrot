@@ -69,7 +69,7 @@ const rows = computed(() => {
               </div>
             </td>
             <td class="num">{{ integer(r.m.total) }}</td>
-            <td class="num" :class="(successRateOf(r.m) ?? 1) >= 0.99 ? 'g' : 'o'">{{ pctText(successRateOf(r.m), 2) }}</td>
+            <td class="num" :class="(successRateOf(r.m) ?? 1) >= 0.99 ? 'g' : 'o'">{{ pctText(successRateOf(r.m)) }}</td>
             <td class="num">{{ compact(promptOf(r.m)) }}</td>
             <td class="num">{{ compact(r.m.outputTokens) }}</td>
             <td class="num">{{ pctText(cacheShare(r.m)) }}</td>

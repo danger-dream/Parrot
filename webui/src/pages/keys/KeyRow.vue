@@ -2,11 +2,11 @@
 import { computed, ref } from 'vue'
 import { ChevronDown, ChevronRight, DatabaseZap, Download, GripVertical, Upload } from '@lucide/vue'
 import { api, enc, type Schemas } from '@/api/client'
-import { compact, dateTime, integer } from '@/utils/format'
+import { compact, dateTime, integer, pct, tps, usd } from '@/utils/format'
 import OutcomeStrip from '@/components/ui/OutcomeStrip.vue'
 import type { OutcomeItem } from '@/utils/outcomes'
 import { openModel } from '@/links'
-import { cost3, toUsage } from '@/pages/channels/meta'
+import { toUsage } from '@/pages/channels/meta'
 import KeySecret from './KeySecret.vue'
 import { keySecret, limitBrief, type ApiKey } from './meta'
 
@@ -89,7 +89,7 @@ async function toggle(): Promise<void> {
 
       <div class="c-num">
         <b class="num" :class="usage?.successRate == null ? '' : usage.successRate >= 0.99 ? 'ok' : usage.successRate >= 0.9 ? 'warn' : 'bad'">
-          {{ usage?.successRate != null ? `${(usage.successRate * 100).toFixed(1)}%` : '—' }}
+          {{ pct(usage?.successRate) }}
         </b>
       </div>
 
@@ -99,8 +99,8 @@ async function toggle(): Promise<void> {
       </div>
 
       <div class="c-num">
-        <b class="num cost">{{ cost3(usage?.costTicks ?? 0) }}</b>
-        <p class="sub">缓存 {{ usage?.cacheReadRatio != null ? `${(usage.cacheReadRatio * 100).toFixed(0)}%` : '—' }}</p>
+        <b class="num cost">{{ usd(usage?.costTicks ?? 0) }}</b>
+        <p class="sub">缓存占比 {{ pct(usage?.cacheReadRatio) }}</p>
       </div>
 
       <div class="c-recent">
@@ -117,28 +117,28 @@ async function toggle(): Promise<void> {
       <section class="box">
         <p class="bt">Token 结构（本月）</p>
         <div class="tiles">
-          <div class="tile t-in"><Download /><span>输入</span><b class="num">{{ compact(usage?.prompt ?? 0) }}</b></div>
+          <div class="tile t-in"><Download /><span>读入</span><b class="num">{{ compact(usage?.prompt ?? 0) }}</b></div>
           <div class="tile t-out"><Upload /><span>输出</span><b class="num">{{ compact(usage?.output ?? 0) }}</b></div>
           <div class="tile t-cache"><DatabaseZap /><span>缓存读</span><b class="num">{{ compact(usage?.cacheRead ?? 0) }}</b></div>
         </div>
         <p class="lim">限流 {{ limitBrief(k.limiter, live) }}</p>
-        <p v-if="usage?.avgTps" class="lim">速度 平均 {{ usage.avgTps.toFixed(1) }} t/s<template v-if="usage.maxTps"> · 峰值 {{ usage.maxTps.toFixed(0) }} t/s</template></p>
+        <p v-if="usage?.avgTps" class="lim">速度 平均 {{ tps(usage.avgTps) }}<template v-if="usage.maxTps"> · 峰值 {{ tps(usage.maxTps) }}</template></p>
       </section>
       <section class="box models">
         <p class="bt">模型使用（本月）</p>
         <table v-if="byModel && byModel.length">
           <thead>
-            <tr><th class="l">模型</th><th>调用</th><th>成功率</th><th>读入</th><th>写出</th><th>缓存</th><th>费用</th></tr>
+            <tr><th class="l">模型</th><th>调用</th><th>成功率</th><th>读入</th><th>写出</th><th>缓存占比</th><th>金额</th></tr>
           </thead>
           <tbody>
             <tr v-for="m in byModel.slice(0, 6)" :key="m.model" @click="openModel(m.model)">
               <td class="l mono">{{ m.model }}</td>
               <td class="num">{{ integer(m.usage.total) }}</td>
-              <td class="num" :class="(m.usage.successRate ?? 1) < 0.95 ? 'bad' : 'ok'">{{ m.usage.successRate != null ? `${(m.usage.successRate * 100).toFixed(1)}%` : '—' }}</td>
+              <td class="num" :class="(m.usage.successRate ?? 1) < 0.95 ? 'bad' : 'ok'">{{ pct(m.usage.successRate) }}</td>
               <td class="num">{{ compact(m.usage.promptTokens) }}</td>
               <td class="num">{{ compact(m.usage.outputTokens) }}</td>
-              <td class="num">{{ m.usage.cacheReadRatio != null ? `${(m.usage.cacheReadRatio * 100).toFixed(0)}%` : '—' }}</td>
-              <td class="num">{{ cost3(m.usage.costTicks) }}</td>
+              <td class="num">{{ pct(m.usage.cacheReadRatio) }}</td>
+              <td class="num">{{ usd(m.usage.costTicks) }}</td>
             </tr>
           </tbody>
         </table>

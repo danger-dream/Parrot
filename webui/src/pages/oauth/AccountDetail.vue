@@ -5,7 +5,7 @@ import { api, ApiError, type Schemas } from '@/api/client'
 import { goLogs, openModel } from '@/links'
 import { confirmAction } from '@/stores/dialogs'
 import { closeInspector, inspector, toast } from '@/stores/ui'
-import { compact, dateTime, integer, relative, usd } from '@/utils/format'
+import { compact, dateTime, dollars, integer, pctValue, relative, usd } from '@/utils/format'
 import Badge from '@/components/ui/Badge.vue'
 import Btn from '@/components/ui/Btn.vue'
 import KeyValue from '@/components/ui/KeyValue.vue'
@@ -29,7 +29,7 @@ import { deltas, loadCompare, minuteNow, type Compare } from '@/utils/compare'
 import WorkBuddyPanel from './WorkBuddyPanel.vue'
 import ZhipuPanel from './ZhipuPanel.vue'
 import { accountPath, errorToast, notifyChanged, oauthBus, runOperation } from './oauthApi'
-import { accountState, costText, countdown, pick, providerMeta, reasonLabel, usageValue, type AccountDetail, type Provider, type QuotaResetPlan, type RuntimeErr, type UsageItem } from './meta'
+import { accountState, countdown, pick, providerMeta, reasonLabel, usageValue, type AccountDetail, type Provider, type QuotaResetPlan, type RuntimeErr, type UsageItem } from './meta'
 import { accountAlerts, allSections, planFacts, planText, POOL_LABEL, quotaPauseGroups } from './facts'
 import { cacheShare, loadAccountModelStats, MODEL_PERIODS, promptTokens, tps, type ModelRow, type StatsPeriod } from './channelStats'
 import { errorTitle } from '@/utils/errors'
@@ -149,7 +149,7 @@ const tiles = computed<UsageTile[]>(() => {
       s: st.unpricedSuccess ? `未计价调用 ${integer(st.unpricedSuccess)} 次` : '',
       t: '按上游调用计：一次请求的重试或多轮工具调用会产生多次上游调用，所以可能多于请求数',
     },
-    { k: '缓存读取', v: compact(st.cacheReadTokens ?? 0), s: share !== null ? `占读入 ${share >= 99.95 && share < 100 ? '99.9' : share.toFixed(1)}%` : '', delta: d.cacheRead },
+    { k: '缓存读取', v: compact(st.cacheReadTokens ?? 0), s: share !== null ? `占读入 ${pctValue(share)}` : '', delta: d.cacheRead },
     { k: '缓存写入', v: compact(st.cacheCreationTokens ?? 0), delta: d.cacheWrite },
     { k: '平均速度', v: tps(st.averageTokensPerSecond), s: st.maximumTokensPerSecond ? `峰值 ${tps(st.maximumTokensPerSecond)} · 最低 ${tps(st.minimumTokensPerSecond)}` : '' },
     { k: '请求', v: integer(st.total), s: st.errorCount ? `失败 ${integer(st.errorCount)}` : '全部成功', bad: Boolean(st.errorCount), delta: d.requests },
@@ -536,7 +536,7 @@ function cooldownText(e: RuntimeErr): string {
       <DetailSection title="本期用量" :note="compare?.previousComplete ? `${periodLabel} · 右上角对比前一段等长时间` : periodLabel">
         <UsageTiles v-if="tiles.length" :tiles="tiles" />
         <p v-else-if="stats?.requestCount" class="small">
-          {{ integer(stats.requestCount) }} 次 · ↑{{ compact(stats.inputTokens) }} ↓{{ compact(stats.outputTokens) }} · {{ costText(stats.costUsd) }}
+          {{ integer(stats.requestCount) }} 次 · ↑{{ compact(stats.inputTokens) }} ↓{{ compact(stats.outputTokens) }} · {{ dollars(stats.costUsd) }}
         </p>
         <p v-else class="faint small">这个周期还没有经过 Parrot 的请求。</p>
 
@@ -550,7 +550,7 @@ function cooldownText(e: RuntimeErr): string {
           <p v-else-if="!modelRows.length" class="faint small">这段时间没有请求。</p>
           <table v-else class="mtable">
             <thead>
-              <tr><th class="l">模型</th><th>调用</th><th>失败</th><th>读入 / 写出</th><th>缓存</th><th>TPS</th><th>金额</th></tr>
+              <tr><th class="l">模型</th><th>调用</th><th>失败</th><th>读入 / 写出</th><th>缓存占比</th><th>TPS</th><th>金额</th></tr>
             </thead>
             <tbody>
               <tr v-for="r in (modelRows || []).slice(0, 8)" :key="r.key" @click="openModel(r.key)">
@@ -558,7 +558,7 @@ function cooldownText(e: RuntimeErr): string {
                 <td class="num">{{ integer(r.metrics.total) }}</td>
                 <td class="num" :class="r.metrics.errorCount ? 'c-red' : 'faint'">{{ integer(r.metrics.errorCount) }}</td>
                 <td class="num">{{ compact(promptTokens(r.metrics)) }} / {{ compact(r.metrics.outputTokens) }}</td>
-                <td class="num">{{ cacheShare(r.metrics) !== null ? `${cacheShare(r.metrics)!.toFixed(0)}%` : '—' }}</td>
+                <td class="num">{{ pctValue(cacheShare(r.metrics)) }}</td>
                 <td class="num">{{ r.metrics.averageTokensPerSecond ? tps(r.metrics.averageTokensPerSecond) : '—' }}</td>
                 <td class="num">{{ r.metrics.costTicks || !r.metrics.unpricedSuccess ? usd(r.metrics.costTicks) : '未计价' }}</td>
               </tr>

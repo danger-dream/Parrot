@@ -472,8 +472,8 @@ const scopeNote = computed(() => {
 
     <section class="kpis">
       <StatTile dense label="请求" :icon="Inbox" tone="blue" :loading="scopeLoading" :value="kpi ? integer(kpi.total) : null" :sub="kpi ? requestNote(kpi) : scopeNote" :delta="change.requests" :spark="trend.requests" />
-      <StatTile dense label="成功" :icon="CircleCheck" tone="green" :loading="scopeLoading" :value="kpi ? integer(kpi.success) : null" value-tone="green" :sub="kpi ? `成功率 ${pctText(kpi.rate, 2)}` : ''" :delta="change.success" :spark="trend.success" />
-      <StatTile dense label="失败" :icon="CircleX" tone="red" :loading="scopeLoading" :value="kpi ? integer(kpi.error) : null" :value-tone="kpi && kpi.error ? 'red' : ''" :sub="kpi && kpi.total ? pctText(kpi.error / kpi.total, 2) : ''" :delta="change.errors" :spark="trend.errors" />
+      <StatTile dense label="成功" :icon="CircleCheck" tone="green" :loading="scopeLoading" :value="kpi ? integer(kpi.success) : null" value-tone="green" :sub="kpi ? `成功率 ${pctText(kpi.rate)}` : ''" :delta="change.success" :spark="trend.success" />
+      <StatTile dense label="失败" :icon="CircleX" tone="red" :loading="scopeLoading" :value="kpi ? integer(kpi.error) : null" :value-tone="kpi && kpi.error ? 'red' : ''" :sub="kpi && kpi.total ? pctText(kpi.error / kpi.total) : ''" :delta="change.errors" :spark="trend.errors" />
       <StatTile dense label="金额" :icon="Coins" tone="orange" :loading="scopeLoading" :value="kpi ? usd(kpi.cost) : null" :sub="kpi?.unpriced ? `未计价 ${integer(kpi.unpriced)} 次` : ''" :delta="change.cost" :spark="trend.cost" />
       <StatTile dense label="Token" :icon="Layers" tone="purple" :loading="scopeLoading" :value="kpi ? compact(kpi.prompt + kpi.output) : null" :sub="kpi ? `读入 + 写出` : ''" :delta="change.tokens" :spark="trend.tokens" />
       <StatTile dense label="读入 ↑" :icon="Download" tone="teal" :loading="scopeLoading" :value="kpi ? compact(kpi.prompt) : null" :sub="kpi && kpi.prompt + kpi.output ? `占比 ${pctText(kpi.prompt / (kpi.prompt + kpi.output))}` : ''" :delta="change.prompt" :spark="trend.prompt" />
