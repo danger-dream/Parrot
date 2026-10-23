@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from src import notifier
+from src import notifier, state_db
 from src.telegram import bot, menu_cache, states, ui
 from src.tests.tg_contract import (
     CORE_CAPABILITY_IDS,
@@ -213,6 +213,8 @@ def _run_notifier(case, monkeypatch):
     monkeypatch.setattr(notifier, "set_handler", lambda handler: installed.append(handler))
     monkeypatch.setattr(ui, "api", capture.api)
     ui.configure("fake-token-core", [11, 22])
+    # Installing the handler recovers the delivery queue from the state store.
+    state_db.init()
     ui.install_notify_handler()
     installed[0](
         "<b>告警</b>\nA\u00a0B",
