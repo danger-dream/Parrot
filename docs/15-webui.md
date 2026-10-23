@@ -24,14 +24,19 @@
 
 ---
 
-## 1. 配置项 `management.webUi.enabled`
+## 1. 配置项 `management.webUi`
 
 ```json
-{ "management": { "webUi": { "enabled": false } } }
+{ "management": { "webUi": { "enabled": true, "publicUrl": "" } } }
 ```
 
-- 默认 **false**（老用户升级后默认关闭）。缺少该段的旧配置在加载时自动补默认值并写回
-  `config.json`，不会启动失败。
+- `enabled` 默认 **true**（新装与从旧版本升级都默认开启；登录仍需 Telegram 批准或管理密钥）。
+  缺少该段的旧配置在加载时自动补默认值并写回 `config.json`，不会启动失败；
+  已显式写成 `false` 的保持关闭。
+- `publicUrl` 是控制台的访问地址，显示在 TG 主菜单和「⚙ 系统设置 → 🖥 WebUI」里。
+  留空时按监听地址与公网 IP 推算 `http://<IP>:<端口>/ui/`；经域名或反向代理访问时填写实际地址
+  （网页「系统设置 → 网页控制台」可一键「使用当前地址」）。必须是 http(s) 绝对地址，
+  不能带账号密码、`?` 或 `#`。
 - 值必须是布尔；非布尔值会让管理面初始化失败（与其它 `management.*` 校验一致），
   此时 `/ui` 一律按关闭处理（fail-closed）。
 - 切换立即生效，不需要重启：静态托管每个请求都读当前配置。
@@ -43,12 +48,12 @@
 响应 `data`：
 
 ```json
-{ "enabled": false, "revision": "rev_3c1f…" }
+{ "enabled": true, "publicUrl": "", "revision": "rev_3c1f…" }
 ```
 
-PATCH 请求体（稀疏，未知字段 422）：`{"enabled": true}`。支持 `If-Match: <revision>`，
-不一致返回 409 `REVISION_CONFLICT`；空体、非布尔返回 422 `VALIDATION_FAILED`。每次写入都记审计
-`settings.web-ui.update`。
+PATCH 请求体（稀疏，未知字段 422）：`{"enabled": true}`、`{"publicUrl": "https://example.com/ui/"}`
+（空字符串表示清除）。支持 `If-Match: <revision>`，不一致返回 409 `REVISION_CONFLICT`；空体、
+非布尔、不合法地址返回 422 `VALIDATION_FAILED`。每次写入都记审计 `settings.web-ui.update`。
 
 ---
 

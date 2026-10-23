@@ -185,8 +185,8 @@ def test_release_first_load_preserves_keys_accounts_channels_and_is_idempotent(u
                   'ingressDefaultModel'):
         assert loaded[field] == raw[field], field
     # The released management section is preserved; the only addition is the
-    # backfilled, default-off WebUI switch (management.webUi.enabled=false).
-    assert loaded['management'] == {**raw['management'], 'webUi': {'enabled': False}}
+    # backfilled WebUI section, on by default with no custom address.
+    assert loaded['management'] == {**raw['management'], 'webUi': {'enabled': True, 'publicUrl': ''}}
     # Automatic release upgrades change only the protocol-profile marker inside
     # the account identity. Installation UUID, credentials and account settings
     # remain byte-for-byte equivalent to the released configuration.

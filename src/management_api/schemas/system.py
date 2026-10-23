@@ -202,11 +202,14 @@ class OpenAiWebSocketSettingsPatch(StrictRequestSchema):
 
 class WebUiSettingsData(StrictSchema):
     enabled: bool
+    # Shown in the Telegram main menu; empty means http://<public IP>:<port>/ui/.
+    publicUrl: str = ""
     revision: str
 
 
 class WebUiSettingsPatch(StrictRequestSchema):
     enabled: bool | None = None
+    publicUrl: str | None = Field(default=None, max_length=300)
 
 
 class BlacklistTermRequest(StrictRequestSchema):

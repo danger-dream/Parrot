@@ -383,21 +383,32 @@ def test_management_settings_default_web_ui_and_validate_type():
         key: value for key, value in config.DEFAULT_CONFIG["management"].items()
         if key not in {"managementKey", "webUi"}
     }}}
-    assert config.management_settings(base)["webUiEnabled"] is False
-    assert config.web_ui_enabled(base) is False
-    enabled = json.loads(json.dumps(base))
-    enabled["management"]["webUi"] = {"enabled": True}
-    assert config.management_settings(enabled)["webUiEnabled"] is True
-    assert config.web_ui_enabled(enabled) is True
+    # On when the section is missing (the default); an explicit false still turns it off.
+    assert config.management_settings(base)["webUiEnabled"] is True
+    assert config.web_ui_enabled(base) is True
+    disabled = json.loads(json.dumps(base))
+    disabled["management"]["webUi"] = {"enabled": False}
+    assert config.management_settings(disabled)["webUiEnabled"] is False
+    assert config.web_ui_enabled(disabled) is False
     broken = json.loads(json.dumps(base))
     broken["management"]["webUi"] = {"enabled": "yes"}
     with pytest.raises(ValueError, match="webUi"):
         config.management_settings(broken)
     assert config.web_ui_enabled(broken) is False
-    assert config.DEFAULT_CONFIG["management"]["webUi"] == {"enabled": False}
+    for bad_url in ("ftp://example.com/", "https://user:pw@example.com/ui/", "https://example.com/ui/?a=1", "example.com/ui"):
+        bad = json.loads(json.dumps(base))
+        bad["management"]["webUi"] = {"enabled": True, "publicUrl": bad_url}
+        with pytest.raises(ValueError, match="publicUrl"):
+            config.management_settings(bad)
+    good = json.loads(json.dumps(base))
+    good["management"]["webUi"] = {"enabled": True, "publicUrl": "https://example.com/ui/"}
+    assert config.management_settings(good)["webUiEnabled"] is True
+    assert config.web_ui_address(good, "203.0.113.9") == "https://example.com/ui/"
+    assert config.web_ui_enabled(broken) is False
+    assert config.DEFAULT_CONFIG["management"]["webUi"] == {"enabled": True, "publicUrl": ""}
 
 
-def test_legacy_config_without_web_ui_loads_and_backfills_disabled(tmp_path, monkeypatch):
+def test_legacy_config_without_web_ui_loads_and_backfills_enabled(tmp_path, monkeypatch):
     path = tmp_path / "config.json"
     legacy = {
         "listen": {"host": "127.0.0.1", "port": 1},
@@ -406,9 +417,9 @@ def test_legacy_config_without_web_ui_loads_and_backfills_disabled(tmp_path, mon
     path.write_text(json.dumps(legacy), encoding="utf-8")
     monkeypatch.setattr(config, "CONFIG_PATH", str(path))
     loaded = config._load_from_disk()
-    assert loaded["management"]["webUi"] == {"enabled": False}
+    assert loaded["management"]["webUi"] == {"enabled": True, "publicUrl": ""}
     assert loaded["management"]["managementKey"] == FAKE_KEY
     settings = config.management_settings(loaded)
-    assert settings["webUiEnabled"] is False
+    assert settings["webUiEnabled"] is True
     persisted = json.loads(path.read_text(encoding="utf-8"))
-    assert persisted["management"]["webUi"] == {"enabled": False}
+    assert persisted["management"]["webUi"] == {"enabled": True, "publicUrl": ""}

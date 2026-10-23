@@ -239,9 +239,9 @@ class SettingsControl(DomainControl):
         return _with_revision(OpenAiWebSocketSettings, responsesUpstreamWsForOAuth=bool(raw.get("responsesUpstreamWsForOAuth", False)))
 
     def _web_ui(self, cfg: Mapping[str, Any]) -> WebUiSettings:
-        # Same fail-closed rule as config.web_ui_enabled: only an explicit True.
-        raw = self._mapping(self._mapping(cfg.get("management")).get("webUi"))
-        return _with_revision(WebUiSettings, enabled=raw.get("enabled") is True)
+        # Same rule as config.web_ui_enabled: on when missing, off when malformed.
+        return _with_revision(WebUiSettings, enabled=config_module.web_ui_enabled(dict(cfg)),
+                              publicUrl=config_module.web_ui_public_url(dict(cfg)))
 
     def web_ui_enabled(self) -> bool:
         """Public, non-secret flag used by the unauthenticated login options."""
@@ -481,14 +481,19 @@ class SettingsControl(DomainControl):
     def update_web_ui(self, context, patch, *, expected_revision=None) -> WebUiSettings:
         """Toggle the browser WebUI; the single use case behind HTTP and Telegram."""
         self._write(context, Capability.WRITE)
-        self._keys(patch, {"enabled"})
+        self._keys(patch, {"enabled", "publicUrl"})
         if "enabled" in patch: self._bool(patch["enabled"], "enabled")
+        if "publicUrl" in patch:
+            url = patch["publicUrl"]
+            if not isinstance(url, str) or len(url) > 300 or (url.strip() and not config_module.valid_web_ui_url(url)):
+                raise self._validation("publicUrl", "url", "An http(s) address such as https://example.com/ui/ is required")
         def mutate(cfg):
             management = cfg.setdefault("management", {})
             target = management.setdefault("webUi", {})
             if not isinstance(target, dict):
                 target = management["webUi"] = {}
             if "enabled" in patch: target["enabled"] = patch["enabled"]
+            if "publicUrl" in patch: target["publicUrl"] = patch["publicUrl"].strip()
         return self._update(context, "web-ui", patch, expected_revision, mutate)
 
 

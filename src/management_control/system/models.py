@@ -120,6 +120,7 @@ class OpenAiWebSocketSettings:
 @dataclass(frozen=True, slots=True)
 class WebUiSettings:
     enabled: bool
+    publicUrl: str
     revision: str
 
 

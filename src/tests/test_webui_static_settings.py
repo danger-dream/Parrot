@@ -126,27 +126,45 @@ def test_web_ui_settings_get_patch_revision_and_validation(tmp_path, reset_web_u
         current = client.get(f"{API}/settings/web-ui", headers=headers)
         assert current.status_code == 200, current.text
         data = current.json()["data"]
-        assert data["enabled"] is False and data["revision"].startswith("rev_")
+        # On by default.
+        assert data["enabled"] is True and data["publicUrl"] == "" and data["revision"].startswith("rev_")
 
         stale = client.patch(
-            f"{API}/settings/web-ui", json={"enabled": True},
+            f"{API}/settings/web-ui", json={"enabled": False},
             headers={**headers, "If-Match": "rev_stale"},
         )
         assert stale.status_code == 409
         assert stale.json()["error"]["code"] == "REVISION_CONFLICT"
 
+        turned_off = client.patch(
+            f"{API}/settings/web-ui", json={"enabled": False},
+            headers={**headers, "If-Match": data["revision"]},
+        )
+        assert turned_off.status_code == 200, turned_off.text
+        assert turned_off.json()["data"]["enabled"] is False
+        assert turned_off.json()["data"]["revision"] != data["revision"]
+        assert config.web_ui_enabled() is False
+        assert client.get(f"{API}/auth/login-options").json()["data"]["webUiEnabled"] is False
+
         updated = client.patch(
             f"{API}/settings/web-ui", json={"enabled": True},
-            headers={**headers, "If-Match": data["revision"]},
+            headers={**headers, "If-Match": turned_off.json()["data"]["revision"]},
         )
         assert updated.status_code == 200, updated.text
         assert updated.json()["data"]["enabled"] is True
-        assert updated.json()["data"]["revision"] != data["revision"]
-        assert config.get()["management"]["webUi"] == {"enabled": True}
+        assert config.get()["management"]["webUi"]["enabled"] is True
         assert config.web_ui_enabled() is True
         assert client.get(f"{API}/auth/login-options").json()["data"]["webUiEnabled"] is True
 
-        for body in ({}, {"enabled": "yes"}, {"enabled": True, "other": 1}):
+        addressed = client.patch(f"{API}/settings/web-ui", json={"publicUrl": " https://console.example.com/ui/ "}, headers=headers)
+        assert addressed.status_code == 200, addressed.text
+        assert addressed.json()["data"]["publicUrl"] == "https://console.example.com/ui/"
+        assert config.web_ui_address(config.get(), "203.0.113.9") == "https://console.example.com/ui/"
+        cleared = client.patch(f"{API}/settings/web-ui", json={"publicUrl": ""}, headers=headers)
+        assert cleared.json()["data"]["publicUrl"] == ""
+
+        for body in ({}, {"enabled": "yes"}, {"enabled": True, "other": 1},
+                     {"publicUrl": "ftp://x.example/"}, {"publicUrl": "https://a.example/?q=1"}, {"publicUrl": 3}):
             bad = client.patch(f"{API}/settings/web-ui", json=body, headers=headers)
             assert bad.status_code == 422, body
             assert bad.json()["error"]["code"] == "VALIDATION_FAILED"

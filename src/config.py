@@ -491,10 +491,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "authRateLimitGlobal": 30,
         "maxOperations": 500,
         "maxAuditRecords": 5000,
-        # Browser WebUI (/ui/). Upgraded installations stay closed until an
-        # administrator enables it from Telegram or the Management API.
+        # Browser WebUI (/ui/), on by default; sign-in still needs the management
+        # key or a Telegram approval. ``publicUrl`` is the address shown in the
+        # Telegram main menu (empty: http://<public IP>:<port>/ui/).
         "webUi": {
-            "enabled": False,
+            "enabled": True,
+            "publicUrl": "",
         },
     },
     "telegram": {
@@ -1053,8 +1055,11 @@ def management_settings(cfg: dict | None = None) -> dict[str, Any]:
         clean_origins.append(f"{parsed.scheme}://{parsed.netloc}")
 
     web_ui = management.get("webUi", {})
-    if not isinstance(web_ui, dict) or not isinstance(web_ui.get("enabled", False), bool):
+    if not isinstance(web_ui, dict) or not isinstance(web_ui.get("enabled", True), bool):
         raise ValueError("management.webUi.enabled must be a boolean")
+    public_url = web_ui.get("publicUrl", "")
+    if not isinstance(public_url, str) or (public_url.strip() and not valid_web_ui_url(public_url)):
+        raise ValueError("management.webUi.publicUrl must be an http(s) URL")
 
     configured_path = management.get("stateDbPath")
     if not isinstance(configured_path, str) or not configured_path.strip():
@@ -1073,20 +1078,58 @@ def management_settings(cfg: dict | None = None) -> dict[str, Any]:
         "authRateLimitGlobal": rate_global,
         "maxOperations": max_operations,
         "maxAuditRecords": max_audit,
-        "webUiEnabled": web_ui.get("enabled", False),
+        "webUiEnabled": web_ui.get("enabled", True),
     }
 
 
 def web_ui_enabled(cfg: dict | None = None) -> bool:
-    """Return True only for an explicit boolean ``management.webUi.enabled``.
+    """``management.webUi.enabled``: on when missing (the default), off when malformed.
 
-    Missing or malformed values fail closed so a damaged section never exposes
-    the browser surface.
+    A damaged section (not an object, not a boolean) fails closed so it never
+    exposes the browser surface by accident.
     """
     source = cfg if cfg is not None else get()
     management = source.get("management") if isinstance(source, dict) else None
+    if not isinstance(management, dict) or "webUi" not in management:
+        return True
+    web_ui = management.get("webUi")
+    return isinstance(web_ui, dict) and web_ui.get("enabled", True) is True
+
+
+def valid_web_ui_url(value: str) -> bool:
+    """An absolute http(s) URL with a host, no credentials, query or fragment."""
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(value.strip())
+    except ValueError:
+        return False
+    return (parts.scheme in {"http", "https"} and bool(parts.hostname) and not parts.username
+            and not parts.password and not parts.query and not parts.fragment)
+
+
+def web_ui_address(cfg: dict | None = None, public_ip: str | None = None) -> str:
+    """Where admins open the console: the configured address, else the listen host and port."""
+    source = cfg if cfg is not None else get()
+    url = web_ui_public_url(source)
+    if url:
+        return url
+    listen = source.get("listen") if isinstance(source.get("listen"), dict) else {}
+    host = str(listen.get("host") or "").strip()
+    port = listen.get("port") or 22122
+    if host in {"", "0.0.0.0", "::", "[::]"}:
+        host = public_ip or "127.0.0.1"
+    elif ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{port}/ui/"
+
+
+def web_ui_public_url(cfg: dict | None = None) -> str:
+    """The configured console address, or "" when the default (public IP and port) applies."""
+    source = cfg if cfg is not None else get()
+    management = source.get("management") if isinstance(source, dict) else None
     web_ui = management.get("webUi") if isinstance(management, dict) else None
-    return isinstance(web_ui, dict) and web_ui.get("enabled") is True
+    value = web_ui.get("publicUrl") if isinstance(web_ui, dict) else None
+    return value.strip() if isinstance(value, str) and valid_web_ui_url(value) else ""
 
 
 def _load_from_disk() -> dict:

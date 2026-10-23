@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ... import __version__
+from ... import config as _config
 from ...management_control.observability import DEFAULT_STATUS_CONTROL, telegram_context
 from .. import menu_cache, ui
 
@@ -53,7 +54,7 @@ def _quota_hot_count(threshold_pct: float = 80.0) -> int:
 
 def _first_run_banner() -> str:
     """空配置时的引导文字。"""
-    return (
+    text = (
         "⚠ <b>首次使用检测</b>\n\n"
         "请按以下步骤快速启用服务：\n"
         "1️⃣ 「🔐 管理 OAuth」→ 登录获取 Token\n"
@@ -61,6 +62,17 @@ def _first_run_banner() -> str:
         "2️⃣ 发送 /keys → 创建下游调用用的 API Key\n"
         "3️⃣ 下游客户端配置代理 URL 即可使用\n"
     )
+    console = _web_ui_block()
+    return text + ("\n" + "\n".join(console) + "\n" if console else "")
+
+
+def _web_ui_block() -> list[str]:
+    """Web 控制台地址（开启时）：配置的访问地址，否则公网 IP + 端口。"""
+    cfg = _CONTROL.config_snapshot(_CONTEXT)
+    if not _config.web_ui_enabled(cfg):
+        return []
+    safe = ui.escape_html(_config.web_ui_address(cfg, _CONTROL.public_ip(_CONTEXT)))
+    return ["🖥 <b>Web 控制台</b>", f'  <a href="{safe}">{safe}</a>']
 
 
 def _overview(
@@ -138,6 +150,9 @@ def _overview(
     # ─── 底部固定信息块（每次进入主菜单都重新生成） ───
     lines.append("")
     lines.append("─" * 18)
+    console = _web_ui_block()
+    if console:
+        lines.extend(console + [""])
     lines.extend(_address_block(port))
     lines.append("")
     lines.extend(_lifetime_stats_block(

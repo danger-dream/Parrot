@@ -2967,24 +2967,31 @@ def _show_ws_mode(chat_id: int, message_id: int, cb_id: str) -> None:
 
 
 def _webui_text_kb() -> tuple[str, dict]:
+    from ... import config as _config
+    from ...management_control.observability import DEFAULT_STATUS_CONTROL, telegram_context
     cfg = _runtime_control.config_snapshot()
     enabled = _settings_control.web_ui_enabled()
+    custom = bool(_config.web_ui_public_url(cfg))
+    public_ip = DEFAULT_STATUS_CONTROL.public_ip(telegram_context())
     listen = cfg.get("listen") or {}
     host = str(listen.get("host") or "").strip()
-    port = listen.get("port") or ""
     wildcard = host in {"", "0.0.0.0", "::", "[::]"}
-    shown_host = "&lt;服务器IP&gt;" if wildcard else ui.escape_html(
-        f"[{host}]" if ":" in host and not host.startswith("[") else host
-    )
-    lines = [
-        "🖥 <b>WebUI</b>",
-        "",
-        f"当前状态：<code>{'已开启' if enabled else '已关闭'}</code>",
-        f"访问地址：<code>http://{shown_host}:{ui.escape_html(str(port))}/ui/</code>",
-    ]
-    if wildcard:
-        lines.append(f"<i>当前监听 {ui.escape_html(host or '0.0.0.0')}，请将 &lt;服务器IP&gt; 替换为服务器的 IP 或域名</i>")
-    lines.extend(["", "登录需在 Telegram 中点击批准"])
+    lines = ["🖥 <b>WebUI</b>", "", f"当前状态：<code>{'已开启' if enabled else '已关闭'}</code>"]
+    if wildcard and not custom and not public_ip:
+        # Neither a configured address nor a known public IP: 127.0.0.1 would mislead a remote admin.
+        lines += [
+            f"访问地址：<code>http://&lt;服务器IP&gt;:{ui.escape_html(str(listen.get('port') or ''))}/ui/</code>",
+            f"<i>当前监听 {ui.escape_html(host or '0.0.0.0')}，请将 &lt;服务器IP&gt; 替换为服务器的 IP 或域名，"
+            "也可在 Web 控制台「系统设置 → 网页控制台」中填写访问地址</i>",
+        ]
+    else:
+        address = ui.escape_html(_config.web_ui_address(cfg, public_ip))
+        lines += [
+            f'访问地址：<a href="{address}">{address}</a>',
+            "<i>" + ("自定义访问地址" if custom else "按监听地址与公网 IP 推算；经域名或反向代理访问时")
+            + "，可在 Web 控制台「系统设置 → 网页控制台」中修改</i>",
+        ]
+    lines += ["", "登录方式：在 Telegram 中点击批准，或使用管理密钥"]
     kb = ui.inline_kb([
         [ui.btn("🔴 关闭 WebUI" if enabled else "🟢 开启 WebUI", "sys:webui:toggle")],
         [ui.btn("◀ 返回系统设置", "menu:settings")],

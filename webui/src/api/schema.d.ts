@@ -11919,6 +11919,11 @@ export interface components {
         WebUiSettingsData: {
             /** Enabled */
             enabled: boolean;
+            /**
+             * Publicurl
+             * @default
+             */
+            publicUrl: string;
             /** Revision */
             revision: string;
         };
@@ -11926,6 +11931,8 @@ export interface components {
         WebUiSettingsPatch: {
             /** Enabled */
             enabled?: boolean | null;
+            /** Publicurl */
+            publicUrl?: string | null;
         };
         /** WorkBuddyPlanData */
         WorkBuddyPlanData: {
