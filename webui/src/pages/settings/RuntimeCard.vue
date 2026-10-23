@@ -83,7 +83,7 @@ async function load(): Promise<void> {
 let timer = 0
 onMounted(() => {
   load()
-  timer = window.setInterval(load, 30_000)
+  timer = window.setInterval(() => document.visibilityState === 'visible' && load(), 30_000)
 })
 onBeforeUnmount(() => window.clearInterval(timer))
 

@@ -182,6 +182,7 @@ const option = computed(() => {
       ...base,
       splitNumber: 4,
       max: metric.value === 'cache' ? 100 : undefined,
+      minInterval: metric.value === 'requests' || metric.value === 'errors' || metric.value === 'tokens' ? 1 : undefined,
       axisLabel: {
         ...base.axisLabel,
         formatter: (v: number) =>

@@ -10,6 +10,9 @@ module only decides *when* to recompute:
 * an older value of a slow computation (up to ``max_stale_seconds``) is
   returned immediately while one background thread recomputes it (single
   flight per key);
+* foreground and background computations have separate limits, so a quick
+  recomputation never queues behind slow background refreshes (a month
+  snapshot takes seconds, today's figures well under one);
 * without a usable value the caller computes it, and concurrent callers for
   the same key wait for that single computation instead of repeating it.
 
@@ -67,10 +70,11 @@ class StatsCache:
         self,
         *,
         fresh_seconds: float = 15.0,
-        max_stale_seconds: float = 600.0,
+        max_stale_seconds: float = 3600.0,
         slow_seconds: float = 1.0,
         max_entries: int = 256,
         max_concurrent: int = 2,
+        max_foreground: int = 4,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.fresh_seconds = float(fresh_seconds)
@@ -85,6 +89,7 @@ class StatsCache:
         self._entries: OrderedDict[Hashable, _Entry] = OrderedDict()
         self._flights: dict[Hashable, _Flight] = {}
         self._slots = threading.BoundedSemaphore(max(1, int(max_concurrent)))
+        self._foreground_slots = threading.BoundedSemaphore(max(1, int(max_foreground)))
 
     # ── internals ───────────────────────────────────────────────────
     def _store(self, key: Hashable, value: Any, cost: float = 0.0) -> None:
@@ -94,9 +99,10 @@ class StatsCache:
             while len(self._entries) > self.max_entries:
                 self._entries.popitem(last=False)
 
-    def _run(self, key: Hashable, loader: Callable[[], Any], flight: _Flight) -> None:
+    def _run(self, key: Hashable, loader: Callable[[], Any], flight: _Flight,
+             slots: threading.BoundedSemaphore | None = None) -> None:
         try:
-            with self._slots:
+            with slots or self._slots:
                 started = time.monotonic()
                 value = loader()
                 cost = time.monotonic() - started
@@ -138,7 +144,7 @@ class StatsCache:
             if owner:
                 flight = self._flights[key] = _Flight()
         if owner:
-            self._run(key, loader, flight)
+            self._run(key, loader, flight, self._foreground_slots)
         else:
             flight.done.wait()
         if flight.error is not None:

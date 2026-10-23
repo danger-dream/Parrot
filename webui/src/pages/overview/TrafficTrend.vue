@@ -41,13 +41,16 @@ const option = computed(() => {
       axisLabel: { color: c.axis, fontSize: 11, interval: 3 },
     },
     yAxis: [
+      // Requests and tokens are whole numbers: no 0.2 ticks rounding to repeated labels on a quiet day.
       {
         type: 'value',
+        minInterval: 1,
         splitLine: { lineStyle: { color: c.grid, type: 'dashed' } },
         axisLabel: { color: c.axis, fontSize: 11, formatter: (v: number) => axisNumber(v) },
       },
       {
         type: 'value',
+        minInterval: 1,
         splitLine: { show: false },
         axisLabel: { color: c.axis, fontSize: 11, formatter: (v: number) => axisNumber(v) },
       },

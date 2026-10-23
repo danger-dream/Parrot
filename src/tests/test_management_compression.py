@@ -34,6 +34,22 @@ def _app() -> FastAPI:
     def partial():
         return Response(b"a" * 5000, status_code=206, media_type="text/plain")
 
+    @app.delete("/api/management/v1/thing")
+    def deleted():
+        return Response(status_code=204)
+
+    @app.get("/api/management/v1/unchanged")
+    def unchanged():
+        return Response(status_code=304)
+
+    @app.get("/api/management/v1/blob")
+    def blob():
+        return Response(b"\x00" * 5000)
+
+    @app.get("/ui/assets/app.js")
+    def bundle():
+        return StreamingResponse(iter([b"console.log('parrot');\n" * 2000] * 6), media_type="application/javascript")
+
     @app.get("/v1/models")
     def inference():
         return JSONResponse(BIG)
@@ -69,3 +85,23 @@ def test_server_installs_the_middleware():
     import server
 
     assert any(item.cls is ManagementCompressionMiddleware for item in server.app.user_middleware)
+
+
+def test_bodiless_and_untyped_responses_pass_through():
+    # Starlette's own GZip responder changed between releases; these broke on newer versions.
+    gz = {"Accept-Encoding": "gzip"}
+    with TestClient(_app()) as client:
+        deleted = client.delete("/api/management/v1/thing", headers=gz)
+        assert deleted.status_code == 204 and "content-encoding" not in deleted.headers
+        unchanged = client.get("/api/management/v1/unchanged", headers=gz)
+        assert unchanged.status_code == 304 and "content-encoding" not in unchanged.headers
+        blob = client.get("/api/management/v1/blob", headers=gz)
+        assert blob.status_code == 200 and "content-encoding" not in blob.headers and blob.content == b"\x00" * 5000
+
+
+def test_streamed_bundle_is_gzipped_chunk_by_chunk():
+    with TestClient(_app()) as client:
+        res = client.get("/ui/assets/app.js", headers={"Accept-Encoding": "gzip"})
+        assert res.headers["content-encoding"] == "gzip"
+        assert "content-length" not in res.headers
+        assert res.content == b"console.log('parrot');\n" * 2000 * 6

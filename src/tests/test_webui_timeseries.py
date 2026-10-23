@@ -49,7 +49,8 @@ def test_window_alignment_and_default_buckets():
 
 
 def test_zero_filled_continuous_points_and_validation(store):
-    now = time.time()
+    # Half past a minute, so r1 and r2 (5 s apart) always land in the same minute bucket.
+    now = (int(time.time()) // 60) * 60 + 30.0
     conn = log_db._get_conn()
     insert_request(conn, request_id="r1", created_at=now - 130, input_tokens=10,
                    output_tokens=20, first_token_time_ms=100, total_time_ms=400)

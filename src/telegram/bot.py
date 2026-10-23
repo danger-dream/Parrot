@@ -74,24 +74,61 @@ def configure_management_approval_handler(
     _management_approval_handler = handler
 
 
-def send_management_approval(admin_ids: tuple[int, ...], notification) -> bool:
-    """Render the only new TG surface without exposing browser credentials."""
+# Copies of each pending login approval message, so a decision (or expiry) updates every admin's copy.
+_approval_messages: dict[str, dict] = {}
+_approval_lock = threading.Lock()
+
+_APPROVAL_OUTCOME = {
+    "approved": "✅ <b>已批准</b>",
+    "denied": "❌ <b>已拒绝</b>",
+    "expired": "⌛ <b>已过期</b>，未处理",
+    "consumed": "✅ <b>已批准</b>，登录已完成",
+    "alreadyDecided": "☑️ <b>已处理</b>",
+    "invalid": "⚠️ <b>已失效</b>",
+}
+
+
+def _approval_text(notification, outcome: str | None = None, actor: str = "") -> str:
     device = notification.device_summary or "未提供"
     confirm_code = str(getattr(notification, "confirm_code", "") or "")
-    confirm = (
-        f"确认码：<b><code>{ui.escape_html(confirm_code)}</code></b>\n"
-        "请确认与网页上显示的一致\n\n"
-        if confirm_code else ""
-    )
-    text = (
-        "🔐 <b>Management 登录批准</b>\n\n"
-        f"{confirm}"
-        f"客户端：<code>{ui.escape_html(notification.client_name)}</code>\n"
-        f"来源：<code>{ui.escape_html(notification.source_address)}</code>\n"
-        f"设备：<code>{ui.escape_html(device)}</code>\n"
-        f"请求时间：<code>{notification.requested_at.isoformat()}</code>\n"
-        f"过期时间：<code>{notification.expires_at.isoformat()}</code>"
-    )
+    lines = ["🔐 <b>Parrot 控制台登录</b>", ""]
+    if confirm_code:
+        lines.append(f"确认码：<b><code>{ui.escape_html(confirm_code)}</code></b>")
+        if outcome is None:
+            lines.append("请确认与网页上显示的一致")
+        lines.append("")
+    lines += [
+        f"客户端：<code>{ui.escape_html(notification.client_name)}</code>",
+        f"来源：<code>{ui.escape_html(notification.source_address)}</code>",
+        f"设备：<code>{ui.escape_html(device)}</code>",
+        f"请求时间：<code>{ui.fmt_bjt_ts(notification.requested_at.timestamp())}</code>",
+    ]
+    if outcome is None:
+        lines.append(f"有效期至：<code>{ui.fmt_bjt_ts(notification.expires_at.timestamp())}</code>")
+    else:
+        by = f" · {ui.escape_html(actor)}" if actor else ""
+        lines += ["", f"{_APPROVAL_OUTCOME.get(outcome, _APPROVAL_OUTCOME['alreadyDecided'])}{by} · {ui.fmt_bjt_ts(time.time())}"]
+    return "\n".join(lines)
+
+
+def _finish_approval_messages(approval_id: str, outcome: str, actor: str = "") -> bool:
+    """Rewrite every copy without buttons; False when this process holds no copies (e.g. after a restart)."""
+    with _approval_lock:
+        entry = _approval_messages.pop(approval_id, None)
+    if entry is None:
+        return False
+    timer = entry.get("timer")
+    if timer is not None:
+        timer.cancel()
+    text = _approval_text(entry["notification"], outcome, actor)
+    for chat_id, message_id in entry["copies"]:
+        ui.edit(chat_id, message_id, text)
+    return True
+
+
+def send_management_approval(admin_ids: tuple[int, ...], notification) -> bool:
+    """Render the only new TG surface without exposing browser credentials."""
+    text = _approval_text(notification)
     keyboard = ui.inline_kb(
         [[
             ui.btn("✅ 批准", notification.approve_callback),
@@ -99,11 +136,32 @@ def send_management_approval(admin_ids: tuple[int, ...], notification) -> bool:
         ]]
     )
     sent_all = True
+    copies: list[tuple[int, int]] = []
     for admin_id in admin_ids:
         result = ui.send(admin_id, text, reply_markup=keyboard)
         if not isinstance(result, dict) or not result.get("ok"):
             sent_all = False
+            continue
+        message_id = (result.get("result") or {}).get("message_id")
+        if isinstance(message_id, int):
+            copies.append((admin_id, message_id))
+    if copies:
+        approval_id = notification.approval_id
+        delay = max(1.0, notification.expires_at.timestamp() - time.time() + 2)
+        timer = threading.Timer(delay, _finish_approval_messages, args=(approval_id, "expired"))
+        timer.daemon = True
+        with _approval_lock:
+            _approval_messages[approval_id] = {"notification": notification, "copies": copies, "timer": timer}
+        timer.start()
     return sent_all
+
+
+def _approval_stale_text(cb: dict, outcome: str, actor: str = "") -> str:
+    """Keep the original lines of a message this process did not send, append the outcome, drop the buttons."""
+    original = ui.escape_html(str((cb.get("message") or {}).get("text") or "").strip())
+    by = f" · {ui.escape_html(actor)}" if actor else ""
+    status = f"{_APPROVAL_OUTCOME.get(outcome, _APPROVAL_OUTCOME['alreadyDecided'])}{by} · {ui.fmt_bjt_ts(time.time())}"
+    return f"{original}\n\n{status}" if original else status
 
 
 def _summarize_text(text: str) -> str:
@@ -572,6 +630,8 @@ def _handle_callback(cb: dict) -> None:
             result = _management_approval_handler(parts[2], int(actor_id), parts[1] == "a")
         except Exception:
             ui.answer_cb(cb_id, "登录批准失败或已失效", show_alert=True)
+            if not _finish_approval_messages(parts[2], "invalid"):
+                ui.edit(chat_id, msg_id, _approval_stale_text(cb, "invalid"))
             return
         messages = {
             "approved": "✅ 已批准登录",
@@ -581,6 +641,10 @@ def _handle_callback(cb: dict) -> None:
             "alreadyDecided": "登录批准已处理，不能重复决定",
         }
         ui.answer_cb(cb_id, messages.get(result, "登录批准状态未变更"), show_alert=True)
+        actor = str((cb.get("from") or {}).get("first_name") or "")
+        if not _finish_approval_messages(parts[2], result, actor):
+            # The copies were sent before a restart: at least take the buttons off this one.
+            ui.edit(chat_id, msg_id, _approval_stale_text(cb, result, actor))
         return
 
     if not ui.is_admin(chat_id):

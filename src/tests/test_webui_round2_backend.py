@@ -141,6 +141,21 @@ def test_stats_cache_recomputes_a_cheap_value_instead_of_serving_it_stale():
     assert cache.get("slow", lambda: "new") == "old" and started == ["slow"]
 
 
+def test_stats_cache_foreground_work_does_not_queue_behind_background_refreshes():
+    cache = _cache(max_concurrent=1, max_foreground=1)
+    gate = threading.Event()
+    cache._slots.acquire()  # the only background slot is busy with a slow refresh
+    try:
+        done = []
+        worker = threading.Thread(target=lambda: done.append(cache.get("cheap", lambda: "v")))
+        worker.start()
+        worker.join(2)
+        assert done == ["v"]
+    finally:
+        cache._slots.release()
+        gate.set()
+
+
 def test_item0_stats_cache_errors_disabled_and_keys():
     cache = _cache()
     with pytest.raises(ValueError):
