@@ -13,6 +13,9 @@ htmlcov/
 config.json
 config.json.tmp
 config.json.bak*
+# config.update() writes through a private mkstemp file (.config.json.<random>.tmp) before the atomic
+# replace; while it exists git status shows it, and the release candidate check refuses to publish.
+/.config.json.*
 oauth.json
 .env
 .env.*
