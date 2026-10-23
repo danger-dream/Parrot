@@ -7,7 +7,8 @@ import { integer, pct } from '@/utils/format'
 
 const props = defineProps<{ points: TimePoint[]; ready: boolean }>()
 
-type Cell = { key: string; state: 'none' | 'ok' | 'warn' | 'bad' | 'future'; from: number; total: number; success: number; errors: number }
+// Shade = how many requests the 10 minutes had (against today's busiest slot); red dot = failures, larger for more.
+type Cell = { key: string; state: 'none' | 'busy' | 'future'; level: number; dot: '' | 's' | 'm' | 'l'; from: number; total: number; success: number; errors: number }
 
 const grid = computed(() => {
   const now = Date.now()
@@ -25,15 +26,18 @@ const grid = computed(() => {
       const total = p?.total ?? 0
       const success = p?.successCount ?? 0
       const errors = p?.errorCount ?? 0
-      let state: Cell['state'] = 'none'
-      if (from > now) state = 'future'
-      else if (total) state = errors === 0 ? 'ok' : errors / total < 0.05 ? 'warn' : 'bad'
-      row.push({ key: `${r}-${h}`, state, from, total, success, errors })
+      const state: Cell['state'] = from > now ? 'future' : total ? 'busy' : 'none'
+      const dot: Cell['dot'] = !errors ? '' : errors === 1 ? 's' : errors < 5 ? 'm' : 'l'
+      row.push({ key: `${r}-${h}`, state, level: 0, dot, from, total, success, errors })
     }
     rows.push(row)
   }
+  // Square-root scale so quiet slots still show next to the busiest one.
+  const max = Math.max(1, ...rows.flat().map((c) => c.total))
+  for (const c of rows.flat()) if (c.total) c.level = Math.max(1, Math.ceil(Math.sqrt(c.total / max) * 4))
   return rows
 })
+const busiest = computed(() => Math.max(0, ...grid.value.flat().map((c) => c.total)))
 
 const totals = computed(() => {
   let total = 0
@@ -49,7 +53,7 @@ function label(c: Cell): string {
   const t = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
   if (c.state === 'future') return `${t} · 未到`
   if (!c.total) return `${t} · 无请求`
-  return `${t} · ${integer(c.total)} 次 · 失败 ${integer(c.errors)}`
+  return `${t} · ${integer(c.total)} 次 · 成功 ${integer(c.success)} · 失败 ${integer(c.errors)}`
 }
 
 function open(c: Cell): void {
@@ -67,8 +71,8 @@ function open(c: Cell): void {
     </template>
     <div class="wrap">
       <div class="counts">
-        <span><i class="ok" />成功 {{ integer(totals.ok) }}</span>
-        <span><i class="bad" />失败 {{ integer(totals.errors) }}</span>
+        <span><i class="busy l4" />成功 {{ integer(totals.ok) }}</span>
+        <span><b class="dot m" />失败 {{ integer(totals.errors) }}</span>
         <span v-if="totals.other" class="faint">取消 / 进行中 {{ integer(totals.other) }}</span>
       </div>
       <div class="hm">
@@ -82,18 +86,21 @@ function open(c: Cell): void {
             :key="c.key"
             type="button"
             class="cell"
-            :class="ready ? c.state : 'none'"
+            :class="ready ? [c.state, c.level ? `l${c.level}` : ''] : 'none'"
             :title="label(c)"
             :disabled="!c.total"
             @click="open(c)"
-          />
+          >
+            <i v-if="ready && c.dot" class="dot" :class="c.dot" />
+          </button>
         </div>
       </div>
       <div class="legend">
+        <span :title="`最忙的 10 分钟有 ${integer(busiest)} 次请求`">
+          请求量 少 <i class="busy l1" /><i class="busy l2" /><i class="busy l3" /><i class="busy l4" /> 多
+        </span>
+        <span><b class="dot s" /><b class="dot l" />失败（越大越多）</span>
         <span><i class="none" />无请求</span>
-        <span><i class="ok" />成功</span>
-        <span><i class="warn" />少量失败</span>
-        <span><i class="bad" />失败较多</span>
         <span><i class="future" />未到</span>
       </div>
     </div>
@@ -144,6 +151,9 @@ function open(c: Cell): void {
   height: 9px;
   border-radius: 2px;
 }
+.legend i + i {
+  margin-left: -2px;
+}
 .hm {
   flex: 1;
   display: flex;
@@ -169,6 +179,8 @@ function open(c: Cell): void {
   align-self: center;
 }
 .cell {
+  display: grid;
+  place-items: center;
   border-radius: 3px;
   min-height: 14px;
 }
@@ -179,14 +191,36 @@ function open(c: Cell): void {
 .none {
   background: var(--track);
 }
-.ok {
+.busy.l1 {
+  background: color-mix(in srgb, var(--green) 28%, var(--track));
+}
+.busy.l2 {
+  background: color-mix(in srgb, var(--green) 50%, var(--track));
+}
+.busy.l3 {
+  background: color-mix(in srgb, var(--green) 75%, var(--track));
+}
+.busy.l4 {
   background: var(--green);
 }
-.warn {
-  background: var(--lime);
-}
-.bad {
+.dot {
+  display: block;
+  flex-shrink: 0;
+  border-radius: 50%;
   background: var(--red);
+  box-shadow: 0 0 0 1.5px var(--surface);
+}
+.dot.s {
+  width: 5px;
+  height: 5px;
+}
+.dot.m {
+  width: 8px;
+  height: 8px;
+}
+.dot.l {
+  width: 11px;
+  height: 11px;
 }
 .future {
   background: transparent;
