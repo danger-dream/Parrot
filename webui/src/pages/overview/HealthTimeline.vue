@@ -7,8 +7,8 @@ import { integer, pct } from '@/utils/format'
 
 const props = defineProps<{ points: TimePoint[]; ready: boolean }>()
 
-// Shade = how many requests the 10 minutes had (against today's busiest slot); red dot = failures, larger for more.
-type Cell = { key: string; state: 'none' | 'busy' | 'future'; level: number; dot: '' | 's' | 'm' | 'l'; from: number; total: number; success: number; errors: number }
+// Shade = how many requests the 10 minutes had (against today's busiest slot); a red corner tab = failures, larger for more.
+type Cell = { key: string; state: 'none' | 'busy' | 'future'; level: number; flag: '' | 's' | 'm' | 'l'; from: number; total: number; success: number; errors: number }
 
 const grid = computed(() => {
   const now = Date.now()
@@ -27,8 +27,8 @@ const grid = computed(() => {
       const success = p?.successCount ?? 0
       const errors = p?.errorCount ?? 0
       const state: Cell['state'] = from > now ? 'future' : total ? 'busy' : 'none'
-      const dot: Cell['dot'] = !errors ? '' : errors === 1 ? 's' : errors < 5 ? 'm' : 'l'
-      row.push({ key: `${r}-${h}`, state, level: 0, dot, from, total, success, errors })
+      const flag: Cell['flag'] = !errors ? '' : errors === 1 ? 's' : errors < 5 ? 'm' : 'l'
+      row.push({ key: `${r}-${h}`, state, level: 0, flag, from, total, success, errors })
     }
     rows.push(row)
   }
@@ -72,7 +72,7 @@ function open(c: Cell): void {
     <div class="wrap">
       <div class="counts">
         <span><i class="busy l4" />成功 {{ integer(totals.ok) }}</span>
-        <span><b class="dot m" />失败 {{ integer(totals.errors) }}</span>
+        <span><i class="sample busy l4"><b class="flag m" /></i>失败 {{ integer(totals.errors) }}</span>
         <span v-if="totals.other" class="faint">取消 / 进行中 {{ integer(totals.other) }}</span>
       </div>
       <div class="hm">
@@ -91,7 +91,7 @@ function open(c: Cell): void {
             :disabled="!c.total"
             @click="open(c)"
           >
-            <i v-if="ready && c.dot" class="dot" :class="c.dot" />
+            <i v-if="ready && c.flag" class="flag" :class="c.flag" />
           </button>
         </div>
       </div>
@@ -99,7 +99,7 @@ function open(c: Cell): void {
         <span :title="`最忙的 10 分钟有 ${integer(busiest)} 次请求`">
           请求量 少 <i class="busy l1" /><i class="busy l2" /><i class="busy l3" /><i class="busy l4" /> 多
         </span>
-        <span><b class="dot s" /><b class="dot l" />失败（越大越多）</span>
+        <span><i class="sample busy l2"><b class="flag s" /></i><i class="sample busy l2"><b class="flag l" /></i>失败（角标越大越多）</span>
         <span><i class="none" />无请求</span>
         <span><i class="future" />未到</span>
       </div>
@@ -179,8 +179,8 @@ function open(c: Cell): void {
   align-self: center;
 }
 .cell {
-  display: grid;
-  place-items: center;
+  position: relative;
+  overflow: hidden;
   border-radius: 3px;
   min-height: 14px;
 }
@@ -203,24 +203,34 @@ function open(c: Cell): void {
 .busy.l4 {
   background: var(--green);
 }
-.dot {
-  display: block;
-  flex-shrink: 0;
-  border-radius: 50%;
-  background: var(--red);
-  box-shadow: 0 0 0 1.5px var(--surface);
+/* Failure tab folded into the cell's top-right corner, like a spreadsheet's comment marker. */
+.flag {
+  position: absolute;
+  top: 0;
+  right: 0;
+  background: linear-gradient(to bottom left, var(--red) 50%, transparent 50%);
 }
-.dot.s {
-  width: 5px;
-  height: 5px;
+.flag.s {
+  width: 6px;
+  height: 6px;
 }
-.dot.m {
-  width: 8px;
-  height: 8px;
+.flag.m {
+  width: 9px;
+  height: 9px;
 }
-.dot.l {
-  width: 11px;
-  height: 11px;
+.flag.l {
+  width: 12px;
+  height: 12px;
+}
+.sample {
+  position: relative;
+  overflow: hidden;
+}
+.counts .sample,
+.legend .sample {
+  width: 13px;
+  height: 13px;
+  border-radius: 3px;
 }
 .future {
   background: transparent;
