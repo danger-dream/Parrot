@@ -11,6 +11,7 @@ import { routeTitle } from '@/router'
 import { goPage } from '@/links'
 import LbModeMenu from '@/components/LbModeMenu.vue'
 import BrandMark from './BrandMark.vue'
+import NotificationBell from './NotificationBell.vue'
 import StatusDot from '@/components/ui/StatusDot.vue'
 import Segmented from '@/components/ui/Segmented.vue'
 
@@ -88,6 +89,7 @@ function goDevices(): void {
         <span class="search-text">搜索</span>
         <kbd>{{ isMac ? '⌘' : 'Ctrl' }} K</kbd>
       </button>
+      <NotificationBell />
       <div ref="menuRef" class="menu-wrap">
         <button class="avatar" :class="{ on: menuOpen }" aria-label="账户菜单" @click="menuOpen = !menuOpen">
           <UserRound class="avatar-ic" />

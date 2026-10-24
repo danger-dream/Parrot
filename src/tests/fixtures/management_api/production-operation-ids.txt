@@ -272,3 +272,5 @@ listCacheMissSamples
 getMediaLogSummary
 getMediaStatistics
 listRecentOutcomes
+listNotifications
+markNotificationsRead

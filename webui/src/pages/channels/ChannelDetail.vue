@@ -18,7 +18,9 @@ import NumberInput from '@/components/ui/NumberInput.vue'
 import StatusDot from '@/components/ui/StatusDot.vue'
 import ProviderIcon from '@/components/ProviderIcon.vue'
 import Skeleton from '@/components/ui/Skeleton.vue'
+import Select from '@/components/ui/Select.vue'
 import Switch from '@/components/ui/Switch.vue'
+import { useProxyRoute } from '@/composables/useProxyRoute'
 import DetailSection from '@/components/DetailSection.vue'
 import ModelList from '@/components/ModelList.vue'
 import ModelListRow from '@/components/ModelListRow.vue'
@@ -39,6 +41,7 @@ const data = ref<ChannelDetailData | null>(null)
 const error = ref('')
 const notFound = ref(false)
 const busy = ref('')
+const route = useProxyRoute('channels', () => props.id)
 const editOpen = ref(false)
 const modelsOpen = ref(false)
 const compatOpen = ref(false)
@@ -328,6 +331,9 @@ async function remove(): Promise<void> {
           <SettingRow title="最大并发" hint="同时处理的请求上限，0 表示使用默认值">
             <span @keydown.enter="saveConcurrency"><NumberInput v-model="ccDraft" :min="0" :max="10000" integer width="92px" /></span>
             <Btn v-if="ccDirty" size="sm" variant="primary" :loading="busy === 'maxConcurrent'" @click="saveConcurrency">保存</Btn>
+          </SettingRow>
+          <SettingRow title="出口代理" :hint="route.hint">
+            <Select :model-value="route.value" :options="route.options" :disabled="!route.ready || route.saving" width="172px" @update:model-value="route.set" />
           </SettingRow>
           <SettingRow v-if="c.protocol === 'anthropic' || c.ccMimicry" title="CC 伪装" hint="以 Claude Code 客户端身份请求上游">
             <Switch :model-value="c.ccMimicry" :loading="busy === 'ccMimicry'" label="CC 伪装" @update:model-value="patch({ ccMimicry: $event }, $event ? '已开启 CC 伪装' : '已关闭 CC 伪装')" />

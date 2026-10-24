@@ -13,7 +13,9 @@ import NumberInput from '@/components/ui/NumberInput.vue'
 import TextInput from '@/components/ui/TextInput.vue'
 import Segmented from '@/components/ui/Segmented.vue'
 import Skeleton from '@/components/ui/Skeleton.vue'
+import Select from '@/components/ui/Select.vue'
 import Switch from '@/components/ui/Switch.vue'
+import { useProxyRoute } from '@/composables/useProxyRoute'
 import DetailSection from '@/components/DetailSection.vue'
 import AccountModels from './AccountModels.vue'
 import AddAccountModal from './AddAccountModal.vue'
@@ -43,6 +45,7 @@ const data = ref<AccountDetail | null>(null)
 const error = ref('')
 const notFound = ref(false)
 const busy = ref('')
+const route = useProxyRoute('accounts', () => props.id)
 const usageNote = ref('')
 const now = ref(Date.now())
 const relogin = ref<{ accountId: string; provider: Provider; realm?: string | null; site?: string | null } | null>(null)
@@ -497,6 +500,9 @@ function cooldownText(e: RuntimeErr): string {
           <SettingRow title="最大并发" hint="同时处理的请求上限，0 表示不限">
             <span class="cc-in" @keydown.enter="saveConcurrency"><NumberInput v-model="ccDraft" :min="0" :max="10000" integer width="92px" /></span>
             <Btn v-if="ccDirty" size="sm" variant="primary" :loading="busy === 'concurrency'" @click="saveConcurrency">保存</Btn>
+          </SettingRow>
+          <SettingRow title="出口代理" :hint="route.hint">
+            <Select :model-value="route.value" :options="route.options" :disabled="!route.ready || route.saving" width="172px" @update:model-value="route.set" />
           </SettingRow>
           <SettingRow
             v-if="provider === 'openai' && data.allowCredits !== null && data.allowCredits !== undefined"

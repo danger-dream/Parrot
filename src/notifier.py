@@ -269,6 +269,8 @@ def notify_event(event_key: str, text: str,
             return False
     except Exception as exc:
         print(f"[notify_event] config check failed ({exc}), sending anyway")
+    from .notifications import inbox
+    inbox.remember(event_key, text)
     return notify(text, auto_delete_seconds=auto_delete_seconds,
                   reply_markup=reply_markup, meta=meta)
 

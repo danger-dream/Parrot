@@ -17,6 +17,7 @@ import Segmented from '@/components/ui/Segmented.vue'
 import Select from '@/components/ui/Select.vue'
 import Skeleton from '@/components/ui/Skeleton.vue'
 import Switch from '@/components/ui/Switch.vue'
+import { useProxyRoute } from '@/composables/useProxyRoute'
 import DetailSection from '@/components/DetailSection.vue'
 import StatsMini from '@/components/StatsMini.vue'
 import { loadCompare, type Compare, type ComparePeriod } from '@/utils/compare'
@@ -66,6 +67,7 @@ const statsLoading = ref(false)
 /** This period against the one before it, for the tiles' top-right change. */
 const compare = ref<Compare | null>(null)
 const model = ref<ModelData | null>(null)
+const route = useProxyRoute('models', () => model.value?.modelId || props.id)
 const resolved = ref(false)
 const meta = ref<ModelMetadata | null>(null)
 const metaMissing = ref(false)
@@ -425,6 +427,13 @@ const unpriced = computed(() => stats.value?.metrics.unpricedSuccess || 0)
           <p class="st-h">关闭后不出现在 /v1/models，仍可按名称调用</p>
         </div>
         <Switch :model-value="model.visible !== false" :loading="busy === 'visible'" label="对下游展示" @update:model-value="toggleVisible" />
+      </div>
+      <div class="st-row">
+        <div>
+          <p class="st-k">出口代理</p>
+          <p class="st-h">{{ route.hint }}</p>
+        </div>
+        <Select :model-value="route.value" :options="route.options" :disabled="!route.ready || route.saving" width="172px" @update:model-value="route.set" />
       </div>
       <div v-if="model.identity.type === 'chat'" class="st-row">
         <div>

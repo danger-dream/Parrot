@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from src.management_auth import ManagementStateStore
 
@@ -33,7 +33,7 @@ from .observability import (
 )
 from .operations import OperationRegistry, OperationStore
 from .proxy import ProxyControl
-from .system import ContentBlacklistControl, SettingsControl, TelegramRetentionAdapter
+from .system import ContentBlacklistControl, NotificationInboxControl, SettingsControl, TelegramRetentionAdapter
 from .system.runtime import SystemRuntimeControl
 
 
@@ -51,6 +51,7 @@ class SystemNetworkControls:
     settings: SettingsControl
     blacklist: ContentBlacklistControl
     network: NetworkControl
+    notifications: NotificationInboxControl = field(default_factory=NotificationInboxControl)
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +147,7 @@ def build_management_controls(
                 operations=operations,
                 audit_sink=audit_sink,
             ),
+            notifications=NotificationInboxControl(audit_sink=audit_sink),
         ),
         system_runtime=SystemRuntimeControl(audit_sink=audit_sink),
         telegram_retention=TelegramRetentionAdapter(retention),

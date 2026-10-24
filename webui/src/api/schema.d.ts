@@ -3515,6 +3515,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/management/v1/notifications": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Notifications */
+        get: operations["listNotifications"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/management/v1/notifications/actions/mark-read": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Mark Notifications Read */
+        post: operations["markNotificationsRead"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/management/v1/mcp": {
         parameters: {
             query?: never;
@@ -5357,6 +5391,11 @@ export interface components {
         /** DataEnvelope[NotificationSettingsData] */
         DataEnvelope_NotificationSettingsData_: {
             data: components["schemas"]["NotificationSettingsData"];
+            meta: components["schemas"]["ResponseMeta"];
+        };
+        /** DataEnvelope[NotificationUnreadData] */
+        DataEnvelope_NotificationUnreadData_: {
+            data: components["schemas"]["NotificationUnreadData"];
             meta: components["schemas"]["ResponseMeta"];
         };
         /** DataEnvelope[OAuthAccountDetailData] */
@@ -7790,6 +7829,96 @@ export interface components {
             /** Operationattention */
             operationAttention?: boolean | null;
         };
+        /** NotificationInboxData */
+        NotificationInboxData: {
+            /** Items */
+            items: components["schemas"]["NotificationItemData"][];
+            /** Unreadcount */
+            unreadCount: number;
+        };
+        /** NotificationInboxEnvelope */
+        NotificationInboxEnvelope: {
+            data: components["schemas"]["NotificationInboxData"];
+            meta: components["schemas"]["NotificationInboxMeta"];
+        };
+        /** NotificationInboxMeta */
+        NotificationInboxMeta: {
+            /** Requestid */
+            requestId: string;
+            /** Page */
+            page: number;
+            /** Pagesize */
+            pageSize: number;
+            /** Total */
+            total: number;
+            /** Hasnext */
+            hasNext: boolean;
+        };
+        /** NotificationItemData */
+        NotificationItemData: {
+            /** Id */
+            id: string;
+            /**
+             * Source
+             * @enum {string}
+             */
+            source: "event" | "legacy";
+            /** Type */
+            type: string;
+            /**
+             * Tone
+             * @enum {string}
+             */
+            tone: "info" | "warning" | "error" | "critical" | "recovered";
+            /** Title */
+            title: string;
+            /** Subject */
+            subject: string;
+            /** Summary */
+            summary: string;
+            /** Lines */
+            lines: string[];
+            /** Status */
+            status: ("active" | "recovered" | "ended") | null;
+            /** Count */
+            count: number;
+            /**
+             * Firstat
+             * Format: date-time
+             */
+            firstAt: string;
+            /**
+             * Lastat
+             * Format: date-time
+             */
+            lastAt: string;
+            /** Unread */
+            unread: boolean;
+            /** Links */
+            links: components["schemas"]["NotificationLinkData"][];
+        };
+        /** NotificationLinkData */
+        NotificationLinkData: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "account" | "channel" | "model" | "request" | "apikey" | "page";
+            /** Id */
+            id: string;
+            /** Label */
+            label: string;
+        };
+        /** NotificationMarkReadRequest */
+        NotificationMarkReadRequest: {
+            /** Ids */
+            ids?: string[];
+            /**
+             * All
+             * @default false
+             */
+            all: boolean;
+        };
         /** NotificationSettingsData */
         NotificationSettingsData: {
             /** Enabled */
@@ -7803,6 +7932,11 @@ export interface components {
             /** Enabled */
             enabled?: boolean | null;
             events?: components["schemas"]["NotificationEventsPatch"] | null;
+        };
+        /** NotificationUnreadData */
+        NotificationUnreadData: {
+            /** Unreadcount */
+            unreadCount: number;
         };
         /** OAuthAccessData */
         OAuthAccessData: {
@@ -36939,6 +37073,178 @@ export interface operations {
             };
             /** @description Management API error: OPERATION_ALREADY_RUNNING */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE, SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    listNotifications: {
+        parameters: {
+            query?: {
+                view?: "unread" | "read";
+                page?: number;
+                pageSize?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "items": [
+                     *           {
+                     *             "id": "inc:0123456789abcdef0123456789abcdef",
+                     *             "source": "event",
+                     *             "type": "account.auth.refresh_failed",
+                     *             "tone": "warning",
+                     *             "title": "Codex · 授权续期失败",
+                     *             "subject": "账号：someone@example.com",
+                     *             "summary": "授权已失效：refresh token 已被撤销",
+                     *             "lines": [
+                     *               "授权已失效：refresh token 已被撤销",
+                     *               "已暂停调用此账号。",
+                     *               "处理：点「重新授权」重新登录。"
+                     *             ],
+                     *             "status": "active",
+                     *             "count": 3,
+                     *             "firstAt": "2026-01-02T03:04:05Z",
+                     *             "lastAt": "2026-01-02T04:04:05Z",
+                     *             "unread": true,
+                     *             "links": [
+                     *               {
+                     *                 "kind": "account",
+                     *                 "id": "codex:someone@example.com",
+                     *                 "label": "账户详情"
+                     *               }
+                     *             ]
+                     *           }
+                     *         ],
+                     *         "unreadCount": 1
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example",
+                     *         "page": 1,
+                     *         "pageSize": 30,
+                     *         "total": 1,
+                     *         "hasNext": false
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["NotificationInboxEnvelope"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE, SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    markNotificationsRead: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NotificationMarkReadRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "unreadCount": 0
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_NotificationUnreadData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -250,6 +250,17 @@ def test_ws_delivers_request_and_runtime_events(tmp_path):
     _wait(lambda: request_events.active() is False)
 
 
+def test_ws_announces_recorded_notifications(tmp_path):
+    app, runtime, _ = build_app(tmp_path)
+    _install_bus(runtime, snapshot_interval=60)
+    with TestClient(app) as client:
+        credential = key_session(client).json()["data"]["credential"]
+        with client.websocket_connect(WS, headers=bearer(credential)) as ws:
+            assert ws.receive_json()["type"] == "hello"
+            request_events.publish("notification", {})
+            assert _receive_until(ws, "notification.created")["data"] == {}
+
+
 def test_ws_queue_overflow_collapses_into_resync(tmp_path):
     app, runtime, _ = build_app(tmp_path)
     bus, _logs, _status = _install_bus(runtime, queue_size=3, snapshot_interval=60)

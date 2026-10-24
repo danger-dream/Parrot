@@ -47,7 +47,7 @@ def test_management_routes_are_cloned_directly_into_the_application(monkeypatch)
     monkeypatch.setattr(app, "include_router", record_direct_mount)
     install_management_routers(app)
 
-    # Foundation plus 25 ordered domain routers, including search, MCP and the
+    # Foundation plus 26 ordered domain routers, including search, MCP and the
     # WebUI auth/live-event routers. Assert the
     # identities/order, not only a count that could conceal a missing domain.
     expected_router_names = (
@@ -55,12 +55,12 @@ def test_management_routes_are_cloned_directly_into_the_application(monkeypatch)
         "retention", "logs", "media", "mapping", "model_metadata", "models",
         "load_balancing", "proxy", "translation", "status_alerts", "updates",
         "media_settings", "system_settings", "search", "content_blacklist", "network",
-        "mcp", "web_auth", "live_events",
+        "notifications", "mcp", "web_auth", "live_events",
     )
     assert [router for router, _prefix in included] == [
         import_module("src.management_api.routers." + name).router for name in expected_router_names
     ]
-    assert len(included) == 26
+    assert len(included) == 27
     assert all(prefix == "/api/management/v1" for _router, prefix in included)
     # FastAPI may retain nested includes (such as the WorkBuddy router) in
     # router.routes as well as app.routes, rather than flattening them. Count
@@ -72,8 +72,8 @@ def test_management_routes_are_cloned_directly_into_the_application(monkeypatch)
         for method, operation in path_item.items()
         if method in {"get", "post", "delete", "put", "patch"}
     ]
-    assert len(operations) == 274
-    assert len({(method, path) for method, path, _operation in operations}) == 274
+    assert len(operations) == 276
+    assert len({(method, path) for method, path, _operation in operations}) == 276
     assert {operation for _method, _path, operation in operations} == EXPECTED_OPERATIONS
 
     source = Path("server.py").read_text()
@@ -92,10 +92,10 @@ def test_server_mounts_all_domain_routers_and_preserves_lifecycle_order():
     ]
     operation_ids = [operation_id for _method, _path, operation_id in operations]
     method_paths = [(method, path) for method, path, _operation_id in operations]
-    assert len(operations) == 274
-    assert len(set(operation_ids)) == 274
-    assert len(set(method_paths)) == 274
-    assert len({path for _method, path in method_paths}) == 209  # Includes the saved-account Zhipu project selection path and WebUI paths (rounds 1-4)
+    assert len(operations) == 276
+    assert len(set(operation_ids)) == 276
+    assert len(set(method_paths)) == 276
+    assert len({path for _method, path in method_paths}) == 211  # Includes the saved-account Zhipu project selection path, WebUI paths (rounds 1-4) and the notification inbox
     assert set(operation_ids) == EXPECTED_OPERATIONS
 
     source = Path("server.py").read_text()

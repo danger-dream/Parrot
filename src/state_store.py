@@ -34,7 +34,7 @@ DURABLE_DOMAINS = (
     "status_seen_updates", "status_muted_incidents", "workbuddy_actions",
     "model_reroute_mutes", "claude_reset_operations", "zhipu_actions", "qoder_checkins", "qoder_identities", "qoder_refresh", "model_registry",
     "notification_events", "notification_incidents", "notification_deliveries",
-    "notification_refs", "notification_policy",
+    "notification_refs", "notification_policy", "notification_feed",
 )
 
 

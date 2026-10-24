@@ -260,6 +260,8 @@ class LiveEventBus:
                 if payload.get(key) is not None:
                     data[key] = payload[key]
             self.broadcast("request.updated", data)
+        elif kind == "notification":
+            self.broadcast("notification.created", {})
         elif kind == "finished":
             request_id = str(payload.get("id") or "")
             if not request_id:

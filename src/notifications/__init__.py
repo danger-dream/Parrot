@@ -27,6 +27,9 @@ def emit(event, *, recipients=None, transactional=False):
                 store.not_submitted(delivery_id)
             else:
                 accepted += 1
+        if store.get("events", record["event_id"]):
+            from . import inbox
+            inbox.announce()
         return bool(accepted)
     except Exception as exc:
         # Auxiliary failure must not repeat or roll back a committed business action.

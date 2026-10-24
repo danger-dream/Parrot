@@ -349,6 +349,7 @@ sessions 表新增 `client_name`、`source_address`、`device_summary`（旧库�
 | `request.finished` | `{log: RequestLogData}`，与 `GET /logs` 列表项完全相同，可直接 upsert |
 | `runtime.snapshot` | 与 `GET /runtime/concurrency` 的 `data` 完全同形，每 2 秒一次 |
 | `resync` | `{reason}`：`overflow`（该连接队列溢出，事件已丢弃）或 `enrichmentFailed`（读库补全失败）；收到后重新拉数据 |
+| `notification.created` | `{}`：有新通知记录（见文末「通知中心」），收到后重新读取 `GET /notifications` |
 | `ping` | `{}`，约每 20 秒一次 |
 
 样例：
@@ -869,3 +870,28 @@ TG 渠道编辑页的「⚡ 并发上限」随之显示真实值（例如“（7
 - `/api/management/` 与 `/ui/` 的响应在请求带 `Accept-Encoding: gzip` 时压缩（1KB 以上的 JSON、JS、CSS、文本、SVG），返回 `Content-Encoding: gzip` 与 `Vary: Accept-Encoding`。图片、视频、压缩包、`Range` 请求和 206 响应、事件流原样返回；推理接口（`/v1/*` 等）不受影响。模型列表约 817KB → 56KB，WebUI 图表脚本 554KB → 186KB。
 - `getStatsCompare` 把结束超过 1 小时的整点小时按「模型 × 渠道 × Key」聚合一次后缓存（价格设置变化时清空，早于日志最早一条的小时视为空），窗口只对边缘不足一小时的部分和最近未封存的小时实时查询；启动预热会算好本月与上月。结果与直接查询逐项相同。
 - 代理与代理组列表的用量统计走统计缓存（15 秒内直接返回，过期后先返回旧值并在后台重算）。
+
+# 通知中心（2026-10-24）
+
+顶栏「搜索」右侧的铃铛：角标是未读条数，点开是下拉列表，分「未读」「已读」两栏，默认未读；切到「已读」时才读取已读列表。
+
+## 内容来源
+
+- **结构化通知**（`notifications.emit` 记录的 21 种场景）：直接读通知存储，不另存副本。同一对象的同一问题（同一 incident）合并成一条：显示最新一次的标题、对象、首条事实，`count` 为累计记录次数，`status` 为 `active`（进行中）/ `recovered`（已恢复）/ `ended`（已结束，例如套餐额度回来后静默结束）；一次性事件（模型目录变化、权益、操作结果）`status` 为 `null`。最新事件已被容量淘汰的 incident 不显示。
+- **旧通道文本**（`notifier.notify_event`：`status_alert`、`network_monitor`、`app_update`、`model_registry`、`translation_failed`）：通过开关检查后另存一条纯文本记录（durable 域 `notification_feed`，保留 30 天、最多 500 条），标题取第一个 `<b>…</b>`，按来源跳转到上游状态 / 网络 / 版本更新 / 模型中心 / 翻译设置页。
+- 过滤：跟随「系统设置 → 通知」的总开关与各类型开关（在读取时过滤，关掉的类型立即从列表消失）；Telegram 上会自动删除的临时提示（「授权已续期」）不进列表。与是否配置 Telegram、有没有管理员 ID 无关。
+
+## `listNotifications`：`GET /notifications`
+
+- 会话，`management.read`。参数 `view`（`unread` / `read`，默认 `unread`）、`page`、`pageSize`（1–100，默认 30）；未知参数 422。
+- 返回 `data.items[]`（`id`、`source`（`event` / `legacy`）、`type`、`tone`（`info` / `warning` / `error` / `critical` / `recovered`）、`title`、`subject`、`summary`、`lines`、`status`、`count`、`firstAt`、`lastAt`、`unread`、`links[]`）和 `data.unreadCount`；`meta` 带 `page`、`pageSize`、`total`、`hasNext`。按 `lastAt` 从新到旧。
+- `links[].kind`：`account`（`id` 为 accountId）、`channel`（`api:<名称>`）、`model`、`request`（请求日志 id）、`apikey`、`page`（WebUI 路径）。账号/渠道只在原对象（同一 generation）仍存在时给出。点击一条按第一个链接跳转，其余显示为小链接。
+
+## `markNotificationsRead`：`POST /notifications/actions/mark-read`
+
+- 会话，`management.read`（已读状态只影响控制台显示，不改任何业务状态，也不影响 Telegram 推送与静音）。请求体 `{ids?: string[], all?: bool}`，返回 `{unreadCount}`。
+- 已读状态存服务端（`notification_policy` 的 `inbox:*` 键），多设备共用。条目的 `lastAt` 晚于它的已读时间即为未读，所以同一问题再次被通知时会重新变成未读。
+
+## 实时事件 `notification.created`
+
+- `data` 为 `{}`。结构化通知落库或旧通道记下一条时发出；WebUI 收到后（400ms 内合并）重新读取未读数，面板开着时刷新当前列表。连接建立（`hello`）时也会刷新一次。
