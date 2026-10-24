@@ -2636,6 +2636,8 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     # WebUI 开关
     if data == "sys:show:webui":              _show_webui(chat_id, message_id, cb_id); return True
     if data == "sys:webui:toggle":            _on_webui_toggle(chat_id, message_id, cb_id); return True
+    if data == "sys:webui:key":               _show_key_reset(chat_id, message_id, cb_id); return True
+    if data == "sys:webui:key_reset":         _on_key_reset(chat_id, message_id, cb_id); return True
 
     # WS 模式
     if data == "sys:show:ws_mode":            _show_ws_mode(chat_id, message_id, cb_id); return True
@@ -2966,7 +2968,7 @@ def _show_ws_mode(chat_id: int, message_id: int, cb_id: str) -> None:
     ]))
 
 
-def _webui_text_kb() -> tuple[str, dict]:
+def _webui_text_kb(chat_id: int) -> tuple[str, dict]:
     from ... import config as _config
     from ...management_control.observability import DEFAULT_STATUS_CONTROL, telegram_context
     cfg = _runtime_control.config_snapshot()
@@ -2991,9 +2993,14 @@ def _webui_text_kb() -> tuple[str, dict]:
             "<i>" + ("自定义访问地址" if custom else "按监听地址与公网 IP 推算；经域名或反向代理访问时")
             + "，可在 Web 控制台「系统设置 → 网页控制台」中修改</i>",
         ]
-    lines += ["", "登录方式：在 Telegram 中点击批准，或使用管理密钥"]
+    try:
+        key = f"<code>{ui.escape_html(_settings_control.management_key(_control_context(chat_id)))}</code>"
+    except Exception:
+        key = "<i>读取失败</i>"
+    lines += ["", "登录方式：在 Telegram 中点击批准，或使用管理密钥", f"管理密钥：{key}"]
     kb = ui.inline_kb([
         [ui.btn("🔴 关闭 WebUI" if enabled else "🟢 开启 WebUI", "sys:webui:toggle")],
+        [ui.btn("🔄 重置管理密钥", "sys:webui:key")],
         [ui.btn("◀ 返回系统设置", "menu:settings")],
     ])
     return "\n".join(lines), kb
@@ -3001,7 +3008,7 @@ def _webui_text_kb() -> tuple[str, dict]:
 
 def _show_webui(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    text, kb = _webui_text_kb()
+    text, kb = _webui_text_kb(chat_id)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
@@ -3011,7 +3018,34 @@ def _on_webui_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
         _control_context(chat_id), {"enabled": not enabled},
     )
     ui.answer_cb(cb_id, "WebUI 已关闭" if enabled else "WebUI 已开启")
-    text, kb = _webui_text_kb()
+    text, kb = _webui_text_kb(chat_id)
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def _show_key_reset(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    text = "\n".join([
+        "🔄 <b>重置管理密钥</b>", "",
+        "重置后：",
+        "• 旧密钥立即失效，用管理密钥登录的网页会话全部退出",
+        "• Telegram 批准登录的会话不受影响",
+        "• 用旧密钥登录的脚本或客户端需要改用新密钥",
+    ])
+    kb = ui.inline_kb([
+        [ui.btn("✅ 确认重置", "sys:webui:key_reset")],
+        [ui.btn("◀ 返回", "sys:show:webui")],
+    ])
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def _on_key_reset(chat_id: int, message_id: int, cb_id: str) -> None:
+    try:
+        _key, revoked = _settings_control.reset_management_key(_control_context(chat_id))
+    except Exception:
+        ui.answer_cb(cb_id, "重置失败，请稍后重试")
+        return
+    ui.answer_cb(cb_id, f"已重置，{revoked} 个密钥登录的会话已退出" if revoked else "管理密钥已重置")
+    text, kb = _webui_text_kb(chat_id)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 

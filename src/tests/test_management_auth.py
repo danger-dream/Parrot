@@ -234,6 +234,28 @@ def test_revoke_all_and_key_rotation_change_generation(tmp_path):
     ).principal.auth_method is AuthMethod.MANAGEMENT_KEY
 
 
+def test_reset_key_signs_out_only_key_sessions_and_survives_restart(tmp_path):
+    from src.management_auth.principal import ADMINISTRATOR_CAPABILITIES, Role
+    clock = Clock()
+    store = make_store(tmp_path, clock)
+    sessions = make_sessions(store, clock)
+    keyed = sessions.create_from_management_key(FAKE_KEY, source="key", request_id="r1")
+    approved = sessions.issue_for_principal(
+        subject_id="telegram:42", auth_method=AuthMethod.TELEGRAM_APPROVAL,
+        roles=(Role.ADMINISTRATOR,), capabilities=ADMINISTRATOR_CAPABILITIES,
+    )
+    assert sessions.rotate_management_key(OTHER_FAKE_KEY) == 1
+    with pytest.raises(SessionAuthenticationError):
+        sessions.verify(keyed.credential)
+    assert sessions.verify(approved.credential)
+    with pytest.raises(SessionAuthenticationError):
+        sessions.create_from_management_key(FAKE_KEY, source="old", request_id="r2")
+    assert sessions.create_from_management_key(OTHER_FAKE_KEY, source="new", request_id="r3")
+    # A restart with the reset key finds the same fingerprint and keeps every session.
+    restarted = make_sessions(store, clock, key=OTHER_FAKE_KEY)
+    assert restarted.verify(approved.credential)
+
+
 def test_management_key_attempts_are_rate_limited_without_reason_or_secret(tmp_path):
     clock = Clock()
     store = make_store(tmp_path, clock)

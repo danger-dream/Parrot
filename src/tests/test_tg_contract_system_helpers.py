@@ -98,6 +98,8 @@ class SystemEnv:
         mp.setattr(sm.secrets, "token_hex", token_hex)
         mp.setattr(sm.config, "get", lambda: self.cfg)
         mp.setattr(sm.config, "update", lambda fn: fn(self.cfg))
+        mp.setattr(sm.config, "new_management_key", lambda: "pmk_contract-reset-key")
+        mp.setattr(sm._settings_control, "_rotate_management_key", lambda key: 1)
         mp.setattr(sm.load_balancing, "display_mode", lambda mode: {
             "smart": "智能评分", "order": "按配置顺序", "priority": "自定义优先级",
         }.get(mode, str(mode)))

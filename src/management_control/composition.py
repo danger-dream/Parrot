@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Callable
 
 from src.management_auth import ManagementStateStore
 
@@ -81,6 +82,7 @@ def build_management_controls(
     operations: OperationStore,
     operation_registry: OperationRegistry,
     state_store: ManagementStateStore,
+    management_key_rotator: Callable[[str], int] | None = None,
 ) -> ManagementControls:
     """Construct and fully bind one lifecycle's production Control graph."""
 
@@ -95,7 +97,7 @@ def build_management_controls(
     )
     auxiliary.bind_operations(operations, operation_registry)
     retention = RetentionControl(audit_sink=audit_sink)
-    settings = SettingsControl(audit_sink=audit_sink)
+    settings = SettingsControl(audit_sink=audit_sink, management_key_rotator=management_key_rotator)
     oauth = OAuthControl(
         backend=OAuthBackend(settings_control=settings), audit_sink=audit_sink,
     )

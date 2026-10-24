@@ -270,7 +270,7 @@ async function submitKey(): Promise<void> {
                 v-model="keyValue"
                 type="password"
                 autocomplete="current-password"
-                placeholder="config.json 中的 management.managementKey"
+                placeholder="在 Telegram「系统设置 → WebUI」中查看"
               />
               <Btn type="submit" variant="primary" :loading="keyBusy" :disabled="!keyValue.trim()">登录</Btn>
             </div>

@@ -174,6 +174,20 @@ class ManagementStateStore:
                 )
             return generation
 
+    def rotate_credential(self, fingerprint: str, *, revoke_auth_method: str) -> int:
+        """Adopt a reset key without a new generation: only sessions of ``revoke_auth_method`` end."""
+        now = self._clock()
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO metadata(key,value) VALUES('credentialFingerprint',?)",
+                (fingerprint,),
+            )
+            cursor = self._conn.execute(
+                "UPDATE sessions SET revoked_at=? WHERE revoked_at IS NULL AND auth_method=?",
+                (now, revoke_auth_method),
+            )
+            return cursor.rowcount
+
     def credential_generation(self) -> int:
         with self._lock:
             row = self._conn.execute(

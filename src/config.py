@@ -992,7 +992,7 @@ def _normalize_api_keys(cfg: dict) -> bool:
     return changed
 
 
-def _new_management_key() -> str:
+def new_management_key() -> str:
     """Return the documented fixed key format: ``pmk_`` + 64 URL-safe chars."""
     return "pmk_" + secrets.token_urlsafe(48)
 
@@ -1006,7 +1006,7 @@ def _normalize_management_config(cfg: dict, raw: dict | None = None) -> bool:
     if not isinstance(management, dict):
         return False
     if "managementKey" not in raw_management:
-        management["managementKey"] = _new_management_key()
+        management["managementKey"] = new_management_key()
         return True
     return False
 

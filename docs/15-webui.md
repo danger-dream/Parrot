@@ -313,6 +313,12 @@ sessions 表新增 `client_name`、`source_address`、`device_summary`（旧库�
 「登录需在 Telegram 中点击批准」，以及「🟢 开启 WebUI / 🔴 关闭 WebUI」（`sys:webui:toggle`）
 和「◀ 返回系统设置」按钮。切换调用与 `PATCH /settings/web-ui` 相同的 control 用例。
 
+页面同时显示当前管理密钥（`<code>`，点按即可复制），并有「🔄 重置管理密钥」（`sys:webui:key` →
+确认页 → `sys:webui:key_reset`）。重置生成同格式的新密钥（`pmk_` + 64 位）写入
+`management.managementKey`，正在运行的进程立即改用新密钥，无需重启：只有用管理密钥登录的会话被吊销，
+Telegram 批准登录的会话和待处理的批准请求不受影响；存储的凭据指纹同步更新，之后重启不会再按「密钥变化」
+清空全部会话。管理 API 不提供读取或重置密钥的接口。
+
 ---
 
 ## 9. 实时事件 `WS /api/management/v1/events`

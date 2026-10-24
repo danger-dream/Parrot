@@ -80,9 +80,16 @@ def _with_revision(cls, **values):
 class SettingsControl(DomainControl):
     """One authoritative sparse-patch boundary over the serialized config store."""
 
-    def __init__(self, *, config=config_module, audit_sink: AuditSink | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        config=config_module,
+        audit_sink: AuditSink | None = None,
+        management_key_rotator: Callable[[str], int] | None = None,
+    ) -> None:
         super().__init__(audit_sink=audit_sink)
         self.config = config
+        self._rotate_management_key = management_key_rotator
 
     _dependency = staticmethod(dependency_result)
 
@@ -249,6 +256,33 @@ class SettingsControl(DomainControl):
             return self._web_ui(self.config.get()).enabled
         except Exception:
             return False
+
+    def management_key(self, context: ManagementContext | None) -> str:
+        """The fixed WebUI sign-in key; only the Telegram administrator page shows it."""
+        self._read(context)
+        return self._dependency(lambda: str(self.config.get()["management"]["managementKey"]))
+
+    def reset_management_key(self, context: ManagementContext | None) -> tuple[str, int]:
+        """Replace the key at once; returns it and how many key sessions were signed out.
+
+        Telegram-approved sessions keep working: only the old key loses its meaning.
+        """
+        actual = self._write(context, Capability.SECRETS_WRITE)
+        if self._rotate_management_key is None:
+            raise ManagementError(ManagementErrorCode.SERVICE_NOT_READY, retryable=True)
+        key = config_module.new_management_key()
+
+        def mutate(cfg: dict[str, Any]) -> None:
+            cfg.setdefault("management", {})["managementKey"] = key
+
+        try:
+            self.config.update(mutate)
+            revoked = self._rotate_management_key(key)
+        except Exception:
+            self._audit(actual, "settings.management-key.reset", "management-key", "failed")
+            raise
+        self._audit(actual, "settings.management-key.reset", "management-key", "succeeded")
+        return key, revoked
 
     _READERS: dict[str, str] = {
         "retry": "_retry", "timeouts": "_timeouts", "error-cooldown": "_error_cooldown",

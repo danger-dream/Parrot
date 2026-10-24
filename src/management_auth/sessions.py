@@ -253,6 +253,15 @@ class SessionService:
         )
         return issued
 
+    def rotate_management_key(self, new_key: str) -> int:
+        """Switch the running key; returns how many key sessions were signed out."""
+        revoked = self._store.rotate_credential(
+            hashlib.sha256(new_key.encode("utf-8")).hexdigest(),
+            revoke_auth_method=AuthMethod.MANAGEMENT_KEY.value,
+        )
+        self._management_key = new_key
+        return revoked
+
     def issue_for_principal(
         self,
         *,

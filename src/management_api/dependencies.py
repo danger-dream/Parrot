@@ -75,6 +75,7 @@ class ManagementRuntime:
                     operations=self.operations,
                     operation_registry=self.operation_registry,
                     state_store=self.state_store,
+                    management_key_rotator=getattr(self.sessions, "rotate_management_key", None),
                 )
             return self.controls
 
