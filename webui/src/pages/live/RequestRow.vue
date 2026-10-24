@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { ArrowRight, Brain, DatabaseZap, Globe, Repeat, ShieldAlert, Star, TriangleAlert, Zap } from '@lucide/vue'
 import ProviderIcon from '@/components/ProviderIcon.vue'
 import StatusBars from '@/components/ui/StatusBars.vue'
+import ElapsedTime from './ElapsedTime.vue'
 import { clock, dateTime, ms, usdOne } from '@/utils/format'
 import { statusLabel, statusTone } from './status'
 import {
@@ -29,7 +30,7 @@ import {
 // Telegram list card (`ui.fmt_log_entry_headline/body`) is on the row; the rest is in the detail.
 const props = defineProps<{
   row: LogRow
-  now?: number
+  /** Read once: a row that arrived live is highlighted on first render only, never again on later updates. */
   fresh?: boolean
   selected?: boolean
   withDate?: boolean
@@ -40,10 +41,9 @@ const r = computed(() => props.row)
 const tone = computed(() => statusTone(r.value.status))
 const pending = computed(() => r.value.status === 'pending')
 const failed = computed(() => r.value.status === 'error' || r.value.status === 'cancelled')
-const elapsed = computed(() => {
-  if (!pending.value || !r.value.createdAt || !props.now) return null
-  return Math.max(0, props.now - new Date(r.value.createdAt).getTime())
-})
+const flash = ref(Boolean(props.fresh))
+// Every running dot blinks on the same 2.4 s beat, whenever its row was created.
+const blinkPhase = { animationDelay: `${-Math.round(performance.now() % 2400)}ms` }
 const prompt = computed(() => promptTokens(r.value))
 const ratio = computed(() => cacheRatio(r.value))
 const speed = computed(() => rowTps(r.value))
@@ -53,7 +53,7 @@ const fast = computed(() => speedBadge(r.value))
 const showTokens = computed(() => prompt.value > 0 || r.value.outputTokens > 0)
 const showCost = computed(() => !pending.value && hasBilling(r.value))
 const firstToken = computed(() => (r.value.isStream === false ? null : r.value.firstTokenMilliseconds ?? null))
-const total = computed(() => (pending.value ? elapsed.value : r.value.durationMilliseconds ?? null))
+const total = computed(() => (pending.value ? null : r.value.durationMilliseconds ?? null))
 
 function grade(v: number | null | undefined, warn: number, bad: number): 'g' | 'o' | 'r' | '' {
   if (v == null) return ''
@@ -79,7 +79,14 @@ const costKind = computed(() => {
 </script>
 
 <template>
-  <button class="row" :class="[`t-${tone}`, { fresh, selected, pending, failed }]" type="button" :data-id="row.id" :data-status="row.status">
+  <button
+    class="row"
+    :class="[`t-${tone}`, { fresh: flash, selected, pending, failed }]"
+    type="button"
+    :data-id="row.id"
+    :data-status="row.status"
+    @animationend.self="flash = false"
+  >
     <span class="c-time">
       <span class="main num">{{ clock(row.createdAt) }}</span>
       <span class="sub num">{{ withDate ? dateTime(row.createdAt).slice(0, 5) : '' }}</span>
@@ -129,7 +136,7 @@ const costKind = computed(() => {
     <span class="c-recent"><StatusBars :outcomes="recent" :slots="10" :width="4" :gap="2" :height="18" /></span>
 
     <span class="c-status">
-      <span class="pill" :class="`p-${tone}`"><i />{{ statusLabel(row.status) }}</span>
+      <span class="pill" :class="`p-${tone}`"><i :style="blinkPhase" />{{ statusLabel(row.status) }}</span>
       <span class="sub num">{{ row.httpStatus ? `HTTP ${row.httpStatus}` : pending ? '处理中' : '' }}</span>
     </span>
 
@@ -156,7 +163,10 @@ const costKind = computed(() => {
 
     <span class="c-lat" :class="`l-${barGrade}`">
       <span class="ln"><em>首字</em><b class="num" :class="firstGrade">{{ firstToken != null ? ms(firstToken) : '—' }}</b></span>
-      <span class="ln"><em>{{ pending ? '已进行' : '总耗时' }}</em><b class="num" :class="pending ? '' : totalGrade">{{ ms(total) }}</b></span>
+      <span class="ln">
+        <em>{{ pending ? '已进行' : '总耗时' }}</em>
+        <b class="num" :class="pending ? '' : totalGrade"><ElapsedTime v-if="pending && row.createdAt" :since="row.createdAt" /><template v-else>{{ ms(total) }}</template></b>
+      </span>
       <span class="ln"><em>TPS</em><b class="num">{{ speed != null ? tps(speed) : '—' }}</b></span>
     </span>
 

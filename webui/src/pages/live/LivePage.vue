@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   ArrowRight, ChevronLeft, ChevronRight, ChevronsLeft, CircleCheck, CircleX, Coins, Hourglass, Inbox,
@@ -34,12 +34,16 @@ const PAGE_SIZE = 50
 const route = useRoute()
 const router = useRouter()
 const mode = ref<Mode>(route.query.mode === 'history' ? 'history' : 'live')
-const now = ref(Date.now())
 const quick = ref('')
 const statusFilter = ref<StatusFilter>('')
 const seedLoading = ref(false)
 const seedTotal = ref(0)
-let ticker: number | undefined
+// Rows slide in only when they arrive live; the initial seed and a filter change replace the list at once.
+const animateRows = ref(false)
+function animateAfterRender(): void {
+  animateRows.value = false
+  nextTick(() => requestAnimationFrame(() => (animateRows.value = true)))
+}
 
 // request.started / request.updated carry facts the shared live store drops; keep them for in-flight rows.
 interface StartedExtra {
@@ -59,7 +63,6 @@ const offUpdated = onEvent('request.updated', (e) => {
 })
 
 onMounted(async () => {
-  ticker = window.setInterval(() => (now.value = Date.now()), 500)
   seedLoading.value = !live.feed.length
   try {
     // More than the 30 shown rows, so the "recent status" bars have history from the start.
@@ -70,10 +73,10 @@ onMounted(async () => {
     /* rows still arrive from events */
   } finally {
     seedLoading.value = false
+    animateAfterRender()
   }
 })
 onBeforeUnmount(() => {
-  window.clearInterval(ticker)
   window.clearInterval(scopeTimer)
   offStarted()
   offUpdated()
@@ -136,6 +139,10 @@ const receivedAt = computed(() => {
   for (const r of live.feed) m.set(r.id, r.receivedAt)
   return m
 })
+function arrivedJustNow(id: string): boolean {
+  return Date.now() - (receivedAt.value.get(id) ?? 0) < 1500
+}
+watch([quick, statusFilter], animateAfterRender)
 
 /** Per row: the last 10 finished outcomes of its channel up to and including that row. */
 function recentByRow(rowsNewestFirst: LogRow[]): Map<string, string[]> {
@@ -504,16 +511,17 @@ const scopeNote = computed(() => {
         <template v-if="seedLoading && !liveRows.length">
           <div v-for="i in 6" :key="i" class="ph-row" />
         </template>
-        <RequestRow
-          v-for="r in liveRows"
-          :key="r.id"
-          :row="r"
-          :now="now"
-          :recent="liveRecent.get(r.id)"
-          :fresh="now - (receivedAt.get(r.id) || 0) < 1500"
-          :selected="r.id === selectedId"
-          @click="openRequest(r.id)"
-        />
+        <TransitionGroup tag="div" class="rows" name="row" :css="animateRows">
+          <RequestRow
+            v-for="r in liveRows"
+            :key="r.id"
+            :row="r"
+            :recent="liveRecent.get(r.id)"
+            :fresh="arrivedJustNow(r.id)"
+            :selected="r.id === selectedId"
+            @click="openRequest(r.id)"
+          />
+        </TransitionGroup>
         <Empty v-if="!seedLoading && !liveRows.length" title="还没有请求" :detail="quick || statusFilter ? '没有符合筛选条件的请求' : '新请求会实时出现在这里'">
           <template #icon><Inbox /></template>
         </Empty>
@@ -688,6 +696,20 @@ const scopeNote = computed(() => {
 }
 .rows.dim {
   opacity: 0.55;
+}
+/* A live arrival slides in from above while the rows below glide down; the row pushed off the end just goes. */
+.rows .row-enter-active {
+  transition: opacity 0.3s var(--ease-out), transform 0.4s var(--ease-out);
+}
+.rows .row-enter-from {
+  opacity: 0;
+  transform: translateY(-12px);
+}
+.rows .row-move {
+  transition: transform 0.4s var(--ease-out);
+}
+.rows .row-leave-active {
+  transition: none;
 }
 .head {
   display: grid;

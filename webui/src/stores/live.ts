@@ -182,7 +182,8 @@ export function seedFeed(logs: RequestLogData[]): void {
   const known = new Set(live.feed.map((r) => r.id))
   for (const log of logs) {
     if (known.has(log.id)) continue
-    live.feed.push(fromLog(log))
+    // History loaded with the page, not a live arrival: never highlighted as new.
+    live.feed.push({ ...fromLog(log), receivedAt: 0 })
   }
   live.feed.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
   if (live.feed.length > MAX_FEED) live.feed.length = MAX_FEED

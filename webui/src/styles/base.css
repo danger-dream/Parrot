@@ -182,16 +182,6 @@ select optgroup {
   }
 }
 
-
-@media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
-    animation-duration: 0.01ms !important;
-    transition-duration: 0.01ms !important;
-  }
-}
-
 /* Privacy mode: input values cannot be rewritten in place, so sensitive ones stay blurred until focused. */
 .pm-blur {
   filter: blur(4px);
