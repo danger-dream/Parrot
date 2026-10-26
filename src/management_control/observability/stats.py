@@ -161,9 +161,22 @@ class StatsControl:
             print(f"[management] statistics warm-up skipped ({type(exc).__name__})")
 
     def period_snapshot_since(self, context: ManagementContext, since_ts: float) -> dict[str, Any]:
-        """Compatibility query for TG's exact BJT cache keys."""
+        """Compatibility query for TG's exact BJT cache keys.
+
+        Today and this month share the statistics pages' snapshot entry: TG
+        takes it while it is fresh and otherwise recomputes it for both.
+        """
         require(context)
-        return copy.deepcopy(self.log_db.stats_period_snapshot(float(since_ts)) or {})
+        since = float(since_ts)
+        if self.log_db is log_db_module:
+            from src.management_control.stats_cache import STATS_CACHE
+            for period in (StatsPeriod.MONTH, StatsPeriod.TODAY):
+                if since == self.period_since(period):
+                    return STATS_CACHE.fresh(
+                        snapshot_key(period.value, since),
+                        lambda: self.log_db.stats_period_snapshot(since),
+                    ) or {}
+        return copy.deepcopy(self.log_db.stats_period_snapshot(since) or {})
 
     def lifetime_snapshot(self, context: ManagementContext) -> dict[str, Any]:
         require(context)

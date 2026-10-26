@@ -650,6 +650,7 @@ def _handle_callback(cb: dict) -> None:
     if not ui.is_admin(chat_id):
         ui.answer_cb(cb_id, "⛔ 无权限")
         return
+    menu_cache.note_activity()
 
     # Closing a grant notification is not navigation: leave any pending input
     # or background account operation in another message untouched.
@@ -768,6 +769,7 @@ def _handle_message(msg: dict) -> None:
             "请联系管理员将此 ID 加入 <code>config.telegram.adminIds</code>",
         )
         return
+    menu_cache.note_activity()
 
     # Navigation leaves owned input/login flows before text-state dispatch.
     # Other menus retain their historical command/input semantics.

@@ -14,7 +14,10 @@ module only decides *when* to recompute:
   recomputation never queues behind slow background refreshes (a month
   snapshot takes seconds, today's figures well under one);
 * without a usable value the caller computes it, and concurrent callers for
-  the same key wait for that single computation instead of repeating it.
+  the same key wait for that single computation instead of repeating it;
+* a background refresh still waiting for a worker is taken over by the
+  foreground caller that needs the value, so a detail read never queues
+  behind every list card's refresh.
 
 Sealed (past) months are already cached by ``log_db`` keyed on their file
 signature; the live month is therefore what this short-lived cache absorbs.
@@ -44,12 +47,13 @@ class _Entry:
 
 
 class _Flight:
-    __slots__ = ("done", "value", "error")
+    __slots__ = ("done", "value", "error", "started")
 
-    def __init__(self) -> None:
+    def __init__(self, *, started: bool = True) -> None:
         self.done = threading.Event()
         self.value: Any = None
         self.error: BaseException | None = None
+        self.started = started
 
 
 _POOL: ThreadPoolExecutor | None = None
@@ -116,12 +120,19 @@ class StatsCache:
                     del self._flights[key]
             flight.done.set()
 
+    def _run_queued(self, key: Hashable, loader: Callable[[], Any], flight: _Flight) -> None:
+        with self._lock:
+            if flight.started:
+                return  # taken over by a foreground caller while queued
+            flight.started = True
+        self._run(key, loader, flight)
+
     def _start_background(self, key: Hashable, loader: Callable[[], Any]) -> None:
         with self._lock:
             if key in self._flights:
                 return
-            flight = self._flights[key] = _Flight()
-        _refresh_pool().submit(self._run, key, loader, flight)
+            flight = self._flights[key] = _Flight(started=False)
+        _refresh_pool().submit(self._run_queued, key, loader, flight)
 
     # ── public API ──────────────────────────────────────────────────
     def get(self, key: Hashable, loader: Callable[[], Any]) -> Any:
@@ -138,11 +149,28 @@ class StatsCache:
                 and entry.cost >= self.slow_seconds):
             self._start_background(key, loader)
             return copy.deepcopy(entry.value)
+        return self._compute(key, loader)
+
+    def fresh(self, key: Hashable, loader: Callable[[], Any]) -> Any:
+        """Like :meth:`get`, but never serves a value older than ``fresh_seconds``:
+        a stale one is recomputed by the caller (for a scheduler that refreshes)."""
+        if not self.enabled:
+            return loader()
+        now = self._clock()
+        with self._lock:
+            entry = self._entries.get(key)
+            age = None if entry is None else now - entry.stored_at
+        if entry is not None and age is not None and age < self.fresh_seconds:
+            return copy.deepcopy(entry.value)
+        return self._compute(key, loader)
+
+    def _compute(self, key: Hashable, loader: Callable[[], Any]) -> Any:
         with self._lock:
             flight = self._flights.get(key)
-            owner = flight is None
-            if owner:
+            owner = flight is None or not flight.started
+            if flight is None:
                 flight = self._flights[key] = _Flight()
+            flight.started = True
         if owner:
             self._run(key, loader, flight, self._foreground_slots)
         else:

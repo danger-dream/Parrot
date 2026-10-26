@@ -377,6 +377,62 @@ def test_stats_cache_peek_or_refresh_is_non_blocking():
     assert (value, loading) == (True, False) or (value, loading) == (7, False)
 
 
+def test_stats_cache_get_takes_over_a_refresh_still_queued(monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from src.management_control import stats_cache
+    from src.management_control.stats_cache import StatsCache
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(stats_cache, "_refresh_pool", lambda: pool)
+    gate = threading.Event()
+    pool.submit(gate.wait, 5)  # the only worker is busy with another card
+    cache = StatsCache()
+    cache.enabled = True
+    queued_calls: list = []
+    assert cache.peek_or_refresh("k", lambda: queued_calls.append(1) or 1) == (None, True)
+    finished = threading.Event()
+    result: list = []
+    threading.Thread(target=lambda: (result.append(cache.get("k", lambda: 2)), finished.set()), daemon=True).start()
+    try:
+        assert finished.wait(2), "get() waited for the queued background refresh"
+        assert result == [2]
+    finally:
+        gate.set()
+        pool.shutdown(wait=True)
+    assert queued_calls == []  # the queued job found it taken over
+    assert cache.get("k", lambda: 3) == 2
+
+
+def test_telegram_and_pages_share_the_today_and_month_snapshots(monkeypatch):
+    from src import log_db
+    from src.management_control import stats_cache
+    from src.management_control.observability.stats import StatsControl
+
+    cache = stats_cache.StatsCache()
+    cache.enabled = True
+    monkeypatch.setattr(stats_cache, "STATS_CACHE", cache)
+    computed: list = []
+    monkeypatch.setattr(log_db, "stats_period_snapshot",
+                        lambda since, **kwargs: computed.append(since) or {"since_ts": since})
+    control = StatsControl()
+    context = telegram_context(1)
+    month, today = control.period_since("month"), control.period_since("today")
+    assert control.period_snapshot_since(context, month) == {"since_ts": month}
+    assert control.period_snapshot(context, "month") == {"since_ts": month}
+    assert control.period_snapshot(context, "today") == {"since_ts": today}
+    assert control.period_snapshot_since(context, today) == {"since_ts": today}
+    assert computed == [month, today]
+    # A stale entry is recomputed by the scheduler instead of being served.
+    monkeypatch.setattr(cache, "fresh_seconds", 0.0)
+    control.period_snapshot_since(context, month)
+    assert computed == [month, today, month]
+    # Other exact windows are not shared.
+    control.period_snapshot_since(context, month - 86400)
+    control.period_snapshot_since(context, month - 86400)
+    assert computed[3:] == [month - 86400, month - 86400]
+
+
 def test_log_detail_counts_local_searches_like_list(monkeypatch):
     from src.management_control.observability.logs import LogsControl
 

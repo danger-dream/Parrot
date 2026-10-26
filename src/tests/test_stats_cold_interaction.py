@@ -245,6 +245,23 @@ def test_interactive_loads_precede_due_background_jobs_and_promote_singleflight(
     assert not cache._interactive
 
 
+def test_periodic_refresh_slows_while_idle_and_resumes_on_menu_use(runtime):
+    import time
+    m, worker, recorder, snapshot, calls = runtime
+    worker.idle_after_seconds = 0.3
+    worker.idle_interval_seconds = 60.0
+    runs: list = []
+    worker.register_periodic("p", 0.02, lambda: runs.append(time.monotonic()) or True, priority=0)
+    worker.start()
+    _wait_until(lambda: len(runs) >= 5)
+    time.sleep(0.5)  # nobody used a menu: the job now waits the idle interval
+    idle = len(runs)
+    time.sleep(0.3)
+    assert len(runs) == idle
+    m["menu_cache"].note_activity()
+    _wait_until(lambda: len(runs) >= idle + 5)  # refreshed at once, then the normal pace
+
+
 def test_priority_survives_background_reservation_before_enqueue(runtime, monkeypatch):
     m, worker, recorder, snapshot, calls = runtime
     cache = m["menu_cache"].SWRCache(60)

@@ -340,8 +340,11 @@ def _allow_small_compaction(monkeypatch) -> None:
 
 
 def _fill_sealed_month(count: int = 8) -> None:
-    big = "z" * 300_000
+    import base64
+    import random
     for index in range(count):
+        # Incompressible like real bodies: stored request bodies are zlib-compressed.
+        big = base64.b64encode(random.Random(index).randbytes(225_000)).decode()
         _write_request(f"jan-{index}", _ts(2026, 1, 5) + index, body_text=big)
 
 

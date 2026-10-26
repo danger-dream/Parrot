@@ -360,7 +360,7 @@ def test_cost_overflow_is_exact_for_batch_stats_groups_and_lifetime(
 def test_current_window_channel_stats_keep_retry_filter_as_outer_join(
     monkeypatch, tmp_path,
 ):
-    """频道窗口不能按日期先扫全部 retry，否则会长期阻塞唯一统计线程。"""
+    """窗口不比该频道账本小时，频道窗口不能按日期先扫全部 retry，否则会长期阻塞唯一统计线程。"""
     conn = _memory_log_db()
     now = datetime.now(log_db._BJT).timestamp()
     _insert_request(
@@ -402,6 +402,90 @@ def test_current_window_channel_stats_keep_retry_filter_as_outer_join(
     assert len(missing_queries) == 1
     assert "FROM retry_chain r JOIN request_log" in missing_queries[0]
     assert "FROM request_log CROSS JOIN retry_chain" not in missing_queries[0]
+    conn.close()
+
+
+def test_short_channel_window_starts_ledger_joins_from_window_requests(
+    monkeypatch, tmp_path,
+):
+    """繁忙频道的短窗口从窗口内请求出发连账本，频道条件不走索引，结果与按频道出发一致。"""
+    conn = _memory_log_db()
+    now = datetime.now(log_db._BJT).timestamp()
+    month_start = datetime.now(log_db._BJT).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0,
+    ).timestamp()
+    busy = "oauth:claude:busy-account"
+    retry_ids = iter(range(1, 1000))
+
+    def attempt(request_id, channel, at, *, settled=True, order=1):
+        retry_id = next(retry_ids)
+        conn.execute(
+            """INSERT INTO retry_chain(
+                   id, request_id, attempt_order, channel_key, channel_type, model,
+                   started_at, dispatched_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (retry_id, request_id, order, channel, "oauth", "model-a", at, at),
+        )
+        if settled:
+            conn.execute(
+                """INSERT INTO upstream_attempt_usage(
+                       retry_attempt_id, root_request_id, call_request_id, attempt_order,
+                       channel_key, channel_type, model, outcome, usage_observed,
+                       input_tokens, output_tokens, cost_source, cost_ticks, settled_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    retry_id, request_id, request_id, order, channel, "oauth",
+                    "model-a", "success", 1, 7, 3, "actual", 100 * order, at,
+                ),
+            )
+
+    early = month_start + 60
+    for index in range(30):
+        _insert_request(conn, f"old-{index}", early + index, channel=busy)
+        attempt(f"old-{index}", busy, early + index)
+    for index in range(20):
+        _insert_request(conn, f"other-{index}", early + 100 + index, channel="api:z")
+    _insert_request(conn, "in-window", now - 60, channel=busy)
+    attempt("in-window", busy, now - 60)
+    # Failover: the busy account's failed attempt belongs to a request finished elsewhere.
+    _insert_request(conn, "failover", now - 50, channel="api:z")
+    attempt("failover", busy, now - 50)
+    attempt("failover", "api:z", now - 49, order=2)
+    _insert_request(conn, "crashed", now - 40, channel=busy)
+    attempt("crashed", busy, now - 40, settled=False)
+    attempt("in-window:compact:direct", busy, now - 30, settled=False, order=2)
+    conn.commit()
+    monkeypatch.setattr(log_db, "_log_dir", str(tmp_path))
+    monkeypatch.setattr(
+        log_db, "_iter_month_conns_all",
+        lambda _since: [(conn, lambda: None)],
+    )
+    monkeypatch.setattr(
+        log_db.model_pricing, "settings",
+        lambda *args, **kwargs: type("Settings", (), {"enabled": True})(),
+    )
+    since = now - 3600
+    where = ("final_channel_key=?", (busy,))
+    assert log_db._channel_window_request_first(conn, *where, since)
+    assert not log_db._channel_window_request_first(conn, *where, month_start)
+
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    result = log_db.tokens_for_channel(busy, since)
+    conn.set_trace_callback(None)
+    ledger = [sql for sql in statements if "CROSS JOIN" in sql]
+    assert len(ledger) == 3
+    assert all("+a.channel_key=" in sql or "+r.channel_key=" in sql for sql in ledger)
+    for sql in ledger:
+        plan = " | ".join(
+            str(row["detail"]) for row in conn.execute("EXPLAIN QUERY PLAN " + sql)
+        )
+        assert "(channel_key=?" not in plan, plan
+
+    monkeypatch.setattr(log_db, "_channel_window_request_first", lambda *args: False)
+    assert result == log_db.tokens_for_channel(busy, since)
+    assert result["total"] == 2 and result["input"] == 7 + 10 + 7
+    assert result["unpriced_success"] == 2
     conn.close()
 
 

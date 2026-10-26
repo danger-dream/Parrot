@@ -31,6 +31,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src import compact_rescue  # noqa: E402
+from src.log_db import decode_log_body  # noqa: E402
 
 DEFAULT_CASES = [
     # Five distinct historical periods; request IDs come from Parrot monthly logs.
@@ -136,7 +137,7 @@ def load_case(log_dir: Path, db_name: str, request_id: str) -> Case:
     con.close()
     if row is None:
         raise SystemExit(f"request not found: {db_name} {request_id}")
-    body = json.loads(row["request_body"])
+    body = json.loads(decode_log_body(row["request_body"]))
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
         raise SystemExit(f"request body is not Anthropic messages-shaped: {request_id}")
     return Case(

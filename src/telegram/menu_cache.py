@@ -257,10 +257,18 @@ class _QueuedLoad:
 
 
 class StatsRefreshCoordinator:
-    """一个 timed wait 循环，串行执行周期刷新与低频按需统计。"""
+    """一个 timed wait 循环，串行执行周期刷新与低频按需统计。
+
+    这些快照只供 TG 菜单读取：连续 ``idle_after_seconds`` 无人操作菜单后，周期
+    任务改为至少每 ``idle_interval_seconds`` 一次；下一次菜单操作立即全部刷新。
+    """
+
+    idle_after_seconds = 600.0
+    idle_interval_seconds = 600.0
 
     def __init__(self) -> None:
         self._condition = threading.Condition()
+        self._last_activity = time.monotonic()
         self._periodic: list[_PeriodicJob] = []
         self._queue: deque[_QueuedLoad] = deque()
         self._thread: threading.Thread | None = None
@@ -295,6 +303,7 @@ class StatsRefreshCoordinator:
                 return
             now = time.monotonic()
             startup_started_ns = startup_timing.now_ns()
+            self._last_activity = now
             # 所有预热都立即到期，由 priority 决定业务顺序，并始终串行执行。
             for job in self._periodic:
                 job.next_due = now
@@ -378,6 +387,19 @@ class StatsRefreshCoordinator:
                 status="ok" if self._startup_detail_failures == 0 else "partial",
                 failed_details=self._startup_detail_failures,
             )
+
+    def note_activity(self) -> None:
+        """管理员操作了菜单：空闲期间推迟的周期任务立即到期。"""
+        with self._condition:
+            now = time.monotonic()
+            was_idle = now - self._last_activity >= self.idle_after_seconds
+            self._last_activity = now
+            if not was_idle or not self._running:
+                return
+            for job in self._periodic:
+                if job.next_due != float("inf"):  # inf: running right now
+                    job.next_due = min(job.next_due, now)
+            self._condition.notify_all()
 
     @property
     def thread(self) -> threading.Thread | None:
@@ -490,7 +512,10 @@ class StatsRefreshCoordinator:
                     self._active_jobs -= 1
                     if selected_job is not None:
                         delay = selected_job.interval if success else min(15.0, selected_job.interval)
-                        selected_job.next_due = time.monotonic() + delay
+                        finished = time.monotonic()
+                        if success and finished - self._last_activity >= self.idle_after_seconds:
+                            delay = max(delay, self.idle_interval_seconds)
+                        selected_job.next_due = finished + delay
                     if startup_job_name is not None and success:
                         self._startup_pending.discard(startup_job_name)
                     if startup_detail:
@@ -938,6 +963,11 @@ COORDINATOR.register_periodic(
 
 def start() -> None:
     COORDINATOR.start()
+
+
+def note_activity() -> None:
+    """An admin used the bot; see StatsRefreshCoordinator.note_activity."""
+    COORDINATOR.note_activity()
 
 
 def stop() -> None:

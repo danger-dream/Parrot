@@ -1201,6 +1201,40 @@ def test_logs_detail_with_execution_chain(m):
     print("  [PASS] logs detail with execution chain")
 
 
+def test_long_request_bodies_are_stored_compressed_and_read_back_unchanged(m, stored_log_bodies):
+    _setup(m)
+    ld = m["log_db"]
+    long_body = {"model": "gpt-test", "messages": [{"role": "user", "content": "长文本 body " * 3000}]}
+    short_body = {"model": "gpt-test", "messages": [{"role": "user", "content": "hi"}]}
+    ld.insert_pending("BODY-long", "1.1.1.1", "k1", "gpt-test", True, 1, 0, {"x": "y"}, long_body)
+    ld.insert_pending("BODY-short", "1.1.1.1", "k1", "gpt-test", True, 1, 0, {"x": "y"}, short_body)
+    conn = ld._get_conn()
+    stored = {
+        row["request_id"]: (row["kind"], row["size"])
+        for row in conn.execute(
+            "SELECT request_id, typeof(request_body) AS kind, "
+            "length(CAST(request_body AS BLOB)) AS size FROM request_detail "
+            "WHERE request_id IN ('BODY-long', 'BODY-short')"
+        )
+    }
+    long_text = json.dumps(long_body, ensure_ascii=False)
+    assert stored["BODY-long"][0] == "blob" and stored["BODY-long"][1] < len(long_text.encode()) / 5
+    assert stored["BODY-short"][0] == "text"
+    for rid, body in (("BODY-long", long_body), ("BODY-short", short_body)):
+        text = json.dumps(body, ensure_ascii=False)
+        assert ld.log_detail(rid)["detail"]["request_body"] == text
+        assert ld.management_log_detail(rid)["detail"]["request_body"] == text
+        historical = ld._management_historical_log_detail(ld._open_readonly(ld._current_db_path()[0]), rid)
+        assert historical["detail"]["request_body"] == text
+    # Rows written before compression existed are plain TEXT and stay as stored.
+    conn.execute("UPDATE request_detail SET request_body='{\"legacy\": true}' WHERE request_id='BODY-short'")
+    conn.commit()
+    assert ld.log_detail("BODY-short")["detail"]["request_body"] == '{"legacy": true}'
+    assert ld.decode_log_body(b"not ours") == b"not ours"
+    surrogate = '{"x": "\\ud800"}'.encode().decode("unicode_escape") * 2000
+    assert ld._encode_log_body(surrogate) is surrogate
+
+
 def test_log_detail_body_buttons_follow_storage_policy_and_row_data(m):
     _setup(m)
     original = m["config"].get().get("logStoreBodies", False) is not False

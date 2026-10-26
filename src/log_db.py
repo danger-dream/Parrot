@@ -25,6 +25,7 @@ import sqlite3
 import threading
 import time
 import weakref
+import zlib
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -940,6 +941,12 @@ def _get_conn_for_ref(ref: LogDbRef) -> sqlite3.Connection:
             except BaseException:
                 conn.close()
                 raise
+            try:
+                _install_stats_triggers(conn, ref.path)
+            except Exception as exc:
+                # Without the triggers this file's closed days are never cached.
+                _stats_untracked_paths.add(_stats_path_key(ref.path))
+                print(f"[log_db] statistics write tracking unavailable: {exc}")
             cache[ref.path] = conn
             with _write_conn_registry_lock:
                 _prune_finished_thread_connections_locked()
@@ -998,6 +1005,7 @@ def migrate_month_schema(month: str) -> None:
             conn.commit()
     finally:
         conn.close()
+        _invalidate_summary_prefixes()
 
 
 def checkpoint() -> None:
@@ -1910,6 +1918,7 @@ def apply_retention_plan(
         _compact_trimmed_months(result, fresh, progress)
         return result
     finally:
+        _invalidate_summary_prefixes()
         _retention_lock.release()
 
 
@@ -2006,10 +2015,48 @@ def migrate_channel_keys(mapping: dict[str, str]) -> dict:
                 conn.close()
             except Exception:
                 pass
+    _invalidate_summary_prefixes()
     return stats
 
 
 # ─── 写入 ──────────────────────────────────────────────────────────
+
+# Long request bodies are stored zlib-compressed as BLOBs behind this marker;
+# older rows and short bodies stay TEXT.  Read them through decode_log_body().
+_BODY_CODEC_MAGIC = b"PZ1\x00"
+_BODY_COMPRESS_MIN_BYTES = 4096
+
+
+def _encode_log_body(text: str | None) -> str | bytes | None:
+    if text is None:
+        return None
+    try:
+        raw = text.encode("utf-8")
+    except UnicodeEncodeError:
+        return text  # stored (or rejected) exactly as before
+    if len(raw) < _BODY_COMPRESS_MIN_BYTES:
+        return text
+    packed = _BODY_CODEC_MAGIC + zlib.compress(raw, 1)
+    return packed if len(packed) < len(raw) else text
+
+
+def decode_log_body(value: Any) -> Any:
+    """A stored request body as written: compressed rows are inflated to text."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        data = bytes(value)
+        if data.startswith(_BODY_CODEC_MAGIC):
+            return zlib.decompress(data[len(_BODY_CODEC_MAGIC):]).decode("utf-8")
+    return value
+
+
+def _render_detail_row(row) -> dict | None:
+    if not row:
+        return None
+    rendered = dict(row)
+    if "request_body" in rendered:
+        rendered["request_body"] = decode_log_body(rendered["request_body"])
+    return rendered
+
 
 def insert_pending(
     request_id: str,
@@ -2031,6 +2078,13 @@ def insert_pending(
     handle = RequestLogHandle(request_id=request_id, db=_db_ref_for_timestamp(created))
     store_bodies = _store_log_bodies()
     fast_value = 1 if (extract_fast_mode(request_body, ingress_protocol, request_headers) if fast_mode is None else fast_mode) else 0
+    # Serialized and compressed before taking the log write lock.
+    stored_headers = (
+        json.dumps(request_headers, ensure_ascii=False) if store_bodies and request_headers else None
+    )
+    stored_body = _encode_log_body(
+        json.dumps(request_body, ensure_ascii=False) if store_bodies and request_body else None
+    )
     with _write_lock:
         conn = _get_conn_for_ref(handle.db)
         conn.execute(
@@ -2053,11 +2107,7 @@ def insert_pending(
         conn.execute(
             """INSERT INTO request_detail (request_id, request_headers, request_body)
                VALUES (?,?,?)""",
-            (
-                request_id,
-                json.dumps(request_headers, ensure_ascii=False) if store_bodies and request_headers else None,
-                json.dumps(request_body, ensure_ascii=False) if store_bodies and request_body else None,
-            ),
+            (request_id, stored_headers, stored_body),
         )
         conn.commit()
         _request_handles[request_id] = handle
@@ -4014,12 +4064,40 @@ def _retry_root_expr(alias: str = "r") -> str:
     )
 
 
+def _until_sql(until_ts: float | None, column: str = "created_at") -> tuple[str, tuple]:
+    """Optional exclusive upper bound for a ``created_at >= ?`` window."""
+    if until_ts is None:
+        return "", ()
+    return f" AND {column}<?", (float(until_ts),)
+
+
 def _prefer_request_first_join(since_ts: float) -> bool:
     """Use date-first probes only for a proper subset of the live month."""
     month_start = datetime.now(_BJT).replace(
         day=1, hour=0, minute=0, second=0, microsecond=0,
     ).timestamp()
     return float(since_ts) > month_start
+
+
+def _channel_window_request_first(
+    conn: sqlite3.Connection, where: str, where_args: tuple, since_ts: float,
+) -> bool:
+    """Whether a channel window's attempt/retry joins should start from the window's requests.
+
+    Those ledgers index only the attempt channel, so starting there visits the
+    channel's whole month even for a 5h window; the window's requests (every
+    channel) are the smaller side for short windows of busy channels.
+    """
+    if where.strip() != "final_channel_key=?" or not _attempt_rows_exist(conn):
+        return False
+    channel_rows = int(conn.execute(
+        "SELECT COUNT(*) FROM upstream_attempt_usage WHERE channel_key=?", where_args,
+    ).fetchone()[0] or 0)
+    window_rows = int(conn.execute(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM request_log WHERE created_at>=? LIMIT ?)",
+        (since_ts, channel_rows + 1),
+    ).fetchone()[0] or 0)
+    return window_rows <= channel_rows
 
 
 def _attempt_exclusion_sql(conn: sqlite3.Connection) -> str:
@@ -4238,14 +4316,20 @@ def _token_aggregate_rows(
     return conn.execute(exact_sql, args).fetchall()
 
 
-def _summary_attempt_aggregate_rows(
+def _summary_attempt_union_rows(
     conn: sqlite3.Connection,
     since_ts: float,
     family: str | None,
-) -> tuple[list[sqlite3.Row], list[sqlite3.Row], list[dict]]:
-    """Build token, cost and legacy model-route groups from one attempt scan."""
+    until_ts: float | None = None,
+) -> list[dict]:
+    """Token, cost and legacy model-route groups from one attempt scan, unsplit.
+
+    Model-route groups also carry their raw GROUP BY values (``raw_*``) so
+    windows can be merged without folding NULL into the displayed ``'?'``.
+    """
     if not _attempt_rows_exist(conn):
-        return ([], [], [])
+        return []
+    until_sql, until_args = _until_sql(until_ts, "request_log.created_at")
     effective = _effective_attempt_exprs(conn, alias="a")
     protocol_expr = _attempt_protocol_expr(conn)
     materialized = "MATERIALIZED " if sqlite3.sqlite_version_info >= (3, 35, 0) else ""
@@ -4274,7 +4358,7 @@ def _summary_attempt_aggregate_rows(
                ({effective['cache_creation']}) AS cache_creation_tokens,
                ({effective['cache_read']}) AS cache_read_tokens
           FROM {attempt_join}
-         WHERE request_log.created_at>=?{_attempt_family_where(conn, family)}
+         WHERE request_log.created_at>=?{until_sql}{_attempt_family_where(conn, family)}
     )
     SELECT 0 AS aggregate_kind,
            attempt_channel AS channel_key,
@@ -4289,7 +4373,9 @@ def _summary_attempt_aggregate_rows(
            SUM(CASE WHEN cache_read_tokens>0 THEN 1 ELSE 0 END) AS cr_rows,
            NULL AS service_tier, NULL AS cost_source,
            0 AS row_count, 0 AS cost_ticks,
-           NULL AS map_model, NULL AS channel_type
+           NULL AS map_model, NULL AS channel_type,
+           NULL AS raw_model, NULL AS raw_channel, NULL AS raw_channel_type,
+           NULL AS raw_protocol
       FROM base
      WHERE usage_observed=1 AND included=1
        AND COALESCE(call_request_id, '')<>''
@@ -4301,7 +4387,7 @@ def _summary_attempt_aggregate_rows(
            family_protocol,
            0, 0, 0, 0, 0, 0,
            service_tier, cost_source, COUNT(*), {_COST_TICKS_SUM_TOKEN},
-           NULL, NULL
+           NULL, NULL, NULL, NULL, NULL, NULL
       FROM base
      GROUP BY COALESCE(attempt_channel, final_channel, '?'),
               COALESCE(requested_model, '?'), COALESCE(api_key_name, '?'),
@@ -4310,7 +4396,8 @@ def _summary_attempt_aggregate_rows(
     SELECT 2, COALESCE(attempt_channel, '?'), NULL, NULL,
            COALESCE(family_protocol, ''),
            0, 0, 0, 0, 0, 0, NULL, NULL, COUNT(*), 0,
-           COALESCE(requested_model, '?'), COALESCE(channel_type, '?')
+           COALESCE(requested_model, '?'), COALESCE(channel_type, '?'),
+           requested_model, attempt_channel, channel_type, family_protocol
       FROM base
      GROUP BY requested_model, attempt_channel, channel_type, family_protocol"""
     expressions = {
@@ -4321,7 +4408,7 @@ def _summary_attempt_aggregate_rows(
     sql = template.replace(_COST_TICKS_SUM_TOKEN, f"SUM({clamped_cost})")
     for name, expression in expressions.items():
         sql = sql.replace(_TOKEN_SUM_TOKENS[name], f"SUM({expression})")
-    args = (since_ts, *_family_params(family))
+    args = (since_ts, *until_args, *_family_params(family))
     try:
         rows = conn.execute(sql, args).fetchall()
     except sqlite3.OperationalError as exc:
@@ -4338,6 +4425,13 @@ def _summary_attempt_aggregate_rows(
                 f"{_EXACT_INT_SUM_FUNCTION}({expression})",
             )
         rows = conn.execute(exact_sql, args).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _split_summary_attempt_rows(
+    rows: list[dict],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Token groups, cost groups and legacy model-route groups of one union."""
     token_rows = [row for row in rows if int(row["aggregate_kind"] or 0) == 0]
     cost_rows = [row for row in rows if int(row["aggregate_kind"] or 0) == 1]
     mapping_rows = [
@@ -4425,25 +4519,39 @@ def _model_attempt_aggregate_rows(
     )
 
 
-def _accumulate_filtered_costs(
+def _filtered_cost_facts(
     conn,
     since_ts: float,
     where: str,
     where_args: tuple,
-    bucket: dict,
     *,
     family: str | None = None,
-) -> None:
-    """Accumulate cost for one hard-coded request_log filter into bucket."""
+    channel_request_first: bool = False,
+    until_ts: float | None = None,
+    fine: bool = False,
+) -> dict[str, list[dict] | None]:
+    """The grouped SQL behind _accumulate_filtered_costs (xAI rows are read live).
+
+    ``fine`` estimate groups must go through _coarse_estimate_rows before use.
+    """
     pricing_settings = model_pricing.settings()
-    if not pricing_settings.enabled:
-        return
     pricing_exprs = _request_pricing_exprs(conn)
     attempt_exclusion = _attempt_exclusion_sql(conn)
+    fast_expr, fine_select, fine_group = _estimate_fast_columns(conn, pricing_exprs, fine)
+    channel_where = where.strip() == "final_channel_key=?"
+    # Unary + keeps the inner ledger lookup on its request-id index.
+    channel_mark = "+" if channel_where and channel_request_first else ""
+    until_sql, until_args = _until_sql(until_ts, "request_log.created_at")
+    facts: dict[str, list[dict] | None] = {"attempt_costs": None, "missing": [], "estimates": []}
 
     if _attempt_rows_exist(conn):
-        attempt_where = (
-            "a.channel_key=?" if where.strip() == "final_channel_key=?" else where
+        attempt_where = f"{channel_mark}a.channel_key=?" if channel_where else where
+        attempt_join = (
+            "request_log CROSS JOIN upstream_attempt_usage a "
+            "ON a.root_request_id=request_log.request_id"
+            if channel_mark else
+            "upstream_attempt_usage a JOIN request_log "
+            "ON request_log.request_id=a.root_request_id"
         )
         # Settlement rows already contain their immutable actual/estimated result;
         # aggregate the ledger in SQLite instead of materializing every attempt.
@@ -4451,47 +4559,34 @@ def _accumulate_filtered_costs(
             conn,
             f"""SELECT a.cost_source, COUNT(*) AS row_count,
                        {_COST_TICKS_SUM_TOKEN} AS cost_ticks
-                  FROM upstream_attempt_usage a
-                  JOIN request_log ON request_log.request_id=a.root_request_id
-                 WHERE ({attempt_where}) AND request_log.created_at >= ?
+                  FROM {attempt_join}
+                 WHERE ({attempt_where}) AND request_log.created_at >= ?{until_sql}
                  {_attempt_family_where(conn, family)}
                  GROUP BY a.cost_source""",
-            where_args + (since_ts, *_family_params(family)),
+            where_args + (since_ts, *until_args, *_family_params(family)),
             cost_ticks_expr="a.cost_ticks",
         )
-        for row in rows:
-            count = int(row["row_count"] or 0)
-            source = str(row["cost_source"] or "unpriced")
-            if source == "actual":
-                _add_cost(bucket, int(row["cost_ticks"] or 0), count, actual=True)
-            elif source == "estimated":
-                _add_cost(bucket, int(row["cost_ticks"] or 0), count, actual=False)
-            else:
-                _add_unpriced(bucket, count)
-    missing_where = (
-        "r.channel_key=?" if where.strip() == "final_channel_key=?" else where
-    )
+        facts["attempt_costs"] = [dict(row) for row in rows]
+    missing_where = f"{channel_mark}r.channel_key=?" if channel_where else where
     retry_family_where = _attempt_family_where(
         conn, family, table="retry_chain", alias="r",
     )
-    missing_rows = _missing_dispatch_rows(
+    facts["missing"] = [dict(row) for row in _missing_dispatch_rows(
         conn,
         select_sql="COUNT(*) AS row_count",
         where_sql=(
-            f"{missing_where} AND request_log.created_at>=?{retry_family_where}"
+            f"{missing_where} AND request_log.created_at>=?{until_sql}{retry_family_where}"
         ),
-        args=where_args + (since_ts, *_family_params(family)),
-        # Channel windows already have a selective retry-chain predicate.  Keeping
-        # request_log outer here turns every matching request into a range probe
-        # over that channel's entire retry history and can starve the sole TG
-        # statistics scheduler indefinitely on production-sized ledgers.
+        args=where_args + (since_ts, *until_args, *_family_params(family)),
+        # A channel window starts from request_log only when the window is the
+        # smaller side, and then its channel predicate is unindexable: probing
+        # that channel's entire retry history per request starved the sole TG
+        # statistics scheduler on production-sized ledgers.
         request_first=(
-            _prefer_request_first_join(since_ts)
-            and where.strip() != "final_channel_key=?"
+            channel_request_first if channel_where
+            else _prefer_request_first_join(since_ts)
         ),
-    )
-    if missing_rows:
-        _add_unpriced(bucket, int(missing_rows[0]["row_count"] or 0))
+    )]
 
     model_expr = "COALESCE(final_model, requested_model, '?')"
     channel_expr = "COALESCE(final_channel_key, '?')"
@@ -4500,12 +4595,12 @@ def _accumulate_filtered_costs(
         "+ COALESCE(cache_read_tokens, 0)"
     )
     standard_where = (
-        f"({where}) AND created_at >= ?{_family_where_for_conn(conn, family)} "
+        f"({where}) AND created_at >= ?{_until_sql(until_ts)[0]}{_family_where_for_conn(conn, family)} "
         "AND status='success' "
         f"{attempt_exclusion}"
         "AND COALESCE(final_channel_key, '') NOT LIKE 'oauth:xai:%'"
     )
-    standard_args = where_args + (since_ts, *_family_params(family))
+    standard_args = where_args + (since_ts, *until_args, *_family_params(family))
     pricing_pairs = _pricing_model_channel_rows(
         conn,
         model_expr=model_expr,
@@ -4537,7 +4632,7 @@ def _accumulate_filtered_costs(
         f"""SELECT
                {model_expr} AS pricing_model,
                {channel_expr} AS pricing_channel,
-               COALESCE({pricing_exprs['fast_mode']}, 0) AS fast_mode,
+               {fast_expr} AS fast_mode,
                {long_case} AS long_context,
                {cache_ttl_case} AS cache_ttl_known,
                MIN({pricing_exprs['usage_known']}) AS usage_semantics_known,
@@ -4545,14 +4640,57 @@ def _accumulate_filtered_costs(
                SUM(input_tokens) AS input_tokens,
                SUM(output_tokens) AS output_tokens,
                SUM(cache_creation_tokens) AS cache_creation_tokens,
-               SUM(cache_read_tokens) AS cache_read_tokens
+               SUM(cache_read_tokens) AS cache_read_tokens{fine_select}
              FROM request_log
              WHERE {standard_where}
              GROUP BY pricing_model, pricing_channel, fast_mode, long_context, cache_ttl_known,
-                      {pricing_exprs['usage_known']}""",
+                      {pricing_exprs['usage_known']}{fine_group}""",
         long_args + cache_ttl_args + standard_args,
     ).fetchall()
-    for row in rows:
+    facts["estimates"] = [dict(row) for row in rows]
+    return facts
+
+
+def _accumulate_filtered_costs(
+    conn,
+    since_ts: float,
+    where: str,
+    where_args: tuple,
+    bucket: dict,
+    *,
+    family: str | None = None,
+    channel_request_first: bool = False,
+    facts: dict | None = None,
+) -> None:
+    """Accumulate cost for one hard-coded request_log filter into bucket.
+
+    ``channel_request_first`` (see _channel_window_request_first) drives a
+    channel window's ledger joins from the window's requests.  ``facts`` (see
+    _filtered_cost_facts) replaces the grouped SQL; xAI rows are read live.
+    """
+    pricing_settings = model_pricing.settings()
+    if not pricing_settings.enabled:
+        return
+    if facts is None:
+        facts = _filtered_cost_facts(
+            conn, since_ts, where, where_args,
+            family=family, channel_request_first=channel_request_first,
+        )
+    pricing_exprs = _request_pricing_exprs(conn)
+    attempt_exclusion = _attempt_exclusion_sql(conn)
+
+    for row in facts["attempt_costs"] or ():
+        count = int(row["row_count"] or 0)
+        source = str(row["cost_source"] or "unpriced")
+        if source == "actual":
+            _add_cost(bucket, int(row["cost_ticks"] or 0), count, actual=True)
+        elif source == "estimated":
+            _add_cost(bucket, int(row["cost_ticks"] or 0), count, actual=False)
+        else:
+            _add_unpriced(bucket, count)
+    if facts["missing"]:
+        _add_unpriced(bucket, int(facts["missing"][0]["row_count"] or 0))
+    for row in facts["estimates"]:
         _estimate_cost_into(
             bucket,
             row,
@@ -5160,15 +5298,24 @@ def _sealed_read_signature(path: str, conn: sqlite3.Connection) -> tuple[Any, ..
 
 def _aggregate_lifetime_month(conn: sqlite3.Connection) -> dict:
     """Aggregate one SQLite snapshot; attempt costs stay SQL-grouped."""
+    return _apply_lifetime_facts(conn, _lifetime_window_facts(conn))
 
-    out = _empty_lifetime_stats()
+
+def _lifetime_month_facts(
+    conn: sqlite3.Connection, since_ts: float = 0.0, until_ts: float | None = None,
+) -> dict:
+    """Additive lifetime facts of one month file's ``[since, until)`` (xAI rows read live)."""
     request_cols = _table_columns(conn, "request_log")
     cost_schema_ready = {
         "requested_model", "final_model", "input_tokens", "output_tokens",
         "cache_creation_tokens", "cache_read_tokens",
     }.issubset(request_cols)
+    window, window_args = "", ()
+    if since_ts or until_ts is not None:
+        until_sql, until_args = _until_sql(until_ts)
+        window, window_args = f" WHERE created_at >= ?{until_sql}", (since_ts, *until_args)
     row = conn.execute(
-        """SELECT
+        f"""SELECT
              COUNT(*) AS total,
              SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS succ,
              SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS err,
@@ -5176,8 +5323,64 @@ def _aggregate_lifetime_month(conn: sqlite3.Connection) -> dict:
              SUM(output_tokens) AS outp,
              SUM(cache_creation_tokens) AS cc,
              SUM(cache_read_tokens) AS cr
-           FROM request_log""",
+           FROM request_log{window}""",
+        window_args,
     ).fetchone()
+    facts: dict[str, Any] = {
+        "overall": dict(row) if row else None,
+        "cost_schema_ready": cost_schema_ready,
+        "delta": None,
+        "costs": None,
+    }
+    if cost_schema_ready:
+        facts["delta"] = _attempt_token_delta_for_filter(conn, "1=1", (), since_ts, until_ts=until_ts)
+        if model_pricing.settings().enabled:
+            facts["costs"] = _filtered_cost_facts(
+                conn, since_ts, "1=1", (), until_ts=until_ts, fine=True,
+            )
+    return facts
+
+
+def _merge_lifetime_facts(parts: list[dict]) -> dict:
+    overall = None
+    for part in parts:
+        row = part["overall"]
+        if row is None:
+            continue
+        overall = dict(row) if overall is None else {
+            key: _sql_sum(overall[key], row[key]) for key in overall
+        }
+    deltas = [part["delta"] for part in parts]
+    costs = [part["costs"] for part in parts]
+    merged_costs = None
+    if all(value is not None for value in costs):
+        attempt_costs = [value["attempt_costs"] for value in costs]
+        missing = [row for value in costs for row in value["missing"]]
+        merged_costs = {
+            "attempt_costs": None if any(value is None for value in attempt_costs) else _merge_grouped_rows(
+                (row for rows in attempt_costs for row in rows), ("cost_source",), ("row_count", "cost_ticks"),
+            ),
+            # One ungrouped COUNT(*) row per window whenever the retry ledger exists.
+            "missing": [{"row_count": sum(int(row["row_count"] or 0) for row in missing)}] if missing else [],
+            "estimates": _merge_grouped_rows(
+                (row for value in costs for row in value["estimates"]),
+                (*_LIFETIME_ESTIMATE_KEYS, "fast_mode"),
+                ("row_count", "input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens"),
+            ),
+        }
+    return {
+        "overall": overall,
+        "cost_schema_ready": parts[0]["cost_schema_ready"],
+        "delta": None if any(value is None for value in deltas) else tuple(
+            sum(values) for values in zip(*deltas)
+        ),
+        "costs": merged_costs,
+    }
+
+
+def _apply_lifetime_facts(conn: sqlite3.Connection, facts: dict) -> dict:
+    out = _empty_lifetime_stats()
+    row = facts["overall"]
     if row:
         out["total"] = int(row["total"] or 0)
         out["success_count"] = int(row["succ"] or 0)
@@ -5186,13 +5389,19 @@ def _aggregate_lifetime_month(conn: sqlite3.Connection) -> dict:
         out["output_tokens"] = int(row["outp"] or 0)
         out["cache_creation"] = int(row["cc"] or 0)
         out["cache_read"] = int(row["cr"] or 0)
-    if cost_schema_ready:
-        delta = _attempt_token_delta_for_filter(conn, "1=1", (), 0)
+    if facts["cost_schema_ready"]:
+        delta = facts["delta"]
         out["input_tokens"] += delta[0]
         out["output_tokens"] += delta[1]
         out["cache_creation"] += delta[2]
         out["cache_read"] += delta[3]
-        _accumulate_filtered_costs(conn, 0, "1=1", (), out)
+        costs = facts["costs"]
+        if costs is not None:
+            estimates = _coarse_estimate_rows(costs["estimates"], _LIFETIME_ESTIMATE_KEYS)
+            if estimates is None:
+                estimates = _filtered_cost_facts(conn, 0, "1=1", ())["estimates"]
+            costs = {**costs, "estimates": estimates}
+        _accumulate_filtered_costs(conn, 0, "1=1", (), out, facts=costs)
     elif model_pricing.settings().enabled:
         _add_unpriced(out, int(row["succ"] or 0) if row else 0)
     return out
@@ -5506,38 +5715,51 @@ def xai_cost_for_channel(channel_key: str, since_ts: float = 0) -> dict:
 
 
 def _attempt_token_delta_for_filter(
-    conn: sqlite3.Connection, where: str, where_args: tuple, since_ts: float
+    conn: sqlite3.Connection, where: str, where_args: tuple, since_ts: float,
+    *, request_first: bool = False, until_ts: float | None = None,
 ) -> tuple[int, int, int, int]:
-    """Replace final-request tokens with all observed attempt tokens."""
+    """Replace final-request tokens with all observed attempt tokens.
+
+    ``request_first`` (channel windows only, see _channel_window_request_first)
+    drives the attempt join from the window's requests.
+    """
 
     if not _attempt_rows_exist(conn):
         return (0, 0, 0, 0)
+    until_sql, until_args = _until_sql(until_ts, "request_log.created_at")
     old = conn.execute(
         f"""SELECT SUM(input_tokens) AS inp, SUM(output_tokens) AS outp,
                    SUM(cache_creation_tokens) AS cc, SUM(cache_read_tokens) AS cr
             FROM request_log
-            WHERE {where} AND created_at >= ?
+            WHERE {where} AND created_at >= ?{until_sql}
               AND {_final_observed_attempt_sql(conn)}""",
-        where_args + (since_ts,),
+        where_args + (since_ts, *until_args),
     ).fetchone()
+    request_first = request_first and where.strip() == "final_channel_key=?"
     if where.strip() == "final_channel_key=?":
-        attempt_where = "a.channel_key=?"
+        attempt_where = "+a.channel_key=?" if request_first else "a.channel_key=?"
     else:
         attempt_where = where.replace("api_key_name", "request_log.api_key_name")
         attempt_where = attempt_where.replace("requested_model", "request_log.requested_model")
     effective = _effective_attempt_exprs(conn, alias="a")
+    attempt_join = (
+        "request_log CROSS JOIN upstream_attempt_usage a "
+        "ON a.root_request_id=request_log.request_id"
+        if request_first else
+        "upstream_attempt_usage a JOIN request_log "
+        "ON request_log.request_id=a.root_request_id"
+    )
     new = conn.execute(
         f"""SELECT SUM({effective['input']}) AS inp,
                    SUM({effective['output']}) AS outp,
                    SUM({effective['cache_creation']}) AS cc,
                    SUM({effective['cache_read']}) AS cr
-            FROM upstream_attempt_usage a
-            JOIN request_log ON request_log.request_id=a.root_request_id
-            WHERE {attempt_where} AND request_log.created_at >= ?
+            FROM {attempt_join}
+            WHERE {attempt_where} AND request_log.created_at >= ?{until_sql}
               AND ({effective['usage_observed']})=1
               AND ({effective['included']})=1
               AND COALESCE(a.call_request_id, '')<>''""",
-        where_args + (since_ts,),
+        where_args + (since_ts, *until_args),
     ).fetchone()
     return tuple(
         int((new[key] if new else 0) or 0) - int((old[key] if old else 0) or 0)
@@ -5604,20 +5826,17 @@ def _replace_model_tokens_with_attempts(
         apply(row, 1)
 
 
-def _replace_summary_tokens_with_attempts(
+def _summary_root_token_rows(
     conn: sqlite3.Connection, since_ts: float, family: str | None,
-    overall: dict, by_channel: dict, by_model: dict, by_apikey: dict,
-    family_targets: dict[str, tuple[dict, dict, dict, dict]] | None = None,
-    attempt_rows: list[sqlite3.Row] | None = None,
-) -> None:
-    if not _attempt_rows_exist(conn):
-        return
-    args = (since_ts, *_family_params(family))
+    until_ts: float | None = None,
+) -> list[dict]:
+    """Final-request token groups that the attempt ledger replaces."""
+    until_sql, until_args = _until_sql(until_ts, "request_log.created_at")
     request_protocol_expr = (
         "request_log.upstream_protocol"
         if "upstream_protocol" in _table_columns(conn, "request_log") else "NULL"
     )
-    roots = _token_aggregate_rows(
+    rows = _token_aggregate_rows(
         conn,
         f"""SELECT request_log.final_channel_key AS channel_key,
                    request_log.requested_model AS model_key,
@@ -5630,16 +5849,75 @@ def _replace_summary_tokens_with_attempts(
                    SUM(CASE WHEN request_log.cache_creation_tokens>0 THEN 1 ELSE 0 END) AS cc_rows,
                    SUM(CASE WHEN request_log.cache_read_tokens>0 THEN 1 ELSE 0 END) AS cr_rows
             FROM request_log
-            WHERE request_log.created_at >= ?{_family_where_for_conn(conn, family)}
+            WHERE request_log.created_at >= ?{until_sql}{_family_where_for_conn(conn, family)}
               AND {_final_observed_attempt_sql(conn)}
             GROUP BY channel_key, model_key, apikey_key, family_protocol""",
-        args,
+        (since_ts, *until_args, *_family_params(family)),
         expressions={
             "inp": "request_log.input_tokens",
             "outp": "request_log.output_tokens",
             "cc": "request_log.cache_creation_tokens",
             "cr": "request_log.cache_read_tokens",
         },
+    )
+    return [dict(row) for row in rows]
+
+
+def _summary_attempt_token_rows(
+    conn: sqlite3.Connection, since_ts: float, family: str | None,
+    until_ts: float | None = None,
+) -> list[dict]:
+    """Observed attempt token groups (the summary without cost shares no scan)."""
+    until_sql, until_args = _until_sql(until_ts, "request_log.created_at")
+    attempt_protocol_expr = _attempt_protocol_expr(conn)
+    effective = _effective_attempt_exprs(conn, alias="a")
+    attempt_join = (
+        "request_log CROSS JOIN upstream_attempt_usage a "
+        "ON a.root_request_id=request_log.request_id"
+        if _prefer_request_first_join(since_ts) else
+        "upstream_attempt_usage a JOIN request_log "
+        "ON request_log.request_id=a.root_request_id"
+    )
+    rows = _token_aggregate_rows(
+        conn,
+        f"""SELECT a.channel_key, request_log.requested_model AS model_key,
+                   request_log.api_key_name AS apikey_key,
+                   {attempt_protocol_expr} AS family_protocol,
+                   {_TOKEN_SUM_TOKENS['inp']} AS inp,
+                   {_TOKEN_SUM_TOKENS['outp']} AS outp,
+                   {_TOKEN_SUM_TOKENS['cc']} AS cc,
+                   {_TOKEN_SUM_TOKENS['cr']} AS cr,
+                   SUM(CASE WHEN {effective['cache_creation']}>0 THEN 1 ELSE 0 END) AS cc_rows,
+                   SUM(CASE WHEN {effective['cache_read']}>0 THEN 1 ELSE 0 END) AS cr_rows
+            FROM {attempt_join}
+            WHERE request_log.created_at >= ?{until_sql}{_attempt_family_where(conn, family)}
+              AND ({effective['usage_observed']})=1
+              AND ({effective['included']})=1
+              AND COALESCE(a.call_request_id, '')<>''
+            GROUP BY a.channel_key, model_key, apikey_key, family_protocol""",
+        (since_ts, *until_args, *_family_params(family)),
+        expressions={
+            "inp": effective["input"],
+            "outp": effective["output"],
+            "cc": effective["cache_creation"],
+            "cr": effective["cache_read"],
+        },
+    )
+    return [dict(row) for row in rows]
+
+
+def _replace_summary_tokens_with_attempts(
+    conn: sqlite3.Connection, since_ts: float, family: str | None,
+    overall: dict, by_channel: dict, by_model: dict, by_apikey: dict,
+    family_targets: dict[str, tuple[dict, dict, dict, dict]] | None = None,
+    attempt_rows: list[dict] | None = None,
+    root_rows: list[dict] | None = None,
+) -> None:
+    if not _attempt_rows_exist(conn):
+        return
+    roots = (
+        root_rows if root_rows is not None
+        else _summary_root_token_rows(conn, since_ts, family)
     )
 
     def apply_root(row, sign: int, targets: tuple[dict, dict, dict, dict]) -> None:
@@ -5674,43 +5952,10 @@ def _replace_summary_tokens_with_attempts(
         if family_targets and fam in family_targets:
             apply_root(row, -1, family_targets[fam])
 
-    if attempt_rows is None:
-        attempt_protocol_expr = _attempt_protocol_expr(conn)
-        effective = _effective_attempt_exprs(conn, alias="a")
-        attempt_join = (
-            "request_log CROSS JOIN upstream_attempt_usage a "
-            "ON a.root_request_id=request_log.request_id"
-            if _prefer_request_first_join(since_ts) else
-            "upstream_attempt_usage a JOIN request_log "
-            "ON request_log.request_id=a.root_request_id"
-        )
-        attempts = _token_aggregate_rows(
-            conn,
-            f"""SELECT a.channel_key, request_log.requested_model AS model_key,
-                       request_log.api_key_name AS apikey_key,
-                       {attempt_protocol_expr} AS family_protocol,
-                       {_TOKEN_SUM_TOKENS['inp']} AS inp,
-                       {_TOKEN_SUM_TOKENS['outp']} AS outp,
-                       {_TOKEN_SUM_TOKENS['cc']} AS cc,
-                       {_TOKEN_SUM_TOKENS['cr']} AS cr,
-                       SUM(CASE WHEN {effective['cache_creation']}>0 THEN 1 ELSE 0 END) AS cc_rows,
-                       SUM(CASE WHEN {effective['cache_read']}>0 THEN 1 ELSE 0 END) AS cr_rows
-                FROM {attempt_join}
-                WHERE request_log.created_at >= ?{_attempt_family_where(conn, family)}
-                  AND ({effective['usage_observed']})=1
-                  AND ({effective['included']})=1
-                  AND COALESCE(a.call_request_id, '')<>''
-                GROUP BY a.channel_key, model_key, apikey_key, family_protocol""",
-            args,
-            expressions={
-                "inp": effective["input"],
-                "outp": effective["output"],
-                "cc": effective["cache_creation"],
-                "cr": effective["cache_read"],
-            },
-        )
-    else:
-        attempts = attempt_rows
+    attempts = (
+        attempt_rows if attempt_rows is not None
+        else _summary_attempt_token_rows(conn, since_ts, family)
+    )
     for row in attempts:
         apply_root(row, 1, all_targets)
         fam = _family_from_protocol(row["family_protocol"])
@@ -5749,12 +5994,18 @@ def _aggregate_by_filter(where: str, where_args: tuple, since_ts: float) -> dict
                 out["cache_creation"] += int(row["cc"] or 0)
                 out["cache_read"] += int(row["cr"] or 0)
                 _merge_tps(out, row)
-            delta = _attempt_token_delta_for_filter(conn, where, where_args, since_ts)
+            request_first = _channel_window_request_first(conn, where, where_args, since_ts)
+            delta = _attempt_token_delta_for_filter(
+                conn, where, where_args, since_ts, request_first=request_first,
+            )
             out["input"] += delta[0]
             out["output"] += delta[1]
             out["cache_creation"] += delta[2]
             out["cache_read"] += delta[3]
-            _accumulate_filtered_costs(conn, since_ts, where, where_args, out)
+            _accumulate_filtered_costs(
+                conn, since_ts, where, where_args, out,
+                channel_request_first=request_first,
+            )
         except Exception as exc:
             raise HistoricalLogError(f"aggregate query failed: {exc}") from exc
         finally:
@@ -8046,7 +8297,7 @@ def log_detail(request_id: str) -> dict:
     ).fetchall()
     effective_billing = [_effective_attempt_row(row) for row in billing_rows]
     rendered_log = _sanitize_request_timing(log_row) if log_row else None
-    rendered_detail = dict(detail_row) if detail_row else None
+    rendered_detail = _render_detail_row(detail_row)
     if rendered_log is not None:
         # Preserve the historical LEFT JOIN response contract without selecting
         # the large body twice: when present, both views share one materialization.
@@ -8168,7 +8419,7 @@ def _management_historical_log_detail(
         ).fetchall()
 
     rendered_log = _sanitize_request_timing(log_row)
-    rendered_detail = dict(detail_row) if detail_row else None
+    rendered_detail = _render_detail_row(detail_row)
     rendered_log["response_body"] = (
         rendered_detail["response_body"] if rendered_detail is not None else None
     )
@@ -8246,6 +8497,170 @@ _GROUP_BY_COLS = {
 }
 
 
+def _usage_missing_rows(
+    conn, since_ts: float, family: str | None, until_ts: float | None = None,
+) -> list[dict]:
+    """Dispatched retries that never settled, grouped like the summary buckets."""
+    until_sql, until_args = _until_sql(until_ts, "request_log.created_at")
+    retry_protocol_expr = _attempt_protocol_expr(
+        conn, table="retry_chain", alias="r",
+    )
+    retry_cols = _table_columns(conn, "retry_chain")
+    retry_channel_type = (
+        "COALESCE(r.channel_type, '?')"
+        if "channel_type" in retry_cols else "'?'"
+    )
+    rows = _missing_dispatch_rows(
+        conn,
+        select_sql=(
+            "COALESCE(r.channel_key, '?') AS channel_key, "
+            "COALESCE(request_log.requested_model, '?') AS model_key, "
+            "COALESCE(request_log.api_key_name, '?') AS apikey_key, "
+            f"{retry_protocol_expr} AS family_protocol, "
+            f"{retry_channel_type} AS channel_type, COUNT(*) AS row_count"
+        ),
+        where_sql=(
+            "request_log.created_at>=?"
+            + until_sql
+            + _attempt_family_where(
+                conn, family, table="retry_chain", alias="r",
+            )
+        ),
+        args=(since_ts, *until_args, *_family_params(family)),
+        request_first=_prefer_request_first_join(since_ts),
+        group_by_sql=(
+            "COALESCE(r.channel_key, '?'), "
+            "COALESCE(request_log.requested_model, '?'), "
+            "COALESCE(request_log.api_key_name, '?'), "
+            f"{retry_protocol_expr}, {retry_channel_type}"
+        ),
+    )
+    return [dict(row) for row in rows]
+
+
+def _estimate_fast_columns(conn, pricing_exprs: dict, fine: bool) -> tuple[str, str, str]:
+    """``(fast_mode expr, extra SELECT, extra GROUP BY)`` of an estimate query.
+
+    ``GROUP BY fast_mode`` resolves to the request_log column when it exists,
+    while the selected ``fast_mode`` is the computed flag of one row of that
+    group.  ``fine`` also groups by the computed flag and exposes the grouped
+    column, so windows merge exactly (see _coarse_estimate_rows).
+    """
+    fast_expr = f"COALESCE({pricing_exprs['fast_mode']}, 0)"
+    if not fine:
+        return fast_expr, "", ""
+    raw_fast = (
+        "request_log.fast_mode"
+        if "fast_mode" in _table_columns(conn, "request_log") else fast_expr
+    )
+    return fast_expr, f", {raw_fast} AS raw_fast_mode", f", {fast_expr}"
+
+
+def _coarse_estimate_rows(rows: list[dict], key_cols: tuple[str, ...]) -> list[dict] | None:
+    """The estimate query's own groups from ``fine`` rows, or None when a group
+    mixes computed fast flags (SQLite would show an arbitrary row's flag)."""
+    merged: dict[tuple, dict] = {}
+    sums = ("row_count", "input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens")
+    for row in rows:
+        key = tuple(row[col] for col in key_cols)
+        target = merged.get(key)
+        if target is None:
+            merged[key] = dict(row)
+            continue
+        if target["fast_mode"] != row["fast_mode"]:
+            return None
+        for col in sums:
+            target[col] = _sql_sum(target[col], row[col])
+    out = sorted(
+        merged.values(),
+        key=lambda row: tuple(_sqlite_sort_key(row[col]) for col in key_cols),
+    )
+    for row in out:
+        del row["raw_fast_mode"]
+    return out
+
+
+def _usage_estimate_rows(
+    conn, since_ts: float, family: str | None, until_ts: float | None = None,
+    *, pricing_pairs: list | None = None, fine: bool = False,
+) -> list[dict]:
+    """Successful non-xAI requests grouped by everything their price depends on.
+
+    ``pricing_pairs`` may be any superset of the window's (model, channel) pairs.
+    """
+    pricing_settings = model_pricing.settings()
+    pricing_exprs = _request_pricing_exprs(conn)
+    attempt_exclusion = _attempt_exclusion_sql(conn)
+    fast_expr, fine_select, fine_group = _estimate_fast_columns(conn, pricing_exprs, fine)
+    until_sql, until_args = _until_sql(until_ts)
+    # 非 xAI 请求可以先按四个展示维度 + 实际计价模型 + fast/priority 聚合，
+    # 避免把整段历史逐行搬进 Python。
+    model_expr = "COALESCE(final_model, requested_model, '?')"
+    channel_expr = "COALESCE(final_channel_key, '?')"
+    prompt_expr = (
+        "COALESCE(input_tokens, 0) + COALESCE(cache_creation_tokens, 0) "
+        "+ COALESCE(cache_read_tokens, 0)"
+    )
+    standard_where = (
+        f"created_at >= ?{until_sql}{_family_where(family)} AND status='success' "
+        f"{attempt_exclusion}"
+        "AND COALESCE(final_channel_key, '') NOT LIKE 'oauth:xai:%'"
+    )
+    standard_args = (since_ts, *until_args, *_family_params(family))
+    if pricing_pairs is None:
+        pricing_pairs = _pricing_model_channel_rows(
+            conn,
+            model_expr=model_expr,
+            channel_expr=channel_expr,
+            where_sql=standard_where,
+            where_args=standard_args,
+        )
+    long_case, long_args = _long_context_case_sql(
+        conn,
+        model_expr=model_expr,
+        channel_expr=channel_expr,
+        prompt_expr=prompt_expr,
+        where_sql=standard_where,
+        where_args=standard_args,
+        pricing_settings=pricing_settings,
+        pricing_pairs=pricing_pairs,
+    )
+    cache_ttl_case, cache_ttl_args = _cache_ttl_known_case_sql(
+        conn,
+        model_expr=model_expr,
+        channel_expr=channel_expr,
+        cache_creation_expr="COALESCE(cache_creation_tokens, 0)",
+        where_sql=standard_where,
+        where_args=standard_args,
+        pricing_settings=pricing_settings,
+        pricing_pairs=pricing_pairs,
+    )
+    rows = conn.execute(
+        f"""SELECT
+               {model_expr} AS pricing_model,
+               COALESCE(final_channel_key, '?') AS channel_key,
+               COALESCE(requested_model, '?') AS model_key,
+               COALESCE(api_key_name, '?') AS apikey_key,
+               upstream_protocol AS family_protocol,
+               {fast_expr} AS fast_mode,
+               {long_case} AS long_context,
+               {cache_ttl_case} AS cache_ttl_known,
+               MIN({pricing_exprs['usage_known']}) AS usage_semantics_known,
+               COUNT(*) AS row_count,
+               SUM(input_tokens) AS input_tokens,
+               SUM(output_tokens) AS output_tokens,
+               SUM(cache_creation_tokens) AS cache_creation_tokens,
+               SUM(cache_read_tokens) AS cache_read_tokens{fine_select}
+             FROM request_log
+             WHERE {standard_where}
+             GROUP BY pricing_model, channel_key, model_key, apikey_key,
+                      family_protocol, fast_mode, long_context, cache_ttl_known,
+                      {pricing_exprs['usage_known']}{fine_group}""",
+        long_args + cache_ttl_args + standard_args,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def _accumulate_usage_costs(
     conn,
     since_ts: float,
@@ -8256,13 +8671,16 @@ def _accumulate_usage_costs(
     by_apikey: dict[str, dict],
     family_targets: dict[str, tuple[dict, dict, dict, dict]] | None = None,
     object_cost_targets: tuple[dict[str, dict], dict[str, dict]] | None = None,
-    attempt_cost_rows: list[sqlite3.Row] | None = None,
+    attempt_cost_rows: list[dict] | None = None,
     missing_mapping_rows: list[dict] | None = None,
+    missing_dispatch_rows: list[dict] | None = None,
+    estimate_rows: list[dict] | None = None,
 ) -> None:
     """把成功请求的 USD 金额合并进统计桶。
 
     普通渠道按模型价格表分组估算；xAI OAuth 若响应携带官方
     ``cost_in_usd_ticks`` 则优先采用真实金额，缺失时再回退估算。
+    预先采集的分组行（``*_rows``）代替对应 SQL；xAI 行始终按整个窗口实时读取。
     """
 
     pricing_settings = model_pricing.settings()
@@ -8347,37 +8765,9 @@ def _accumulate_usage_costs(
                     _add_cost(target, int(row["cost_ticks"] or 0), count, actual=False)
                 else:
                     _add_unpriced(target, count)
-    retry_protocol_expr = _attempt_protocol_expr(
-        conn, table="retry_chain", alias="r",
-    )
-    retry_cols = _table_columns(conn, "retry_chain")
-    retry_channel_type = (
-        "COALESCE(r.channel_type, '?')"
-        if "channel_type" in retry_cols else "'?'"
-    )
-    missing_rows = _missing_dispatch_rows(
-        conn,
-        select_sql=(
-            "COALESCE(r.channel_key, '?') AS channel_key, "
-            "COALESCE(request_log.requested_model, '?') AS model_key, "
-            "COALESCE(request_log.api_key_name, '?') AS apikey_key, "
-            f"{retry_protocol_expr} AS family_protocol, "
-            f"{retry_channel_type} AS channel_type, COUNT(*) AS row_count"
-        ),
-        where_sql=(
-            "request_log.created_at>=?"
-            + _attempt_family_where(
-                conn, family, table="retry_chain", alias="r",
-            )
-        ),
-        args=(since_ts, *_family_params(family)),
-        request_first=_prefer_request_first_join(since_ts),
-        group_by_sql=(
-            "COALESCE(r.channel_key, '?'), "
-            "COALESCE(request_log.requested_model, '?'), "
-            "COALESCE(request_log.api_key_name, '?'), "
-            f"{retry_protocol_expr}, {retry_channel_type}"
-        ),
+    missing_rows = (
+        missing_dispatch_rows if missing_dispatch_rows is not None
+        else _usage_missing_rows(conn, since_ts, family)
     )
     if missing_mapping_rows is not None:
         missing_mapping_rows.extend({
@@ -8434,70 +8824,10 @@ def _accumulate_usage_costs(
         for target in targets:
             _add_cost(target, estimate.total_ticks, row_count, actual=False)
 
-    # 非 xAI 请求可以先按四个展示维度 + 实际计价模型 + fast/priority 聚合，
-    # 避免把整段历史逐行搬进 Python。
-    model_expr = "COALESCE(final_model, requested_model, '?')"
-    channel_expr = "COALESCE(final_channel_key, '?')"
-    prompt_expr = (
-        "COALESCE(input_tokens, 0) + COALESCE(cache_creation_tokens, 0) "
-        "+ COALESCE(cache_read_tokens, 0)"
+    estimated_rows = (
+        estimate_rows if estimate_rows is not None
+        else _usage_estimate_rows(conn, since_ts, family)
     )
-    standard_where = (
-        f"created_at >= ?{_family_where(family)} AND status='success' "
-        f"{attempt_exclusion}"
-        "AND COALESCE(final_channel_key, '') NOT LIKE 'oauth:xai:%'"
-    )
-    standard_args = (since_ts, *_family_params(family))
-    pricing_pairs = _pricing_model_channel_rows(
-        conn,
-        model_expr=model_expr,
-        channel_expr=channel_expr,
-        where_sql=standard_where,
-        where_args=standard_args,
-    )
-    long_case, long_args = _long_context_case_sql(
-        conn,
-        model_expr=model_expr,
-        channel_expr=channel_expr,
-        prompt_expr=prompt_expr,
-        where_sql=standard_where,
-        where_args=standard_args,
-        pricing_settings=pricing_settings,
-        pricing_pairs=pricing_pairs,
-    )
-    cache_ttl_case, cache_ttl_args = _cache_ttl_known_case_sql(
-        conn,
-        model_expr=model_expr,
-        channel_expr=channel_expr,
-        cache_creation_expr="COALESCE(cache_creation_tokens, 0)",
-        where_sql=standard_where,
-        where_args=standard_args,
-        pricing_settings=pricing_settings,
-        pricing_pairs=pricing_pairs,
-    )
-    estimated_rows = conn.execute(
-        f"""SELECT
-               {model_expr} AS pricing_model,
-               COALESCE(final_channel_key, '?') AS channel_key,
-               COALESCE(requested_model, '?') AS model_key,
-               COALESCE(api_key_name, '?') AS apikey_key,
-               upstream_protocol AS family_protocol,
-               COALESCE({pricing_exprs['fast_mode']}, 0) AS fast_mode,
-               {long_case} AS long_context,
-               {cache_ttl_case} AS cache_ttl_known,
-               MIN({pricing_exprs['usage_known']}) AS usage_semantics_known,
-               COUNT(*) AS row_count,
-               SUM(input_tokens) AS input_tokens,
-               SUM(output_tokens) AS output_tokens,
-               SUM(cache_creation_tokens) AS cache_creation_tokens,
-               SUM(cache_read_tokens) AS cache_read_tokens
-             FROM request_log
-             WHERE {standard_where}
-             GROUP BY pricing_model, channel_key, model_key, apikey_key,
-                      family_protocol, fast_mode, long_context, cache_ttl_known,
-                      {pricing_exprs['usage_known']}""",
-        long_args + cache_ttl_args + standard_args,
-    ).fetchall()
     object_estimates: tuple[dict[tuple, dict], dict[tuple, dict]] = ({}, {})
     for row in estimated_rows:
         apply_estimate(row, row_count=int(row["row_count"] or 0))
@@ -8630,6 +8960,11 @@ def _aggregate_summary_month(
     include_cost: bool, need_groups: bool, collect_families: bool,
 ) -> tuple:
     """Unfinalized per-month sums/counts, extrema, cost buckets and recent rows."""
+    if need_groups and collect_families:
+        # The grouped family snapshot (menus, statistics pages) reads mergeable
+        # GROUP BY facts, so the live month can reuse its closed days.
+        facts = _summary_window_facts(conn, since_ts, include_cost)
+        return _apply_summary_facts(conn, since_ts, include_cost, facts)
     raw = _new_summary_month_agg(collect_families)
     (overall_agg, by_channel, by_model, by_apikey, recent_errors, recent_calls, recent_cache_misses, family_aggs, object_cost_maps, model_channel_attempt_rows, model_channel_missing_rows) = raw
 
@@ -8665,65 +9000,6 @@ def _aggregate_summary_month(
         for r in rows:
             k = r["grp_key"] or "?"
             bucket = target.setdefault(k, _new_group_agg())
-            _accumulate_group(bucket, r)
-            _merge_tps(bucket, r)
-
-    def _agg_family_groups(conn, col_expr: str, target_index: int) -> None:
-        if not family_aggs:
-            return
-        connect_expr = _request_connect_sql(conn)
-        rows = conn.execute(
-            f"""SELECT upstream_protocol AS family_protocol, {col_expr} AS grp_key,
-                 COUNT(*) AS total,
-                 SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success_count,
-                 SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS error_count,
-                 SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending_count,
-                 SUM(retry_count) AS total_retries,
-                 SUM(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END) AS retried_requests,
-                 SUM(CASE WHEN affinity_hit=1 THEN 1 ELSE 0 END) AS affinity_hits,
-                 SUM(CASE WHEN status='success' AND cache_read_tokens > 0 THEN 1 ELSE 0 END) AS hit_requests,
-                 SUM(CASE WHEN status='success' AND cache_creation_tokens > 0 THEN 1 ELSE 0 END) AS write_requests,
-                 SUM(CASE WHEN status='success' AND cache_read_tokens > 0 THEN 1 ELSE 0 END) AS success_with_cache_hit,
-                 SUM(CASE WHEN status='success' AND cache_creation_tokens > 0 THEN 1 ELSE 0 END) AS success_with_cache_write,
-                 SUM(input_tokens) AS total_input_tokens,
-                 SUM(input_tokens + cache_creation_tokens + cache_read_tokens) AS total_prompt_tokens,
-                 SUM(output_tokens) AS total_output_tokens,
-                 SUM(cache_creation_tokens) AS total_cache_creation,
-                 SUM(cache_read_tokens) AS total_cache_read,
-                 SUM(CASE WHEN status='success' AND {connect_expr} IS NOT NULL THEN {connect_expr} ELSE 0 END) AS sum_connect_ms,
-                 SUM(CASE WHEN status='success' AND {connect_expr} IS NOT NULL THEN 1 ELSE 0 END) AS cnt_connect,
-                 SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN first_token_time_ms ELSE 0 END) AS sum_first_token_ms,
-                 SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_first_token,
-                 SUM(CASE WHEN status='success' AND total_time_ms IS NOT NULL THEN total_time_ms ELSE 0 END) AS sum_total_ms,
-                 SUM(CASE WHEN status='success' AND total_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_total,
-                 {_tps_agg_sql()}
-               FROM request_log WHERE created_at >= ?
-               GROUP BY family_protocol, grp_key""",
-            (since_ts,),
-        ).fetchall()
-        main_target = (by_channel, by_model, by_apikey)[target_index - 1]
-        # The former unfiltered GROUP BY inserted keys in SQLite's lexical group
-        # order.  Preserve that order because equal-token rows use stable sorting.
-        for key in sorted({r["grp_key"] or "?" for r in rows}):
-            main_target.setdefault(key, _new_group_agg())
-        for r in rows:
-            key = r["grp_key"] or "?"
-            # The protocol-split rows are additive.  Reuse them for the unfiltered
-            # dimension instead of scanning request_log once more for the same key.
-            main_bucket = main_target.setdefault(key, _new_group_agg())
-            _accumulate_group(main_bucket, r)
-            _merge_tps(main_bucket, r)
-            fam = _family_from_protocol(r["family_protocol"])
-            if target_index == 1:
-                _accumulate(overall_agg, r)
-                _merge_tps(overall_agg, r)
-                if fam in family_aggs:
-                    _accumulate(family_aggs[fam][0], r)
-                    _merge_tps(family_aggs[fam][0], r)
-            if fam not in family_aggs:
-                continue
-            target = family_aggs[fam][target_index]
-            bucket = target.setdefault(key, _new_group_agg())
             _accumulate_group(bucket, r)
             _merge_tps(bucket, r)
 
@@ -8796,19 +9072,14 @@ def _aggregate_summary_month(
         _merge_tps(overall_agg, row)
 
     if need_groups:
-        if family_aggs:
-            _agg_family_groups(conn, _GROUP_BY_COLS["channel"], 1)
-            _agg_family_groups(conn, _GROUP_BY_COLS["model"], 2)
-            _agg_family_groups(conn, _GROUP_BY_COLS["apikey"], 3)
-        else:
-            _agg_group(by_channel, conn, _GROUP_BY_COLS["channel"])
-            _agg_group(by_model,   conn, _GROUP_BY_COLS["model"])
-            _agg_group(by_apikey,  conn, _GROUP_BY_COLS["apikey"])
-    shared_attempt_tokens: list[sqlite3.Row] | None = None
-    shared_attempt_costs: list[sqlite3.Row] | None = None
+        _agg_group(by_channel, conn, _GROUP_BY_COLS["channel"])
+        _agg_group(by_model,   conn, _GROUP_BY_COLS["model"])
+        _agg_group(by_apikey,  conn, _GROUP_BY_COLS["apikey"])
+    shared_attempt_tokens: list[dict] | None = None
+    shared_attempt_costs: list[dict] | None = None
     if include_cost and need_groups:
         shared_attempt_tokens, shared_attempt_costs, shared_mapping_rows = (
-            _summary_attempt_aggregate_rows(conn, since_ts, family)
+            _split_summary_attempt_rows(_summary_attempt_union_rows(conn, since_ts, family))
         )
         if model_channel_attempt_rows is not None:
             model_channel_attempt_rows.extend(shared_mapping_rows)
@@ -8845,7 +9116,16 @@ def _aggregate_summary_month(
 
     if not need_groups:
         return raw
+    _collect_summary_recent(conn, since_ts, family, include_cost, raw)
+    return raw
 
+
+def _collect_summary_recent(
+    conn: sqlite3.Connection, since_ts: float, family: str | None,
+    include_cost: bool, raw: tuple,
+) -> None:
+    """The newest error / call / cache-miss rows of the window (always live)."""
+    recent_errors, recent_calls, recent_cache_misses = raw[4], raw[5], raw[6]
     for r in conn.execute(
         """SELECT created_at, api_key_name, requested_model,
                           final_channel_key, error_message,
@@ -8900,7 +9180,6 @@ def _aggregate_summary_month(
         (since_ts, *_family_params(family)),
     ).fetchall():
         recent_cache_misses.append(dict(r))
-    return raw
 
 
 def _merge_summary_bucket(target: dict, source: dict) -> None:
@@ -8949,6 +9228,540 @@ def _merge_summary_month(target: tuple, source: tuple) -> None:
         target[10].extend(copy.deepcopy(source[10]))
 
 
+# ─── Grouped summary facts (mergeable across adjacent windows) ─────────────
+
+_SUMMARY_GROUP_SUMS = (
+    "total", "success_count", "error_count", "pending_count",
+    "total_retries", "retried_requests", "affinity_hits",
+    "hit_requests", "write_requests",
+    "success_with_cache_hit", "success_with_cache_write",
+    "total_input_tokens", "total_prompt_tokens", "total_output_tokens",
+    "total_cache_creation", "total_cache_read",
+    "sum_connect_ms", "cnt_connect", "sum_first_token_ms", "cnt_first_token",
+    "sum_total_ms", "cnt_total", "tps_num_tokens", "tps_denom_ms",
+)
+_SUMMARY_TOKEN_SUMS = ("inp", "outp", "cc", "cr", "cc_rows", "cr_rows")
+_SUMMARY_TOKEN_KEYS = ("channel_key", "model_key", "apikey_key", "family_protocol")
+_SUMMARY_ESTIMATE_KEYS = (
+    "pricing_model", "channel_key", "model_key", "apikey_key", "family_protocol",
+    "raw_fast_mode", "long_context", "cache_ttl_known", "usage_semantics_known",
+)
+_LIFETIME_ESTIMATE_KEYS = (
+    "pricing_model", "pricing_channel", "raw_fast_mode", "long_context",
+    "cache_ttl_known", "usage_semantics_known",
+)
+_SUMMARY_ATTEMPT_KEYS = {
+    0: _SUMMARY_TOKEN_KEYS,
+    1: (*_SUMMARY_TOKEN_KEYS, "service_tier", "cost_source"),
+    2: ("raw_model", "raw_channel", "raw_channel_type", "raw_protocol"),
+}
+# name -> (GROUP BY columns in order, SUM columns); other columns depend on the key.
+_SUMMARY_FACT_SPECS = {
+    "groups": (
+        ("family_protocol", "grp_channel", "grp_model", "grp_apikey", "grp_pricing_model"),
+        _SUMMARY_GROUP_SUMS,
+    ),
+    "roots": (_SUMMARY_TOKEN_KEYS, _SUMMARY_TOKEN_SUMS),
+    "attempt_tokens": (_SUMMARY_TOKEN_KEYS, _SUMMARY_TOKEN_SUMS),
+    "missing": ((*_SUMMARY_TOKEN_KEYS, "channel_type"), ("row_count",)),
+    # ``fine`` estimate groups (see _estimate_fast_columns).
+    "estimates": (
+        (*_SUMMARY_ESTIMATE_KEYS, "fast_mode"),
+        ("row_count", "input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens"),
+    ),
+}
+
+
+def _sqlite_sort_key(value: Any) -> tuple:
+    """SQLite's default ordering: NULL, numbers, text (BINARY), blobs."""
+    if value is None:
+        return (0, 0)
+    if isinstance(value, (int, float)):
+        return (1, value)
+    if isinstance(value, str):
+        return (2, value.encode("utf-8", "surrogatepass"))
+    return (3, bytes(value))
+
+
+def _sql_sum(left: Any, right: Any) -> Any:
+    """SUM() of two partial sums: NULL only if both are; exact-text sums stay text."""
+    if left is None:
+        return right
+    if right is None:
+        return left
+    total = int(left) + int(right)
+    return str(total) if isinstance(left, str) or isinstance(right, str) else total
+
+
+def _merge_grouped_rows(
+    rows, key_cols: tuple[str, ...], sum_cols: tuple[str, ...], *,
+    max_cols: tuple[str, ...] = (), min_cols: tuple[str, ...] = (),
+) -> list[dict]:
+    """GROUP BY rows of adjacent windows merged into the rows of their union.
+
+    The result is in GROUP BY order (ascending keys, as SQLite emits groups),
+    so every consumer inserts keys in the same order as one query would.
+    """
+    merged: dict[tuple, dict] = {}
+    for row in rows:
+        key = tuple(row[col] for col in key_cols)
+        target = merged.get(key)
+        if target is None:
+            merged[key] = dict(row)
+            continue
+        for col in sum_cols:
+            target[col] = _sql_sum(target[col], row[col])
+        for col in max_cols:
+            if row[col] is not None and (target[col] is None or row[col] > target[col]):
+                target[col] = row[col]
+        for col in min_cols:
+            if row[col] is not None and (target[col] is None or row[col] < target[col]):
+                target[col] = row[col]
+    return sorted(
+        merged.values(),
+        key=lambda row: tuple(_sqlite_sort_key(row[col]) for col in key_cols),
+    )
+
+
+def _summary_group_rows(
+    conn: sqlite3.Connection, since_ts: float, until_ts: float | None = None,
+) -> list[dict]:
+    """Request totals per (protocol, channel, model, API key, priced model) in one scan."""
+    until_sql, until_args = _until_sql(until_ts)
+    connect_expr = _request_connect_sql(conn)
+    rows = conn.execute(
+        f"""SELECT upstream_protocol AS family_protocol,
+             {_GROUP_BY_COLS['channel']} AS grp_channel,
+             {_GROUP_BY_COLS['model']} AS grp_model,
+             {_GROUP_BY_COLS['apikey']} AS grp_apikey,
+             COALESCE(final_model, requested_model, '?') AS grp_pricing_model,
+             COUNT(*) AS total,
+             SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success_count,
+             SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS error_count,
+             SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending_count,
+             SUM(retry_count) AS total_retries,
+             SUM(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END) AS retried_requests,
+             SUM(CASE WHEN affinity_hit=1 THEN 1 ELSE 0 END) AS affinity_hits,
+             SUM(CASE WHEN status='success' AND cache_read_tokens > 0 THEN 1 ELSE 0 END) AS hit_requests,
+             SUM(CASE WHEN status='success' AND cache_creation_tokens > 0 THEN 1 ELSE 0 END) AS write_requests,
+             SUM(CASE WHEN status='success' AND cache_read_tokens > 0 THEN 1 ELSE 0 END) AS success_with_cache_hit,
+             SUM(CASE WHEN status='success' AND cache_creation_tokens > 0 THEN 1 ELSE 0 END) AS success_with_cache_write,
+             SUM(input_tokens) AS total_input_tokens,
+             SUM(input_tokens + cache_creation_tokens + cache_read_tokens) AS total_prompt_tokens,
+             SUM(output_tokens) AS total_output_tokens,
+             SUM(cache_creation_tokens) AS total_cache_creation,
+             SUM(cache_read_tokens) AS total_cache_read,
+             SUM(CASE WHEN status='success' AND {connect_expr} IS NOT NULL THEN {connect_expr} ELSE 0 END) AS sum_connect_ms,
+             SUM(CASE WHEN status='success' AND {connect_expr} IS NOT NULL THEN 1 ELSE 0 END) AS cnt_connect,
+             SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN first_token_time_ms ELSE 0 END) AS sum_first_token_ms,
+             SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_first_token,
+             SUM(CASE WHEN status='success' AND total_time_ms IS NOT NULL THEN total_time_ms ELSE 0 END) AS sum_total_ms,
+             SUM(CASE WHEN status='success' AND total_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_total,
+             {_tps_agg_sql()}
+           FROM request_log WHERE created_at >= ?{until_sql}
+           GROUP BY family_protocol, grp_channel, grp_model, grp_apikey, grp_pricing_model""",
+        (since_ts, *until_args),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _fold_summary_group_rows(rows: list[dict], key_col: str) -> list[dict]:
+    """One dimension's (protocol, key) groups, as its own GROUP BY would return them."""
+    carried = (*_SUMMARY_GROUP_SUMS, "max_tps", "min_tps")
+    return _merge_grouped_rows(
+        (
+            {"family_protocol": row["family_protocol"], "grp_key": row[key_col],
+             **{col: row[col] for col in carried}}
+            for row in rows
+        ),
+        ("family_protocol", "grp_key"), _SUMMARY_GROUP_SUMS,
+        max_cols=("max_tps",), min_cols=("min_tps",),
+    )
+
+
+def _apply_summary_family_groups(raw: tuple, rows: list[dict], target_index: int) -> None:
+    overall_agg, family_aggs = raw[0], raw[7]
+    main_target = raw[target_index]
+    # The former unfiltered GROUP BY inserted keys in SQLite's lexical group
+    # order.  Preserve that order because equal-token rows use stable sorting.
+    for key in sorted({r["grp_key"] or "?" for r in rows}):
+        main_target.setdefault(key, _new_group_agg())
+    for r in rows:
+        key = r["grp_key"] or "?"
+        # The protocol-split rows are additive.  Reuse them for the unfiltered
+        # dimension instead of scanning request_log once more for the same key.
+        main_bucket = main_target.setdefault(key, _new_group_agg())
+        _accumulate_group(main_bucket, r)
+        _merge_tps(main_bucket, r)
+        fam = _family_from_protocol(r["family_protocol"])
+        if target_index == 1:
+            _accumulate(overall_agg, r)
+            _merge_tps(overall_agg, r)
+            if fam in family_aggs:
+                _accumulate(family_aggs[fam][0], r)
+                _merge_tps(family_aggs[fam][0], r)
+        if fam not in family_aggs:
+            continue
+        target = family_aggs[fam][target_index]
+        bucket = target.setdefault(key, _new_group_agg())
+        _accumulate_group(bucket, r)
+        _merge_tps(bucket, r)
+
+
+def _collect_summary_facts(
+    conn: sqlite3.Connection, since_ts: float, until_ts: float | None, include_cost: bool,
+) -> dict[str, list[dict] | None]:
+    """Every GROUP BY behind the grouped family snapshot of ``[since, until)``.
+
+    Rows that need response bodies (xAI billing) and the recent-row samples
+    are not facts: they are read live for the whole window when applied.
+    """
+    has_attempts = _attempt_rows_exist(conn)
+    facts: dict[str, list[dict] | None] = {
+        "groups": _summary_group_rows(conn, since_ts, until_ts),
+        "roots": _summary_root_token_rows(conn, since_ts, None, until_ts) if has_attempts else [],
+        "attempts": None, "attempt_tokens": None, "missing": None, "estimates": None,
+    }
+    if include_cost:
+        # Every (priced model, channel) of the window: a superset of the pairs
+        # the price classifiers need, whose extra CASE arms match no row.
+        pricing_pairs = [
+            {"pricing_model": model, "pricing_channel": channel}
+            for model, channel in dict.fromkeys(
+                (row["grp_pricing_model"], row["grp_channel"]) for row in facts["groups"]
+            )
+        ]
+        facts["attempts"] = _summary_attempt_union_rows(conn, since_ts, None, until_ts)
+        facts["missing"] = _usage_missing_rows(conn, since_ts, None, until_ts)
+        facts["estimates"] = _usage_estimate_rows(
+            conn, since_ts, None, until_ts, pricing_pairs=pricing_pairs, fine=True,
+        )
+    else:
+        facts["attempt_tokens"] = (
+            _summary_attempt_token_rows(conn, since_ts, None, until_ts) if has_attempts else []
+        )
+    return facts
+
+
+def _merge_summary_facts(parts: list[dict]) -> dict[str, list[dict] | None]:
+    out: dict[str, list[dict] | None] = {}
+    for name, (key_cols, sum_cols) in _SUMMARY_FACT_SPECS.items():
+        values = [part[name] for part in parts]
+        if any(value is None for value in values):
+            out[name] = None
+            continue
+        extrema = {"max_cols": ("max_tps",), "min_cols": ("min_tps",)} if name == "groups" else {}
+        out[name] = _merge_grouped_rows(
+            (row for rows in values for row in rows), key_cols, sum_cols, **extrema,
+        )
+    attempts = [part["attempts"] for part in parts]
+    if any(value is None for value in attempts):
+        out["attempts"] = None
+    else:
+        # UNION ALL emits each aggregate kind's groups in turn.
+        out["attempts"] = [
+            row
+            for kind, key_cols in _SUMMARY_ATTEMPT_KEYS.items()
+            for row in _merge_grouped_rows(
+                (row for rows in attempts for row in rows
+                 if int(row["aggregate_kind"] or 0) == kind),
+                key_cols, (*_SUMMARY_TOKEN_SUMS, "row_count", "cost_ticks"),
+            )
+        ]
+    return {name: out[name] for name in parts[0]}
+
+
+def _apply_summary_facts(
+    conn: sqlite3.Connection, since_ts: float, include_cost: bool, facts: dict,
+) -> tuple:
+    """The grouped family snapshot month built from its facts and live rows."""
+    raw = _new_summary_month_agg(True)
+    (overall_agg, by_channel, by_model, by_apikey, _errors, _calls, _misses, family_aggs, object_cost_maps, model_channel_attempt_rows, model_channel_missing_rows) = raw
+    for key_col, target_index in (("grp_channel", 1), ("grp_model", 2), ("grp_apikey", 3)):
+        _apply_summary_family_groups(
+            raw, _fold_summary_group_rows(facts["groups"], key_col), target_index,
+        )
+    attempt_tokens = facts["attempt_tokens"]
+    attempt_costs = None
+    if include_cost:
+        attempt_tokens, attempt_costs, mapping_rows = _split_summary_attempt_rows(facts["attempts"])
+        model_channel_attempt_rows.extend(mapping_rows)
+    _replace_summary_tokens_with_attempts(
+        conn, since_ts, None, overall_agg,
+        by_channel, by_model, by_apikey,
+        family_targets=family_aggs or None,
+        attempt_rows=attempt_tokens,
+        root_rows=facts["roots"],
+    )
+    if include_cost:
+        estimate_rows = _coarse_estimate_rows(facts["estimates"], _SUMMARY_ESTIMATE_KEYS)
+        if estimate_rows is None:
+            estimate_rows = _usage_estimate_rows(conn, since_ts, None)
+        _accumulate_usage_costs(
+            conn,
+            since_ts,
+            None,
+            overall_agg,
+            by_channel,
+            by_model,
+            by_apikey,
+            family_targets=family_aggs or None,
+            object_cost_targets=object_cost_maps,
+            attempt_cost_rows=attempt_costs,
+            missing_mapping_rows=model_channel_missing_rows,
+            missing_dispatch_rows=facts["missing"],
+            estimate_rows=estimate_rows,
+        )
+    _collect_summary_recent(conn, since_ts, None, include_cost, raw)
+    return raw
+
+
+# ─── Closed days of the live month ─────────────────────────────────────────
+#
+# The grouped facts of [month start, today 00:00) are kept per log file and
+# combined with a live read of today.  Every cached fact is a GROUP BY result
+# merged exactly (see _merge_grouped_rows), and costs are still estimated once
+# on the merged groups, so the snapshot equals a single full-window read.
+#
+# Writers invalidate it precisely: request-log write connections carry TEMP
+# triggers that report writes to requests created before the cached boundary
+# (in-flight requests crossing midnight, late settlements, cleanup), and
+# maintenance on other connections (retention, key migration) invalidates
+# explicitly.  A cached range is also re-checked against its row count/max id,
+# the file identity, the pricing/binding signature and a one-hour age limit.
+
+_SUMMARY_PREFIX_MAX_AGE = 3600.0
+_summary_prefix_lock = threading.Lock()
+_summary_prefix_cache: dict[tuple, dict[str, Any]] = {}
+_stats_write_generation: dict[str, int] = {}
+_stats_cached_before: dict[str, float] = {}
+_stats_untracked_paths: set[str] = set()
+_stats_maintenance_epoch = 0
+_stats_lookup_lock = threading.Lock()
+_stats_lookup_conns: dict[str, sqlite3.Connection] = {}
+
+
+def _stats_path_key(path: str) -> str:
+    return str(Path(path).resolve())
+
+
+def _bump_stats_generation(path_key: str) -> None:
+    _stats_write_generation[path_key] = _stats_write_generation.get(path_key, 0) + 1
+
+
+def _note_stats_write(path_key: str, created_at: Any) -> None:
+    """Trigger callback for request_log rows; never raises inside a write."""
+    try:
+        if created_at is not None and float(created_at) < _stats_cached_before.get(path_key, float("-inf")):
+            _bump_stats_generation(path_key)
+    except Exception:
+        _bump_stats_generation(path_key)
+
+
+def _note_stats_request_write(path_key: str, request_id: Any) -> None:
+    """Trigger callback for attempt/retry rows; never raises inside a write.
+
+    The root request's creation time is read on a separate read-only
+    connection, so the trigger SQL references no other table (a renamed or
+    rebuilt table can never make a log write fail).  Unknown means invalidate.
+    """
+    boundary = _stats_cached_before.get(path_key)
+    if boundary is None or request_id is None:
+        return
+    try:
+        root = str(request_id).split(":compact:", 1)[0]
+        with _stats_lookup_lock:
+            lookup = _stats_lookup_conns.get(path_key)
+            if lookup is None:
+                _close_stats_lookups_locked()
+                # Runs inside a write: never wait long, a busy read just invalidates.
+                lookup = sqlite3.connect(
+                    f"{Path(path_key).as_uri()}?mode=ro", uri=True, timeout=1,
+                    check_same_thread=False,
+                )
+                _stats_lookup_conns[path_key] = lookup
+            row = lookup.execute(
+                "SELECT created_at FROM request_log WHERE request_id=?", (root,),
+            ).fetchone()
+        if row is None or row[0] is None or float(row[0]) < boundary:
+            _bump_stats_generation(path_key)
+    except Exception:
+        _bump_stats_generation(path_key)
+
+
+def _close_stats_lookups_locked() -> None:
+    for lookup in _stats_lookup_conns.values():
+        try:
+            lookup.close()
+        except Exception:
+            pass
+    _stats_lookup_conns.clear()
+
+
+def _invalidate_summary_prefixes() -> None:
+    """For writes on connections without the triggers (retention, key migration)."""
+    global _stats_maintenance_epoch
+    _stats_maintenance_epoch += 1
+    # Retention may have removed or replaced a file this lookup still holds open.
+    with _stats_lookup_lock:
+        _close_stats_lookups_locked()
+
+
+def _install_stats_triggers(conn: sqlite3.Connection, path: str) -> None:
+    """Report writes that touch requests already inside a cached closed range."""
+    path_key = _stats_path_key(path)
+    conn.create_function(
+        "parrot_stats_touch", 1,
+        lambda created_at: _note_stats_write(path_key, created_at),
+    )
+    conn.create_function(
+        "parrot_stats_touch_request", 1,
+        lambda request_id: _note_stats_request_write(path_key, request_id),
+    )
+    touches = {
+        "request_log": ("parrot_stats_touch", "created_at"),
+        "upstream_attempt_usage": ("parrot_stats_touch_request", "root_request_id"),
+        "retry_chain": ("parrot_stats_touch_request", "request_id"),
+    }
+    tables = _existing_tables(conn)
+    for table, (function, column) in touches.items():
+        if table not in tables:
+            continue
+        for event, rows in (("INSERT", ("NEW",)), ("UPDATE", ("OLD", "NEW")), ("DELETE", ("OLD",))):
+            body = " ".join(f"SELECT {function}({row}.{column});" for row in rows)
+            conn.execute(
+                f"CREATE TEMP TRIGGER IF NOT EXISTS parrot_stats_{table}_{event.lower()} "
+                f"AFTER {event} ON main.{table} BEGIN {body} END"
+            )
+
+
+def _summary_prefix_fingerprint(conn: sqlite3.Connection, since_ts: float, until_ts: float) -> tuple:
+    row = conn.execute(
+        "SELECT COUNT(*), MAX(id) FROM request_log WHERE created_at >= ? AND created_at < ?",
+        (since_ts, until_ts),
+    ).fetchone()
+    return (int(row[0] or 0), row[1])
+
+
+def _file_identity(path: str) -> tuple | None:
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return (stat.st_dev, stat.st_ino)
+
+
+def _summary_prefix_plan(conn: sqlite3.Connection, since_ts: float) -> tuple[str, float] | None:
+    """``(path, today 00:00)`` when the window is this month (or all of it) on the live file."""
+    if _log_dir is None or os.environ.get("PARROT_STATS_CACHE", "1") == "0":
+        return None
+    raw_path = next(
+        (str(row[2]) for row in conn.execute("PRAGMA database_list").fetchall() if row[1] == "main"),
+        "",
+    )
+    if not raw_path:
+        return None
+    current_path, _ = _current_db_path()
+    path = _stats_path_key(raw_path)
+    if path != _stats_path_key(current_path) or path in _stats_untracked_paths:
+        return None
+    month, today = _live_month_bounds()
+    if float(since_ts) not in (0.0, month) or today <= float(since_ts):
+        return None
+    return path, today
+
+
+def _live_month_bounds() -> tuple[float, float]:
+    """Beijing ``(month start, today 00:00)``."""
+    now = datetime.now(_BJT)
+    return (
+        now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp(),
+        now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp(),
+    )
+
+
+def _cached_window_prefix(
+    conn: sqlite3.Connection, path: str, kind: str, since_ts: float, until_ts: float,
+    include_cost: bool, collect,
+) -> dict | None:
+    """``collect(conn, since, until)`` of the closed range, or None while it
+    cannot be cached (pending requests)."""
+    key = (path, kind, float(since_ts), float(until_ts), bool(include_cost))
+    signature = _lifetime_pricing_signature() if include_cost else ""
+    with _summary_prefix_lock:
+        entry = _summary_prefix_cache.get(key)
+        if (
+            entry is not None
+            and entry["generation"] == (_stats_write_generation.get(path, 0), _stats_maintenance_epoch)
+            and entry["signature"] == signature
+            and entry["identity"] == _file_identity(path)
+            and time.monotonic() - entry["stored_at"] < _SUMMARY_PREFIX_MAX_AGE
+            and entry["fingerprint"] == _summary_prefix_fingerprint(conn, since_ts, until_ts)
+        ):
+            return entry["facts"]
+        _summary_prefix_cache.pop(key, None)
+        pending = conn.execute(
+            "SELECT 1 FROM request_log WHERE status='pending' "
+            "AND created_at >= ? AND created_at < ? LIMIT 1",
+            (since_ts, until_ts),
+        ).fetchone()
+        if pending is not None:
+            return None
+        # Raise the reported boundary first; then every write that touches the
+        # range either committed before the generation is read (writers commit
+        # under _write_lock) or bumps the generation afterwards.
+        _stats_cached_before[path] = max(_stats_cached_before.get(path, float("-inf")), float(until_ts))
+        with _write_lock:
+            generation = (_stats_write_generation.get(path, 0), _stats_maintenance_epoch)
+        identity = _file_identity(path)
+        facts = collect(conn, since_ts, until_ts)
+        fingerprint = _summary_prefix_fingerprint(conn, since_ts, until_ts)
+        stable = (
+            generation == (_stats_write_generation.get(path, 0), _stats_maintenance_epoch)
+            and identity == _file_identity(path)
+            and signature == (_lifetime_pricing_signature() if include_cost else "")
+        )
+        if stable:
+            for stale in [
+                k for k in _summary_prefix_cache
+                if k[:2] == (path, kind) and k[3] != float(until_ts)
+            ]:
+                _summary_prefix_cache.pop(stale, None)
+            _summary_prefix_cache[key] = {
+                "generation": generation, "signature": signature, "identity": identity,
+                "fingerprint": fingerprint, "stored_at": time.monotonic(), "facts": facts,
+            }
+        return facts
+
+
+def _summary_window_facts(
+    conn: sqlite3.Connection, since_ts: float, include_cost: bool,
+) -> dict[str, list[dict] | None]:
+    plan = _summary_prefix_plan(conn, since_ts)
+    if plan is not None:
+        path, until_ts = plan
+        prefix = _cached_window_prefix(
+            conn, path, "summary", since_ts, until_ts, include_cost,
+            lambda c, since, until: _collect_summary_facts(c, since, until, include_cost),
+        )
+        if prefix is not None:
+            live = _collect_summary_facts(conn, until_ts, None, include_cost)
+            return _merge_summary_facts([prefix, live])
+    return _collect_summary_facts(conn, since_ts, None, include_cost)
+
+
+def _lifetime_window_facts(conn: sqlite3.Connection) -> dict:
+    plan = _summary_prefix_plan(conn, 0.0)
+    if plan is not None:
+        path, until_ts = plan
+        prefix = _cached_window_prefix(
+            conn, path, "lifetime", 0.0, until_ts, True, _lifetime_month_facts,
+        )
+        if prefix is not None:
+            return _merge_lifetime_facts([prefix, _lifetime_month_facts(conn, until_ts, None)])
+    return _lifetime_month_facts(conn)
+
+
 _summary_cache_lock = threading.Lock()
 _summary_sealed_cache: dict[tuple, tuple[tuple[Any, ...], str, tuple]] = {}
 
@@ -8956,6 +9769,9 @@ _summary_sealed_cache: dict[tuple, tuple[tuple[Any, ...], str, tuple]] = {}
 def _reset_summary_cache_for_tests() -> None:
     with _summary_cache_lock:
         _summary_sealed_cache.clear()
+    with _summary_prefix_lock:
+        _summary_prefix_cache.clear()
+    _invalidate_summary_prefixes()
 
 
 def _sealed_summary_month(
