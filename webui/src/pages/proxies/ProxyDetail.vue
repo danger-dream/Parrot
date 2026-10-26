@@ -163,9 +163,39 @@ async function rename(): Promise<void> {
 // ---- delete with reference cleanup (same outcome as the Telegram menu) ----
 interface Ref {
   text: string
+  failure: string
   apply: () => Promise<unknown>
 }
-async function references(id: string): Promise<Ref[]> {
+const ROUTING_SECTIONS: [keyof Routing, string][] = [
+  ['functions', '功能'],
+  ['providers', '上游类型'],
+  ['accounts', '账号'],
+  ['channels', '渠道'],
+  ['models', '模型'],
+]
+function routeKeyName(sec: keyof Routing, key: string): string {
+  return sec === 'channels' ? channelName(key) : sec === 'accounts' ? channelName(`oauth:${key}`) : key
+}
+/** Turns the server's RESOURCE_IN_USE paths (`groups.us[0]`, `routing.models.x`) into the names shown elsewhere. */
+function referenceName(path: string): string {
+  const inGroup = /^groups\.(.+)\[\d+\]$/.exec(path)
+  if (inGroup) return `代理组 ${inGroup[1]}`
+  if (path === 'routing.default') return '默认路线'
+  const nested = /^routing\.(providers|accounts|channels|models)\.(.+)$/.exec(path)
+  if (nested) {
+    const sec = nested[1] as keyof Routing
+    const label = ROUTING_SECTIONS.find(([s]) => s === sec)?.[1]
+    return `${label}规则：${routeKeyName(sec, nested[2])}`
+  }
+  const fn = /^routing\.(.+)$/.exec(path)
+  return fn ? `功能规则：${fn[1]}` : path
+}
+function inUseBy(err: unknown): string[] {
+  if (!(err instanceof ApiError) || err.code !== 'RESOURCE_CONFLICT') return []
+  const names = (err.fields || []).filter((f) => f.code === 'RESOURCE_IN_USE').map((f) => referenceName(f.path))
+  return [...new Set(names)]
+}
+async function references(id: string, name: string): Promise<Ref[]> {
   const [groups, routing] = await Promise.all([
     api.get<ProxyGroup[]>('/proxy-groups', { pageSize: 200 }).then((r) => r.data),
     api.get<Routing>('/proxy-routing').then((r) => r.data),
@@ -176,7 +206,13 @@ async function references(id: string): Promise<Ref[]> {
       if (!g.members.includes(id)) continue
       out.push({
         text: `代理组 ${g.name}`,
-        apply: () => api.patch(`/proxy-groups/${enc(g.groupId)}`, { members: g.members.filter((m) => m !== id) }),
+        failure: `没能把「${name}」移出代理组 ${g.name}`,
+        // Proxies, groups and routing share one revision that every step bumps, so read it right before writing.
+        apply: async () => {
+          const cur = (await api.get<ProxyGroup>(`/proxy-groups/${enc(g.groupId)}`)).data
+          if (!cur.members.includes(id)) return
+          await api.patch(`/proxy-groups/${enc(g.groupId)}`, { members: cur.members.filter((m) => m !== id) }, { ifMatch: cur.revision })
+        },
       })
     }
   }
@@ -186,22 +222,20 @@ async function references(id: string): Promise<Ref[]> {
     patch.default = 'direct'
     labels.push('默认路线（改为直连）')
   }
-  const sections: [keyof Routing, string][] = [
-    ['functions', '功能'],
-    ['providers', '上游类型'],
-    ['accounts', '账号'],
-    ['channels', '渠道'],
-    ['models', '模型'],
-  ]
-  for (const [sec, label] of sections) {
+  for (const [sec, label] of ROUTING_SECTIONS) {
     const map = routing[sec] as Record<string, string>
     const keys = Object.keys(map).filter((k) => map[k] === id)
     if (!keys.length) continue
     patch[sec] = Object.fromEntries(keys.map((k) => [k, null]))
-    const names = keys.map((k) => (sec === 'channels' ? channelName(k) : sec === 'accounts' ? channelName(`oauth:${k}`) : k))
-    labels.push(`${label}规则：${names.join('、')}`)
+    labels.push(`${label}规则：${keys.map((k) => routeKeyName(sec, k)).join('、')}`)
   }
-  if (labels.length) out.push({ text: `分流规则 · ${labels.join('；')}`, apply: () => api.patch('/proxy-routing', patch) })
+  if (labels.length) {
+    out.push({
+      text: `分流规则 · ${labels.join('；')}`,
+      failure: `没能清理指向「${name}」的分流规则`,
+      apply: () => api.patch('/proxy-routing', patch),
+    })
+  }
   return out
 }
 
@@ -211,7 +245,7 @@ async function remove(): Promise<void> {
   busy.value = 'delete'
   let refs: Ref[] = []
   try {
-    refs = await references(props.id)
+    refs = await references(props.id, it.name)
   } catch (err) {
     busy.value = ''
     toast(errorTitle(err), 'error', errorDetail(err))
@@ -229,8 +263,13 @@ async function remove(): Promise<void> {
   })
   if (!ok) return
   busy.value = 'delete'
+  let failedStep = ''
   try {
-    for (const r of refs) await r.apply()
+    for (const r of refs) {
+      failedStep = r.failure
+      await r.apply()
+    }
+    failedStep = ''
     const fresh = isGroup.value
       ? (await api.get<ProxyGroup>(`/proxy-groups/${enc(props.id)}`)).data.revision
       : (await api.get<Proxy>(`/proxies/${enc(props.id)}`)).data.revision
@@ -239,7 +278,10 @@ async function remove(): Promise<void> {
     notifyProxiesChanged()
     closeInspector()
   } catch (err) {
-    toast(errorTitle(err), 'error', errorDetail(err), 7000)
+    const users = failedStep ? [] : inUseBy(err)
+    if (users.length) toast(`${what}「${it.name}」仍被引用，没有删除`, 'error', `还在使用它的位置：${users.join('、')}`, 7000)
+    else if (failedStep) toast(failedStep, 'error', `${errorTitle(err)}。${what}还没有删除。`, 7000)
+    else toast(`删除${what}「${it.name}」失败`, 'error', errorTitle(err), 7000)
     notifyProxiesChanged()
   } finally {
     busy.value = ''
