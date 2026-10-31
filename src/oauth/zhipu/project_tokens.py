@@ -76,7 +76,7 @@ def business_request(account, url, *, account_key="", header_kind="business", re
     try:
         return send()
     except c.ZhipuError as exc:
-        if exc.status_code != 401 or "/api/biz/" not in url or c.site_of(account) != "zai" or not account.get("zhipu_oauth_token"):
+        if not exc.unauthorized or "/api/biz/" not in url or c.site_of(account) != "zai" or not account.get("zhipu_oauth_token"):
             raise
         if recovery_budget is not None:
             if recovery_budget["remaining"] <= 0:

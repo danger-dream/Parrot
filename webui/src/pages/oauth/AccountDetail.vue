@@ -31,8 +31,8 @@ import { deltas, loadCompare, minuteNow, type Compare } from '@/utils/compare'
 import WorkBuddyPanel from './WorkBuddyPanel.vue'
 import ZhipuPanel from './ZhipuPanel.vue'
 import { accountPath, errorToast, notifyChanged, oauthBus, runOperation } from './oauthApi'
-import { accountState, countdown, pick, providerMeta, reasonLabel, usageValue, type AccountDetail, type Provider, type QuotaResetPlan, type RuntimeErr, type UsageItem } from './meta'
-import { accountAlerts, allSections, planFacts, planText, POOL_LABEL, quotaPauseGroups } from './facts'
+import { accountState, countdown, noteLabel, pick, providerMeta, reasonLabel, usageValue, type AccountDetail, type Provider, type QuotaResetPlan, type RuntimeErr, type UsageItem } from './meta'
+import { accountAlerts, allSections, planFacts, planText, POOL_LABEL, quotaDisabledText, quotaPauseGroups } from './facts'
 import { cacheShare, loadAccountModelStats, MODEL_PERIODS, promptTokens, tps, type ModelRow, type StatsPeriod } from './channelStats'
 import { errorTitle } from '@/utils/errors'
 
@@ -114,11 +114,11 @@ const quotaSections = computed(() =>
     .filter((x) => x.items.length),
 )
 function resetLine(it: UsageItem): string {
-  return [usageValue(it), it.note, it.resetsAt ? `${relative(it.resetsAt, now.value)}可用` : ''].filter(Boolean).join(' · ') || '—'
+  return [usageValue(it), noteLabel(it.note), it.resetsAt ? `${relative(it.resetsAt, now.value)}可用` : ''].filter(Boolean).join(' · ') || '—'
 }
 const plan = computed(() => (acc.value ? planText(acc.value, data.value?.plan, data.value?.usageSections, data.value?.planType) : ''))
 /** The disabled-reason banner is rendered separately; keep cooldown / restriction / platform alerts. */
-const alerts = computed(() => (acc.value ? accountAlerts(acc.value, acc.value.card || null, { detail: data.value }).filter((al) => !al.text.startsWith('认证失效') && !al.text.startsWith('额度暂停，') && !al.text.startsWith('额度用尽')) : []))
+const alerts = computed(() => (acc.value ? accountAlerts(acc.value, acc.value.card || null, { detail: data.value, now: now.value }).filter((al) => al.kind !== 'quota' && !al.text.startsWith('认证失效')) : []))
 const errs = computed(() => data.value?.runtimeErrors || [])
 /** TG「⚠ 冷却中的模型」: real faults only; quota pauses are listed per pool, hidden ones (disabled models) skipped. */
 const cooling = computed(() => errs.value.filter((e) => e.modelId && e.kind === 'fault'))
@@ -273,11 +273,12 @@ async function refreshToken(): Promise<void> {
   try {
     const r = (await api.post<Mutation>(accountPath(props.id, '/actions/refresh-token'))).data
     toast(r.status === 'model_key_resolved' ? '已重新解析模型 Key' : '令牌已刷新', 'success')
-    notifyChanged(props.id)
   } catch (err) {
     errorToast(err)
   } finally {
     busy.value = ''
+    // A failed refresh can still change the account (e.g. mark it as needing a new login).
+    notifyChanged(props.id)
   }
 }
 
@@ -307,10 +308,8 @@ async function refreshUsage(): Promise<void> {
   }
   usageNote.value = ''
   busy.value = ''
-  if (ok) {
-    panelTick.value++
-    notifyChanged(props.id)
-  }
+  if (ok) panelTick.value++
+  notifyChanged(props.id)
 }
 
 async function simple(path: string, key: string, success: string): Promise<void> {
@@ -468,7 +467,8 @@ function cooldownText(e: RuntimeErr): string {
       <div v-if="(acc.disabledReason && acc.disabledReason !== 'user') || alerts.length || needsLogin" class="banners">
         <p v-if="acc.disabledReason && acc.disabledReason !== 'user' && acc.disabledReason !== '供应商限制'" class="banner" :class="acc.disabledReason === 'auth_error' ? 'red' : 'orange'">
           <TriangleAlert />
-          <span>{{ reasonLabel(acc.disabledReason) }}<template v-if="acc.disabledUntil">，预计 {{ dateTime(acc.disabledUntil) }} 恢复</template></span>
+          <span v-if="acc.disabledReason === 'quota'">{{ quotaDisabledText(acc, sections, now, 'detail') }}</span>
+          <span v-else>{{ reasonLabel(acc.disabledReason) }}<template v-if="acc.disabledUntil">，预计 {{ dateTime(acc.disabledUntil) }} 恢复</template></span>
           <Btn v-if="needsLogin" size="sm" variant="primary" @click="startRelogin()"><LogIn /> 重新登录</Btn>
           <Btn v-else-if="acc.disabledReason === 'quota' && provider === 'claude'" size="sm" :loading="busy === 'reset'" @click="quotaReset()"><RotateCcw /> 清除本地额度暂停</Btn>
         </p>
@@ -522,7 +522,7 @@ function cooldownText(e: RuntimeErr): string {
         </template>
         <p v-if="usageNote" class="progress"><span class="spin" /> {{ usageNote }}</p>
         <p v-if="!quotaSections.length && provider !== 'claude'" class="faint small">暂无额度数据，点「刷新额度」从官方拉取。</p>
-        <UsageView v-if="quotaSections.length" :sections="quotaSections" :now="now" />
+        <UsageView v-if="quotaSections.length" :sections="quotaSections" :now="now" :quota-paused="acc.disabledReason === 'quota' || acc.quotaLimited" :disabled-until="acc.disabledUntil" />
         <SubBlock v-if="provider === 'claude'" title="官方额度重置" note="消耗 Anthropic 发放的重置次数">
           <template #actions>
             <Btn variant="ghost" size="sm" @click="claudeResetOpen = true"><Sparkles /> 额度重置…</Btn>

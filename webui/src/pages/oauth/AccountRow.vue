@@ -7,8 +7,8 @@ import OutcomeStrip from '@/components/ui/OutcomeStrip.vue'
 import type { OutcomeItem } from '@/utils/outcomes'
 import Switch from '@/components/ui/Switch.vue'
 import { cacheShare, localUsageLine, promptTokens, tps } from './channelStats'
-import { accountAlerts, planText } from './facts'
-import { accountState, countdown, num, providerMeta, quotaLabel, remainingAmount, usageValue, type AccountSummary } from './meta'
+import { accountAlerts, hitWindowKeys, planFacts, planText } from './facts'
+import { accountState, countdown, noteLabel, num, providerMeta, quotaLabel, remainingAmount, usageValue, type AccountSummary } from './meta'
 
 const props = defineProps<{
   account: AccountSummary
@@ -27,7 +27,13 @@ const a = computed(() => props.account)
 const card = computed(() => a.value.card || null)
 const state = computed(() => accountState(a.value))
 const plan = computed(() => planText(a.value, card.value?.plan, card.value?.usageSections))
-const alert = computed(() => accountAlerts(a.value, card.value)[0] || null)
+const alerts = computed(() => accountAlerts(a.value, card.value, { now: props.now }))
+const quotaPaused = computed(() => a.value.disabledReason === 'quota' || a.value.quotaLimited || card.value?.statusTag === 'quotaDisabled')
+const hitKeys = computed(() => hitWindowKeys(card.value?.usageSections, { quotaPaused: quotaPaused.value, disabledUntil: a.value.disabledUntil }))
+const QUOTA_FACT_LABELS = new Set(['积分', '官方重置', '重置卡'])
+const quotaFacts = computed(() =>
+  planFacts(a.value, card.value?.plan, card.value?.usageSections).filter((f) => QUOTA_FACT_LABELS.has(f.label)),
+)
 const period = computed(() => card.value?.localPeriod || null)
 const stats = computed(() => period.value?.stats || null)
 const share = computed(() => cacheShare(stats.value))
@@ -38,12 +44,25 @@ function remaining(i: Item): number | null {
   const used = num(i.usedPercent)
   return used == null ? null : 100 - used
 }
+function isExpiry(it: Item): boolean {
+  return it.label === '套餐' || it.note === 'resetsAt=最近到期'
+}
+function itemReset(it: Item): string {
+  if (!it.resetsAt) return ''
+  if (isExpiry(it)) return it.resetsAt.startsWith('9999') ? '' : `${dateTime(it.resetsAt)} 到期`
+  return countdown(it.resetsAt, props.now)
+}
+function itemNote(it: Item): string {
+  if (it.note === 'resetsAt=最近到期') return '最近到期'
+  return noteLabel(it.note)
+}
 const quotas = computed(() => {
   const items = (card.value?.usageSections || [])
-    .filter((s) => s.id !== 'credits')
-    .flatMap((s) => s.items.map((it) => ({ ...it, label: quotaLabel(s, it) })))
+    .filter((s) => s.id !== 'credits' && s.id !== 'claudeReset')
+    .map((s) => (s.id === 'qoderCredits' ? { ...s, items: s.items.filter((i) => i.label !== '套餐') } : s))
+    .flatMap((s) => s.items.map((it) => ({ ...it, label: quotaLabel(s, it), hit: hitKeys.value.has(`${s.id}:${it.label}`) })))
   const bars = items.filter((i) => remaining(i) != null).slice(0, 6)
-  const values = bars.length ? [] : items.filter((i) => usageValue(i)).slice(0, 2)
+  const values = items.filter((i) => remaining(i) == null && (usageValue(i) || i.note)).slice(0, Math.max(1, 5 - bars.length))
   return { bars, values }
 })
 function tone(left: number | null): string {
@@ -100,19 +119,33 @@ function tone(left: number | null): string {
     </div>
 
     <div class="c-quota">
-      <p v-if="alert" class="alert" :class="`t-${alert.tone}`">{{ alert.text }}</p>
-      <template v-else>
-        <div v-for="(q, i) in quotas.bars" :key="i" class="q">
-          <div class="qh">
-            <span class="ql">{{ q.label }}</span>
-            <span class="qv">剩余 <b class="num" :class="tone(remaining(q))">{{ pctValue(remaining(q) ?? 0) }}</b><template v-if="remainingAmount(q)"> · {{ remainingAmount(q) }}</template><template v-if="q.resetsAt"> · {{ countdown(q.resetsAt, now) }}</template></span>
-          </div>
-          <div class="bar"><span :class="tone(remaining(q))" :style="{ width: `${Math.max(0, Math.min(100, remaining(q) ?? 0))}%` }" /></div>
-          <p v-if="localUsageLine(q.local)" class="qf num">{{ localUsageLine(q.local) }}</p>
+      <div v-if="alerts.length" class="alerts">
+        <p v-for="(al, i) in alerts" :key="i" class="alert" :class="`t-${al.tone}`">{{ al.text }}</p>
+      </div>
+      <div v-for="(q, i) in quotas.bars" :key="i" class="q">
+        <div class="qh">
+          <span class="ql-wrap">
+            <span class="ql" :class="{ hit: q.hit }">{{ q.label }}</span>
+            <span v-if="q.hit" class="hit-tag">已撞限</span>
+          </span>
+          <span class="qv">剩余 <b class="num" :class="tone(remaining(q))">{{ pctValue(remaining(q) ?? 0) }}</b><template v-if="remainingAmount(q)"> · {{ remainingAmount(q) }}</template><template v-if="itemReset(q)"> · {{ itemReset(q) }}</template></span>
         </div>
-        <p v-for="(v, i) in quotas.values" :key="`v${i}`" class="val">{{ v.label }} <b class="num">{{ usageValue(v) }}</b></p>
-        <p v-if="!quotas.bars.length && !quotas.values.length" class="sub">尚未获取额度数据</p>
-      </template>
+        <div class="bar"><span :class="tone(remaining(q))" :style="{ width: `${Math.max(0, Math.min(100, remaining(q) ?? 0))}%` }" /></div>
+        <p v-if="localUsageLine(q.local)" class="qf num">{{ localUsageLine(q.local) }}</p>
+      </div>
+      <p v-for="(v, i) in quotas.values" :key="`v${i}`" class="val">
+        <span>{{ v.label }}</span>
+        <template v-if="usageValue(v)"> <b class="num">{{ usageValue(v) }}</b></template>
+        <span v-if="v.note" class="vn">{{ usageValue(v) ? ' · ' : ' ' }}{{ itemNote(v) }}</span>
+        <span v-if="itemReset(v)" class="vn"> · {{ itemReset(v) }}</span>
+      </p>
+      <dl v-if="quotaFacts.length" class="qfacts">
+        <div v-for="f in quotaFacts" :key="f.label" class="qfact">
+          <dt>{{ f.label }}</dt>
+          <dd :class="[f.tone ? `c-${f.tone === 'neutral' ? 'muted' : f.tone}` : '', { mono: f.mono }]">{{ f.value }}</dd>
+        </div>
+      </dl>
+      <p v-if="!quotas.bars.length && !quotas.values.length && !quotaFacts.length && !alerts.length" class="sub">尚未获取额度数据</p>
     </div>
 
     <div class="c-act" @click.stop @pointerdown.stop>
@@ -268,7 +301,12 @@ function tone(left: number | null): string {
 .c-quota {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 7px;
+}
+.alerts {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 .q {
   display: flex;
@@ -277,22 +315,48 @@ function tone(left: number | null): string {
 }
 .qh {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
   justify-content: space-between;
-  gap: 8px;
+  gap: 2px 8px;
   font-size: 11.5px;
+}
+.ql-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  flex-shrink: 0;
 }
 .ql {
   padding: 0 6px;
   border-radius: 4px;
   color: var(--text-2);
   background: var(--fill-2);
-}
-.qv {
-  color: var(--text-3);
-}
-.qv {
   white-space: nowrap;
+}
+.ql.hit {
+  color: var(--text-red);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  font-weight: 600;
+}
+.hit-tag {
+  display: inline-block;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 10.5px;
+  font-weight: 650;
+  line-height: 16px;
+  color: var(--text-red);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.qv {
+  margin-left: auto;
+  color: var(--text-3);
+  text-align: right;
+  min-width: 0;
 }
 .qv b {
   font-size: 12.5px;
@@ -324,13 +388,39 @@ function tone(left: number | null): string {
 .bar .o { background: var(--orange); }
 .bar .r { background: var(--red); }
 .val {
-  font-size: 12px;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+.vn {
+  color: var(--text-3);
+}
+.qfacts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 12px;
+  margin: 0;
+  font-size: 11.5px;
+}
+.qfact {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+}
+.qfact dt {
+  color: var(--text-3);
+}
+.qfact dd {
+  margin: 0;
+  font-weight: 550;
+}
+.c-muted {
   color: var(--text-2);
 }
 .alert {
-  padding: 6px 10px;
-  border-radius: 8px;
-  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  line-height: 1.4;
 }
 .t-red {
   color: var(--text-red);

@@ -283,7 +283,13 @@ def fetch_usage_sync(account, account_key):
     from ... import oauth_manager
     observed = time.time() * 1000
     query = "?type=2" if account.get("plan_scope") == "team" else ""
-    token = auth.resolve_model_key(account, account_key=account_key)
+    try:
+        token = auth.resolve_model_key(account, account_key=account_key)
+    except c.ZhipuError as exc:
+        if exc.auth_error and account.get("credential_mode") == "oauth":
+            oauth_manager.mutate_account_if_unchanged(account_key, account,
+                lambda value: value.update(management_status="relogin_required"))
+        raise
     headers = {"authorization": token}
     if query:
         headers.update(c.scope_headers(account))

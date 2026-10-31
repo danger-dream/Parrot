@@ -259,7 +259,9 @@ def describe_oauth_error(
                 reason += " 目标：" + facts["target_host"] + "。"
             if facts["proxy_route"] and facts["proxy_route"] != "unobserved":
                 reason += " 实际出口：" + facts["proxy_route"] + ("（已回退）" if facts["fallback_used"] else "") + "。"
-            if exc.auth_error:
+            if exc.auth_error and exc.kind == "business":
+                title, reason, action = ("智谱管理登录已过期", "管理接口返回登录状态已过期。", "请重新登录此账号。")
+            elif exc.auth_error:
                 title, reason, action = ("智谱鉴权未通过", "上游拒绝了本次请求所用的凭据。", "核对模型 Key 或管理登录凭据；配置缺失与登录过期是不同问题。")
             stage_label = {"project_lookup": "组织/项目查询", "projects": "组织/项目查询", "subscription": "订阅查询", "key_list": "已有 Key 查询",
                            "key_copy": "模型 Key 读取", "key_create": "模型 Key 创建", "key_save": "模型 Key 保存",

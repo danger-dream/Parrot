@@ -153,7 +153,8 @@
         "openaiServerError": true,
         "claudeOverloaded": true,
         "xaiUnavailable": true,
-        "antigravityRateLimit": true
+        "antigravityRateLimit": true,
+        "antigravityToolCallFailure": true
       }
     },
     "recovery": {

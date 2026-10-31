@@ -7,7 +7,7 @@ import ProviderIcon from '@/components/ProviderIcon.vue'
 import UsageView from './UsageView.vue'
 import { cacheShare, promptTokens, tps } from './channelStats'
 import { accountAlerts, planFacts, planText } from './facts'
-import { accountState, countdown, num, providerMeta, usageValue, type AccountSummary } from './meta'
+import { accountState, num, providerMeta, usageValue, type AccountSummary } from './meta'
 
 /** Everything shown comes from `account.card` (server-built, TG _format_account_block). */
 const props = defineProps<{
@@ -29,18 +29,14 @@ const facts = computed(() => planFacts(a.value, card.value?.plan, card.value?.us
 /** OpenAI credits / reset cards appear as facts; the Qoder 套餐 row is the subtitle. */
 const sections = computed(() =>
   (card.value?.usageSections || [])
-    .filter((s) => s.id !== 'credits')
+    .filter((s) => s.id !== 'credits' && s.id !== 'claudeReset')
     .map((s) => (s.id === 'qoderCredits' ? { ...s, items: s.items.filter((i) => i.label !== '套餐') } : s))
     .filter((s) => s.items.length),
 )
 const hasUsage = computed(() => sections.value.some((s) => s.items.some((it) => num(it.usedPercent) !== null || usageValue(it) || it.note)))
+const quotaPaused = computed(() => a.value.disabledReason === 'quota' || a.value.quotaLimited || card.value?.statusTag === 'quotaDisabled')
 
-const alerts = computed(() => {
-  const list = accountAlerts(a.value, card.value)
-  const until = a.value.disabledUntil
-  // Add the countdown TG shows next to 「配额禁用 · 预计 …」.
-  return list.map((al) => (al.text.startsWith('额度暂停，预计') && until ? { ...al, text: `${al.text}（${countdown(until, props.now).replace('后重置', '后')}）` } : al))
-})
+const alerts = computed(() => accountAlerts(a.value, card.value, { now: props.now }))
 
 const period = computed(() => card.value?.localPeriod || null)
 const stats = computed(() => period.value?.stats || null)
@@ -78,8 +74,8 @@ const projection = computed(() => card.value?.weeklyProjection || null)
     </dl>
 
     <div class="usage">
-      <UsageView v-if="hasUsage" :sections="sections" compact :limit="5" :now="now" />
-      <p v-else class="none">尚未获取额度数据</p>
+      <UsageView v-if="hasUsage" :sections="sections" compact :limit="5" :now="now" :quota-paused="quotaPaused" :disabled-until="account.disabledUntil" />
+      <p v-else-if="!alerts.length" class="none">尚未获取额度数据</p>
     </div>
 
     <div v-if="period" class="local">

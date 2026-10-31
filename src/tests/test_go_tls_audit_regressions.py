@@ -395,6 +395,45 @@ async def test_close_terminal_prevents_false_poll_event_route_replay(monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("silent_first", [True, False], ids=["silent-proxy-first", "single-silent-route"])
+async def test_sync_unreachable_route_leaves_deadline_for_next_route(tls_files, monkeypatch, silent_first):
+    # #42: a proxy that never answers must not consume the whole control-plane
+    # deadline before the next route is tried.
+    from src import config
+    monkeypatch.setattr(config, "get", lambda: {"timeouts": {"connect": 0.3}})
+    accepted = []
+
+    async def silent(reader, writer):
+        accepted.append(writer)
+        await reader.read()
+
+    silent_server = await asyncio.start_server(silent, "127.0.0.1", 0)
+    silent_route = SimpleNamespace(type="socks5", url=f"socks5://127.0.0.1:{silent_server.sockets[0].getsockname()[1]}")
+    routes = [("silent", silent_route), ("direct", SimpleNamespace(type="direct"))] if silent_first else [("silent", silent_route)]
+    monkeypatch.setattr(go_tls.network, "_configured_proxy_chain_or_none", lambda **kw: routes)
+    original = go_tls.create_client
+    monkeypatch.setattr(go_tls, "create_client", lambda **kw: original(ca_pem=tls_files[1], **kw))
+    try:
+        async with local_server(tls_files) as server:
+            started = time.monotonic()
+            if silent_first:
+                response = await asyncio.to_thread(go_tls.request_sync, "GET", server["url"], timeout=3)
+                assert response.content == b"ok" and len(server["headers"]) == 1
+                assert time.monotonic() - started < 2
+            else:
+                # The only route keeps the full deadline rather than the connect budget.
+                with pytest.raises(httpx.TimeoutException):
+                    await asyncio.to_thread(go_tls.request_sync, "GET", server["url"], timeout=1)
+                assert time.monotonic() - started >= .9 and not server["headers"]
+            assert accepted
+    finally:
+        for writer in accepted:
+            writer.close()
+        silent_server.close()
+        await silent_server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_sync_total_after_send_is_not_connect_failover(tls_files, monkeypatch):
     monkeypatch.setattr(go_tls.network, "_configured_proxy_chain_or_none", lambda **kw: [
         ("first", SimpleNamespace(type="direct")), ("second", SimpleNamespace(type="direct")),

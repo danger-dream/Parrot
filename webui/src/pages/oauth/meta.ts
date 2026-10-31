@@ -215,6 +215,7 @@ export const CLAUDE_PROGRAM_LABEL: Record<ClaudeProgram, string> = {
 export const CLAUDE_REASON: Record<string, string> = {
   status_unknown: '官方未返回这项功能的状态',
   ineligible: '官方判定当前没有资格',
+  surface: '当前入口不支持',
   control: '账号不在这项功能的试验组里',
   already_used: '本周次数已用完',
   cooldown: '还在冷却期内',

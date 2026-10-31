@@ -6,9 +6,11 @@
 import { dateTime } from '@/utils/format'
 import {
   amount,
+  countdown,
   num,
   pick,
   planLabel,
+  quotaLabel,
   type AccountCardData,
   type AccountDetail,
   type AccountSummary,
@@ -30,7 +32,7 @@ export interface Fact {
 export interface Alert {
   text: string
   tone: 'red' | 'orange' | 'blue'
-  kind?: 'restriction' | 'relogin'
+  kind?: 'restriction' | 'relogin' | 'quota'
 }
 
 function rec(v: unknown): Rec {
@@ -79,8 +81,8 @@ export function planFacts(
     case 'openai': {
       if (p.workspaceLabel || (d && d.workspaceName)) out.push({ label: '工作区', value: p.workspaceLabel || d?.workspaceName || '' })
       const count = p.resetCreditCount ?? num(sectionItem(sections, 'credits', '官方重置卡')?.remaining)
-      if (count !== null && count !== undefined) out.push({ label: '官方重置', value: `${count} 次`, tone: count > 0 ? 'green' : 'neutral' })
-      const credits = sectionItem(sections, 'credits', 'Credits')
+      if (count !== null && count !== undefined && (d || count > 0)) out.push({ label: '官方重置', value: `${count} 次`, tone: count > 0 ? 'green' : 'neutral' })
+      const credits = sectionItem(sections, 'credits', '积分') || sectionItem(sections, 'credits', 'Credits')
       if (credits) {
         const r = num(credits.remaining)
         let value = r !== null ? amount(r) : credits.note || '—'
@@ -152,14 +154,115 @@ function zhipuCards(z: Rec): { five: number; week: number } | null {
   return { five: Array.isArray(five) ? five.length : 0, week: Array.isArray(week) ? week.length : 0 }
 }
 
+function itemRemainingPct(it: UsageItem): number | null {
+  if (it.remainingPercent != null) return num(it.remainingPercent)
+  const used = num(it.usedPercent)
+  return used == null ? null : 100 - used
+}
+
+function isQuotaWindowItem(s: UsageSection, it: UsageItem): boolean {
+  if (s.id === 'claudeReset' || s.id === 'credits') return false
+  if (it.label === '套餐' || it.note === 'resetsAt=最近到期') return false
+  return itemRemainingPct(it) !== null
+}
+
+/**
+ * Keys (`${section.id}:${item.label}`) of quota windows that have hit their limit
+ * or triggered the account's current quota pause.
+ */
+export function hitWindowKeys(
+  sections: UsageSection[] | null | undefined,
+  opts: { quotaPaused?: boolean; disabledUntil?: string | null } = {},
+): Set<string> {
+  const hits = new Set<string>()
+  const candidates: { key: string; rem: number; resetMs: number | null }[] = []
+  for (const s of sections || []) {
+    for (const it of s.items) {
+      if (!isQuotaWindowItem(s, it)) continue
+      const rem = itemRemainingPct(it)!
+      const key = `${s.id}:${it.label}`
+      const d = it.resetsAt ? new Date(it.resetsAt).getTime() : NaN
+      const resetMs = Number.isFinite(d) ? d : null
+      candidates.push({ key, rem, resetMs })
+      if (rem <= 0) hits.add(key)
+    }
+  }
+  if (!opts.quotaPaused || !candidates.length) return hits
+
+  const untilMs = opts.disabledUntil ? new Date(opts.disabledUntil).getTime() : NaN
+  if (Number.isFinite(untilMs)) {
+    const matched = candidates.filter((c) => c.resetMs !== null && Math.abs(c.resetMs - untilMs) <= 300_000)
+    if (matched.length) {
+      const low = matched.filter((c) => c.rem <= 15)
+      if (low.length) {
+        for (const c of low) hits.add(c.key)
+      } else {
+        const minRem = Math.min(...matched.map((c) => c.rem))
+        if (minRem < 50) {
+          for (const c of matched) if (c.rem === minRem) hits.add(c.key)
+        }
+      }
+    }
+  }
+  if (!hits.size) {
+    for (const c of candidates) {
+      if (c.rem <= 5) hits.add(c.key)
+    }
+  }
+  return hits
+}
+
+export function hitWindowLabels(
+  sections: UsageSection[] | null | undefined,
+  opts: { quotaPaused?: boolean; disabledUntil?: string | null } = {},
+): string[] {
+  const keys = hitWindowKeys(sections, opts)
+  if (!keys.size) return []
+  const labels: string[] = []
+  for (const s of sections || []) {
+    for (const it of s.items) {
+      if (!keys.has(`${s.id}:${it.label}`)) continue
+      const lbl = quotaLabel(s, it)
+      if (!labels.includes(lbl)) labels.push(lbl)
+    }
+  }
+  return labels
+}
+
+export function quotaDisabledText(
+  a: Pick<AccountSummary, 'disabledUntil'>,
+  sections: UsageSection[] | null | undefined,
+  now = Date.now(),
+  style: 'short' | 'detail' = 'short',
+): string {
+  const hits = hitWindowLabels(sections, { quotaPaused: true, disabledUntil: a.disabledUntil })
+  const winPrefix = hits.length ? `${hits.join(' / ')}` : ''
+  const until = a.disabledUntil
+  const rawCd = until ? countdown(until, now).replace('后重置', '后') : ''
+  const cd = rawCd && rawCd !== '已到重置时间' ? `（${rawCd}）` : ''
+  if (style === 'detail') {
+    const head = winPrefix ? `${winPrefix}额度用尽，自动暂停` : '额度用尽，自动暂停'
+    return until ? `${head}，预计 ${dateTime(until)} 恢复${cd}` : head
+  }
+  if (until) {
+    const head = winPrefix ? `${winPrefix}额度暂停` : '额度暂停'
+    return `${head} · 预计 ${dateTime(until)} 恢复${cd}`
+  }
+  return winPrefix ? `${winPrefix}额度用尽，自动暂停` : '额度用尽，自动暂停'
+}
+
 /** TG status tag + 冷却行 + platform warnings. */
-export function accountAlerts(a: AccountSummary, card: AccountCardData | null, opts: { detail?: AccountDetail | null } = {}): Alert[] {
+export function accountAlerts(
+  a: AccountSummary,
+  card: AccountCardData | null,
+  opts: { detail?: AccountDetail | null; now?: number } = {},
+): Alert[] {
   const out: Alert[] = []
   const tag = card?.statusTag
+  const sections = card?.usageSections || opts.detail?.usageSections
   if (tag === 'authFailed') out.push({ text: '认证失效，需要重新登录', tone: 'red', kind: 'relogin' })
   else if (tag === 'quotaDisabled') {
-    const until = a.disabledUntil
-    out.push({ text: until ? `额度暂停，预计 ${dateTime(until)} 恢复` : '额度用尽，自动暂停', tone: 'orange' })
+    out.push({ text: quotaDisabledText(a, sections, opts.now), tone: 'orange', kind: 'quota' })
   } else if (tag === 'providerRestricted' || card?.cooldown.accountPaused) {
     out.push({ text: '供应商限制账户：全部模型暂停，请在官方客户端申诉', tone: 'red', kind: 'restriction' })
   }

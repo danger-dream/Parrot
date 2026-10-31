@@ -86,6 +86,7 @@ from .protocols.runtime import (
     transient_retry_limit,
     request_invalid_result_if_needed,
     workbuddy_request_rejection,
+    antigravity_request_failure,
     retry_body_without_encrypted_content,
     retry_body_without_context_1m,
     sse_error_for_ingress,
@@ -2577,6 +2578,21 @@ async def run_failover(
                     print(
                         f"[failover] invalid encrypted_content for {ch.key}/{resolved_model}; "
                         f"retrying same channel without {removed_ec} encrypted_content item(s)"
+                    )
+                    continue
+            transient_kind = retryable_transient_error_kind(ch, result)
+            if (
+                transient_retries_used < transient_retry_limit
+                and _transient_retry_allowed(transient_kind, cfg)
+            ):
+                delay = await _wait_for_overload_retry(transient_retries_used, deadline_ts)
+                if delay is not None:
+                    transient_retries_used += 1
+                    retry_count += 1
+                    print(
+                        f"[failover] {transient_kind} on {ch.key}/{resolved_model}; "
+                        f"retrying same channel ({transient_retries_used}/"
+                        f"{transient_retry_limit}) after {delay:.2f}s"
                     )
                     continue
             status = int(result.http_status or 400)
@@ -5680,8 +5696,13 @@ async def _consume_stream(
         # Includes cancellation after observing a vendor rejection. An HTTP 200
         # SSE transport must not turn this request fault into a health failure.
         rejection = _workbuddy_stream_rejection()
+        generation_failure = antigravity_request_failure(
+            ch, http_status=upstream_status, translator_ctx=translator_ctx,
+        )
         if rejection is not None:
             outcome, message = "request_invalid", rejection[1]
+        elif generation_failure is not None:
+            outcome, message = "request_invalid", generation_failure[1]
         mapped = _qoder_stream_mapping()
         terminal_status = upstream_status
         if mapped is not None:

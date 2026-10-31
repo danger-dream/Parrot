@@ -3,6 +3,7 @@ import { computed } from 'vue'
 import { dateTime, pctValue } from '@/utils/format'
 import Meter from '@/components/ui/Meter.vue'
 import { localUsageLine } from './channelStats'
+import { hitWindowKeys } from './facts'
 import { countdown, noteLabel, num, quotaLabel, remainingAmount, sectionTitle, usageValue, WINDOW_LABEL, windowName, type UsageItem, type UsageSection, type UsageWindow } from './meta'
 
 const props = withDefaults(
@@ -14,6 +15,8 @@ const props = withDefaults(
     now: number
     /** Max rows in compact mode. */
     limit?: number
+    quotaPaused?: boolean
+    disabledUntil?: string | null
   }>(),
   { limit: 4 },
 )
@@ -26,11 +29,19 @@ const list = computed<UsageSection[]>(() => {
   return items.length ? [{ id: 'windows', title: '用量窗口', items }] : []
 })
 
+const hitKeys = computed(() =>
+  hitWindowKeys(list.value, { quotaPaused: props.quotaPaused, disabledUntil: props.disabledUntil }),
+)
+function isHit(s: UsageSection, it: UsageItem): boolean {
+  return hitKeys.value.has(`${s.id}:${it.label}`)
+}
+
 interface Row {
   key: string
   label: string
   item: UsageItem
   pct: number | null
+  hit: boolean
 }
 /** Compact: percent rows first (they are what the card is for), then a value row or two. */
 const compactRows = computed<Row[]>(() => {
@@ -40,7 +51,7 @@ const compactRows = computed<Row[]>(() => {
     for (const [i, it] of s.items.entries()) {
       const pct = num(it.usedPercent)
       const label = quotaLabel(s, it)
-      const row = { key: `${s.id}-${i}`, label, item: it, pct }
+      const row = { key: `${s.id}-${i}`, label, item: it, pct, hit: isHit(s, it) }
       if (pct !== null) pctRows.push(row)
       else if (usageValue(it) || it.note) valueRows.push(row)
     }
@@ -81,7 +92,10 @@ function localLine(it: UsageItem): string {
       <template v-for="r in compactRows" :key="r.key">
         <div v-if="r.pct !== null" class="win">
           <div class="wh">
-            <span class="k truncate" :title="r.label">{{ r.label }}</span>
+            <span class="k-wrap">
+              <span class="k truncate" :class="{ hit: r.hit }" :title="r.label">{{ r.label }}</span>
+              <span v-if="r.hit" class="hit-tag">已撞限</span>
+            </span>
             <span class="v">剩余 <b class="mono" :class="tone(100 - r.pct)">{{ pctValue(100 - r.pct) }}</b><template v-if="remainingAmount(r.item)"> · {{ remainingAmount(r.item) }}</template><template v-if="reset(r.item)"> · {{ reset(r.item) }}</template></span>
           </div>
           <Meter :value="100 - r.pct" remaining />
@@ -101,7 +115,10 @@ function localLine(it: UsageItem): string {
         <template v-for="(it, i) in s.items" :key="i">
           <div v-if="num(it.usedPercent) !== null" class="win">
             <div class="wh">
-              <span class="k" :title="it.label">{{ windowName(it.label) }}</span>
+              <span class="k-wrap">
+                <span class="k" :class="{ hit: isHit(s, it) }" :title="it.label">{{ windowName(it.label) }}</span>
+                <span v-if="isHit(s, it)" class="hit-tag">已撞限</span>
+              </span>
               <span class="v" :title="it.resetsAt ? dateTime(it.resetsAt) : ''">剩余 <b class="mono" :class="tone(100 - (it.usedPercent ?? 0))">{{ pctValue(100 - (it.usedPercent ?? 0)) }}</b><template v-if="remainingAmount(it)"> · {{ remainingAmount(it) }}</template><template v-if="reset(it)"> · {{ reset(it) }}</template></span>
             </div>
             <Meter :value="100 - (it.usedPercent ?? 0)" remaining />
@@ -139,19 +156,46 @@ function localLine(it: UsageItem): string {
 }
 .wh {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
   justify-content: space-between;
-  gap: 10px;
+  gap: 2px 10px;
   font-size: 12px;
+}
+.k-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: 100%;
+  flex-shrink: 0;
 }
 .k {
   color: var(--text-2);
   min-width: 0;
 }
+.k.hit {
+  color: var(--text-red);
+  font-weight: 600;
+}
+.hit-tag {
+  display: inline-block;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 10.5px;
+  font-weight: 650;
+  line-height: 16px;
+  color: var(--text-red);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
 .v {
+  margin-left: auto;
   font-size: 11.5px;
   color: var(--text-3);
-  white-space: nowrap;
+  text-align: right;
+  min-width: 0;
 }
 .v b {
   font-size: 12.5px;

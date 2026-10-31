@@ -24,6 +24,7 @@ import httpx
 
 from .. import blacklist, errors
 from ..providers import registry as provider_registry
+from ..providers.antigravity_codec import RETRYABLE_REQUEST_FAILURE_CODES
 from ..providers.antigravity_errors import parse_antigravity_429
 from ..providers.workbuddy_errors import request_rejection_info
 from .commit_gate import (
@@ -824,6 +825,12 @@ def retryable_transient_error_kind(channel: Any, result: AttemptResult) -> str |
     """
     if getattr(result, "success", False) or getattr(result, "stream_started", False):
         return None
+    # Already a request fault (no health effect, no alternate account); only
+    # the bounded same-candidate replay remains.
+    if (getattr(result, "outcome", None) == "request_invalid"
+            and str(getattr(channel, "provider", "")) == "antigravity"
+            and getattr(result, "error_code", None) in RETRYABLE_REQUEST_FAILURE_CODES):
+        return "antigravityToolCallFailure"
     if getattr(result, "outcome", None) not in _RETRYABLE_TRANSIENT_OUTCOMES:
         return None
     if str(getattr(channel, "provider", "")) == "workbuddy":
@@ -1222,6 +1229,19 @@ def workbuddy_request_rejection(
     return None
 
 
+def antigravity_request_failure(
+    channel,
+    *,
+    http_status: int | None,
+    translator_ctx: dict | None = None,
+) -> tuple[str, str] | None:
+    """Trust only this attempt's Antigravity decoder, never response text."""
+    if getattr(channel, "provider", None) != "antigravity" or http_status not in (None, 200):
+        return None
+    decoder = (translator_ctx or {}).get("antigravity_stream")
+    return getattr(decoder, "request_failure", None)
+
+
 def workbuddy_account_restricted(result, channel) -> bool:
     if getattr(channel, "provider", None) != "workbuddy" or result.success:
         return False
@@ -1254,6 +1274,12 @@ def request_invalid_result_if_needed(result: AttemptResult, *, channel=None) -> 
         )
         if rejection is not None:
             result.error_code, result.error_detail = rejection
+            return _mark_request_invalid(result, 400)
+        failure = antigravity_request_failure(
+            channel, http_status=result.http_status, translator_ctx=result.translator_ctx,
+        )
+        if failure is not None:
+            result.error_code, result.error_detail = failure
             return _mark_request_invalid(result, 400)
     # Candidate-local guards retain their established alternate-candidate path.
     if result.outcome in {"candidate_guard", "guard_error"}:

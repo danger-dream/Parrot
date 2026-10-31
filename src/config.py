@@ -230,6 +230,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "claudeOverloaded": True,
                 "xaiUnavailable": True,
                 "antigravityRateLimit": True,
+                "antigravityToolCallFailure": True,
             },
         },
         "recovery": {

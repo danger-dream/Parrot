@@ -7,7 +7,7 @@ import json
 import os
 import platform
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 from ...proxy.connector import ProxyConnectError, UpstreamConnectError
@@ -27,7 +27,8 @@ READ_TIMEOUT = httpx.Timeout(connect=20, read=60, write=20, pool=20)
 
 class ZhipuError(RuntimeError):
     def __init__(self, stage, kind="upstream", *, status=0, code=None, fail_open=False, timeout_phase="",
-                 request_not_sent=False, network_phase="", target_host="", proxy_route="", fallback_used=False):
+                 request_not_sent=False, network_phase="", target_host="", proxy_route="", fallback_used=False,
+                 unauthorized=False):
         self.stage, self.kind, self.status_code = stage, kind, status
         self.response_status = status
         self.timeout_phase = timeout_phase
@@ -36,7 +37,8 @@ class ZhipuError(RuntimeError):
         self.code = (code if type(code) is int else
                      int(code) if isinstance(code, str) and code.isascii() and code.isdecimal() and len(code) <= 12 else None)
         self.fail_open_eligible = fail_open
-        self.auth_error = status in (401, 403)
+        self.unauthorized = status == 401 or unauthorized
+        self.auth_error = status in (401, 403) or unauthorized
         self.retryable = kind in {"network", "timeout"} or status in (408, 429) or status >= 500
         super().__init__(f"Zhipu {stage}: {kind} (HTTP {status}, code {self.code})")
         inherit(self)
@@ -207,13 +209,16 @@ def _check_status(response):
         raise error
 
 
-def _decode_response(raw, status, envelope):
+def _decode_response(raw, status, envelope, url=""):
     value = json.loads(raw)
     if not envelope:
         return value
     if not isinstance(value, dict) or value.get("success") is False or str(value.get("code", 0)) not in {"0", "200"}:
-        raise ZhipuError("response", "business", status=status,
-                         code=value.get("code") if isinstance(value, dict) else None)
+        code = value.get("code") if isinstance(value, dict) else None
+        # Management endpoints report an expired login as HTTP 200 with body
+        # code 401 (ZCode logs out on exactly this); 403 stays a permission error.
+        raise ZhipuError("response", "business", status=status, code=code,
+                         unauthorized=str(code) == "401" and urlsplit(url).path.startswith("/api/biz/"))
     return value.get("data")
 
 
@@ -230,7 +235,7 @@ async def _read_once(url, *, headers, account_key, timeout, envelope, trace=None
                     raw.extend(chunk)
                     if len(raw) > MAX_BYTES:
                         raise ZhipuError("response", "too_large")
-        return _decode_response(raw, response.status_code, envelope)
+        return _decode_response(raw, response.status_code, envelope, url)
     except ZhipuError as exc:
         for name, value in trace.facts().items():
             setattr(exc, name, value)
@@ -257,7 +262,7 @@ def _request_once(url, *, headers, method, body, account_key, timeout, envelope)
                     raw.extend(chunk)
                     if len(raw) > MAX_BYTES:
                         raise ZhipuError("response", "too_large")
-        return _decode_response(raw, response.status_code, envelope)
+        return _decode_response(raw, response.status_code, envelope, url)
     except ZhipuError as exc:
         for name, value in trace.facts().items():
             setattr(exc, name, value)

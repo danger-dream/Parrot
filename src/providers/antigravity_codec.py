@@ -29,6 +29,18 @@ from . import antigravity_schema
 
 _DATA_URL_RE = re.compile(r"^data:([^;,]+);base64,(.+)$", re.DOTALL)
 SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator"
+# Google served these over HTTP 200: they describe this prompt's generation,
+# not the account, and another account replays the same prompt.
+REQUEST_FAILURE_CODES = frozenset({
+    "gemini_malformed_function_call", "gemini_unexpected_tool_call",
+    "gemini_missing_thought_signature",
+})
+# Sampled tool-call output, also retried by Gemini CLI. A missing signature
+# is fixed by the request and never by a replay.
+RETRYABLE_REQUEST_FAILURE_CODES = frozenset({
+    "gemini_malformed_function_call", "gemini_unexpected_tool_call",
+})
+_FINISH_MESSAGE_LIMIT = 1000
 
 
 def _gen_id(prefix: str) -> str:
@@ -768,7 +780,7 @@ def _finish_to_status(reason: str | None) -> tuple[str, dict | None]:
     return "failed", None
 
 
-def _terminal_details(reason: str | None, feedback: Any, error: Any = None):
+def _terminal_details(reason: str | None, feedback: Any, error: Any = None, finish_message: str | None = None):
     status, incomplete = _finish_to_status(reason)
     response_error = None
     if isinstance(feedback, dict):
@@ -783,11 +795,24 @@ def _terminal_details(reason: str | None, feedback: Any, error: Any = None):
             "code": str(err.get("status") or err.get("code") or "api_error"),
         }
     elif status == "failed":
+        message = f"Gemini generation ended with {reason}" if reason else "Gemini response ended without finishReason"
+        if reason and finish_message:
+            message += ": " + str(finish_message)[:_FINISH_MESSAGE_LIMIT]
         response_error = {
             "code": "gemini_" + str(reason).lower() if reason else "upstream_stream_incomplete",
-            "message": f"Gemini generation ended with {reason}" if reason else "Gemini response ended without finishReason",
+            "message": message,
         }
     return status, incomplete, response_error
+
+
+def request_failure_info(response: Any) -> tuple[str, str] | None:
+    """(code, message) of a request-scoped Gemini generation failure, if any."""
+    if not isinstance(response, dict) or response.get("status") != "failed":
+        return None
+    error = response.get("error")
+    if not isinstance(error, dict) or error.get("code") not in REQUEST_FAILURE_CODES:
+        return None
+    return str(error["code"]), str(error.get("message") or error["code"])
 
 
 def _complete_call(item: dict) -> bool:
@@ -912,7 +937,8 @@ def gemini_to_responses(payload: dict, *, model: str, namespace_tool_map: Any = 
     invalid_calls = [it for it in items if it["type"] == "function_call" and not _complete_call(it)]
     if invalid_calls and reason == "STOP" and error is None:
         error = {"code": "gemini_malformed_function_call", "message": "Invalid Gemini function call arguments"}
-    status, incomplete, response_error = _terminal_details(reason, feedback, error)
+    finish_message = candidate.get("finishMessage")
+    status, incomplete, response_error = _terminal_details(reason, feedback, error, finish_message)
     for item in items:
         if item["type"] == "function_call":
             if item in invalid_calls or reason in {"MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL"}:
@@ -931,7 +957,7 @@ def gemini_to_responses(payload: dict, *, model: str, namespace_tool_map: Any = 
         "status": status,
         "error": response_error,
         "incomplete_details": incomplete,
-        "provider_metadata": _provider_metadata(reason, feedback, error, candidate.get("finishMessage")),
+        "provider_metadata": _provider_metadata(reason, feedback, error, finish_message),
         "model": model,
         "output": items,
         "output_text": output_text,
@@ -980,6 +1006,8 @@ class GeminiStreamToResponses:
         self.finish_message: str | None = None
         self.prompt_feedback: dict | None = None
         self.upstream_error: Any = None
+        # Per-attempt observation read by the failover runtime.
+        self.request_failure: tuple[str, str] | None = None
         self.item_status = "completed"
         self.usage_meta: dict[str, Any] = {}
         self.usage: dict[str, Any] | None = None
@@ -1043,6 +1071,7 @@ class GeminiStreamToResponses:
             self.finished = True
             self.buffer = ""
             response = gemini_to_responses(payload, model=self.model, namespace_tool_map=self.namespace_tool_map)
+            self.request_failure = request_failure_info(response)
             self._save_local_response(response)
             return _json_dumps(response).encode("utf-8")
         out = bytearray()
@@ -1469,7 +1498,7 @@ class GeminiStreamToResponses:
                 "code": "gemini_malformed_function_call", "message": "Invalid Gemini function call arguments",
             }
         status, incomplete, response_error = _terminal_details(
-            self.finish_reason, self.prompt_feedback, self.upstream_error,
+            self.finish_reason, self.prompt_feedback, self.upstream_error, self.finish_message,
         )
         self.item_status = "completed" if status == "completed" else "incomplete"
         yield from self._ensure_created()
@@ -1491,6 +1520,7 @@ class GeminiStreamToResponses:
         response["provider_metadata"] = _provider_metadata(
             self.finish_reason, self.prompt_feedback, self.upstream_error, self.finish_message,
         )
+        self.request_failure = request_failure_info(response)
         if status == "failed":
             event = "response.failed"
         elif status == "incomplete":

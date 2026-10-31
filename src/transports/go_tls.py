@@ -10,6 +10,7 @@ import asyncio
 import base64
 import inspect
 import ipaddress
+import math
 import threading
 import time
 from typing import Any
@@ -17,7 +18,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from .. import network
+from .. import config, network
 from ..async_owned import await_owned
 from .http import before_native_handoff
 
@@ -340,6 +341,14 @@ def create_client(*, timeout: httpx.Timeout, **kwargs) -> httpx.AsyncClient:
                              trust_env=False, follow_redirects=False)
 
 
+def _route_connect_timeout() -> float:
+    try:
+        value = float((config.get().get("timeouts") or {}).get("connect", 10))
+    except (TypeError, ValueError):
+        return 10.0
+    return value if math.isfinite(value) and value > 0 else 10.0
+
+
 async def _routed_request(method, url, *, headers, json, data, timeout,
                           proxy_purpose, proxy_channel, proxy_model, proxy_provider):
     chain = network._configured_proxy_chain_or_none(
@@ -347,8 +356,17 @@ async def _routed_request(method, url, *, headers, json, data, timeout,
         proxy_model=proxy_model, proxy_provider=proxy_provider,
     )
     routes = chain if chain is not None else [("legacy", None)]
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    route_connect = _route_connect_timeout()
     last = None
-    for _name, connector in routes:
+    for index, (_name, connector) in enumerate(routes):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        # An unreachable route may only spend its connect budget, leaving the
+        # rest of the shared deadline to later routes; the last keeps it all.
+        connect = remaining if index == len(routes) - 1 else min(route_connect, remaining)
         owner = None
         proxy = ""
         auth = None
@@ -361,7 +379,7 @@ async def _routed_request(method, url, *, headers, json, data, timeout,
             if target.scheme != "https":
                 raise httpx.UnsupportedProtocol("SS2022 LS bridge requires HTTPS")
             try:
-                owner = await connector.acquire_curl_proxy(target.host, target.port or 443, timeout=timeout)
+                owner = await connector.acquire_curl_proxy(target.host, target.port or 443, timeout=connect)
             except Exception as exc:
                 # Lease construction owns its partial cleanup and cannot have
                 # sent an upstream request. Match runtime's setup failover.
@@ -371,7 +389,7 @@ async def _routed_request(method, url, *, headers, json, data, timeout,
         elif connector.type != "direct":
             raise httpx.ProxyError("route is unsupported by LS transport")
         try:
-            async with create_client(timeout=httpx.Timeout(timeout), proxy=proxy, proxy_auth=auth,
+            async with create_client(timeout=httpx.Timeout(remaining, connect=connect), proxy=proxy, proxy_auth=auth,
                                      trust_env=connector is None and not proxy, route_owner=owner) as client:
                 return await client.request(method, url, headers=headers, json=json, data=data)
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
