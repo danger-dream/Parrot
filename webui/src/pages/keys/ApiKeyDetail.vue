@@ -24,6 +24,7 @@ import KeyChannelsModal from './KeyChannelsModal.vue'
 import KeyLimitsModal from './KeyLimitsModal.vue'
 import KeyMcpModal from './KeyMcpModal.vue'
 import KeyModelsModal from './KeyModelsModal.vue'
+import KeyModelBlocksModal from './KeyModelBlocksModal.vue'
 import KeyRegenModal from './KeyRegenModal.vue'
 import KeySecret from './KeySecret.vue'
 import SecretModal from './SecretModal.vue'
@@ -38,7 +39,7 @@ const stats = ref<Stats | null>(null)
 const error = ref('')
 const notFound = ref(false)
 const busy = ref('')
-const modal = ref<'' | 'models' | 'channels' | 'mcp' | 'limits' | 'regen' | 'custom'>('')
+const modal = ref<'' | 'blocks' | 'models' | 'channels' | 'mcp' | 'limits' | 'regen' | 'custom'>('')
 const secret = ref<{ value: string; title: string } | null>(null)
 let timer: number | undefined
 
@@ -231,6 +232,12 @@ const mcpText = computed(() => {
           </div>
           <div class="row col">
             <div class="r-head">
+              <span>模型拦截</span>
+              <button type="button" class="edit" @click="modal = 'blocks'"><Pencil /> {{ (k.modelBlocks || []).filter(r => r.enabled).length }} 条启用 / {{ (k.modelBlocks || []).length }} 条规则</button>
+            </div>
+          </div>
+          <div class="row col">
+            <div class="r-head">
               <span>允许的渠道</span>
               <button type="button" class="edit" @click="modal = 'channels'">
                 <Pencil /> {{ k.channelBindingEnabled ? `已绑定 ${(k.allowedChannels || []).length} 个` : (k.allowedChannels || []).length ? `已选 ${(k.allowedChannels || []).length} 个（未启用）` : '不限制' }}
@@ -314,6 +321,7 @@ const mcpText = computed(() => {
         </div>
       </DetailSection>
 
+      <KeyModelBlocksModal :open="modal === 'blocks'" :k="k" @close="modal = ''" @saved="saved" />
       <KeyModelsModal :open="modal === 'models'" :k="k" @close="modal = ''" @saved="saved" />
       <KeyChannelsModal :open="modal === 'channels'" :k="k" @close="modal = ''" @saved="saved" />
       <KeyMcpModal :open="modal === 'mcp'" :k="k" @close="modal = ''" @saved="saved" />

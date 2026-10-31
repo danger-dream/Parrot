@@ -3836,6 +3836,8 @@ export interface components {
             mcpTools: ("web_search" | "web_fetch" | "image_generate" | "image_edit" | "video_generate" | "video_status")[];
             /** Allowedmodels */
             allowedModels: string[];
+            /** Modelblocks */
+            modelBlocks?: components["schemas"]["ModelBlockRule"][];
             /** Allowedchannels */
             allowedChannels?: string[];
             /**
@@ -4134,6 +4136,8 @@ export interface components {
             mcpTools?: ("web_search" | "web_fetch" | "image_generate" | "image_edit" | "video_generate" | "video_status")[] | null;
             /** Allowedmodels */
             allowedModels?: string[] | null;
+            /** Modelblocks */
+            modelBlocks?: components["schemas"]["ModelBlockRule"][] | null;
             /** Allowedchannels */
             allowedChannels?: string[] | null;
             /** Channelbindingenabled */
@@ -7130,6 +7134,24 @@ export interface components {
             /** Outputmodalities */
             outputModalities?: string[];
             cost?: components["schemas"]["MetadataPricing"] | null;
+        };
+        /** ModelBlockRule */
+        ModelBlockRule: {
+            /**
+             * Enabled
+             * @default true
+             */
+            enabled: boolean;
+            /** Model */
+            model: string;
+            /**
+             * Preset
+             * @default quota_exhausted
+             * @enum {string}
+             */
+            preset: "quota_exhausted" | "insufficient_balance" | "service_busy" | "model_unavailable";
+            /** Message */
+            message?: string | null;
         };
         /** ModelData */
         ModelData: {

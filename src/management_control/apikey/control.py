@@ -349,7 +349,7 @@ class ApiKeyControl:
     ) -> ApiKeyView:
         self._require(context, Capability.WRITE)
         known = {"enabled", "allow_images", "allow_videos", "allow_mcp", "mcp_tools",
-                 "allowed_models", "allowed_channels", "channel_binding_enabled", "limit_override"}
+                 "allowed_models", "model_blocks", "allowed_channels", "channel_binding_enabled", "limit_override"}
         unknown = set(changes) - known
         if unknown or not changes:
             path = sorted(unknown)[0] if unknown else "body"
@@ -357,6 +357,13 @@ class ApiKeyControl:
         if "channel_binding_enabled" in changes and not isinstance(changes["channel_binding_enabled"], bool):
             raise self._validation("channelBindingEnabled", "INVALID_TYPE", "channelBindingEnabled must be a boolean")
         allowed_models = changes.get("allowed_models")
+        model_blocks = None
+        if "model_blocks" in changes:
+            from src.api_key_policy import validate_rules
+            try:
+                model_blocks = validate_rules(changes["model_blocks"])
+            except ValueError as exc:
+                raise self._validation("modelBlocks", "INVALID_RULES", str(exc)) from exc
         if "mcp_tools" in changes:
             self._validate_mcp_tools(changes["mcp_tools"])
         limit_change = changes.get("limit_override", ...)
@@ -390,6 +397,8 @@ class ApiKeyControl:
                 entry["allowMcp"] = bool(changes["allow_mcp"])
             if "mcp_tools" in changes:
                 entry["mcpTools"] = [str(item) for item in (changes["mcp_tools"] or ())]
+            if model_blocks is not None:
+                entry["modelBlocks"] = model_blocks
             if "allowed_models" in changes:
                 entry["allowedModels"] = list(changes["allowed_models"] or ())
             if "allowed_channels" in changes:
@@ -732,6 +741,7 @@ class ApiKeyControl:
                 str(item) for item in (entry.get("mcpTools") or ()) if isinstance(item, str)
             ),
             allowed_models=tuple(entry.get("allowedModels") or ()),
+            model_blocks=tuple(dict(rule) for rule in entry.get("modelBlocks", [])),
             allowed_channels=tuple(entry.get("allowedChannels") or ()),
             channel_binding_enabled=entry.get("channelBindingEnabled", bool(entry.get("allowedChannels"))) is True,
             limit_override=override,
@@ -851,6 +861,7 @@ class ApiKeyControl:
             result = dict(raw)
             result.setdefault("enabled", True)
             result.setdefault("allowedModels", [])
+            result.setdefault("modelBlocks", [])
             result.setdefault("allowImages", False)
             result.setdefault("allowVideos", False)
             # 既有条目没有 MCP 字段时必须保持关闭，不能因缺字段就放行。

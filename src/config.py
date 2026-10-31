@@ -977,6 +977,14 @@ def _normalize_api_keys(cfg: dict) -> bool:
             if "allowedModels" not in v:
                 v["allowedModels"] = []
                 changed = True
+            if "modelBlocks" in v:
+                # Missing rules preserve legacy behavior; invalid rules must not
+                # silently disappear on reload. Never accept user-defined status.
+                from .api_key_policy import validate_rules
+                rules = validate_rules(v["modelBlocks"])
+                if rules != v["modelBlocks"]:
+                    v["modelBlocks"] = rules
+                    changed = True
             if "allowImages" not in v:
                 # 新增图片接口权限默认关闭，避免老 Key 自动获得新能力。
                 v["allowImages"] = False

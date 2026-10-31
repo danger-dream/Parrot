@@ -108,6 +108,7 @@ class ApiKeyView:
     # The saved secret. Requested only by Telegram's renderer and (round 3,
     # user requirement) by listApiKeys/getApiKey for secrets-capable sessions.
     secret: str | None = None
+    model_blocks: tuple[dict, ...] = ()
     allowed_channels: tuple[str, ...] = ()
     channel_binding_enabled: bool = False
 

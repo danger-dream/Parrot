@@ -960,6 +960,12 @@ async def _handle_responses_ws_lane(websocket: WebSocket) -> None:
     except model_validation.ExplicitModelError as exc:
         await websocket.close(code=4400, reason=_trim_reason(exc.message))
         return
+    from .. import api_key_policy
+    denial = api_key_policy.check(key_name, body["model"], "openai-responses")
+    if denial is not None:
+        await _send_downstream(websocket, _dump_frame(denial.ws_frame()))
+        await _close_downstream(websocket, 4403, "Local model policy denied this request")
+        return
     _ingress_line = "openai-responses"
     model_mapping.apply_mapping(body, _ingress_line)
     body["_client_visible_model"] = str(body.get("model") or "").strip()
@@ -3536,6 +3542,11 @@ async def _receive_next_response_create(
         except model_validation.ExplicitModelError as exc:
             await _close_downstream(websocket, 4400, exc.message)
             return None
+        from .. import api_key_policy
+        denial = api_key_policy.check(api_key_name, body["model"], "openai-responses")
+        if denial is not None:
+            await _send_downstream(websocket, _dump_frame(denial.ws_frame()))
+            continue
         model_mapping.apply_mapping(body, "openai-responses")
         body["_client_visible_model"] = str(body.get("model") or "").strip()
         model = body.get("model")

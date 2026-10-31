@@ -565,9 +565,15 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         "openai-chat" if ingress_protocol == "chat" else "openai-responses"
     )
     downstream_betas = parse_beta_header(request.headers.get("anthropic-beta"))
+    requested_model = body["model"]
     model = _normalize_model_context_controls(
         body, _ingress_line, downstream_betas=downstream_betas,
     )
+
+    from .. import api_key_policy
+    denial = api_key_policy.check(key_name, requested_model, _ingress_line, effective=model)
+    if denial is not None:
+        return denial.http_response(_ingress_line)
 
     # 3. model 白名单
     if not model:

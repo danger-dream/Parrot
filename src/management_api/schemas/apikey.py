@@ -14,6 +14,8 @@ from src.management_control.apikey import (
     ApiKeySource,
 )
 
+from src.api_key_policy import ModelBlockRule, Rules, validate_rules
+
 from .base import ResponseMeta, StrictSchema
 from .mcp import McpToolName
 
@@ -85,6 +87,7 @@ class ApiKeyData(StrictSchema):
     allowMcp: bool
     mcpTools: list[McpToolName]
     allowedModels: list[str]
+    modelBlocks: list[ModelBlockRule] = Field(default_factory=list)
     allowedChannels: list[str] = Field(default_factory=list)
     channelBindingEnabled: bool = False
     limitOverride: ApiKeyLimitOverrideData | None
@@ -178,6 +181,7 @@ class ApiKeyUpdateRequest(StrictSchema):
     allowMcp: bool | None = None
     mcpTools: list[McpToolName] | None = None
     allowedModels: list[ModelId] | None = None
+    modelBlocks: Rules | None = None
     allowedChannels: list[str] | None = None
     channelBindingEnabled: bool | None = None
     limitOverride: ApiKeyLimitOverridePatch | None = None
@@ -186,10 +190,12 @@ class ApiKeyUpdateRequest(StrictSchema):
     def require_change(self):
         if not self.model_fields_set:
             raise ValueError("at least one field is required")
-        nullable = {"enabled", "allowImages", "allowVideos", "allowMcp", "mcpTools", "allowedModels", "allowedChannels", "channelBindingEnabled"}
+        nullable = {"enabled", "allowImages", "allowVideos", "allowMcp", "mcpTools", "allowedModels", "modelBlocks", "allowedChannels", "channelBindingEnabled"}
         for field in self.model_fields_set & nullable:
             if getattr(self, field) is None:
                 raise ValueError(f"{field} must not be null")
+        if self.modelBlocks is not None:
+            validate_rules(self.modelBlocks)
         return self
 
 

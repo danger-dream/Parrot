@@ -28,7 +28,7 @@ import weakref
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from fastapi import Request
 from starlette.responses import Response
@@ -541,6 +541,36 @@ class _BodyPreservingReceive:
                 _queued_body_spool_bytes_by_key.get(self._key_name, 0) - spool_charge,
             )
 
+    async def inspect_model(self) -> str | None:
+        """Bounded pre-queue read, retaining the original ASGI events.
+
+        Only call after the locked admission check finds the key saturated.
+        Uses the same memory/spool budgets and ownership as a queued body. The
+        caller must abandon this guard even when policy evaluation rejects.
+        """
+        import json
+        from starlette.requests import ClientDisconnect
+        while True:
+            message = await self._raw_receive()
+            if message.get("type") == "http.disconnect":
+                raise ClientDisconnect()
+            if message.get("type") != "http.request":
+                continue
+            await self._reserve(message)
+            if not message.get("more_body", False):
+                break
+        try:
+            raw = b"".join([await self._read_spooled_body(event) for event in self._buffer])
+        except Exception as exc:
+            raise _spool_failure("inspect", exc) from exc
+        try:
+            body = json.loads(raw)
+            model = body.get("model") if isinstance(body, dict) else None
+            # Do not retain another parsed body for the whole queue/generation.
+            return model if isinstance(model, str) else None
+        except (ValueError, UnicodeDecodeError):
+            return None  # The normal handler retains ownership of invalid JSON.
+
     async def wait_for_disconnect(self) -> None:
         """Consume raw events while preserving every request-body event."""
         while True:
@@ -822,12 +852,17 @@ async def acquire(
     key_name: str | None,
     request: Request | None = None,
     *, receive: Receive | None = None,
+    before_queue: Callable[[], Awaitable[_BodyPreservingReceive | None]] | None = None,
 ) -> ApiKeyLease:
     """占用一个 API Key 并发槽位；必要时进入 FIFO 队列。
 
     返回 ApiKeyLease，调用方必须在请求生命周期结束时 release。
     Queue disconnect monitoring preserves every unread ``http.request`` event
-    and replays it to the route after admission.
+    and replays it to the route after admission. ``before_queue`` runs once,
+    only after a locked admission decision finds no immediate capacity, before
+    either enqueueing or rejecting a full queue. It runs WITHOUT the slot lock;
+    capacity is rechecked atomically afterwards. Its returned body guard is
+    handed to the lease. The callback owns cleanup if it raises before returning.
     """
     key = str(key_name or "").strip()
     if not key:
@@ -839,41 +874,50 @@ async def acquire(
         return ApiKeyLease(key, None, limits, noop=True)
 
     start_wait = time.monotonic()
+    body_guard = None
+    queue_checked = False
+    try:
+        while True:
+            async with slot.lock:
+                slot.limits = _resolve_limits(key)
+                limits = slot.limits
+                # Existing FIFO waiters get first claim on newly available slots.
+                _wake_eligible_waiters_locked(slot)
+                if not limits.enabled:
+                    return ApiKeyLease(key, None, limits, noop=True, replay_guard=body_guard)
+                if limits.unlimited or slot.in_flight < limits.max_concurrent:
+                    # Queue budgets must not cap nonqueued core APIs, even when
+                    # this key has policies for a different model.
+                    replay_guard = body_guard
+                    if replay_guard is None and request is not None and _requires_nonqueued_body_guard(request):
+                        replay_guard = _body_preserving_receive(
+                            request, key, limits, raw_receive=receive,
+                        )
+                    slot.in_flight += 1
+                    return ApiKeyLease(
+                        key, slot, limits, queue_wait_ms=0, replay_guard=replay_guard
+                    )
 
-    # 快速路径：不限并发或还有空位。
-    async with slot.lock:
-        slot.limits = _resolve_limits(key)
-        limits = slot.limits
-        # Existing FIFO waiters get first claim on any newly available or
-        # hot-reloaded capacity before this fresh request may use the fast path.
-        _wake_eligible_waiters_locked(slot)
-        if not limits.enabled:
-            return ApiKeyLease(key, None, limits, noop=True)
-        if limits.unlimited or slot.in_flight < limits.max_concurrent:
-            # Generic replay limits are queue resource contracts, not protocol
-            # caps for nonqueued core APIs. Image endpoints keep their separate,
-            # endpoint-aware protocol body contract.
-            replay_guard = None
-            if request is not None and _requires_nonqueued_body_guard(request):
-                replay_guard = _body_preserving_receive(
-                    request, key, limits, raw_receive=receive,
-                )
-            slot.in_flight += 1
-            return ApiKeyLease(
-                key, slot, limits, queue_wait_ms=0, replay_guard=replay_guard
-            )
-
-        if limits.max_queue <= 0 or len(slot.waiters) >= limits.max_queue:
-            raise _queue_full_error(key, slot)
-
-        replay_guard = None
-        if request is not None:
-            replay_guard = _body_preserving_receive(
-                request, key, limits, raw_receive=receive,
-            )
-        fut = asyncio.get_event_loop().create_future()
-        waiter = Waiter(future=fut, enqueued_at=time.monotonic())
-        slot.waiters.append(waiter)
+                if before_queue is None or queue_checked:
+                    if limits.max_queue <= 0 or len(slot.waiters) >= limits.max_queue:
+                        raise _queue_full_error(key, slot)
+                    replay_guard = body_guard
+                    if replay_guard is None and request is not None:
+                        replay_guard = _body_preserving_receive(
+                            request, key, limits, raw_receive=receive,
+                        )
+                    fut = asyncio.get_event_loop().create_future()
+                    waiter = Waiter(future=fut, enqueued_at=time.monotonic())
+                    slot.waiters.append(waiter)
+                    break
+            # No lease/waiter has been allocated. Never hold the slot lock while
+            # reading a slow body: active requests must still be able to release.
+            queue_checked = True
+            body_guard = await before_queue()
+    except BaseException:
+        if body_guard is not None:
+            await body_guard.abandon()
+        raise
 
     queue_deadline = start_wait + max(0, limits.queue_wait_seconds)
     try:

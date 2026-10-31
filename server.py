@@ -31,6 +31,7 @@ startup_timing.set_process_start_ns(_PROCESS_START_NS)
 import uvicorn
 from uvicorn.server import HANDLED_SIGNALS
 from fastapi import FastAPI, Request, WebSocket
+from starlette.requests import ClientDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -884,6 +885,14 @@ def _with_asgi_response_headers(
     return updated
 
 
+class _LocalModelPolicyDenied(Exception):
+    """Pre-queue policy response, never a limiter/upstream failure."""
+
+    def __init__(self, response):
+        self.response = response
+        super().__init__("local model policy denied this request")
+
+
 class _DrainHttpMiddleware:
     """Pure ASGI drain/API-key middleware with explicit receive ownership.
 
@@ -916,6 +925,7 @@ class _DrainHttpMiddleware:
         method = str(scope.get("method") or "")
         drain_lease = await drain.enter(f"http {method} {path}")
         key_lease: apikey_limiter.ApiKeyLease | None = None
+        policy_body_guard = None
         response_started = False
         released = False
 
@@ -928,7 +938,11 @@ class _DrainHttpMiddleware:
                 if key_lease is not None:
                     await key_lease.release()
             finally:
-                await drain_lease.aclose()
+                try:
+                    if policy_body_guard is not None:
+                        await policy_body_guard.abandon()
+                finally:
+                    await drain_lease.aclose()
 
         async def send_wrapped(message: Message) -> None:
             nonlocal response_started
@@ -954,8 +968,29 @@ class _DrainHttpMiddleware:
             if _is_api_key_limited_http_request(method, path):
                 key_name, _allowed_models, err = auth.validate(request.headers)
                 if not err and key_name:
+                    from src import api_key_policy
+                    ingress = {"/v1/messages": "anthropic", "/v1/chat/completions": "openai-chat",
+                               "/v1/responses": "openai-responses"}.get(path)
+                    async def check_before_queue():
+                        nonlocal policy_body_guard
+                        policy_body_guard = apikey_limiter._body_preserving_receive(
+                            request, key_name, apikey_limiter._resolve_limits(key_name), raw_receive=receive,
+                        )
+                        requested_model = await policy_body_guard.inspect_model()
+                        if requested_model is not None:
+                            denial = api_key_policy.check(key_name, requested_model, ingress)
+                            if denial is not None:
+                                raise _LocalModelPolicyDenied(denial.http_response(ingress))
+                        return policy_body_guard
+
+                    # The limiter invokes this only on its locked saturated path;
+                    # immediate admission keeps the original unbuffered receive.
+                    acquire_kwargs = (
+                        {"before_queue": check_before_queue}
+                        if ingress and api_key_policy.has_rules(key_name) else {}
+                    )
                     key_lease = await apikey_limiter.acquire(
-                        key_name, request, receive=receive,
+                        key_name, request, receive=receive, **acquire_kwargs,
                     )
             downstream_receive = (
                 key_lease.receive
@@ -963,6 +998,13 @@ class _DrainHttpMiddleware:
                 else receive
             )
             await self.app(scope, downstream_receive, send_wrapped)
+        except _LocalModelPolicyDenied as exc:
+            await send_error(exc.response)
+        except ClientDisconnect:
+            if policy_body_guard is None or key_lease is not None:
+                raise
+            # Pre-queue reader owns cleanup; no response for a disconnected peer.
+            return
         except apikey_limiter.ApiKeyLimitError as exc:
             if response_started:
                 raise
@@ -1437,6 +1479,11 @@ async def proxy_messages(request: Request):
         return errors.json_error_response(
             400, errors.ErrType.INVALID_REQUEST, "model is required"
         )
+
+    from src import api_key_policy
+    denial = api_key_policy.check(key_name, original_model, "anthropic", effective=model)
+    if denial is not None:
+        return denial.http_response("anthropic")
 
     # 模型白名单检查：allowed_models 为空 = 无限制；非空则必须命中
     if allowed_models and not model_registry_runtime.permits(allowed_models, model):
