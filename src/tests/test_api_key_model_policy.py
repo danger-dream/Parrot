@@ -454,3 +454,24 @@ async def test_prequeue_hook_rechecks_capacity_without_holding_slot_lock(cfg, re
             await competing.release()
         if admitted:
             await admitted.release()
+
+
+def test_rule_config_normalization_does_not_import_inference_or_management():
+    import subprocess
+    import sys
+
+    # A fresh interpreter catches import cycles/dependencies masked by this
+    # test module's already imported server. Inherits isolated test paths.
+    subprocess.run([sys.executable, "-c", '''
+import sys
+from src.api_key_rules import validate_rules
+assert "src.config" not in sys.modules
+from src import config
+candidate = {"apiKeys": {"legacy": {"key": "fixture-old"},
+                          "configured": {"key": "fixture-new", "modelBlocks": [{"model": " model-a "}]}}}
+config._normalize_api_keys(candidate)
+assert "modelBlocks" not in candidate["apiKeys"]["legacy"]
+assert candidate["apiKeys"]["configured"]["modelBlocks"] == validate_rules([{"model": "model-a"}])
+assert "src.api_key_policy" not in sys.modules
+assert not any(name.startswith("src.management_") for name in sys.modules)
+'''], check=True)

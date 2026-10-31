@@ -26,6 +26,9 @@ from src.management_control.context import AuditSink, ManagementContext, audit_r
 from src.management_control.errors import ErrorField, ManagementError, ManagementErrorCode
 from src.management_control.stats_cache import CachingStatsSource
 
+from src.api_key_rules import validate_rules
+
+from .entries import clean_models, normalize_entry
 from .models import (
     ApiKeyEnabledFilter,
     ApiKeyLimitOverride,
@@ -359,7 +362,6 @@ class ApiKeyControl:
         allowed_models = changes.get("allowed_models")
         model_blocks = None
         if "model_blocks" in changes:
-            from src.api_key_policy import validate_rules
             try:
                 model_blocks = validate_rules(changes["model_blocks"])
             except ValueError as exc:
@@ -852,23 +854,7 @@ class ApiKeyControl:
         payload += b"\0" + str(secret).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
 
-    @staticmethod
-    def _normalize_entry(raw: Any) -> dict:
-        if isinstance(raw, str):
-            return {"key": raw, "enabled": True, "allowedModels": [], "allowImages": False,
-                    "allowVideos": False, "allowMcp": False, "mcpTools": []}
-        if isinstance(raw, dict):
-            result = dict(raw)
-            result.setdefault("enabled", True)
-            result.setdefault("allowedModels", [])
-            result.setdefault("modelBlocks", [])
-            result.setdefault("allowImages", False)
-            result.setdefault("allowVideos", False)
-            # 既有条目没有 MCP 字段时必须保持关闭，不能因缺字段就放行。
-            result.setdefault("allowMcp", False)
-            result.setdefault("mcpTools", [])
-            return result
-        return {}
+    _normalize_entry = staticmethod(normalize_entry)
 
     def _validate_allowed_models(self, values: Any, *, retained=()) -> None:
         if not isinstance(values, (list, tuple)):
@@ -966,16 +952,7 @@ class ApiKeyControl:
             return "•" * len(secret)
         return f"{secret[:4]}…{secret[-4:]}"
 
-    @staticmethod
-    def _clean_models(raw: Any) -> tuple[str, ...]:
-        if not isinstance(raw, list):
-            return ()
-        out: list[str] = []
-        for item in raw:
-            value = str(item or "").strip()
-            if value and value not in out:
-                out.append(value)
-        return tuple(out)
+    _clean_models = staticmethod(clean_models)
 
     def _month_start_ts(self) -> float:
         return datetime.fromtimestamp(self._clock(), _BJT).replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()

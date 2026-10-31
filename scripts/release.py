@@ -505,7 +505,8 @@ sys.exit(bool(missing))'''
         if read_version(self.repo) != self.state["version"]:
             raise ReleaseError("candidate", "Version was changed outside this release")
         self.audit_dependencies()
-        self.git("add", "--", *sorted(allowed))
+        # The allowlist can retain deletions already committed by a prior candidate.
+        self.git("add", "--", *sorted(set(changed) | {"src/__init__.py"}))
         hook = self.repo / ".githooks/pre-commit"
         configured = self.git("config", "--get", "core.hooksPath", check=False).stdout.strip()
         if hook.is_file() and configured != ".githooks":

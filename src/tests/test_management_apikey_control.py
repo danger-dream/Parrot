@@ -442,3 +442,62 @@ def test_reorder_reset_stats_authorization_and_complete_set_validation():
         "CAPABILITY_DENIED",
         lambda: control.list_api_keys(denied),
     )
+
+
+@pytest.mark.parametrize("transport", ["telegram", "management"])
+@pytest.mark.parametrize("blocks", [None, [], [{"model": "model-a", "enabled": False, "preset": "service_busy", "message": "Unavailable."}]])
+def test_model_blocks_presence_survives_unrelated_writes_and_secret_changes(transport, blocks):
+    control, store, _, _ = make_control()
+    if blocks is not None:
+        store.value["apiKeys"]["alpha"]["modelBlocks"] = deepcopy(blocks)
+    if transport == "telegram":
+        actor = ManagementContext(
+            request_id="test-tg-model-block-preservation",
+            actor=ManagementPrincipal.administrator(
+                subject_id="telegram:fixture", auth_method=AuthMethod.TELEGRAM_ADMIN,
+                issued_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            ),
+        )
+    else:
+        actor = context(Capability.READ, Capability.WRITE, Capability.SECRETS_WRITE)
+
+    def assert_preserved():
+        entry = store.value["apiKeys"]["alpha"]
+        if blocks is None:
+            assert "modelBlocks" not in entry
+        else:
+            assert entry["modelBlocks"] == blocks
+        # Public reads may expose an empty list without adding a stored field.
+        assert list(control.get_api_key(actor, "alpha").model_blocks) == (blocks or [])
+        assert ("modelBlocks" in entry) == (blocks is not None)
+
+    assert_preserved()
+    for changes in ({"allow_images": True}, {"allowed_models": ["model-a"]},
+                    {"limit_override": {"max_concurrent": 2}}, {"limit_override": None}):
+        revision = control.get_api_key(actor, "alpha").revision
+        control.update_api_key(actor, "alpha", changes=changes,
+                               if_match=revision if transport == "management" else None)
+        assert_preserved()
+    if transport == "management":
+        plan = control.plan_regeneration(actor, "alpha")
+        control.regenerate_api_key(actor, "alpha", plan_id=plan.plan_id, plan_token=plan.plan_token)
+    else:
+        control.regenerate_api_key(actor, "alpha", require_plan=False, reset_runtime=False)
+    assert_preserved()
+    revision = control.get_api_key(actor, "alpha").revision
+    control.replace_api_key_secret(actor, "alpha", custom_secret="fixture-new-secret",
+                                   if_match=revision if transport == "management" else None,
+                                   require_revision=transport == "management")
+    assert_preserved()
+
+
+def test_model_blocks_explicit_save_and_clear_are_not_treated_as_missing():
+    control, store, _, _ = make_control()
+    actor = context(Capability.READ, Capability.WRITE)
+    assert "modelBlocks" not in store.value["apiKeys"]["alpha"]
+    for blocks in ([], [{"model": "model-a"}], []):
+        view = control.get_api_key(actor, "alpha")
+        changed = control.update_api_key(actor, "alpha", changes={"model_blocks": blocks}, if_match=view.revision)
+        assert "modelBlocks" in store.value["apiKeys"]["alpha"]
+        assert store.value["apiKeys"]["alpha"]["modelBlocks"] == list(changed.model_blocks)
+        assert [rule["model"] for rule in changed.model_blocks] == [rule["model"] for rule in blocks]

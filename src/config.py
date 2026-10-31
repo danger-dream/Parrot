@@ -981,7 +981,7 @@ def _normalize_api_keys(cfg: dict) -> bool:
             if "modelBlocks" in v:
                 # Missing rules preserve legacy behavior; invalid rules must not
                 # silently disappear on reload. Never accept user-defined status.
-                from .api_key_policy import validate_rules
+                from .api_key_rules import validate_rules
                 rules = validate_rules(v["modelBlocks"])
                 if rules != v["modelBlocks"]:
                     v["modelBlocks"] = rules

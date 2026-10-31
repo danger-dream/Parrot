@@ -190,6 +190,38 @@ def test_stale_owned_snapshot_is_reclaimed_before_clone(run):
     assert not (x.work / 'source/stale').exists()
 
 
+def test_resume_keeps_committed_deletions_without_staging_missing_paths(run):
+    x, git = run
+    removed = x.repo / 'src/profile.json'
+    removed.unlink()
+    x.prepare()
+    first = x.state['candidate']
+    assert git('ls-tree', '--name-only', first, 'src/profile.json') == ''
+    (x.repo / 'server.py').write_text('import time\n')
+    x.prepare()
+    second = x.state['candidate']
+    assert second != first
+    assert git('rev-parse', second + '^') == first
+    assert git('ls-tree', '--name-only', second, 'src/profile.json') == ''
+    assert git('show', second + ':server.py') == 'import time'
+    assert git('status', '--porcelain') == ''
+    x.prepare()
+    assert x.state['candidate'] == second
+
+
+def test_resume_after_committed_deletion_still_rejects_unreviewed_files(run):
+    x, git = run
+    (x.repo / 'src/profile.json').unlink()
+    x.prepare()
+    first = x.state['candidate']
+    (x.repo / 'server.py').write_text('import time\n')
+    (x.repo / 'unreviewed.py').write_text('import os\n')
+    with pytest.raises(r.ReleaseError, match='Unreviewed files'):
+        x.prepare()
+    assert git('rev-parse', 'HEAD') == first
+    assert git('diff', '--cached', '--name-only') == ''
+
+
 def test_rehearsal_uses_isolated_index_and_never_bumps_or_moves_main(run):
     x, git = run
     x.state['mode'] = 'rehearsal'
