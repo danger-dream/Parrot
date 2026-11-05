@@ -56,6 +56,29 @@ def test_models_api_permissions_strict_query_typed_openapi_and_details(domain_cl
         assert any(code.startswith("2") for code in operation["responses"])
 
 
+def test_model_detail_serializes_oauth_source_disabled_until():
+    from datetime import datetime, timezone
+
+    from src.management_api.routers.models import _source
+    from src.management_control.models import ModelSourceType
+    from src.management_control.models.control import ModelSourceView
+
+    source = ModelSourceView(
+        type=ModelSourceType.OAUTH, id="claude:paused@example.com", label="claude:paused@example.com",
+        provider="claude", outbound_model="claude-model", source_enabled=True,
+        container_enabled=True, effective_routable=False, effective_metadata={},
+        value_source={}, constrained_by={},
+    )
+    until = datetime(2026, 11, 6, 3, 0, tzinfo=timezone.utc)
+    data = _source(source, {"account": {
+        "status_tag": "quota", "available": False, "quota_limited": True,
+        "disabled_reason": "quota", "disabled_until": until,
+    }})
+    account = data.model_dump(mode="json")["account"]
+    assert datetime.fromisoformat(account["disabledUntil"]) == until
+    assert account["disabledReason"] == "quota"
+
+
 def test_models_state_http_error_mapping_and_explicit_targets(domain_client):
     client, _runtime, admin, read_only, _denied = domain_client
     _catalog()

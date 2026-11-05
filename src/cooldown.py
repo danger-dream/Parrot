@@ -62,6 +62,8 @@ def init() -> None:
                     http_status=429,
                     error_detail=message,
                 )
+                if reset_ms is None:
+                    reset_ms = _usage_window_reset_ms(channel_key, message, entry)
                 if reset_ms is not None and (
                     cooldown_until is None or int(cooldown_until) < reset_ms
                 ):
@@ -100,10 +102,30 @@ def init() -> None:
         _entries.clear()
         _entries.update(loaded_entries)
     _initialized = True
-    suffix = f"; upgraded {upgraded_quota} Zhipu quota cooldown(s)" if upgraded_quota else ""
+    suffix = f"; upgraded {upgraded_quota} quota cooldown(s) to their reset time" if upgraded_quota else ""
     if recovered_transport:
         suffix += f"; scheduled finite retries for {recovered_transport} OAuth transport cooldown(s)"
     print(f"[cooldown] loaded {len(rows)} entries from StateStore snapshots{suffix}")
+
+
+def _quota_channel(channel_key: str, entry: dict | None = None) -> SimpleNamespace:
+    """Upstream identity the quota parsers check; OAuth keys carry their provider."""
+    if channel_key.startswith("oauth:"):
+        return SimpleNamespace(provider=channel_key.split(":")[1], base_url="")
+    if entry is None:
+        entry = next((item for item in config.get().get("channels") or []
+                      if isinstance(item, dict) and f"api:{item.get('name')}" == channel_key), {})
+    return SimpleNamespace(provider=entry.get("provider") or "", base_url=entry.get("baseUrl") or "")
+
+
+def _usage_window_reset_ms(channel_key: str, message: str | None, entry: dict | None = None) -> int | None:
+    """Upstream reset of an exhausted usage window (WorkBuddy 6004, Zhipu 1308/1316-1321), else None."""
+    reset = quota_errors.workbuddy_usage_limit_reset_ms(channel_key, message)
+    if reset is None and str(message or "").lstrip().startswith("HTTP 429:"):
+        reset = quota_errors.zhipu_usage_window_reset_ms(
+            _quota_channel(channel_key, entry), http_status=429, error_detail=message,
+        )
+    return reset
 
 
 def _windows() -> list[int]:
@@ -229,6 +251,11 @@ def record_error(channel_key: str, model: str, message: str | None = None,
 
     若本次推进让该 (channel, model) **首次进入永久冷却**，触发"channel_permanent"事件通知。
     """
+    usage_reset = _usage_window_reset_ms(channel_key, message)
+    if usage_reset is not None and (
+        cooldown_until is None or (cooldown_until != _INF and cooldown_until < usage_reset)
+    ):
+        cooldown_until = usage_reset
     windows = _windows()
     ladder_min_interval = _ladder_min_interval_ms()
     permanent_min_age = _permanent_min_age_ms()

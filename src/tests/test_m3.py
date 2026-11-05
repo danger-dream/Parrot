@@ -191,53 +191,118 @@ def test_fingerprint_normalization(m):
     print("  [PASS] fingerprint normalization (thinking/caller/cache_control/msg-meta)")
 
 
+def _set_scoring(m, **values):
+    def _set(c):
+        c.setdefault("scoring", {}).update(values)
+    m["config"].update(_set)
+
+
 def test_scorer_sliding_window(m):
-    """滑动窗口：窗口未满时累加；满后每次新事件等效"滑出一次"再"滑入一次"。"""
+    """滑动窗口：只统计最近 N 次的真实成败，旧结果按顺序滑出。"""
     _reset_all_state(m)
     sc = m["scorer"]
-    cfg = m["config"]
-
-    # 设置较小窗口便于测试
-    def _set(c):
-        c.setdefault("scoring", {})["recentWindow"] = 5
-        c["scoring"]["emaAlpha"] = 0.5
-        c["scoring"]["staleMinutes"] = 99999  # 禁止衰减干扰
-    cfg.update(_set)
+    _set_scoring(m, recentWindow=5, emaAlpha=0.5, staleMinutes=99999)
     sc._initialized = False
     sc.init()
 
     ck, mo = "api:chA", "m1"
-    # 5 次成功（窗口恰好装满）
-    for _ in range(5):
-        sc.record_success(ck, mo, connect_ms=100, first_byte_ms=200, total_ms=1000)
-    s = sc.get_stats(ck, mo)
-    assert s["recent_requests"] == 5
-    assert s["recent_success_count"] == 5
+    ok = lambda: sc.record_success(ck, mo, connect_ms=100, first_byte_ms=200, total_ms=1000)
+    fail = lambda: sc.record_failure(ck, mo, connect_ms=500)
 
-    # 第 6 次成功：窗口满，滑出旧平均(5/5=1)滑入 1 → 仍是 5
-    sc.record_success(ck, mo, connect_ms=100, first_byte_ms=200, total_ms=1000)
+    for _ in range(6):
+        ok()
     s = sc.get_stats(ck, mo)
-    assert s["recent_requests"] == 5, f"recent_requests={s['recent_requests']}"
-    assert s["recent_success_count"] == 5
+    assert (s["recent_requests"], s["recent_success_count"]) == (5, 5)
 
-    # 第 7 次失败：滑出 1 滑入 0 → 4
-    sc.record_failure(ck, mo, connect_ms=500)
+    fail()
     s = sc.get_stats(ck, mo)
-    assert s["recent_requests"] == 5
-    assert s["recent_success_count"] == 4, f"expected 4, got {s['recent_success_count']}"
+    assert (s["recent_requests"], s["recent_success_count"]) == (5, 4)
 
-    # 再连续 N 次失败 → recent_success_count 指数级衰减；
-    # 由于每次仅滑出旧平均 1/window 的"贡献"且使用整数化 round，
-    # 稳态可能停在一个小整数（不会精确归零，这是 EMA 等效方案的特性）。
-    # 测试意图是：成功率应大幅下降。
     for _ in range(30):
-        sc.record_failure(ck, mo, connect_ms=500)
-    s = sc.get_stats(ck, mo)
-    rate = s["recent_success_count"] / s["recent_requests"]
-    assert rate <= 0.5, f"rate={rate} too high after 30 failures (expected big drop from 1.0)"
-    assert s["recent_success_count"] < 4, f"expected < 4, got {s['recent_success_count']}"
+        fail()
+    assert sc.get_stats(ck, mo)["recent_success_count"] == 0
+
+    # 失败之后连续成功 N 次，失败全部滑出、成功率回到 100%
+    for expected in (1, 2, 3, 4, 5):
+        ok()
+        assert sc.get_stats(ck, mo)["recent_success_count"] == expected
+    assert [r for r in sc.snapshot() if r["model"] == mo][0]["recent_success_count"] == 5
 
     print("  [PASS] scorer sliding window")
+
+
+def test_scorer_window_recovers_after_sparse_failures(m):
+    """偶发失败不能把成功率永久卡住（旧近似算法 N=10 时会停在 6/10）。"""
+    _reset_all_state(m)
+    sc = m["scorer"]
+    _set_scoring(m, recentWindow=10, staleMinutes=99999)
+    sc._initialized = False
+    sc.init()
+
+    ck, mo = "api:chSparse", "m1"
+    for _ in range(10):
+        sc.record_success(ck, mo, connect_ms=100, first_byte_ms=200, total_ms=1000)
+    for _ in range(4):
+        sc.record_failure(ck, mo, connect_ms=100)
+    assert sc.get_stats(ck, mo)["recent_success_count"] == 6
+    for expected in (6, 6, 6, 6, 6, 6, 7, 8, 9, 10, 10, 10):
+        sc.record_success(ck, mo, connect_ms=100, first_byte_ms=200, total_ms=1000)
+        assert sc.get_stats(ck, mo)["recent_success_count"] == expected
+
+
+def test_scorer_window_persists_and_reloads(m):
+    """成败序列持久化后重载保持原样；旧快照（无序列）按历史成功率推算且失败最先滑出。"""
+    _reset_all_state(m)
+    sc, db = m["scorer"], m["state_db"]
+    _set_scoring(m, recentWindow=5, staleMinutes=99999)
+    sc._initialized = False
+    sc.init()
+
+    ck, mo = "api:chPersist", "m1"
+    for ok in (True, False, True, True, False):
+        if ok:
+            sc.record_success(ck, mo, connect_ms=100, first_byte_ms=200, total_ms=1000)
+        else:
+            sc.record_failure(ck, mo, connect_ms=100)
+    assert db.perf_load(ck, mo)["recent_outcomes"] == "10110"
+    sc._initialized = False
+    sc.init()
+    s = sc.get_stats(ck, mo)
+    assert (s["recent_outcomes"], s["recent_requests"], s["recent_success_count"]) == ("10110", 5, 3)
+
+    legacy = {
+        "total_requests": 100, "success_count": 60, "recent_requests": 5, "recent_success_count": 1,
+        "avg_connect_ms": 100.0, "avg_first_byte_ms": 200.0, "avg_total_ms": 1000.0, "last_updated": 1,
+    }
+    db.perf_save("api:chLegacy", mo, legacy)
+    assert "recent_outcomes" not in db.perf_load("api:chLegacy", mo)
+    sc._initialized = False
+    sc.init()
+    s = sc.get_stats("api:chLegacy", mo)
+    assert s["recent_outcomes"] == "00111"
+    for _ in range(2):
+        sc.record_success("api:chLegacy", mo, connect_ms=100, first_byte_ms=200, total_ms=1000)
+    assert sc.get_stats("api:chLegacy", mo)["recent_success_count"] == 5
+
+
+def test_scorer_window_shrink_truncates(m):
+    """窗口调小后立即只看最近 N 次，下一次记录时序列也被截断。"""
+    _reset_all_state(m)
+    sc = m["scorer"]
+    _set_scoring(m, recentWindow=10, staleMinutes=99999)
+    sc._initialized = False
+    sc.init()
+
+    ck, mo = "api:chShrink", "m1"
+    for _ in range(5):
+        sc.record_failure(ck, mo, connect_ms=100)
+    for _ in range(5):
+        sc.record_success(ck, mo, connect_ms=100, first_byte_ms=200, total_ms=1000)
+    _set_scoring(m, recentWindow=4)
+    row = [r for r in sc.snapshot() if r["channel_key"] == ck][0]
+    assert (row["recent_requests"], row["recent_success_count"]) == (4, 4)
+    sc.record_failure(ck, mo, connect_ms=100)
+    assert sc.get_stats(ck, mo)["recent_outcomes"] == "1110"
 
 
 def test_scorer_stale_decay(m):
@@ -610,6 +675,9 @@ def main():
         test_fingerprint_symmetry(m)
         test_fingerprint_normalization(m)
         test_scorer_sliding_window(m)
+        test_scorer_window_recovers_after_sparse_failures(m)
+        test_scorer_window_persists_and_reloads(m)
+        test_scorer_window_shrink_truncates(m)
         test_scorer_stale_decay(m)
         test_cooldown_ladder(m)
         test_affinity_ttl_and_delete(m)

@@ -75,20 +75,31 @@ async def test_model_array_is_a_client_error_not_a_server_failure(m, app_client,
     assert rows(m) == before
 
 
+def _audit_channel(m, path, name, model):
+    if path == "/v1/messages":
+        return _make_anthropic_channel(m, name, "http://audit.invalid", alias=model, real=model)
+    return _make_openai_channel(name, "http://audit.invalid",
+        protocol="openai-chat" if path.endswith("completions") else "openai-responses",
+        alias=model, real=model)
+
+
 @pytest.mark.parametrize("path", PATHS)
-@pytest.mark.parametrize("registered", [False, True], ids=["unknown-404", "disabled-503"])
-async def test_no_candidate_response_and_log_status_match(m, app_client, path, registered):
-    if registered:
-        if path == "/v1/messages":
-            channel = _make_anthropic_channel(m, "audit-disabled", "http://disabled.invalid", alias="audit-model", real="audit-model")
-        else:
-            channel = _make_openai_channel("audit-disabled", "http://disabled.invalid",
-                protocol="openai-chat" if path.endswith("completions") else "openai-responses",
-                alias="audit-model", real="audit-model")
-        channel.enabled = False
+@pytest.mark.parametrize("scenario,status", [("unknown", 404), ("disabled", 503), ("cooling", 503)],
+                         ids=["unknown-404", "disabled-503", "cooling-503"])
+async def test_no_candidate_response_and_log_status_match(m, app_client, path, scenario, status):
+    """Unknown or explicitly disabled models are not logged; other no-route failures are."""
+    if scenario != "unknown":
+        channel = _audit_channel(m, path, "audit-" + scenario, "audit-model")
+        channel.enabled = scenario != "disabled"
         _install_channels(m, [channel])
+        if scenario == "cooling":
+            m["cooldown"].record_error(channel.key, "audit-model", cooldown_until=int(time.time() * 1000) + 60000)
+    before = rows(m)
     response = await app_client.post(path, json=body())
-    assert response.status_code == (503 if registered else 404), response.text
+    assert response.status_code == status, response.text
+    if scenario != "cooling":
+        assert rows(m) == before
+        return
     row = rows(m)[-1]
     assert row["status"] == "error" and row["finished_at"] is not None
     assert row["http_status"] == response.status_code
@@ -103,12 +114,15 @@ async def test_empty_collections_remain_accepted_but_ingress_default_is_not_appl
     m, app_client, path, ingress, collection,
 ):
     m["config"].update(lambda c: c.update(ingressDefaultModel={ingress: "default-audit-model"}))
+    # The default model is routable, so a 404 proves the explicit unknown model was kept.
+    _install_channels(m, [_audit_channel(m, path, "audit-default", "default-audit-model")])
+    before = rows(m)
     response = await app_client.post(
         path,
         json=body(model="audit-model", messages=collection, tools=collection),
     )
     assert response.status_code == 404, response.text
-    assert rows(m)[-1]["requested_model"] == "audit-model"
+    assert rows(m) == before
     assert m["config"].get()["ingressDefaultModel"] == {ingress: "default-audit-model"}
 
 

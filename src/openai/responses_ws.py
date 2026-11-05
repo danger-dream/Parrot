@@ -1025,21 +1025,31 @@ async def _handle_responses_ws_lane(websocket: WebSocket) -> None:
     req_headers = _sanitize_headers(dict(websocket.headers))
     fast_mode = log_db.extract_fast_mode(body, "responses_ws", req_headers)
     log_body = {k: v for k, v in body.items() if not (isinstance(k, str) and k.startswith("_"))}
-    await asyncio.to_thread(
-        log_db.insert_pending,
-        request_id, client_ip, key_name, model, True, msg_count, tool_count,
-        req_headers, log_body, fingerprint=fp_query, ingress_protocol="responses_ws",
-        reasoning_effort=reasoning_effort,
-        fast_mode=fast_mode,
-    )
 
-    result = scheduler.schedule(
-        body,
-        api_key_name=key_name or "",
-        client_ip=client_ip,
-        ingress_protocol="responses",
-        fp_query=fp_query,
-    )
+    async def insert_pending():
+        await asyncio.to_thread(
+            log_db.insert_pending,
+            request_id, client_ip, key_name, model, True, msg_count, tool_count,
+            req_headers, log_body, fingerprint=fp_query, ingress_protocol="responses_ws",
+            reasoning_effort=reasoning_effort,
+            fast_mode=fast_mode,
+        )
+
+    try:
+        result = scheduler.schedule(
+            body,
+            api_key_name=key_name or "",
+            client_ip=client_ip,
+            ingress_protocol="responses",
+            fp_query=fp_query,
+        )
+        model_never_supported = _model_never_supported(model) if not result else False
+        skip_log = scheduler.skip_no_route_log(model, result, model_never_supported=model_never_supported)
+    except Exception:
+        await insert_pending()
+        raise
+    if not skip_log:
+        await insert_pending()
     if result.affinity_hit:
         await asyncio.to_thread(log_db.update_pending, request_id, affinity_hit=1)
 
@@ -1050,15 +1060,16 @@ async def _handle_responses_ws_lane(websocket: WebSocket) -> None:
             f"[scheduler] no channels ingress=responses_ws model={model}: "
             f"{exclusion_summary}"
         )
-        await asyncio.to_thread(
-            log_db.finish_error, request_id, msg, 0,
-            http_status=503, affinity_hit=(1 if result.affinity_hit else 0),
-            total_ms=None,
-            request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
-        )
+        if not skip_log:
+            await asyncio.to_thread(
+                log_db.finish_error, request_id, msg, 0,
+                http_status=503, affinity_hit=(1 if result.affinity_hit else 0),
+                total_ms=None,
+                request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
+            )
         ek = notifier.escape_html
-        notifications.routing_unavailable(ingress="responses_ws", model=model, exclusions=result.exclusions, api_key_name=key_name, request_id=request_id)
-        code = 4404 if _model_never_supported(model) else 4503
+        notifications.routing_unavailable(ingress="responses_ws", model=model, exclusions=result.exclusions, api_key_name=key_name, request_id="" if skip_log else request_id)
+        code = 4404 if model_never_supported else 4503
         await websocket.close(code=code, reason=_trim_reason(msg))
         return
 
@@ -1229,6 +1240,7 @@ async def _run_ws_failover(
     fp_query: Optional[str],
     allowed_models: list[str] | None = None,
     api_key_lease: apikey_limiter.ApiKeyLease | None = None,
+    skip_request_log: bool = False,
 ) -> bool:
     from .. import search_tool_policy
     search_declared = any(search_tool_policy.kind(tool) for tool, _ in search_tool_policy.declarations(body))
@@ -1240,6 +1252,7 @@ async def _run_ws_failover(
             request_id=request_id, api_key_name=api_key_name, client_ip=client_ip,
             start_time=start_time, start_monotonic=start_monotonic,
             allowed_models=allowed_models, api_key_lease=api_key_lease,
+            skip_request_log=skip_request_log,
         )
     cfg = config.get()
     deadline_ts = 0.0  # legacy transport argument; every upstream route owns its round total
@@ -1693,31 +1706,32 @@ async def _run_ws_failover(
     if only_local_rejections:
         # The guard's source/outbound suffix belongs only in the private ledger.
         downstream_message = (local_candidate_error or "Request exceeds the effective route token budget").split(" source=", 1)[0]
-    await asyncio.to_thread(
-        log_db.finish_error,
-        request_id, err[:4000], retry_count,
-        final_channel_key=(last_ch.key if last_ch else None),
-        final_channel_type=(last_ch.type if last_ch else None),
-        final_model=last_model,
-        connect_ms=(last_result.connect_ms if last_result else None),
-        first_token_ms=(last_result.first_byte_ms if last_result else None),
-        idle_ms=(last_result.idle_ms if last_result else None),
-        total_ms=(last_result.total_ms if last_result else None),
-        final_round_id=(last_result.round_id if last_result else None),
-        request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
-        http_status=http_status,
-        affinity_hit=affinity_hit,
-        response_signals=getattr(last_result, "response_signals", None),
-        http_header_model=getattr(last_result, "http_header_model", None),
-        response_body=(last_result.response_text or None) if last_result else None,
-        usage=(last_result.usage if last_result else None),
-        usage_observed=(last_result.usage_observed if last_result else None),
-        upstream_protocol=(getattr(last_ch, "protocol", "openai-responses") if last_ch else None),
-        upstream_transport=(last_result.upstream_transport if last_result and last_ch is not None else ("ws" if last_ch is not None else None)),
-        proxy_name=(last_result.proxy_name if last_result else None),
-        proxy_bytes_up=(last_result.proxy_bytes.up if last_result else None),
-        proxy_bytes_down=(last_result.proxy_bytes.down if last_result else None),
-    )
+    if not skip_request_log:
+        await asyncio.to_thread(
+            log_db.finish_error,
+            request_id, err[:4000], retry_count,
+            final_channel_key=(last_ch.key if last_ch else None),
+            final_channel_type=(last_ch.type if last_ch else None),
+            final_model=last_model,
+            connect_ms=(last_result.connect_ms if last_result else None),
+            first_token_ms=(last_result.first_byte_ms if last_result else None),
+            idle_ms=(last_result.idle_ms if last_result else None),
+            total_ms=(last_result.total_ms if last_result else None),
+            final_round_id=(last_result.round_id if last_result else None),
+            request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
+            http_status=http_status,
+            affinity_hit=affinity_hit,
+            response_signals=getattr(last_result, "response_signals", None),
+            http_header_model=getattr(last_result, "http_header_model", None),
+            response_body=(last_result.response_text or None) if last_result else None,
+            usage=(last_result.usage if last_result else None),
+            usage_observed=(last_result.usage_observed if last_result else None),
+            upstream_protocol=(getattr(last_ch, "protocol", "openai-responses") if last_ch else None),
+            upstream_transport=(last_result.upstream_transport if last_result and last_ch is not None else ("ws" if last_ch is not None else None)),
+            proxy_name=(last_result.proxy_name if last_result else None),
+            proxy_bytes_up=(last_result.proxy_bytes.up if last_result else None),
+            proxy_bytes_down=(last_result.proxy_bytes.down if last_result else None),
+        )
     if only_local_rejections:
         if "context_length_exceeded" in downstream_message:
             await _send_context_length_error_frame(websocket, downstream_message)
@@ -2119,17 +2133,13 @@ async def _try_ws_channel(
                         # internally compiled function down the native relay.
                         body = search_tool_policy.restore_replay(body, "responses", api_key_name)
                         new_id, new_time, new_mono = str(uuid.uuid4()), time.time(), time.monotonic()
-                        msg_count, tool_count = _count_msg_tool(body, "responses")
-                        await asyncio.to_thread(log_db.insert_pending,
-                            new_id, client_ip, api_key_name, body.get("model"), True,
-                            msg_count, tool_count, _sanitize_headers(dict(websocket.headers)),
-                            {k: v for k, v in body.items() if not k.startswith("_")},
-                            fingerprint=fp_query, ingress_protocol="responses_ws")
-                        route = scheduler.schedule(body, api_key_name=api_key_name,
-                            client_ip=client_ip, ingress_protocol="responses", fp_query=fp_query)
+                        route, skip_log = await _schedule_search_turn(
+                            websocket, body, new_id, api_key_name, client_ip, fp_query,
+                        )
                         await _run_search_ws_session(websocket, body=body, schedule_result=route,
                             request_id=new_id, api_key_name=api_key_name, client_ip=client_ip,
-                            start_time=new_time, start_monotonic=new_mono, allowed_models=allowed_models)
+                            start_time=new_time, start_monotonic=new_mono, allowed_models=allowed_models,
+                            skip_request_log=skip_log)
                         return session_result or relay_result
                     requested_model = str(body.get("model") or "")
                     registry_choice = None
@@ -4234,9 +4244,38 @@ async def _relay_ws_session(
         await asyncio.gather(*owned_tasks, return_exceptions=True)
 
 
+async def _schedule_search_turn(websocket, body, request_id, api_key_name, client_ip, fp_query):
+    msg_count, tool_count = _count_msg_tool(body, "responses")
+    headers = _sanitize_headers(dict(websocket.headers))
+    log_body = {k: v for k, v in body.items() if not k.startswith("_")}
+
+    async def insert_pending():
+        await asyncio.to_thread(
+            log_db.insert_pending, request_id, client_ip, api_key_name,
+            body.get("model"), True, msg_count, tool_count, headers, log_body,
+            fingerprint=fp_query, ingress_protocol="responses_ws",
+        )
+
+    try:
+        route = scheduler.schedule(
+            body, api_key_name=api_key_name, client_ip=client_ip,
+            ingress_protocol="responses", fp_query=fp_query,
+        )
+        model = str(body.get("model") or "")
+        skip_log = scheduler.skip_no_route_log(
+            model, route, model_never_supported=_model_never_supported(model) if not route else False,
+        )
+    except Exception:
+        await insert_pending()
+        raise
+    if not skip_log:
+        await insert_pending()
+    return route, skip_log
+
+
 async def _run_search_ws_session(
     websocket, *, body, schedule_result, request_id, api_key_name, client_ip,
-    start_time, start_monotonic, allowed_models, api_key_lease=None,
+    start_time, start_monotonic, allowed_models, api_key_lease=None, skip_request_log=False,
 ):
     """Search sockets use exactly the HTTP ownership/continuation state machine.
 
@@ -4264,6 +4303,7 @@ async def _run_search_ws_session(
                     api_key_name=api_key_name, client_ip=client_ip, start_time=start_time,
                     start_monotonic=start_monotonic, fp_query=None,
                     allowed_models=allowed_models, api_key_lease=lease,
+                    skip_request_log=skip_request_log,
                 )
             finally:
                 await lease.release()
@@ -4272,7 +4312,7 @@ async def _run_search_ws_session(
             response = await runtime.run_failover(
                 schedule_result, round_body, request_id, api_key_name, client_ip,
                 bool(round_body.get("stream")), start_time, ingress_protocol="responses",
-                start_monotonic=start_monotonic,
+                start_monotonic=start_monotonic, skip_request_log=skip_request_log,
             )
             schedule_result = search_tool_policy.advance_route(schedule_result, response)
             return response
@@ -4381,17 +4421,8 @@ async def _run_search_ws_session(
         _obj, body, fp_query = next_turn
         body = search_tool_policy.restore_replay(body, "responses", api_key_name)
         start_time, start_monotonic, request_id = time.time(), time.monotonic(), str(uuid.uuid4())
-        msg_count, tool_count = _count_msg_tool(body, "responses")
-        await asyncio.to_thread(
-            log_db.insert_pending, request_id, client_ip, api_key_name,
-            body.get("model"), True, msg_count, tool_count,
-            _sanitize_headers(dict(websocket.headers)),
-            {k: v for k, v in body.items() if not k.startswith("_")},
-            fingerprint=fp_query, ingress_protocol="responses_ws",
-        )
-        schedule_result = scheduler.schedule(
-            body, api_key_name=api_key_name, client_ip=client_ip,
-            ingress_protocol="responses", fp_query=fp_query,
+        schedule_result, skip_request_log = await _schedule_search_turn(
+            websocket, body, request_id, api_key_name, client_ip, fp_query,
         )
 
 

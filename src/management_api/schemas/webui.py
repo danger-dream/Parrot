@@ -99,6 +99,15 @@ class OutcomeBucketData(StrictSchema):
     cancelledCount: int = Field(ge=0)
 
 
+class OutcomeFailureData(StrictSchema):
+    """Failed attempts of one model on a channel in the timeline window, with the latest one."""
+    model: str
+    count: int = Field(ge=0)
+    lastAt: datetime | None = None
+    lastError: str | None = None
+    lastRequestId: str | None = None
+
+
 class OutcomeTimelineItemData(StrictSchema):
     key: str
     # Oldest first, one per bucket of the timeline (empty buckets included).
@@ -107,10 +116,15 @@ class OutcomeTimelineItemData(StrictSchema):
     errorCount: int = Field(ge=0)
     cancelledCount: int = Field(ge=0)
     lastAt: datetime | None = None
+    # Channel dimension only: most failing models first, at most five.
+    failures: list[OutcomeFailureData] = Field(default_factory=list)
 
 
 class OutcomeTimelineData(StrictSchema):
-    """Finished requests per channel / API key / model in fixed buckets; the last bucket is the current one."""
+    """Finished requests per channel / API key / model in fixed buckets; the last bucket is the current one.
+
+    Channels count attempts: a request that failed over counts on every channel it tried.
+    """
     from_: datetime = Field(alias="from")
     bucketSeconds: int = Field(ge=60)
     items: list[OutcomeTimelineItemData]

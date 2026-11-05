@@ -50,6 +50,49 @@ def test_hourly_buckets_end_with_the_current_hour(store):
     assert by_key["api:two"]["buckets"][-6]["total"] == 1
 
 
+def test_channels_count_attempts_so_failover_failures_stay_visible(store):
+    now = (int(time.time()) // 3600) * 3600 + 1800
+    conn = log_db._get_conn()
+    # Failed over: the 429 on oauth:busy is absorbed by api:one, the request succeeds.
+    insert_request(conn, request_id="fo", created_at=now - 300, final_channel_key="api:one",
+                   requested_model="deepseek-v4.1-flash", status="success", retry_count=1)
+    insert_request(conn, request_id="ok", created_at=now - 200, final_channel_key="api:one", status="success")
+    insert_request(conn, request_id="gone", created_at=now - 100, final_channel_key="api:one", status="cancelled")
+    insert_request(conn, request_id="none", created_at=now - 50, final_channel_key=None, status="error")
+    quota = 'HTTP 429: {"code":6004,"msg":"您的使用量已超出频率限制，将在 2026-11-06 08:48:11 UTC+8 重置"}'
+    attempts = [
+        ("fo", 1, "oauth:busy", "deepseek-v4.1-flash", "http_error", quota),
+        ("fo", 2, "api:one", "deepseek-v4.1-flash", "success", None),
+        ("ok", 1, "api:one", "model-a", "success", None),
+        ("gone", 1, "api:one", "model-a", "client_disconnected", "client disconnected"),
+    ]
+    for rid, order, channel, model, outcome, detail in attempts:
+        conn.execute(
+            "INSERT INTO retry_chain (request_id, attempt_order, channel_key, channel_type, model, "
+            "client_visible_model, started_at, outcome, error_detail) VALUES (?,?,?,?,?,?,?,?,?)",
+            (rid, order, channel, channel.split(":")[0], model, model, now - 300, outcome, detail),
+        )
+    conn.commit()
+
+    data = StatsControl(now=lambda: now).outcome_timeline(CTX, dimension="channel", bucket_minutes=60, buckets=24)
+    by_key = {item["key"]: item for item in data["items"]}
+
+    busy = by_key["oauth:busy"]
+    assert (busy["total"], busy["errorCount"], busy["cancelledCount"]) == (1, 1, 0)
+    assert busy["buckets"][-1] == {"total": 1, "errorCount": 1, "cancelledCount": 0}
+    [failure] = busy["failures"]
+    assert (failure["model"], failure["count"], failure["lastRequestId"]) == ("deepseek-v4.1-flash", 1, "fo")
+    assert failure["lastError"] == quota
+    one = by_key["api:one"]
+    assert (one["total"], one["errorCount"], one["cancelledCount"]) == (3, 0, 1)
+    assert one["failures"] == []
+    assert (by_key["?"]["total"], by_key["?"]["errorCount"]) == (1, 1)
+
+    model_view = StatsControl(now=lambda: now).outcome_timeline(CTX, dimension="model", bucket_minutes=60, buckets=24)
+    flash = {item["key"]: item for item in model_view["items"]}["deepseek-v4.1-flash"]
+    assert (flash["total"], flash["errorCount"], flash["failures"]) == (1, 0, [])
+
+
 def test_endpoint_validates_and_serves_the_timeline(store, tmp_path):
     conn = log_db._get_conn()
     insert_request(conn, request_id="x", created_at=time.time() - 10, final_channel_key="api:one", status="success")

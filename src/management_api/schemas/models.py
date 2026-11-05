@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import Field, model_validator
@@ -59,7 +60,7 @@ class OAuthSourceAccountData(StrictSchema):
     quotaLimited: bool | None = None
     invalid: bool | None = None
     disabledReason: str | None = None
-    disabledUntil: str | None = None
+    disabledUntil: datetime | None = None
 
 
 class ModelSourceData(StrictSchema):

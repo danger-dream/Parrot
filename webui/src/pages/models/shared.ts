@@ -330,6 +330,10 @@ const DISABLED_REASON: Record<string, string> = {
   quota: '额度用尽',
   quota_exhausted: '额度用尽',
   user: '已停用',
+  arrears: '欠费停用',
+  plan_expired: '套餐到期',
+  fair_use_limited: '公平使用限制',
+  key_not_allowed: 'Key 类型不符',
 }
 const HEALTH_LABEL: Record<string, string> = {
   healthy: '正常',

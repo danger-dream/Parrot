@@ -669,6 +669,8 @@ docker compose logs --since 1h         # 最近 1 小时
 
 按月分库在 `data/logs/YYYY-MM.db`（SQLite）。在 TG Bot「📋 最近日志」查看；或宿主机直接 `sqlite3 <安装目录>/data/logs/2026-04.db`。
 
+对于文本、Chat、Responses 和 Responses WebSocket 请求，模型不存在或所有来源均被明确禁用、因此无法路由时，不写入请求摘要和正文，也不计入基于请求日志的统计；客户端仍收到原有错误。冷却、渠道权限或其他暂时不可用的路由失败仍按原有方式记录。路由告警独立保留，历史日志不受影响。
+
 #### 数据留存（TG「系统设置 → 🗃 数据留存」/ 管理接口 `/api/management/v1/logs/retention`）
 
 两种互相独立的策略，默认都是永久保留：

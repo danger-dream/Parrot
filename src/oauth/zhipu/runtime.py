@@ -351,7 +351,9 @@ def evaluate(account_key, account, usage, *, fresh, threshold):
             reset = max((windows[name].get("resets_at") or "" for name in hit), default="") or None
             captured = list(previous.get("cooldowns") or []) if previous.get("source") == "zhipu_quota" else []
             for item in cooldown.active_entries():
-                if item.get("channel_key") == "oauth:" + account_key and quota_errors.is_zhipu_1310_message(item.get("last_error_message")):
+                detail = item.get("last_error_message")
+                if item.get("channel_key") == "oauth:" + account_key and (
+                        quota_errors.is_zhipu_1310_message(detail) or quota_errors.is_zhipu_usage_window_message(detail)):
                     model = item.get("model")
                     if model:
                         captured = [saved for saved in captured if saved["model"] != model]

@@ -1505,35 +1505,44 @@ async def proxy_messages(request: Request):
     # 3. 调度：先计算指纹（供 log_db 记录）
     fp_query = fingerprint.fingerprint_query(key_name or "", client_ip, messages)
 
-    # 4. pending 日志
+    # 4. pending 日志内容在添加内部路由信息前准备。
     reasoning_effort = log_db.extract_reasoning_effort(body, "anthropic")
     req_headers = _sanitize_headers(dict(request.headers))
-    await asyncio.to_thread(
-        log_db.insert_pending,
-        request_id, client_ip, key_name, model, is_stream,
-        len(messages), len(tools),
-        req_headers,
-        {k: v for k, v in body.items() if not (isinstance(k, str) and k.startswith("_parrot_"))},
-        fingerprint=fp_query,
-        ingress_protocol="anthropic",
-        reasoning_effort=reasoning_effort,
-        fast_mode=explicit_fast_mode,
-    )
+    log_body = {k: v for k, v in body.items() if not (isinstance(k, str) and k.startswith("_parrot_"))}
 
-    # Internal-only routing/cache hints for downstream channel builders.  These
-    # fields are stripped by provider allowlists and never sent upstream.
-    body["_parrot_api_key_name"] = key_name or ""
-    body["_parrot_client_ip"] = client_ip or ""
-    from src.oauth.zhipu.request_context import capture_headers as capture_zcode_headers
-    capture_zcode_headers(body, request.headers)
-    from src.providers.workbuddy_context import capture_headers as capture_workbuddy_headers
-    capture_workbuddy_headers(body, request.headers)
-    claude_session_id = str(request.headers.get("x-claude-code-session-id") or "").strip()
-    if claude_session_id:
-        body[PARROT_CC_SESSION_ID_KEY] = claude_session_id
+    async def insert_pending():
+        await asyncio.to_thread(
+            log_db.insert_pending,
+            request_id, client_ip, key_name, model, is_stream,
+            len(messages), len(tools), req_headers, log_body,
+            fingerprint=fp_query,
+            ingress_protocol="anthropic",
+            reasoning_effort=reasoning_effort,
+            fast_mode=explicit_fast_mode,
+        )
 
-    # 5. 调度
-    result = scheduler.schedule(body, api_key_name=key_name, client_ip=client_ip)
+    try:
+        # Internal-only routing/cache hints for downstream channel builders.  These
+        # fields are stripped by provider allowlists and never sent upstream.
+        body["_parrot_api_key_name"] = key_name or ""
+        body["_parrot_client_ip"] = client_ip or ""
+        from src.oauth.zhipu.request_context import capture_headers as capture_zcode_headers
+        capture_zcode_headers(body, request.headers)
+        from src.providers.workbuddy_context import capture_headers as capture_workbuddy_headers
+        capture_workbuddy_headers(body, request.headers)
+        claude_session_id = str(request.headers.get("x-claude-code-session-id") or "").strip()
+        if claude_session_id:
+            body[PARROT_CC_SESSION_ID_KEY] = claude_session_id
+
+        # 5. 调度
+        result = scheduler.schedule(body, api_key_name=key_name, client_ip=client_ip)
+        model_never_supported = _model_never_supported(model) if not result and not result.guard_error else False
+        skip_log = scheduler.skip_no_route_log(model, result, model_never_supported=model_never_supported)
+    except Exception:
+        await insert_pending()
+        raise
+    if not skip_log:
+        await insert_pending()
 
     # pending 时更新 affinity_hit（亲和命中本身需要调度之后才知道）
     if result.affinity_hit:
@@ -1559,16 +1568,17 @@ async def proxy_messages(request: Request):
             f"{exclusion_summary}"
         )
         # Resolve once so the log and downstream response describe the same error.
-        err_type = errors.ErrType.NOT_FOUND if _model_never_supported(model) else errors.ErrType.API
+        err_type = errors.ErrType.NOT_FOUND if model_never_supported else errors.ErrType.API
         status = 404 if err_type == errors.ErrType.NOT_FOUND else 503
-        await asyncio.to_thread(
-            log_db.finish_error, request_id, msg, 0,
-            http_status=status, affinity_hit=(1 if result.affinity_hit else 0),
-            total_ms=int((time.monotonic() - start_monotonic) * 1000),
-        )
+        if not skip_log:
+            await asyncio.to_thread(
+                log_db.finish_error, request_id, msg, 0,
+                http_status=status, affinity_hit=(1 if result.affinity_hit else 0),
+                total_ms=int((time.monotonic() - start_monotonic) * 1000),
+            )
         from src import notifications
         notifications.routing_unavailable(ingress="anthropic", model=model, exclusions=result.exclusions,
-                                           api_key_name=key_name, request_id=request_id)
+                                           api_key_name=key_name, request_id="" if skip_log else request_id)
         return errors.json_error_response(status, err_type, msg)
 
     # Local token estimates are advisory, not a request-wide hard input cap.

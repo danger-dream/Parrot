@@ -21,6 +21,7 @@ SCENES = {
     'account.quota.recovered': ({'windows': [], 'metrics': []}, 'confirmed', 'still_paused'),
     'model.quota.blocked': ({'models': ['m'], 'pool': '自有模型额度池', 'count': 1}, 'confirmed', 'model_paused'),
     'model.quota.recovered': ({'models': ['m'], 'pool': '自有模型额度池', 'count': 1}, 'confirmed', 'model_resumed'),
+    'account.access.blocked': ({'error_code': '1309', 'error_reason': '套餐已到期或失效，续订后手动启用'}, 'confirmed', 'account_paused'),
     'account.credits.started': ({'metrics': []}, 'confirmed', 'credits_allowed'),
     'account.action.attention': ({'operation': '自动签到', 'result': 'unknown', 'error_code': 'result_unknown'}, 'unknown', 'action_unknown'),
     'account.benefit.granted': ({'operation': '领取', 'result': '新增尚未核实', 'inventory': [{'name': '周卡库存', 'count': 2}]}, 'confirmed', 'benefit_saved'),

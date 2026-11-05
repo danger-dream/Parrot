@@ -3394,6 +3394,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
 
     icon = _status_icon(acc)
     reason = acc.get("disabled_reason") or "—"
+    reason = quota_errors.ACCOUNT_BLOCK_LABELS.get(reason, reason)
     prov = oauth_control.provider_of_snapshot(acc)
     quota_row = oauth_control.quota_snapshot(account_key)
     reset_credit_cached_count = _openai_reset_credit_count_from_row(quota_row) if prov == "openai" else None

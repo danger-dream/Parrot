@@ -1,7 +1,7 @@
 """智能渠道评分（基于 openai-proxy/scorer.js 的 Python 等价移植）。
 
 策略：
-  1. 滑动窗口 EMA（默认 50）：老数据自然淡出
+  1. 滑动窗口（默认 50）：按序保存最近 N 次成败，老数据按真实顺序滑出
   2. 无 MIN_SAMPLES 混合：样本少的渠道直接用实测值
   3. 探索率 0.2：五分之一请求故意选"最值得探索"的渠道
   4. 陈旧衰减：15 min 开始向默认分漂移，30 min 完全回归
@@ -87,17 +87,24 @@ def init() -> None:
     with _lock:
         _stats.clear()
         for row in rows:
-            # 历史累积数据无法还原滑动窗口，按全量成功率等比推算，并 cap 到窗口上限
             total = int(row.get("total_requests") or 0)
             succ = int(row.get("success_count") or 0)
-            capped_recent = min(total, window)
-            rate = (succ / total) if total > 0 else 0
-            capped_succ = int(round(capped_recent * rate))
+            outcomes = row.get("recent_outcomes")
+            if isinstance(outcomes, str) and not outcomes.strip("01"):
+                outcomes = outcomes[-window:]
+            else:
+                # 旧快照没有成败序列，按全量成功率等比推算并 cap 到窗口上限；
+                # 推算出的失败放在最旧位置，真实请求进来后最先滑出
+                capped_recent = min(total, window)
+                rate = (succ / total) if total > 0 else 0
+                capped_succ = int(round(capped_recent * rate))
+                outcomes = "0" * (capped_recent - capped_succ) + "1" * capped_succ
             _stats[(row["channel_key"], row["model"])] = {
                 "total_requests": total,
                 "success_count": succ,
-                "recent_requests": capped_recent,
-                "recent_success_count": capped_succ,
+                "recent_outcomes": outcomes,
+                "recent_requests": len(outcomes),
+                "recent_success_count": outcomes.count("1"),
                 "avg_connect_ms": _loaded_connect_ema(
                     row, stored_version=stored_version, neutral=params["defaultScore"],
                 ),
@@ -120,6 +127,27 @@ def get_stats(channel_key: str, model: str) -> Optional[dict]:
     return _get(channel_key, model)
 
 
+def _recent(stats: dict, window: int) -> tuple[int, int]:
+    """(requests, successes) among the last ``window`` outcomes."""
+    outcomes = stats.get("recent_outcomes")
+    if outcomes is not None:
+        outcomes = outcomes[-window:]
+        return len(outcomes), outcomes.count("1")
+    total = min(int(stats.get("recent_requests", 0)), window)
+    return total, min(int(stats.get("recent_success_count", 0)), total)
+
+
+def _push_outcome(stats: dict, ok: bool, window: int) -> None:
+    outcomes = stats.get("recent_outcomes")
+    if outcomes is None:
+        total, succ = _recent(stats, window)
+        outcomes = "0" * (total - succ) + "1" * succ
+    outcomes = (outcomes + ("1" if ok else "0"))[-window:]
+    stats["recent_outcomes"] = outcomes
+    stats["recent_requests"] = len(outcomes)
+    stats["recent_success_count"] = outcomes.count("1")
+
+
 def calculate_score(stats: Optional[dict], params: Optional[dict] = None) -> float:
     if params is None:
         params = _params()
@@ -127,10 +155,9 @@ def calculate_score(stats: Optional[dict], params: Optional[dict] = None) -> flo
     if not stats or stats.get("total_requests", 0) == 0:
         return default
 
-    window = params["recentWindow"]
-    recent_total = min(int(stats.get("recent_requests", 0)), window)
+    recent_total, recent_success = _recent(stats, params["recentWindow"])
     if recent_total > 0:
-        rate = min(int(stats.get("recent_success_count", 0)), recent_total) / recent_total
+        rate = recent_success / recent_total
     else:
         tot = stats.get("total_requests", 0) or 1
         rate = (stats.get("success_count", 0) or 0) / tot
@@ -194,7 +221,7 @@ def _record_success(channel_key: str, model: str,
         if stats is None:
             stats = {
                 "total_requests": 0, "success_count": 0,
-                "recent_requests": 0, "recent_success_count": 0,
+                "recent_outcomes": "", "recent_requests": 0, "recent_success_count": 0,
                 # Missing means pool reuse / not reliably observed, never a
                 # synthetic zero-latency connection sample.
                 "avg_connect_ms": (
@@ -209,17 +236,7 @@ def _record_success(channel_key: str, model: str,
         stats["total_requests"] += 1
         stats["success_count"] += 1
         stats["last_updated"] = _now_ms()
-
-        # 滑动窗口
-        if stats["recent_requests"] < window:
-            stats["recent_requests"] += 1
-            stats["recent_success_count"] += 1
-        else:
-            old_rate = stats["recent_success_count"] / window
-            stats["recent_success_count"] = min(
-                window,
-                int(round(stats["recent_success_count"] - old_rate + 1)),
-            )
+        _push_outcome(stats, True, window)
 
         # EMA 延迟
         if stats["total_requests"] == 1:
@@ -262,7 +279,7 @@ def _record_failure(channel_key: str, model: str, connect_ms: Optional[float]) -
         if stats is None:
             stats = {
                 "total_requests": 0, "success_count": 0,
-                "recent_requests": 0, "recent_success_count": 0,
+                "recent_outcomes": "", "recent_requests": 0, "recent_success_count": 0,
                 "avg_connect_ms": float(connect_ms) if connect_ms is not None else params["defaultScore"],
                 "avg_first_byte_ms": 0.0,
                 "avg_total_ms": 0.0,
@@ -272,15 +289,7 @@ def _record_failure(channel_key: str, model: str, connect_ms: Optional[float]) -
 
         stats["total_requests"] += 1
         stats["last_updated"] = _now_ms()
-
-        if stats["recent_requests"] < window:
-            stats["recent_requests"] += 1
-        else:
-            old_rate = stats["recent_success_count"] / window
-            stats["recent_success_count"] = max(
-                0,
-                int(round(stats["recent_success_count"] - old_rate)),
-            )
+        _push_outcome(stats, False, window)
 
         if connect_ms is not None and stats["total_requests"] > 1:
             stats["avg_connect_ms"] = alpha * float(connect_ms) + (1 - alpha) * stats["avg_connect_ms"]
@@ -337,8 +346,7 @@ def _pick_explore_target(ordered: list) -> Optional[int]:
         if not stats or stats.get("total_requests", 0) == 0:
             priority = 1_000_000.0
         else:
-            recent_count = min(int(stats.get("recent_requests", 0)),
-                               int(_params()["recentWindow"]))
+            recent_count = _recent(stats, int(_params()["recentWindow"]))[0]
             stale_min = (_now_ms() - int(stats.get("last_updated", 0))) / 60000
             priority = (stale_min + 1) / (recent_count + 1)
         if priority > best_priority:
@@ -423,13 +431,14 @@ def snapshot() -> list[dict]:
     with _lock:
         for (ck, m), s in _stats.items():
             score = calculate_score(s, params)
+            recent_requests, recent_success_count = _recent(s, params["recentWindow"])
             out.append({
                 "channel_key": ck,
                 "model": m,
                 "total_requests": s["total_requests"],
                 "success_count": s["success_count"],
-                "recent_requests": s["recent_requests"],
-                "recent_success_count": s["recent_success_count"],
+                "recent_requests": recent_requests,
+                "recent_success_count": recent_success_count,
                 "avg_connect_ms": round(s["avg_connect_ms"]),
                 "avg_first_byte_ms": round(s["avg_first_byte_ms"]),
                 "avg_total_ms": round(s["avg_total_ms"]),

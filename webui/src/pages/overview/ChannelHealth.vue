@@ -5,18 +5,42 @@ import OutcomeStrip from '@/components/ui/OutcomeStrip.vue'
 import ProviderIcon from '@/components/ProviderIcon.vue'
 import { catalog } from '@/stores/catalog'
 import { channelProvider } from '@/utils/providers'
-import { goLogs, goPage, openChannel } from '@/links'
+import { goLogs, goPage, openChannel, openRequest } from '@/links'
 import { Ban } from '@lucide/vue'
-import { compact, integer, pctValue } from '@/utils/format'
+import { compact, integer } from '@/utils/format'
+import type { OutcomeItem } from '@/utils/outcomes'
 import { ov } from './data'
 import { promptOf } from './metrics'
 
 defineProps<{ ready: boolean }>()
 
 type Status = NonNullable<typeof catalog.status>['channels'][number]
+type Failure = NonNullable<OutcomeItem['failures']>[number]
 
-/** What is wrong, naming the models: cooldowns first, then models whose recent success rate is low. */
-function problemOf(c: Status): { label: string; tone: string } | null {
+/** "HTTP 429 · 您的使用量已超出频率限制…" from a stored attempt error (`HTTP nnn: {json}` or plain text). */
+function briefError(raw: string | null | undefined): string {
+  if (!raw) return '未知错误'
+  const http = /^HTTP (\d{3}): ([\s\S]*)$/.exec(raw)
+  const body = http ? http[2] : raw
+  let text = body
+  try {
+    const obj = JSON.parse(body)
+    const err = obj?.error && typeof obj.error === 'object' ? obj.error : obj
+    text = String(err?.message || err?.msg || obj?.message || obj?.msg || body)
+  } catch {
+    // Plain text, or JSON cut off by the stored length limit.
+    const quoted = /"(?:message|msg)"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(body)
+    if (quoted) text = quoted[1].replace(/\\(["\\/])/g, '$1').replace(/\\n/g, ' ')
+  }
+  text = text.replace(/\s+/g, ' ').trim()
+  return http ? `HTTP ${http[1]} · ${text}` : text
+}
+
+/**
+ * What is wrong, naming the models: cooldowns first, then today's failed attempts with the latest
+ * error. Both come from the same attempts as the strip and the failure count on the right.
+ */
+function problemOf(c: Status, failures: Failure[], tone: string): { label: string; tone: string } | null {
   const cool = c.cooldowns || []
   if (cool.length) {
     const permanent = cool.some((x) => x.state === 'permanent')
@@ -24,20 +48,24 @@ function problemOf(c: Status): { label: string; tone: string } | null {
     const names = cool.map((x) => x.model).filter(Boolean)
     return { label: `${kind} · ${names.slice(0, 2).join('、')}${names.length > 2 ? ` 等 ${names.length} 个` : ''}`, tone: permanent ? 'r' : 'o' }
   }
-  const weak = c.weakModels || []
-  if (weak.length) {
-    const w = weak[0]
-    const more = weak.length > 1 ? `，另 ${weak.length - 1} 个模型偏低` : ''
-    return {
-      label: `${w.model} 成功率 ${pctValue(w.successRate)}（最近 ${w.recentRequests} 次）${more}`,
-      tone: w.successRate < 50 ? 'r' : 'o',
-    }
+  if (failures.length) {
+    const f = failures[0]
+    const more = failures.length > 1 ? `；另 ${failures.length - 1} 个模型也有失败` : ''
+    return { label: `${f.model} 今日失败 ${integer(f.count)} 次 · ${briefError(f.lastError)}${more}`, tone }
   }
   return null
 }
 
-// Enabled channels/accounts with requests today: problems first, then by today's traffic.
-// The strip, the request count and the failure count all cover today, like the request health timeline.
+/** The most recent failed request on this channel, which shows the whole attempt chain. */
+function latestFailure(failures: Failure[]): string | null {
+  let best: Failure | null = null
+  for (const f of failures) if (f.lastRequestId && (!best || String(f.lastAt || '') > String(best.lastAt || ''))) best = f
+  return best?.lastRequestId || null
+}
+
+// Enabled channels/accounts with attempts today: problems first, then by today's traffic.
+// The strip and the failure count cover every attempt today, so a failure that failover
+// absorbed still shows on the channel that failed.
 const all = computed(() => {
   const today = new Map(ov.channels.map((r) => [r.key, r.metrics]))
   return (catalog.status?.channels || [])
@@ -46,12 +74,17 @@ const all = computed(() => {
       const o = ov.outcomes?.items[c.id]
       const m = today.get(c.id)
       const n = o?.total ?? 0
+      const errors = o?.errorCount ?? 0
+      const tone = errors ? (errors / n >= 0.2 ? 'r' : 'o') : 'g'
+      const failures = o?.failures || []
       return {
         id: c.id,
         name: c.name,
-        health: problemOf(c),
+        health: problemOf(c, failures, tone),
+        failedRequest: latestFailure(failures),
         outcome: o ?? null,
-        errors: o?.errorCount ?? 0,
+        errors,
+        tone,
         n,
         today: m?.total ?? 0,
         tokens: m ? promptOf(m) + m.outputTokens : 0,
@@ -73,10 +106,15 @@ function openUnassigned(): void {
   start.setHours(0, 0, 0, 0)
   goLogs({ status: 'error', from: start.getTime() })
 }
+
+function openRow(r: { id: string; failedRequest: string | null }): void {
+  if (r.failedRequest) openRequest(r.failedRequest)
+  else openChannel(r.id)
+}
 </script>
 
 <template>
-  <Card title="渠道健康" subtitle="今日按小时：绿全部成功、橙有失败、红失败超两成">
+  <Card title="渠道健康" subtitle="今日每次尝试按小时统计：绿全部成功、橙有失败、红失败超两成">
     <template #actions>
       <button class="more" @click="goPage('/channels')">全部渠道</button>
     </template>
@@ -95,7 +133,13 @@ function openUnassigned(): void {
         <OutcomeStrip :item="unassigned" :from="ov.outcomes?.from" :count="24" :elapsed="elapsed" :width="3" :gap="1" :height="16" />
         <span class="rate num r">失败 {{ integer(unassigned.errorCount) }}</span>
       </button>
-      <button v-for="r in rows" :key="r.id" class="item" @click="openChannel(r.id)">
+      <button
+        v-for="r in rows"
+        :key="r.id"
+        class="item"
+        :title="r.failedRequest ? '查看最近一次失败的请求' : undefined"
+        @click="openRow(r)"
+      >
         <ProviderIcon :provider="channelProvider(r.id)" :size="22" />
         <div class="main">
           <span class="name truncate">{{ r.name }}</span>
@@ -103,7 +147,7 @@ function openUnassigned(): void {
           <span v-else class="sub">今日 {{ integer(r.today) }} 次 · {{ compact(r.tokens) }} Token</span>
         </div>
         <OutcomeStrip :item="r.outcome" :from="ov.outcomes?.from" :count="24" :elapsed="elapsed" :width="3" :gap="1" :height="16" />
-        <span class="rate num" :class="r.errors ? (r.errors / r.n >= 0.2 ? 'r' : 'o') : 'g'" :title="`今日 ${integer(r.n)} 次`">{{ r.errors ? `失败 ${integer(r.errors)}` : '无失败' }}</span>
+        <span class="rate num" :class="r.tone" :title="`今日尝试 ${integer(r.n)} 次${r.errors ? `，失败 ${integer(r.errors)} 次（含已切换到其他渠道完成的请求）` : ''}`">{{ r.errors ? `失败 ${integer(r.errors)}` : '无失败' }}</span>
       </button>
       <p v-if="ready && !rows.length && !unassigned" class="empty">今天还没有请求</p>
       <p v-if="quiet" class="quiet">另有 {{ quiet }} 个启用的渠道今天没有请求</p>

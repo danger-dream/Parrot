@@ -14,6 +14,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
 
+from .providers.workbuddy_errors import error_payload as _workbuddy_error_payload
+
 
 _BJT = timezone(timedelta(hours=8))
 _ZHIPU_RESET_RE = re.compile(r"(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
@@ -27,6 +29,43 @@ _ZHIPU_PLAN_MESSAGE_RE = re.compile(
     re.IGNORECASE,
 )
 _MAX_RESET_AHEAD_MS = 45 * 24 * 60 * 60 * 1000
+# WorkBuddy 6004: per-model usage limit of one account, e.g.
+# {"code":6004,"msg":"您的使用量已超出频率限制，将在 2026-11-06 08:48:11 UTC+8 重置，您也可以切换其他模型继续使用。"}
+_WORKBUDDY_USAGE_LIMIT_CODE = "6004"
+_WORKBUDDY_RESET_RE = re.compile(
+    r"使用量已超出.*?将在\s*(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*(?:UTC\+0?8(?::00)?)?\s*重置"
+)
+# Zhipu plan usage windows that are used up and carry their reset time
+# (docs.bigmodel.cn/cn/api/api-code, docs.z.ai/api-reference/api-code):
+# 1308 a `${number} ${unit}` window; 1316-1321 the 5-hour / 7-day window when extra
+# pay-as-you-go usage is also unavailable (balance or monthly spend limit). e.g.
+# [1308][已达到 5 小时的使用上限。您的限额将在 2026-11-05 19:34:04 重置。][request-id]
+# 已达到 5 小时使用上限。主账号余额不足，无法使用超额按量付费。您的限额将在 2026-11-05 19:34:04 重置。
+# Usage limit reached for 5 hour. Your limit will reset at 2026-11-05 19:34:04
+# Usage limit reached for the past 7 days. Insufficient balance for extra usage. Resets at 2026-11-05 19:34:04.
+_ZHIPU_WINDOW_CODES = frozenset({"1308", "1316", "1317", "1318", "1319", "1320", "1321"})
+_ZHIPU_WINDOW_RESET_RE = re.compile(
+    r"已达到\s*\d+\s*[^\s\d的。]{1,4}\s*的?使用上限.*?限额将在\s*(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*重置"
+    r"|Usage limit reached for\s+(?:the past\s+)?\d+\s*[a-z]+.*?resets? at\s+(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})",
+    re.IGNORECASE | re.DOTALL,
+)
+# Zhipu account-level refusals without a reset time: they do not clear by themselves,
+# so the account is disabled until the operator fixes it and enables it again.
+# code -> (disabled_reason, documented wording in Chinese or English)
+_ZHIPU_ACCOUNT_BLOCKS = {
+    "1113": ("arrears", re.compile(r"欠费|Insufficient balance|no resource package", re.IGNORECASE)),
+    "1309": ("plan_expired", re.compile(r"套餐已到期|package has expired", re.IGNORECASE)),
+    "1313": ("fair_use_limited", re.compile(r"公平使用|Fair Usage", re.IGNORECASE)),
+    "1314": ("plan_expired", re.compile(r"企业套餐已失效|enterprise package has expired", re.IGNORECASE)),
+    "1315": ("key_not_allowed", re.compile(r"仅限企业编程套餐|limited to enterprise coding package", re.IGNORECASE)),
+}
+# Operator-facing text for these disabled reasons (Web console and Telegram).
+ACCOUNT_BLOCK_LABELS = {
+    "arrears": "账户已欠费，充值后手动启用",
+    "plan_expired": "套餐已到期或失效，续订后手动启用",
+    "fair_use_limited": "被判定不符合公平使用策略，到官网申请解除后手动启用",
+    "key_not_allowed": "API Key 仅限企业编程套餐使用，更换 Key 后手动启用",
+}
 
 
 def _json_payload(detail: str | None) -> dict:
@@ -113,6 +152,110 @@ def zhipu_1310_reset_ms(
     return reset_ms
 
 
+def _zhipu_window_reset(detail: str | None) -> datetime | None:
+    code, message = _error_fields(detail)
+    if code not in _ZHIPU_WINDOW_CODES:
+        return None
+    match = _ZHIPU_WINDOW_RESET_RE.search(message)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1) or match.group(2), "%Y-%m-%d %H:%M:%S").replace(tzinfo=_BJT)
+    except ValueError:
+        return None
+
+
+def is_zhipu_usage_window_message(detail: str | None) -> bool:
+    return _zhipu_window_reset(detail) is not None
+
+
+def zhipu_usage_window_reset_ms(
+    channel: Any,
+    *,
+    http_status: int | None,
+    error_detail: str | None,
+    now_ms: int | None = None,
+) -> int | None:
+    """Reset time of a used-up Zhipu plan usage window (HTTP 429, code 1308/1316-1321 and its wording).
+
+    Validated like 1310: stale or absurd dates are rejected.
+    """
+    try:
+        status = int(http_status or 0)
+    except (TypeError, ValueError):
+        return None
+    if status != 429 or not is_zhipu_channel(channel):
+        return None
+    reset = _zhipu_window_reset(error_detail)
+    if reset is None:
+        return None
+    reset_ms = int(reset.timestamp() * 1000)
+    current = int(now_ms if now_ms is not None else time.time() * 1000)
+    if reset_ms <= current or reset_ms - current > _MAX_RESET_AHEAD_MS:
+        return None
+    return reset_ms
+
+
+def _workbuddy_usage_limit_reset(detail: str | None) -> datetime | None:
+    error = _workbuddy_error_payload(_json_payload(detail))
+    if str(error.get("code") or "").strip() != _WORKBUDDY_USAGE_LIMIT_CODE:
+        return None
+    match = _WORKBUDDY_RESET_RE.search(str(error.get("msg") or error.get("message") or ""))
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=_BJT)
+    except ValueError:
+        return None
+
+
+def zhipu_account_block(
+    channel: Any,
+    *,
+    http_status: int | None,
+    error_detail: str | None,
+) -> tuple[str, str] | None:
+    """``(code, disabled_reason)`` when Zhipu refuses the whole account (HTTP 429 + code + wording)."""
+    try:
+        status = int(http_status or 0)
+    except (TypeError, ValueError):
+        return None
+    if status != 429 or not is_zhipu_channel(channel):
+        return None
+    code, message = _error_fields(error_detail)
+    block = _ZHIPU_ACCOUNT_BLOCKS.get(code)
+    if block is None or not block[1].search(message):
+        return None
+    return code, block[0]
+
+
+def is_workbuddy_usage_limit_message(detail: str | None) -> bool:
+    return _workbuddy_usage_limit_reset(detail) is not None
+
+
+def workbuddy_usage_limit_reset_ms(
+    channel_key: str | None,
+    error_detail: str | None,
+    *,
+    now_ms: int | None = None,
+) -> int | None:
+    """Upstream reset time of a WorkBuddy account/model usage limit (code 6004).
+
+    The limit belongs to one model of one account, so the caller cools that
+    (channel, model) pair and other accounts stay schedulable.
+    """
+    if not str(channel_key or "").startswith("oauth:workbuddy:"):
+        return None
+    reset = _workbuddy_usage_limit_reset(error_detail)
+    if reset is None:
+        return None
+    reset_ms = int(reset.timestamp() * 1000)
+    current = int(now_ms if now_ms is not None else time.time() * 1000)
+    if reset_ms <= current or reset_ms - current > _MAX_RESET_AHEAD_MS:
+        return None
+    return reset_ms
+
+
 def is_cursor_pool_quota_message(detail: str | None) -> bool:
     code, _message = _error_fields(detail)
     return code == "cursor_quota_pool" or "cursor_quota_pool" in str(detail or "")
@@ -154,7 +297,8 @@ def active_quota_cooldown(entry: dict | None, *, now_ms: int | None = None) -> b
     if not isinstance(entry, dict):
         return False
     detail = entry.get("last_error_message")
-    if not (is_zhipu_1310_message(detail) or is_cursor_pool_quota_message(detail)):
+    if not (is_zhipu_1310_message(detail) or is_cursor_pool_quota_message(detail)
+            or is_zhipu_usage_window_message(detail) or is_workbuddy_usage_limit_message(detail)):
         return False
     try:
         until = int(entry.get("cooldown_until"))

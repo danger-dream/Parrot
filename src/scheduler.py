@@ -78,6 +78,69 @@ class ScheduleResult:
         return bool(self.candidates) or bool(self.saturated)
 
 
+def skip_no_route_log(requested_model: str, result: ScheduleResult, *, model_never_supported: bool) -> bool:
+    """Skip only an unknown model or one whose every source is explicitly disabled."""
+    if result or result.guard_error:
+        return False
+
+    from .model_registry import runtime as model_registry
+    from .model_registry.offers import collect
+    from .model_registry.resolver import resolve
+
+    try:
+        cfg = config.get()
+        channels = {ch.key: ch for ch in registry.all_channels()}
+        unified = model_registry.current()
+        found = resolve(unified, requested_model) if unified is not None else None
+        if unified is not None:
+            offers = list(unified.models[found.model].offers) if found else []
+        else:
+            offers = [offer for offer in collect(cfg)
+                      if requested_model in (offer.name, offer.wire)]
+        by_source: dict[str, list] = {}
+        for offer in offers:
+            by_source.setdefault(offer.source, []).append(offer)
+        for ch in channels.values():
+            wire = model_registry.serves(ch, requested_model)
+            if wire and ch.key not in by_source:
+                by_source[ch.key] = []
+        if not by_source:
+            return model_never_supported
+
+        reasons = {item.get("channel"): item.get("reason") for item in result.exclusions}
+        for key, source_offers in by_source.items():
+            ch = channels.get(key)
+            if ch is None:
+                return False
+            reason = reasons.get(key)
+            if reason not in (None, "disabled", "global_model_disabled",
+                              "source_model_disabled", "resolved_model_disabled"):
+                return False
+            if not ch.enabled or reason == "global_model_disabled":
+                continue
+            if reason == "disabled":
+                return False
+            model_id = found.model if found else requested_model
+            if not model_state.is_global_enabled(model_id, cfg, source_key=key):
+                continue
+            if source_offers:
+                disabled = all(
+                    any(not model_state.is_source_enabled(key, name, cfg) for name in (
+                        (offer.wire,) if key.startswith("oauth:") else
+                        (model_id, requested_model, offer.name, offer.wire)
+                    )) for offer in source_offers
+                )
+            else:
+                wire = model_registry.serves(ch, requested_model)
+                disabled = any(not model_state.is_source_enabled(key, name, cfg)
+                               for name in (requested_model, wire) if name)
+            if not disabled:
+                return False
+        return True
+    except Exception:
+        return False
+
+
 # ─── 筛选 ─────────────────────────────────────────────────────────
 
 def _filter_candidates(requested_model: str,

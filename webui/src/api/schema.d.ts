@@ -7741,6 +7741,8 @@ export interface components {
             modelQuotaBlocked: boolean;
             /** Modelquotarecovered */
             modelQuotaRecovered: boolean;
+            /** Accountaccessblocked */
+            accountAccessBlocked: boolean;
             /** Accountcreditsstarted */
             accountCreditsStarted: boolean;
             /** Accountactionattention */
@@ -7822,6 +7824,8 @@ export interface components {
             modelQuotaBlocked?: boolean | null;
             /** Modelquotarecovered */
             modelQuotaRecovered?: boolean | null;
+            /** Accountaccessblocked */
+            accountAccessBlocked?: boolean | null;
             /** Accountcreditsstarted */
             accountCreditsStarted?: boolean | null;
             /** Accountactionattention */
@@ -8774,8 +8778,26 @@ export interface components {
             cancelledCount: number;
         };
         /**
+         * OutcomeFailureData
+         * @description Failed attempts of one model on a channel in the timeline window, with the latest one.
+         */
+        OutcomeFailureData: {
+            /** Model */
+            model: string;
+            /** Count */
+            count: number;
+            /** Lastat */
+            lastAt?: string | null;
+            /** Lasterror */
+            lastError?: string | null;
+            /** Lastrequestid */
+            lastRequestId?: string | null;
+        };
+        /**
          * OutcomeTimelineData
          * @description Finished requests per channel / API key / model in fixed buckets; the last bucket is the current one.
+         *
+         *     Channels count attempts: a request that failed over counts on every channel it tried.
          */
         OutcomeTimelineData: {
             /**
@@ -8802,6 +8824,8 @@ export interface components {
             cancelledCount: number;
             /** Lastat */
             lastAt?: string | null;
+            /** Failures */
+            failures?: components["schemas"]["OutcomeFailureData"][];
         };
         /**
          * OverviewData

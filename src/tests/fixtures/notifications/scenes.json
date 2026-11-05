@@ -56,6 +56,14 @@
       "✖ 关闭"
     ]
   },
+  "account.access.blocked": {
+    "text": "❌ <b>OpenAI · 账号被上游拒绝服务，已停用</b>\n账号：A&lt;b&gt;（same@example.test · 工作区 Team）\n\n原因：套餐已到期或失效，续订后手动启用\n错误代码：1309\n\n已暂停调用此账号。\n处理：不会自动恢复；处理好后到账户详情里手动启用。\n2026-10-16 08:00:00",
+    "actions": [
+      "👤 账户详情",
+      "🔕 暂停提醒",
+      "✖ 关闭"
+    ]
+  },
   "account.credits.started": {
     "text": "⚠️ <b>OpenAI · 套餐额度用完，开始消耗积分</b>\n账号：A&lt;b&gt;（same@example.test · 工作区 Team）\n\n后续请求会消耗积分，账号保持可用。\n处理：不想消耗积分，点「暂停积分续用」。\n2026-10-16 08:00:00",
     "actions": [

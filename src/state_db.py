@@ -226,6 +226,7 @@ def xai_video_job_cleanup(now:int|None=None)->int:
 
 def perf_save(channel_key:str,model:str,stats:dict[str,Any])->None:
     row={"channel_key":channel_key,"model":model,"total_requests":int(stats.get("total_requests",0)),"success_count":int(stats.get("success_count",0)),"recent_requests":int(stats.get("recent_requests",0)),"recent_success_count":int(stats.get("recent_success_count",0)),"avg_connect_ms":float(stats.get("avg_connect_ms",0)),"avg_first_byte_ms":float(stats.get("avg_first_byte_ms",0)),"avg_total_ms":float(stats.get("avg_total_ms",0)),"last_updated":int(stats.get("last_updated",now_ms()))}
+    if stats.get("recent_outcomes") is not None:row["recent_outcomes"]=str(stats["recent_outcomes"])
     _mut("performance_stats",lambda d:d.__setitem__(_key(channel_key,model),row))
 def perf_load(channel_key:str,model:str):return _get("performance_stats",_key(channel_key,model))
 def perf_load_all():return _all("performance_stats")

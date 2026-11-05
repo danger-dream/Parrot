@@ -104,3 +104,13 @@ npx vue-tsc --noEmit          # typecheck (whole project)
 pnpm gen:api                  # regenerate api/schema.d.ts (needs PARROT_PYTHON)
 pnpm build                    # bundle into ../src/webui (integration only)
 ```
+
+To test OAuth account drag interactions without changing a running server's bundle, build into a
+separate directory and run the browser checks against their loopback-only mock API. The test needs
+Python Playwright and Chrome/Chromium; it never reads or changes real accounts.
+
+```bash
+out=$(mktemp -d)
+./node_modules/.bin/vite build --outDir "$out"
+python3 scripts/test-oauth-drag.py "$out"
+```

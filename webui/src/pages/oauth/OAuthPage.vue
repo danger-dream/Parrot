@@ -47,6 +47,8 @@ const refreshNote = ref('')
 const clearingAll = ref(false)
 
 let loadSeq = 0
+let loadInFlight = false
+let deferredLoad = false
 let statsRetry: number | undefined
 /**
  * One request renders every card: each list item carries the server-built `card` (plan line, usage,
@@ -59,7 +61,12 @@ watch(view, (v) => localStorage.setItem('parrot.oauth.view', v))
 const effView = computed(() => (ui.width < 900 ? 'cards' : view.value))
 
 async function load(): Promise<void> {
+  if (drag.id || savingOrder.value) {
+    deferredLoad = true
+    return
+  }
   const seq = ++loadSeq
+  loadInFlight = true
   if (!accounts.value.length) loading.value = true
   try {
     const [res, recent] = await Promise.all([
@@ -67,6 +74,10 @@ async function load(): Promise<void> {
       loadOutcomeTimeline('channel'),
     ])
     if (seq !== loadSeq) return
+    if (drag.id || savingOrder.value) {
+      deferredLoad = true
+      return
+    }
     if (recent) outcomes.value = recent
     accounts.value = res.items
     listRevision.value = res.revision
@@ -79,8 +90,22 @@ async function load(): Promise<void> {
   } catch (err) {
     if (seq === loadSeq) error.value = errorTitle(err)
   } finally {
-    if (seq === loadSeq) loading.value = false
+    if (seq === loadSeq) {
+      loading.value = false
+      loadInFlight = false
+    }
   }
+}
+function deferPendingLoad(): void {
+  if (!loadInFlight) return
+  loadSeq++
+  loadInFlight = false
+  deferredLoad = true
+}
+function flushDeferredLoad(): void {
+  if (!deferredLoad || drag.id || savingOrder.value) return
+  deferredLoad = false
+  void load()
 }
 
 watch(
@@ -116,6 +141,7 @@ onBeforeUnmount(() => {
   offFinished()
   window.clearTimeout(liveTimer)
   window.clearTimeout(statsRetry)
+  window.clearTimeout(clickTimer)
   window.clearInterval(ticker)
   window.removeEventListener('focus', onFocus)
 })
@@ -187,8 +213,8 @@ const summary = computed(() => {
   for (const a of accounts.value) {
     if (a.disabledReason === 'auth_error' || a.invalid) s.auth++
     else if (a.disabledReason === 'quota') s.quota++
-    else if (a.disabledReason === 'user' || !a.enabled) s.user++
-    else if (a.disabledReason) s.restricted++
+    else if (a.disabledReason && a.disabledReason !== 'user') s.restricted++
+    else if (!a.enabled) s.user++
     else if (a.available) s.ok++
     s.cooling += a.card?.cooldown.coolingModels || 0
     s.permanent += a.card?.cooldown.permanentModels || 0
@@ -200,12 +226,23 @@ const summary = computed(() => {
 // ---- drag to reorder (whole card; long-press on touch). Saves on drop, rolls back on failure ----
 const drag = reactive({ id: '', active: false, x: 0, y: 0, pointerId: -1, touch: false, before: [] as string[] })
 let pressTimer: number | undefined
+let clickTimer: number | undefined
 let suppressClick = false
+let dragList: HTMLElement | null = null
+let previousSelection: { userSelect: string; webkitUserSelect: string } | null = null
 const savingOrder = ref(false)
 
+function onListPointerDownCapture(): void {
+  if (drag.id) return
+  suppressClick = false
+  window.clearTimeout(clickTimer)
+}
 function onCardPointerDown(e: PointerEvent, id: string): void {
-  if (e.button !== 0 || savingOrder.value) return
+  if (e.button !== 0 || savingOrder.value || drag.id) return
   if ((e.target as HTMLElement).closest('button, a, input, select, textarea')) return
+  dragList = (e.currentTarget as HTMLElement).parentElement
+  if (!dragList) return
+  deferPendingLoad()
   Object.assign(drag, { id, active: false, x: e.clientX, y: e.clientY, pointerId: e.pointerId, touch: e.pointerType !== 'mouse' })
   if (drag.touch) pressTimer = window.setTimeout(startDrag, 380)
   window.addEventListener('pointermove', onPointerMove, { passive: false })
@@ -213,9 +250,15 @@ function onCardPointerDown(e: PointerEvent, id: string): void {
   window.addEventListener('pointercancel', onPointerCancel)
 }
 function startDrag(): void {
-  if (!drag.id) return
+  if (!drag.id || drag.active) return
   drag.active = true
+  suppressClick = true
   drag.before = accounts.value.map((a) => a.accountId)
+  const style = document.body.style
+  previousSelection = { userSelect: style.userSelect, webkitUserSelect: style.webkitUserSelect }
+  style.userSelect = 'none'
+  style.webkitUserSelect = 'none'
+  window.getSelection()?.removeAllRanges()
   window.addEventListener('touchmove', blockTouchScroll, { passive: false })
   navigator.vibrate?.(12)
 }
@@ -228,17 +271,40 @@ function onPointerMove(e: PointerEvent): void {
   if (!drag.active) {
     // Touch: moving before the long-press fires means the user is scrolling.
     if (drag.touch) {
-      if (dist > 8) endDrag()
+      if (dist > 8) {
+        endDrag()
+        flushDeferredLoad()
+      }
       return
     }
     if (dist < 6) return
     startDrag()
   }
   e.preventDefault()
-  const over = (document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null)?.closest<HTMLElement>('[data-account-id]')
-  const overId = over?.dataset.accountId
-  if (overId && overId !== drag.id) moveBefore(drag.id, overId)
+  const overId = dropTarget(e.clientX, e.clientY)
+  if (overId) moveBefore(drag.id, overId)
   autoScroll(e.clientY)
+}
+function dropTarget(clientX: number, clientY: number): string | undefined {
+  if (!dragList) return
+  const rect = dragList.getBoundingClientRect()
+  const x = clientX - rect.left + dragList.scrollLeft
+  const y = clientY - rect.top + dragList.scrollTop
+  const ids = new Set(visible.value.map((a) => a.accountId))
+  const rows = [...dragList.querySelectorAll<HTMLElement>(':scope > [data-account-id]')]
+    .filter((row) => ids.has(row.dataset.accountId || ''))
+  const current = rows.find((row) => row.dataset.accountId === drag.id)
+  const over = rows.find((row) => x >= row.offsetLeft && x <= row.offsetLeft + row.offsetWidth
+    && y >= row.offsetTop && y <= row.offsetTop + row.offsetHeight)
+  if (!current || !over || over === current) return
+  const from = accounts.value.findIndex((a) => a.accountId === drag.id)
+  const to = accounts.value.findIndex((a) => a.accountId === over.dataset.accountId)
+  if (from < 0 || to < 0) return
+  const horizontal = dragList.classList.contains('grid') && current.offsetTop === over.offsetTop
+  const position = horizontal ? x : y
+  const middle = horizontal ? over.offsetLeft + over.offsetWidth / 2 : over.offsetTop + over.offsetHeight / 2
+  if ((from < to && position < middle) || (from > to && position > middle)) return
+  return over.dataset.accountId
 }
 function moveBefore(id: string, overId: string): void {
   const list = [...accounts.value]
@@ -256,18 +322,19 @@ function autoScroll(y: number): void {
   if (y < edge) scroller.scrollTop -= 14
   else if (y > window.innerHeight - edge) scroller.scrollTop += 14
 }
-function onPointerUp(): void {
+function onPointerUp(e: PointerEvent): void {
+  if (e.pointerId !== drag.pointerId) return
   const wasActive = drag.active
   const before = drag.before
   endDrag()
-  if (!wasActive) return
-  suppressClick = true
-  window.setTimeout(() => (suppressClick = false), 0)
-  saveOrder(before)
+  if (wasActive) void saveOrder(before)
+  else flushDeferredLoad()
 }
-function onPointerCancel(): void {
+function onPointerCancel(e: PointerEvent): void {
+  if (e.pointerId !== drag.pointerId) return
   if (drag.active) accounts.value = orderBy(drag.before)
   endDrag()
+  flushDeferredLoad()
 }
 function endDrag(): void {
   window.clearTimeout(pressTimer)
@@ -275,7 +342,21 @@ function endDrag(): void {
   window.removeEventListener('pointerup', onPointerUp)
   window.removeEventListener('pointercancel', onPointerCancel)
   window.removeEventListener('touchmove', blockTouchScroll)
+  if (previousSelection) {
+    document.body.style.userSelect = previousSelection.userSelect
+    document.body.style.webkitUserSelect = previousSelection.webkitUserSelect
+    previousSelection = null
+  }
+  if (drag.active) clickTimer = window.setTimeout(() => (suppressClick = false), 700)
+  dragList = null
   Object.assign(drag, { id: '', active: false, pointerId: -1 })
+}
+function onListClickCapture(e: MouseEvent): void {
+  if (!suppressClick || e.detail === 0) return
+  e.preventDefault()
+  e.stopPropagation()
+  suppressClick = false
+  window.clearTimeout(clickTimer)
 }
 function orderBy(ids: string[]): AccountSummary[] {
   const map = new Map(accounts.value.map((a) => [a.accountId, a]))
@@ -298,7 +379,11 @@ function moveStep(id: string, delta: number): void {
 }
 async function saveOrder(before: string[]): Promise<void> {
   const ids = accounts.value.map((a) => a.accountId)
-  if (ids.join('\n') === before.join('\n')) return
+  if (ids.join('\n') === before.join('\n')) {
+    flushDeferredLoad()
+    return
+  }
+  deferPendingLoad()
   savingOrder.value = true
   try {
     const res = await api.put<{ revision: string }>('/oauth/account-order', { accountIds: ids }, { ifMatch: listRevision.value })
@@ -314,6 +399,7 @@ async function saveOrder(before: string[]): Promise<void> {
     }
   } finally {
     savingOrder.value = false
+    flushDeferredLoad()
   }
 }
 function onCardClick(a: AccountSummary): void {
@@ -489,7 +575,7 @@ function onCreated(id: string | null): void {
           <span>额度</span>
           <span class="r">操作</span>
         </div>
-        <TransitionGroup tag="div" name="reorder" class="alist" :class="{ sorting: drag.active }">
+        <TransitionGroup tag="div" name="reorder" class="alist" :class="{ sorting: drag.active }" @pointerdown.capture="onListPointerDownCapture" @click.capture="onListClickCapture">
           <AccountRow
             v-for="a in visible"
             :key="a.accountId"
@@ -508,10 +594,11 @@ function onCreated(id: string | null): void {
             @keydown="onCardKey($event, a)"
             @toggle="toggleAccount(a, $event)"
             @refresh="refreshAccount(a)"
+            @contextmenu="drag.touch && drag.id && $event.preventDefault()"
           />
         </TransitionGroup>
       </div>
-      <TransitionGroup v-else tag="div" name="reorder" class="grid" :class="{ sorting: drag.active }">
+      <TransitionGroup v-else tag="div" name="reorder" class="grid" :class="{ sorting: drag.active }" @pointerdown.capture="onListPointerDownCapture" @click.capture="onListClickCapture">
         <AccountCard
           v-for="a in visible"
           :key="a.accountId"
@@ -627,6 +714,7 @@ function onCreated(id: string | null): void {
   text-align: right;
 }
 .alist {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -684,6 +772,7 @@ function onCreated(id: string | null): void {
   gap: 8px;
 }
 .grid {
+  position: relative;
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
   align-items: stretch;

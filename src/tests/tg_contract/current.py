@@ -44,6 +44,9 @@ WEBUI_OVERRIDE_IDS_BY_SEGMENT = {
     'channels_apikey.jsonl': WEBUI_CHANNEL_OVERRIDE_CASE_IDS,
 }
 WEBUI_ADDITION_CASE_IDS = ('TG-SYS-08.webui_wildcard', 'TG-SYS-08.webui_host')
+# accountAccessBlocked (2026-11-05): the notification settings list gained exactly one
+# event toggle (「账号被上游拒绝服务，已停用」) and the trace one toggle step.
+ACCESS_BLOCK_OVERRIDE_CASE_IDS = ('TG-SYS-04.001-notifications',)
 SYSTEM_ADDITION_CASE_IDS = BODY_RETENTION_ADDITION_CASE_IDS + WEBUI_ADDITION_CASE_IDS
 
 
@@ -113,6 +116,13 @@ def load_current_jsonl(segment: str | Path) -> list[dict]:
             raise AssertionError('unexpected webui overlay scope')
         replaced = set(expected_ids)
         overrides = [c for c in overrides if c['caseId'] not in replaced] + webui_cases
+    access_overlay = segment.parents[2] / 'notification-2026-11-05' / 'overrides' / segment.name
+    if access_overlay.exists():
+        access_cases = load_jsonl(access_overlay)
+        if tuple(c['caseId'] for c in access_cases) != ACCESS_BLOCK_OVERRIDE_CASE_IDS:
+            raise AssertionError('unexpected account-access overlay scope')
+        replaced = set(ACCESS_BLOCK_OVERRIDE_CASE_IDS)
+        overrides = [c for c in overrides if c['caseId'] not in replaced] + access_cases
     by_id = {case['caseId']: case for case in overrides}
     archived_ids = {case['caseId'] for case in archived}
     if len(by_id) != len(overrides):

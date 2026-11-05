@@ -40,6 +40,7 @@ const GROUPS: { title: string; items: EventDef[] }[] = [
   {
     title: '账号与权益',
     items: [
+      { key: 'accountAccessBlocked', label: '账号被上游拒绝服务，已停用', hint: '上游返回欠费、套餐到期等不会自动恢复的错误、账号被停用时通知。' },
       { key: 'accountActionAttention', label: '账户操作未完成', hint: '签到、领取等账户操作失败或结果未知时通知。' },
       { key: 'accountBenefitGranted', label: '权益已领取', hint: '账号成功领取权益时通知。' },
       { key: 'accountCatalogChanged', label: '模型目录有变化', hint: '账号可用的模型列表有新增或移除时通知。' },

@@ -10,8 +10,8 @@
   3. model 白名单 (allowedModels) 检查
   4. CapabilityGuard 自检（n>1 / audio / background / conversation 等）
   5. fingerprint_query（MS-7 接入；此阶段占位传 None）
-  6. log_db.insert_pending
-  7. scheduler.schedule(ingress_protocol=...)
+  6. scheduler.schedule(ingress_protocol=...)
+  7. log_db.insert_pending（无模型或所有来源明确禁用时跳过）
   8. failover.run_failover(..., ingress_protocol=...)
 
 注：openai 家族没有 CC 伪装，并发量 / usage / 亲和 等细节与 anthropic 共用
@@ -658,25 +658,36 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         claude_code_agent_id=request.headers.get("x-claude-code-agent-id"),
     )
 
-    # 6. pending 日志；剥掉下划线前缀的内部 metadata（_api_key_name 等）后再落盘
     reasoning_effort = log_db.extract_reasoning_effort(body, ingress_protocol)
     req_headers = _sanitize_headers(dict(request.headers))
     fast_mode = log_db.extract_fast_mode(body, ingress_protocol, req_headers)
     log_body = {k: v for k, v in body.items() if not (isinstance(k, str) and k.startswith("_"))}
-    await asyncio.to_thread(
-        log_db.insert_pending,
-        request_id, client_ip, key_name, model, is_stream, msg_count, tool_count,
-        req_headers, log_body, fingerprint=fp_query,
-        ingress_protocol=ingress_protocol,
-        reasoning_effort=reasoning_effort,
-        fast_mode=fast_mode,
-    )
 
-    # 7. 调度（ingress_protocol 决定家族过滤；fp_query 决定亲和命中）
-    result = scheduler.schedule(
-        body, api_key_name=key_name or "", client_ip=client_ip,
-        ingress_protocol=ingress_protocol, fp_query=fp_query,
-    )
+    async def insert_pending():
+        await asyncio.to_thread(
+            log_db.insert_pending,
+            request_id, client_ip, key_name, model, is_stream, msg_count, tool_count,
+            req_headers, log_body, fingerprint=fp_query,
+            ingress_protocol=ingress_protocol,
+            reasoning_effort=reasoning_effort,
+            fast_mode=fast_mode,
+        )
+
+    # 6. 调度（ingress_protocol 决定家族过滤；fp_query 决定亲和命中）
+    try:
+        result = scheduler.schedule(
+            body, api_key_name=key_name or "", client_ip=client_ip,
+            ingress_protocol=ingress_protocol, fp_query=fp_query,
+        )
+        model_never_supported = _model_never_supported(model) if not result and not result.guard_error else False
+        skip_log = scheduler.skip_no_route_log(model, result, model_never_supported=model_never_supported)
+    except Exception:
+        await insert_pending()
+        raise
+
+    # 7. pending 日志；内部 metadata 不写入正文。
+    if not skip_log:
+        await insert_pending()
     if result.affinity_hit:
         await asyncio.to_thread(log_db.update_pending, request_id, affinity_hit=1)
 
@@ -700,17 +711,18 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
             f"{exclusion_summary}"
         )
         # Resolve once so the log and downstream response describe the same error.
-        err_type = errors.ErrTypeOpenAI.NOT_FOUND if _model_never_supported(model) \
+        err_type = errors.ErrTypeOpenAI.NOT_FOUND if model_never_supported \
             else errors.ErrTypeOpenAI.SERVER
         status = 404 if err_type == errors.ErrTypeOpenAI.NOT_FOUND else 503
-        await asyncio.to_thread(
-            log_db.finish_error, request_id, msg, 0,
-            http_status=status, affinity_hit=(1 if result.affinity_hit else 0),
-            total_ms=int((time.monotonic() - start_monotonic) * 1000),
-        )
+        if not skip_log:
+            await asyncio.to_thread(
+                log_db.finish_error, request_id, msg, 0,
+                http_status=status, affinity_hit=(1 if result.affinity_hit else 0),
+                total_ms=int((time.monotonic() - start_monotonic) * 1000),
+            )
         # 节流告警
         ek = notifier.escape_html
-        notifications.routing_unavailable(ingress=ingress_protocol, model=model, exclusions=result.exclusions, api_key_name=key_name, request_id=request_id)
+        notifications.routing_unavailable(ingress=ingress_protocol, model=model, exclusions=result.exclusions, api_key_name=key_name, request_id="" if skip_log else request_id)
         return errors.json_error_openai(status, err_type, msg)
 
     ts = time.strftime("%H:%M:%S", time.localtime(start_time))

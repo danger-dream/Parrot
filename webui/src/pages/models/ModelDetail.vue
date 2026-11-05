@@ -69,6 +69,8 @@ const compare = ref<Compare | null>(null)
 const model = ref<ModelData | null>(null)
 const route = useProxyRoute('models', () => model.value?.modelId || props.id)
 const resolved = ref(false)
+/** getModel failed: the page falls back to the list record, which has no schedule or account facts. */
+const detailError = ref('')
 const meta = ref<ModelMetadata | null>(null)
 const metaMissing = ref(false)
 const registry = ref<Registry | null>(null)
@@ -109,10 +111,15 @@ async function resolveModel(force = false): Promise<void> {
   if (hit) {
     try {
       model.value = (await api.get<ModelData>(`/models/${enc(hit.resourceKey)}`)).data
-    } catch {
+      detailError.value = ''
+    } catch (err) {
       model.value = hit
+      detailError.value = errorTitle(err)
     }
-  } else model.value = null
+  } else {
+    model.value = null
+    detailError.value = ''
+  }
   resolved.value = true
 }
 
@@ -410,6 +417,10 @@ const unpriced = computed(() => stats.value?.metrics.unpricedSuccess || 0)
     <div v-if="resolved && !model" class="notice">
       <TriangleAlert />
       <span>这个模型不在模型中心里，可能来自映射或已删除。下面仅显示请求统计。</span>
+    </div>
+    <div v-else-if="model && detailError" class="notice">
+      <TriangleAlert />
+      <span>模型详情加载失败（{{ detailError }}），下面只显示列表里的概要，调度方式、来源排序和账户额度暂不可用。</span>
     </div>
 
     <!-- settings -->

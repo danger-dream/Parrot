@@ -481,12 +481,22 @@ def recent_outcomes(
     return out
 
 
+# Channel attempts: ``open``/NULL are still running; client cancels and connection
+# lifecycle ends are not channel failures; every other outcome is a failed attempt.
+_ATTEMPT_CANCELLED = "('cancelled', 'client_disconnected', 'connection_lifecycle')"
+_ATTEMPT_FINISHED = "a.outcome IS NOT NULL AND a.outcome != 'open'"
+_ATTEMPT_FAILED = f"{_ATTEMPT_FINISHED} AND a.outcome != 'success' AND a.outcome NOT IN {_ATTEMPT_CANCELLED}"
+
+
 def outcome_buckets(
     *, origin: float, bucket_seconds: int, count: int, group: str,
 ) -> dict[str, dict[int, dict[str, float]]]:
     """Return ``{group_key: {bucket_index: {total, errors, cancelled, last}}}`` of finished requests.
 
     Bucket ``i`` covers ``[origin + i * bucket_seconds, origin + (i + 1) * bucket_seconds)``.
+    The channel grouping counts every channel attempt (a request that failed over
+    counts on each channel it tried); requests without attempts count on their
+    final channel, or ``?`` when no channel was assigned.
     """
     if group not in _GROUP_EXPRS or group is None:
         raise ValueError("unsupported outcome grouping")
@@ -494,25 +504,51 @@ def outcome_buckets(
     out: dict[str, dict[int, dict[str, float]]] = {}
     if log_db._log_dir is not None and not os.path.isdir(log_db._log_dir):
         return out
+    end = float(origin) + int(bucket_seconds) * int(count)
     conns = log_db._iter_month_conns(float(origin))
     try:
         for conn, _close in conns:
-            if "request_log" not in log_db._existing_tables(conn):
+            tables = log_db._existing_tables(conn)
+            if "request_log" not in tables:
                 continue
-            # "+status": keep SQLite on the created_at index for a short window (see bucketed_stats).
-            rows = conn.execute(
-                f"""SELECT {key_expr} AS k,
-                           CAST((created_at - ?) / ? AS INTEGER) AS b,
-                           COUNT(*) AS total,
-                           SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS errors,
-                           SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) AS cancelled,
-                           MAX(created_at) AS last
-                      FROM request_log
-                     WHERE created_at >= ? AND created_at < ?
-                       AND +status IN ('success', 'error', 'cancelled')
-                     GROUP BY k, b""",
-                (float(origin), int(bucket_seconds), float(origin), float(origin) + int(bucket_seconds) * int(count)),
-            ).fetchall()
+            if group == "channel" and "retry_chain" in tables:
+                rows = conn.execute(
+                    f"""SELECT k, CAST((at - ?) / ? AS INTEGER) AS b,
+                               COUNT(*) AS total,
+                               SUM(CASE WHEN kind='error' THEN 1 ELSE 0 END) AS errors,
+                               SUM(CASE WHEN kind='cancelled' THEN 1 ELSE 0 END) AS cancelled,
+                               MAX(at) AS last
+                          FROM (
+                            SELECT a.channel_key AS k, r.created_at AS at,
+                                   CASE WHEN a.outcome = 'success' THEN 'success'
+                                        WHEN a.outcome IN {_ATTEMPT_CANCELLED} THEN 'cancelled'
+                                        ELSE 'error' END AS kind
+                              FROM request_log r JOIN retry_chain a ON a.request_id = r.request_id
+                             WHERE r.created_at >= ? AND r.created_at < ? AND {_ATTEMPT_FINISHED}
+                            UNION ALL
+                            SELECT COALESCE(r.final_channel_key, '?'), r.created_at, r.status
+                              FROM request_log r
+                             WHERE r.created_at >= ? AND r.created_at < ?
+                               AND +r.status IN ('success', 'error', 'cancelled')
+                               AND NOT EXISTS (SELECT 1 FROM retry_chain a WHERE a.request_id = r.request_id))
+                         GROUP BY k, b""",
+                    (float(origin), int(bucket_seconds), float(origin), end, float(origin), end),
+                ).fetchall()
+            else:
+                # "+status": keep SQLite on the created_at index for a short window (see bucketed_stats).
+                rows = conn.execute(
+                    f"""SELECT {key_expr} AS k,
+                               CAST((created_at - ?) / ? AS INTEGER) AS b,
+                               COUNT(*) AS total,
+                               SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS errors,
+                               SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) AS cancelled,
+                               MAX(created_at) AS last
+                          FROM request_log
+                         WHERE created_at >= ? AND created_at < ?
+                           AND +status IN ('success', 'error', 'cancelled')
+                         GROUP BY k, b""",
+                    (float(origin), int(bucket_seconds), float(origin), end),
+                ).fetchall()
             for row in rows:
                 cell = out.setdefault(str(row["k"] or "?"), {}).setdefault(int(row["b"]), {"total": 0, "errors": 0, "cancelled": 0, "last": 0.0})
                 cell["total"] += int(row["total"] or 0)
@@ -527,4 +563,55 @@ def outcome_buckets(
                 close()
             except Exception:
                 pass
+    return out
+
+
+def channel_attempt_failures(*, origin: float, end: float) -> dict[str, list[dict[str, Any]]]:
+    """Failed attempts in ``[origin, end)`` per channel and model, most failures first.
+
+    Each entry carries the latest failure's error detail and request id so a
+    failure that another channel absorbed can still be traced.
+    """
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    if log_db._log_dir is not None and not os.path.isdir(log_db._log_dir):
+        return {}
+    conns = log_db._iter_month_conns(float(origin))
+    try:
+        for conn, _close in conns:
+            if not {"request_log", "retry_chain"} <= log_db._existing_tables(conn):
+                continue
+            model_expr = ("COALESCE(NULLIF(a.client_visible_model, ''), a.model)"
+                          if "client_visible_model" in log_db._table_columns(conn, "retry_chain") else "a.model")
+            rows = conn.execute(
+                f"""SELECT k, model, n, at, request_id, error_detail FROM (
+                        SELECT a.channel_key AS k, {model_expr} AS model, r.created_at AS at,
+                               r.request_id AS request_id, a.error_detail AS error_detail,
+                               COUNT(*) OVER (PARTITION BY a.channel_key, {model_expr}) AS n,
+                               ROW_NUMBER() OVER (PARTITION BY a.channel_key, {model_expr}
+                                                  ORDER BY r.created_at DESC, a.id DESC) AS rn
+                          FROM request_log r JOIN retry_chain a ON a.request_id = r.request_id
+                         WHERE r.created_at >= ? AND r.created_at < ? AND {_ATTEMPT_FAILED})
+                     WHERE rn = 1""",
+                (float(origin), float(end)),
+            ).fetchall()
+            for row in rows:
+                key = (str(row["k"] or "?"), str(row["model"] or ""))
+                item = merged.setdefault(key, {"model": key[1], "count": 0, "last_at": 0.0})
+                item["count"] += int(row["n"] or 0)
+                if float(row["at"] or 0) >= item["last_at"]:
+                    item.update(last_at=float(row["at"] or 0), request_id=row["request_id"],
+                                error=str(row["error_detail"] or "")[:500] or None)
+    except sqlite3.Error as exc:
+        raise log_db.HistoricalLogError(f"channel failure query failed: {exc}") from exc
+    finally:
+        for _conn, close in conns:
+            try:
+                close()
+            except Exception:
+                pass
+    out: dict[str, list[dict[str, Any]]] = {}
+    for (channel, _model), item in merged.items():
+        out.setdefault(channel, []).append(item)
+    for items in out.values():
+        items.sort(key=lambda item: (-item["count"], -item["last_at"], item["model"]))
     return out

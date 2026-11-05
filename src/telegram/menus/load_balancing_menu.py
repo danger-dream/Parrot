@@ -15,6 +15,7 @@ import math
 import re
 from typing import Optional
 
+from ... import quota_errors
 from ...management_control.load_balancing import load_balancing_control
 from .. import states, ui
 from .sort_primitives import (
@@ -59,7 +60,7 @@ def _status_text(ch) -> str:
         return "❌ 认证失败"
     if reason == "user":
         return "🚫 用户禁用"
-    return f"⚠ {reason}"
+    return f"⚠ {quota_errors.ACCOUNT_BLOCK_LABELS.get(reason, reason)}"
 
 
 def _compact_channel_label(ch) -> str:

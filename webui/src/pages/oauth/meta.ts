@@ -71,10 +71,19 @@ export type StateKey = 'available' | 'quota' | 'invalid' | 'disabled'
 export const STATE_KEYS: StateKey[] = ['available', 'quota', 'invalid', 'disabled']
 export type Tone = 'green' | 'orange' | 'red' | 'neutral'
 
+/** Disabled because the upstream refuses the whole account (Zhipu 1113/1309/1313/1314/1315); never auto-resumed. */
+export const BLOCKED_REASON: Record<string, string> = {
+  arrears: '账户已欠费，充值后手动启用',
+  plan_expired: '套餐已到期或失效，续订后手动启用',
+  fair_use_limited: '被判定不符合公平使用策略，到官网申请解除后手动启用',
+  key_not_allowed: 'API Key 仅限企业编程套餐使用，更换 Key 后手动启用',
+}
+
 const REASON_LABEL: Record<string, string> = {
   user: '手动停用',
   quota: '额度用尽，自动暂停',
   auth_error: '认证失效，需要重新登录',
+  ...BLOCKED_REASON,
 }
 
 export function reasonLabel(reason: string | null | undefined): string {
@@ -86,6 +95,7 @@ export function accountState(a: AccountSummary): { key: StateKey; label: string;
   // Same predicate as the backend / Telegram invalid list (and the overview pool card).
   if (a.invalid) return { key: 'invalid', label: '失效', tone: 'red' }
   if (a.quotaLimited) return { key: 'quota', label: '额度受限', tone: 'orange' }
+  if (!a.enabled && a.disabledReason && BLOCKED_REASON[a.disabledReason]) return { key: 'disabled', label: '上游停用', tone: 'red' }
   if (!a.enabled) return { key: 'disabled', label: '已停用', tone: 'neutral' }
   if (a.disabledReason) return { key: 'quota', label: a.disabledReason === '供应商限制' ? '供应商限制' : '受限', tone: 'orange' }
   if (!a.available) return { key: 'quota', label: '暂不可用', tone: 'orange' }

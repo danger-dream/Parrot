@@ -364,7 +364,11 @@ class StatsControl:
     def outcome_timeline(
         self, context: ManagementContext, *, dimension: StatsDimension | str, bucket_minutes: int = 60, buckets: int = 24,
     ) -> dict[str, Any]:
-        """Finished requests per key in clock-aligned buckets ending with the current one."""
+        """Finished requests per key in clock-aligned buckets ending with the current one.
+
+        Channels count every attempt and list the window's failed attempts per model,
+        so a failure absorbed by failover still shows on the channel that failed.
+        """
         require(context)
         dimension = StatsDimension(dimension)
         group = {"channel": "channel", "apiKey": "apikey", "model": "model"}[dimension.value]
@@ -373,6 +377,9 @@ class StatsControl:
 
         def load() -> dict[str, Any]:
             raw = self.timeseries_source.outcome_buckets(origin=origin, bucket_seconds=step, count=int(buckets), group=group)
+            failures_of = getattr(self.timeseries_source, "channel_attempt_failures", None)
+            failures = (failures_of(origin=origin, end=origin + step * int(buckets))
+                        if group == "channel" and failures_of is not None else {})
             items = []
             for key, cells in raw.items():
                 row = [cells.get(i) or {"total": 0, "errors": 0, "cancelled": 0, "last": 0.0} for i in range(int(buckets))]
@@ -384,6 +391,13 @@ class StatsControl:
                     "errorCount": sum(int(c["errors"]) for c in row),
                     "cancelledCount": sum(int(c["cancelled"]) for c in row),
                     "lastAt": datetime.fromtimestamp(last, tz=timezone.utc) if last else None,
+                    "failures": [{
+                        "model": failure["model"],
+                        "count": int(failure["count"]),
+                        "lastAt": datetime.fromtimestamp(failure["last_at"], tz=timezone.utc) if failure["last_at"] else None,
+                        "lastError": failure.get("error"),
+                        "lastRequestId": failure.get("request_id"),
+                    } for failure in failures.get(key, [])[:5]],
                 })
             items.sort(key=lambda item: item["key"])
             return {"from": datetime.fromtimestamp(origin, tz=timezone.utc), "bucketSeconds": step, "items": items}

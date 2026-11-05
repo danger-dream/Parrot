@@ -1393,6 +1393,36 @@ def _apply_codex_error_policy(ch: Channel, resolved_model: str, result) -> bool:
     return True
 
 
+def _apply_zhipu_account_block(ch: Channel, result) -> bool:
+    """Disable a Zhipu OAuth account the upstream refuses outright (arrears, expired plan, ...).
+
+    These refusals carry no reset time and never clear by retrying, so the account
+    stays disabled with its reason until the operator enables it again.
+    """
+    block = quota_errors.zhipu_account_block(ch, http_status=result.http_status, error_detail=result.error_detail)
+    if block is None or ch.type != "oauth":
+        return False
+    code, reason = block
+    account_key = getattr(ch, "account_key", None)
+    disabled = False
+    with oauth_manager.account_generation_guard(getattr(ch, "state_key", None)) as current:
+        account = oauth_manager.get_account(account_key) if current and account_key else None
+        if account and account.get("enabled", True) and not account.get("disabled_reason"):
+            outcome = oauth_manager.mutate_account_if_unchanged(
+                account_key, account, lambda value: value.update(enabled=False, disabled_reason=reason))
+            disabled = outcome.get("status") == "updated"
+    if disabled:
+        print(f"[failover] disabled {ch.key}: Zhipu {code} ({reason})")
+        try:
+            notifications.account_event(
+                "account.access.blocked", account_key,
+                {"error_code": code, "error_reason": quota_errors.ACCOUNT_BLOCK_LABELS[reason]},
+                Effect("confirmed", "account_paused"), source="upstream_error")
+        except Exception as exc:
+            print(f"[failover] account block notification failed for {ch.key}: {exc}")
+    return True
+
+
 def _apply_zhipu_quota_cooldown(ch: Channel, resolved_model: str, result) -> bool:
     """Apply the same quota/plan exclusion policy to immediate and queued attempts."""
     quota_reset_ms = quota_errors.zhipu_1310_reset_ms(
@@ -2083,6 +2113,7 @@ async def run_failover(
     start_time: float,
     ingress_protocol: str = "anthropic",
     start_monotonic: float | None = None,
+    skip_request_log: bool = False,
 ) -> Response:
     """执行调度候选的顺序重试。返回 FastAPI Response。
 
@@ -2106,7 +2137,7 @@ async def run_failover(
                 response = await run_failover(
                     search_route, round_body, request_id, api_key_name, client_ip,
                     bool(round_body.get("stream")), start_time, ingress_protocol=ingress_protocol,
-                    start_monotonic=start_monotonic,
+                    start_monotonic=start_monotonic, skip_request_log=skip_request_log,
                 )
                 search_route = search_tool_policy.advance_route(search_route, response)
                 return response
@@ -2717,6 +2748,11 @@ async def run_failover(
             retry_count += 1
             continue
 
+        if _apply_zhipu_account_block(ch, result):
+            retry_count += 1
+            idx += 1
+            continue
+
         if _apply_zhipu_quota_cooldown(ch, resolved_model, result):
             retry_count += 1
             idx += 1
@@ -2836,29 +2872,30 @@ async def run_failover(
     msg = str(failure_details["summary"])
 
     request_elapsed_ms = _elapsed_ms(start_monotonic)
-    await asyncio.to_thread(
-        log_db.finish_error, request_id, err_detail[:4000], retry_count,
-        final_channel_key=last_ch_key,
-        final_channel_type=last_ch_type,
-        final_model=last_model,
-        connect_ms=(last_result.connect_ms if last_result else None),
-        first_token_ms=(last_result.first_byte_ms if last_result else None),
-        idle_ms=(last_result.idle_ms if last_result else None),
-        total_ms=(last_result.total_ms if last_result else None),
-        final_round_id=(last_result.round_id if last_result else None),
-        request_elapsed_ms=request_elapsed_ms,
-        http_status=status, affinity_hit=affinity_hit,
-        response_signals=getattr(last_result, "response_signals", None),
-        http_header_model=getattr(last_result, "http_header_model", None),
-        response_body=(last_result.full_response_text if last_result else None),
-        usage=(last_result.usage if last_result else None),
-        usage_observed=(last_result.usage_observed if last_result else None),
-        upstream_protocol=last_ch_protocol,
-        proxy_name=(last_result.proxy_name if last_result else None),
-        proxy_bytes_up=(last_result.proxy_bytes_up if last_result else None),
-        proxy_bytes_down=(last_result.proxy_bytes_down if last_result else None),
-        **_request_stage_kwargs(last_result),
-    )
+    if not skip_request_log:
+        await asyncio.to_thread(
+            log_db.finish_error, request_id, err_detail[:4000], retry_count,
+            final_channel_key=last_ch_key,
+            final_channel_type=last_ch_type,
+            final_model=last_model,
+            connect_ms=(last_result.connect_ms if last_result else None),
+            first_token_ms=(last_result.first_byte_ms if last_result else None),
+            idle_ms=(last_result.idle_ms if last_result else None),
+            total_ms=(last_result.total_ms if last_result else None),
+            final_round_id=(last_result.round_id if last_result else None),
+            request_elapsed_ms=request_elapsed_ms,
+            http_status=status, affinity_hit=affinity_hit,
+            response_signals=getattr(last_result, "response_signals", None),
+            http_header_model=getattr(last_result, "http_header_model", None),
+            response_body=(last_result.full_response_text if last_result else None),
+            usage=(last_result.usage if last_result else None),
+            usage_observed=(last_result.usage_observed if last_result else None),
+            upstream_protocol=last_ch_protocol,
+            proxy_name=(last_result.proxy_name if last_result else None),
+            proxy_bytes_up=(last_result.proxy_bytes_up if last_result else None),
+            proxy_bytes_down=(last_result.proxy_bytes_down if last_result else None),
+            **_request_stage_kwargs(last_result),
+        )
     return _json_error_for_ingress(
         ingress_protocol,
         status,
