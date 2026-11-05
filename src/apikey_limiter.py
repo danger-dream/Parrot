@@ -34,7 +34,7 @@ from fastapi import Request
 from starlette.responses import Response
 from starlette.types import Message, Receive
 
-from . import config
+from . import config, json_bytes
 
 
 @dataclass
@@ -548,7 +548,6 @@ class _BodyPreservingReceive:
         Uses the same memory/spool budgets and ownership as a queued body. The
         caller must abandon this guard even when policy evaluation rejects.
         """
-        import json
         from starlette.requests import ClientDisconnect
         while True:
             message = await self._raw_receive()
@@ -564,7 +563,7 @@ class _BodyPreservingReceive:
         except Exception as exc:
             raise _spool_failure("inspect", exc) from exc
         try:
-            body = json.loads(raw)
+            body = json_bytes.loads_utf8(raw)
             model = body.get("model") if isinstance(body, dict) else None
             # Do not retain another parsed body for the whole queue/generation.
             return model if isinstance(model, str) else None

@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 from pathlib import Path
@@ -22,7 +21,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from .. import config
+from .. import config, json_bytes
 
 
 # ─── 异常 ─────────────────────────────────────────────────────────
@@ -248,7 +247,9 @@ def _get_conn() -> sqlite3.Connection:
         # them.  The owner-only-writable parent makes the post-check stable
         # against another uid racing a replacement.
         _validate_private_store_files()
-        conn = sqlite3.connect(_db_path, timeout=10)
+        # No statement cache: a cached INSERT keeps SQLite's copy of the last
+        # bound history until the same SQL runs again on this thread.
+        conn = sqlite3.connect(_db_path, timeout=10, cached_statements=0)
         try:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
@@ -426,8 +427,8 @@ def save(response_id: str, parent_id: Optional[str], *,
                 (
                     response_id, parent_id, api_key_name or "", model or "",
                     channel_key or "", now, expires_at,
-                    json.dumps(input_items, ensure_ascii=False),
-                    json.dumps(output_items, ensure_ascii=False),
+                    json_bytes.dumps_utf8(input_items),
+                    json_bytes.dumps_utf8(output_items),
                 ),
             )
             if cur.rowcount != 1:
@@ -446,8 +447,8 @@ def _row_to_response(row: sqlite3.Row, response_id: str, api_key_name: str) -> S
     if row["expires_at"] is not None and float(row["expires_at"]) < time.time():
         raise ResponseExpired(response_id)
     try:
-        input_items = json.loads(row["input_items"])
-        output_items = json.loads(row["output_items"])
+        input_items = json_bytes.loads_utf8(row["input_items"])
+        output_items = json_bytes.loads_utf8(row["output_items"])
     except (TypeError, ValueError) as exc:
         raise ResponseHistoryError(f"corrupt response history at {response_id}") from exc
     if not isinstance(input_items, list) or not isinstance(output_items, list):

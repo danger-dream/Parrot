@@ -42,7 +42,7 @@ from websockets.exceptions import InvalidStatus, InvalidHandshake
 
 from .. import (
     affinity, apikey_limiter, auth, blacklist, channel_state, concurrency, config, cooldown, fingerprint, local_web_tools,
-    log_db, model_mapping, model_pricing, model_reroute, model_state, model_validation, network, notifier, oauth_manager, scheduler, scorer, translation, upstream,
+    log_db, memory_reclaim, model_mapping, model_pricing, model_reroute, model_state, model_validation, network, notifier, oauth_manager, scheduler, scorer, translation, upstream,
 )
 from ..channel.base import Channel, UpstreamRequest, build_dispatch_metadata
 from ..channel.openai_oauth_channel import OpenAIOAuthChannel
@@ -4731,6 +4731,7 @@ def _map_ws_create_frame_for_upstream(obj: dict, model: str, *, channel: Channel
 
 
 def _loads_frame(raw: str | bytes) -> Any:
+    memory_reclaim.note(len(raw))
     return loads_frame(raw)
 
 

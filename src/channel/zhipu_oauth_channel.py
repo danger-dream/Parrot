@@ -7,7 +7,7 @@ import hashlib
 import json
 import uuid
 
-from .. import config, model_names, oauth_manager
+from .. import config, json_bytes, model_names, oauth_manager
 from ..oauth.zhipu import common as c, request_context, runtime, signing, project_tokens
 from ..oauth.zhipu.response import BusinessContext, BusinessStream
 from ..oauth_ids import account_key
@@ -117,7 +117,7 @@ class ZhipuOAuthChannel(ApiChannel):
         def wire_context(request, factory):
             return BusinessContext(signer.wrap(request, factory), observation)
         return UpstreamRequest(c.MODEL_ORIGINS[c.site_of(current)] + "/api/anthropic/v1/messages", headers,
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(), translator_ctx=ctx,
+            json_bytes.dumps_utf8(payload, separators=(",", ":")), translator_ctx=ctx,
             dispatch_metadata=build_dispatch_metadata(payload, "anthropic", headers), stream_context_hook=wire_context)
 
     def display(self):

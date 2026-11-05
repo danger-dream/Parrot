@@ -15,7 +15,7 @@ import uuid
 
 import xxhash
 
-from .. import cache_hints
+from .. import cache_hints, json_bytes
 from .. import config as _ap_config
 from .cc_model_profile import canonical_model, default_thinking, model_profile
 
@@ -1098,7 +1098,7 @@ def _cch_hash_value(value, *, top_level=False):
 def cch_hash_view(payload_dict) -> bytes:
     placeholder_payload = _replace_generated_billing_cch(payload_dict, "00000")
     view = _cch_hash_value(placeholder_payload, top_level=True)
-    return json.dumps(view, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return json_bytes.dumps_utf8(view, separators=(",", ":"))
 
 
 def compute_cch(payload_dict) -> str:
@@ -1125,9 +1125,7 @@ def _generated_cch_offset(body_bytes: bytes, payload_dict) -> int | None:
 def sign_body(payload_dict):
     # Serialize the final wire body exactly once.  Hash normalization is a
     # separate view and never becomes the transmitted payload.
-    body_bytes = json.dumps(
-        payload_dict, ensure_ascii=False, separators=(",", ":"),
-    ).encode("utf-8")
+    body_bytes = json_bytes.dumps_utf8(payload_dict, separators=(",", ":"))
     cfg = load_config()
     if _normalize_cch_mode(cfg.get("cch_mode", "dynamic")) != "dynamic":
         return body_bytes

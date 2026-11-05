@@ -12,10 +12,9 @@ existing upstream-stream-only aggregation path.
 from __future__ import annotations
 
 import hashlib
-import json
 from typing import Optional
 
-from .. import cache_hints, config, local_web_tools, oauth_manager, search_tool_wire
+from .. import cache_hints, config, json_bytes, local_web_tools, oauth_manager, search_tool_wire
 from ..search_xai import normalize_x_search_tool_dates
 from ..channel.url_utils import resolve_api_endpoint, resolve_upstream_url
 from ..oauth import xai as xai_provider
@@ -256,7 +255,7 @@ class XAIOAuthChannel(Channel):
                      self.base_url, "/responses", preserve_custom_path=True,
                  )),
             headers=headers,
-            body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            body=json_bytes.dumps_utf8(payload, separators=(",", ":")),
             dynamic_tool_map=dynamic_map,
             translator_ctx=translator_ctx,
             dispatch_metadata=build_dispatch_metadata(

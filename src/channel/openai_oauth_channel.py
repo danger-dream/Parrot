@@ -24,10 +24,9 @@ src.oauth.openai.parse_rate_limit_headers 解析头并落库（Commit 3）。
 
 from __future__ import annotations
 
-import json
 from typing import Optional
 
-from .. import cache_hints, config, model_metadata, model_pricing, network, oauth_manager
+from .. import cache_hints, config, json_bytes, model_metadata, model_pricing, network, oauth_manager
 from ..providers import registry as provider_registry
 from ..openai import reasoning_replay
 from ..openai.codex_identity import (
@@ -695,7 +694,7 @@ class OpenAIOAuthChannel(Channel):
         return UpstreamRequest(
             url=upstream_url,
             headers=headers,
-            body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            body=json_bytes.dumps_utf8(payload, separators=(",", ":")),
             dynamic_tool_map=None,
             translator_ctx=translator_ctx,
             dispatch_metadata=build_dispatch_metadata(

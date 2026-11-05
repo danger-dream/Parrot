@@ -6,7 +6,7 @@ import hashlib
 import json
 from typing import Any, Optional
 
-from .. import cache_hints, oauth_manager
+from .. import cache_hints, json_bytes, oauth_manager
 from ..cursor_bridge import catalog as cursor_catalog
 from .. import model_names
 from ..cursor_bridge import runtime as cursor_runtime
@@ -182,7 +182,7 @@ class CursorOAuthChannel(OpenAIApiChannel):
         return UpstreamRequest(
             url=f"{self.base_url}/v1/chat/completions",
             headers=headers,
-            body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            body=json_bytes.dumps_utf8(payload, separators=(",", ":")),
             dynamic_tool_map=None,
             translator_ctx={
                 "ingress": "anthropic",
@@ -339,7 +339,7 @@ class CursorOAuthChannel(OpenAIApiChannel):
         ).hexdigest()
         request.headers[cursor_runtime._ACCOUNT_HEADER] = self.account_key
         request.headers["Authorization"] = f"Bearer {cursor_runtime.bearer_secret()}"
-        request.body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        request.body = json_bytes.dumps_utf8(payload, separators=(",", ":"))
         request.dispatch_metadata = build_dispatch_metadata(
             payload, "openai-chat", request.headers,
         )

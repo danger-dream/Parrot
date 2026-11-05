@@ -38,7 +38,7 @@ from fastapi import Request
 from fastapi.responses import Response
 
 from .. import (
-    affinity, auth, config, errors, failover, fingerprint, local_web_tools,
+    affinity, auth, config, errors, failover, fingerprint, json_bytes, local_web_tools,
     log_db, model_mapping, model_validation, notifier, scheduler, translation,
 )
 from ..client_ip import get_client_ip
@@ -528,7 +528,7 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     # 2. body
     raw = await request.body()
     try:
-        body = json.loads(raw) if raw else {}
+        body = json_bytes.loads_utf8(raw) if raw else {}
     except Exception as exc:
         return errors.json_error_openai(
             400, errors.ErrTypeOpenAI.INVALID_REQUEST, f"invalid json: {exc}",

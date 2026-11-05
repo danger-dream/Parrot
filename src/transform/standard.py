@@ -8,9 +8,7 @@
   - CC 伪装（cc_version / metadata / beta 头 / 工具名混淆 / CCH 签名）
 """
 
-import json
-
-from .. import cache_hints
+from .. import cache_hints, json_bytes
 from .cc_mimicry import (
     PARROT_WANTS_FAST_MODE_KEY,
     _normalize_messages_for_api,
@@ -83,4 +81,4 @@ def standard_transform(body: dict) -> dict:
 def serialize(payload: dict) -> bytes:
     """与 cc_mimicry.sign_body 保持相同的 JSON 序列化策略（紧凑、不转义 ASCII）。
     非 CC 伪装路径不做 CCH 签名，只做序列化。"""
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return json_bytes.dumps_utf8(payload, separators=(",", ":"))

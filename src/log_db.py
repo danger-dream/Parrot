@@ -34,7 +34,7 @@ from functools import cmp_to_key
 from pathlib import Path
 from typing import Any, Literal
 
-from . import config, model_metadata, model_pricing, model_reroute
+from . import config, json_bytes, model_metadata, model_pricing, model_reroute
 from . import request_events
 from .channel.base import UpstreamDispatchMetadata
 
@@ -929,7 +929,9 @@ def _get_conn_for_ref(ref: LogDbRef) -> sqlite3.Connection:
                     raise RetentionPlanError(f"log database was removed by retention cleanup: {ref.path}")
             # check_same_thread=False allows retention to close retired idle
             # connections under this lock; ordinary access remains thread-local.
-            conn = sqlite3.connect(ref.path, timeout=10, check_same_thread=False)
+            # No statement cache: a cached statement keeps SQLite's copy of its
+            # last bound request/response body until that SQL runs again.
+            conn = sqlite3.connect(ref.path, timeout=10, check_same_thread=False, cached_statements=0)
             try:
                 conn.row_factory = sqlite3.Row
                 conn.execute("PRAGMA journal_mode=WAL")
@@ -2040,6 +2042,18 @@ def _encode_log_body(text: str | None) -> str | bytes | None:
     return packed if len(packed) < len(raw) else text
 
 
+def _encode_log_body_value(value: Any) -> str | bytes:
+    """Store ``json.dumps(value, ensure_ascii=False)`` exactly as _encode_log_body would."""
+    try:
+        raw = json_bytes.dumps_utf8(value)
+    except UnicodeEncodeError:
+        return json.dumps(value, ensure_ascii=False)
+    if len(raw) < _BODY_COMPRESS_MIN_BYTES:
+        return raw.decode("utf-8")
+    packed = _BODY_CODEC_MAGIC + zlib.compress(raw, 1)
+    return packed if len(packed) < len(raw) else raw.decode("utf-8")
+
+
 def decode_log_body(value: Any) -> Any:
     """A stored request body as written: compressed rows are inflated to text."""
     if isinstance(value, (bytes, bytearray, memoryview)):
@@ -2082,9 +2096,7 @@ def insert_pending(
     stored_headers = (
         json.dumps(request_headers, ensure_ascii=False) if store_bodies and request_headers else None
     )
-    stored_body = _encode_log_body(
-        json.dumps(request_body, ensure_ascii=False) if store_bodies and request_body else None
-    )
+    stored_body = _encode_log_body_value(request_body) if store_bodies and request_body else None
     with _write_lock:
         conn = _get_conn_for_ref(handle.db)
         conn.execute(

@@ -17,7 +17,7 @@ from typing import Any
 
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from . import local_web_tools as web
+from . import json_bytes, local_web_tools as web
 from .openai.transform.guard import GuardError
 
 ROUND_KEY = "_parrot_search_round"
@@ -283,6 +283,7 @@ def _append(body: dict, obj: dict, results: list[web.LocalToolResult], protocol:
 _REPLAY: OrderedDict[tuple, tuple[float, dict, list]] = OrderedDict()
 _REPLAY_LIMIT = 256
 _REPLAY_TTL = 1800
+_REPLAY_CLEANUP_INTERVAL = 60
 
 
 def _scope(body, protocol, api_key_name):
@@ -295,7 +296,18 @@ def _history(body, protocol):
 
 
 def _digest(value):
-    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    return hashlib.sha256(json_bytes.dumps_utf8(value, sort_keys=True)).hexdigest()
+
+
+def _prune_replay(now: float) -> None:
+    while _REPLAY and (len(_REPLAY) > _REPLAY_LIMIT or now - next(iter(_REPLAY.values()))[0] > _REPLAY_TTL):
+        _REPLAY.popitem(last=False)
+
+
+async def replay_cleanup_loop() -> None:
+    while True:
+        await asyncio.sleep(_REPLAY_CLEANUP_INTERVAL)
+        _prune_replay(time.monotonic())
 
 
 def _remember(body, protocol, api_key_name, references, *, visible_body=None):
@@ -310,8 +322,7 @@ def _remember(body, protocol, api_key_name, references, *, visible_body=None):
             key = (*_scope(body, protocol, api_key_name), reference, identity)
             _REPLAY[key] = (now, saved, visible)
             _REPLAY.move_to_end(key)
-    while _REPLAY and (len(_REPLAY) > _REPLAY_LIMIT or now - next(iter(_REPLAY.values()))[0] > _REPLAY_TTL):
-        _REPLAY.popitem(last=False)
+    _prune_replay(now)
 
 
 def _result_refs(item):
@@ -346,6 +357,7 @@ def _visible_body(body, protocol, api_key_name):
     """
     items = _history(body, protocol)
     best = None
+    _prune_replay(time.monotonic())
     for key, (when, saved, visible) in list(_REPLAY.items()):
         if key[:3] != _scope(body, protocol, api_key_name) or time.monotonic() - when > _REPLAY_TTL:
             continue
@@ -374,6 +386,7 @@ def restore_replay(body: dict, protocol: str, api_key_name: str | None) -> dict:
     if previous:
         refs[previous] = False
     matches = {}
+    _prune_replay(time.monotonic())
     for key, record in list(_REPLAY.items()):
         if key[:3] != _scope(body, protocol, api_key_name) or key[3] not in refs:
             continue

@@ -4,7 +4,7 @@ from __future__ import annotations
 import copy
 import json
 
-from .. import model_names, oauth_manager
+from .. import json_bytes, model_names, oauth_manager
 from ..oauth.qoder import common, catalog, request as qoder_request
 from ..oauth_ids import account_key
 from ..openai.channel.api_channel import OpenAIApiChannel
@@ -98,7 +98,7 @@ class QoderOAuthChannel(OpenAIApiChannel):
                    "X-Model-Key": resolved_model, "X-Model-Source": str(record.get("qoderModelSource") or "")}
         request.url = common.site_of(current)["api"] + common.CHAT_PATH
         request.headers = headers
-        request.body = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
+        request.body = json_bytes.dumps_utf8(body, separators=(",", ":"))
         request.stream_context_hook = lambda physical, factory: QoderWire(physical, factory, signer, self.account_key)
         # Qoder ids are codes (gmodel); answer with the name the client asked for.
         public = str(requested_body.get("_client_visible_model") or requested_body.get("model") or "").strip() \
@@ -108,7 +108,7 @@ class QoderOAuthChannel(OpenAIApiChannel):
         if ingress_protocol == "chat":
             request.translator_ctx.setdefault("response_translator", "chat_model_alias")
             request.translator_ctx.update(ingress="chat", upstream_protocol=self.protocol, response_model_override=public)
-        request.dispatch_metadata = build_dispatch_metadata(payload, self.protocol, headers)
+        request.dispatch_metadata = build_dispatch_metadata(payload, self.protocol, headers, wire_payload=body)
         return request
 
     async def restore_response(self, chunk, dynamic_map=None):

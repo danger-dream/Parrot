@@ -23,7 +23,7 @@ from ...channel.compatibility import (
     normalize_models,
 )
 from ...channel.url_utils import resolve_upstream_url
-from ... import cache_hints, local_web_tools, model_metadata, model_pricing
+from ... import cache_hints, json_bytes, local_web_tools, model_metadata, model_pricing
 from ...providers import registry as provider_registry
 from .. import deepseek_reasoning
 from ..transform import (
@@ -357,7 +357,7 @@ class OpenAIApiChannel(Channel):
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/chat/completions"),
             headers=self._headers(),
-            body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            body=json_bytes.dumps_utf8(payload, separators=(",", ":")),
             dynamic_tool_map=None,
             dispatch_metadata=build_dispatch_metadata(payload, self.protocol),
             translator_ctx={
@@ -388,7 +388,7 @@ class OpenAIApiChannel(Channel):
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/responses"),
             headers=self._headers(),
-            body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            body=json_bytes.dumps_utf8(payload, separators=(",", ":")),
             dynamic_tool_map=None,
             dispatch_metadata=build_dispatch_metadata(payload, self.protocol),
             translator_ctx={
@@ -420,7 +420,7 @@ class OpenAIApiChannel(Channel):
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/chat/completions"),
             headers=self._headers(),
-            body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            body=json_bytes.dumps_utf8(payload, separators=(",", ":")),
             dynamic_tool_map=None,
             dispatch_metadata=build_dispatch_metadata(payload, self.protocol),
             translator_ctx=None,
@@ -436,7 +436,7 @@ class OpenAIApiChannel(Channel):
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/responses"),
             headers=self._headers(),
-            body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            body=json_bytes.dumps_utf8(payload, separators=(",", ":")),
             dynamic_tool_map=None,
             dispatch_metadata=build_dispatch_metadata(payload, self.protocol),
             translator_ctx=None,
@@ -459,7 +459,7 @@ class OpenAIApiChannel(Channel):
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/responses"),
             headers=self._headers(),
-            body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            body=json_bytes.dumps_utf8(payload, separators=(",", ":")),
             dynamic_tool_map=None,
             dispatch_metadata=build_dispatch_metadata(payload, self.protocol),
             translator_ctx={
@@ -494,7 +494,7 @@ class OpenAIApiChannel(Channel):
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/chat/completions"),
             headers=self._headers(),
-            body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            body=json_bytes.dumps_utf8(payload, separators=(",", ":")),
             dynamic_tool_map=None,
             dispatch_metadata=build_dispatch_metadata(payload, self.protocol),
             translator_ctx={

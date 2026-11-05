@@ -6,7 +6,7 @@ import json
 import gzip
 import logging
 
-from .. import cache_hints, config, model_names, oauth_manager
+from .. import cache_hints, config, json_bytes, model_names, oauth_manager
 from ..oauth.workbuddy import common
 from ..oauth_ids import account_key
 from ..openai.channel.api_channel import OpenAIApiChannel
@@ -209,7 +209,7 @@ class WorkBuddyOAuthChannel(OpenAIApiChannel):
             headers["X-Private-Data"] = "true"
         request.url = common.api_base_url(current) + "/v2/chat/completions"
         request.headers = headers
-        request.body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+        request.body = json_bytes.dumps_utf8(payload, separators=(",", ":"))
         # Older last-good catalogs predate this field. Modern products default
         # to gzip; an explicit remote false still wins, and legacy never opts in.
         # workbuddy.ai is outside officialEndpoints: official CODEBUDDY_BASE_URL

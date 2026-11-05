@@ -954,10 +954,14 @@ def _validate_wire_payload_budget(
     outbound_model = str(getattr(dispatch_metadata, "outbound_model_id", "") or "").strip()
     if outbound_model:
         _validate_candidate_model_enabled(ch, outbound_model)
-    if getattr(ch, "provider", "") == "workbuddy" and isinstance(wire_body, bytes) and wire_body.startswith(b"\x1f\x8b"):
-        import gzip
-        wire_body = gzip.decompress(wire_body)
-    payload = _wire_payload(wire_body)
+    # Channel-serialized bytes come from the payload the metadata was built
+    # from; frames and dicts may be rewritten afterwards and are read directly.
+    payload = getattr(dispatch_metadata, "budget_shape", None) if isinstance(wire_body, bytes) else None
+    if payload is None:
+        if getattr(ch, "provider", "") == "workbuddy" and isinstance(wire_body, bytes) and wire_body.startswith(b"\x1f\x8b"):
+            import gzip
+            wire_body = gzip.decompress(wire_body)
+        payload = _wire_payload(wire_body)
     if payload is None:
         # All current inference channels are structured JSON. Preserve the
         # compatibility policy for an unknown future body instead of guessing.

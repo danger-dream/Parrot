@@ -20,6 +20,7 @@ import math
 import os
 import tempfile
 import threading
+from collections.abc import MutableMapping
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -92,6 +93,56 @@ class PricingSettings:
     aliases: Mapping[str, str]
     overrides: Mapping[str, PricingEntry]
     channel_providers: Mapping[str, str]
+
+
+class _PackedRecords(MutableMapping):
+    """provider/model -> models.dev record, kept as compact JSON until read.
+
+    A parsed catalog generation is ~20 MiB of Python objects while records are
+    only read for metadata lookups.  Every read returns a fresh copy; names
+    stay unpacked because catalog listings read nothing else.
+    """
+
+    __slots__ = ("_packed", "_names")
+
+    def __init__(self) -> None:
+        self._packed: dict[str, bytes] = {}
+        self._names: dict[str, Any] = {}
+
+    def __getitem__(self, key: str) -> dict[str, Any]:
+        return json.loads(self._packed[key])
+
+    def __setitem__(self, key: str, record: Mapping[str, Any]) -> None:
+        self._packed[key] = json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self._names[key] = record.get("name")
+
+    def __delitem__(self, key: str) -> None:
+        del self._packed[key]
+        del self._names[key]
+
+    def name_of(self, key: str) -> Any:
+        return self._names[key]
+
+    def __iter__(self):
+        return iter(self._packed)
+
+    def __len__(self) -> int:
+        return len(self._packed)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._packed
+
+    def __deepcopy__(self, memo: dict) -> "_PackedRecords":
+        copied = _PackedRecords()
+        copied._packed = dict(self._packed)
+        copied._names = copy.deepcopy(self._names, memo)
+        return copied
+
+
+def _record_name(records: Mapping[str, Mapping[str, Any]], key: str) -> Any:
+    if isinstance(records, _PackedRecords):
+        return records.name_of(key)
+    return records[key].get("name")
 
 
 @dataclass(frozen=True)
@@ -518,7 +569,7 @@ def _parse_models_dev_catalog(
 def _parse_models_dev_metadata_indexes(
     api_payload: Any,
     models_payload: Any,
-) -> tuple[dict[str, dict[str, Any]], dict[str, str], dict[str, str]]:
+) -> tuple[MutableMapping[str, dict[str, Any]], dict[str, str], dict[str, str]]:
     """Build exact provider/model metadata and canonical-official indexes.
 
     Unlike the tariff index this includes models without token pricing. The
@@ -527,7 +578,7 @@ def _parse_models_dev_metadata_indexes(
     """
     if not isinstance(api_payload, Mapping) or not isinstance(models_payload, Mapping):
         raise ValueError("models.dev catalogs must be JSON objects")
-    entries: dict[str, dict[str, Any]] = {}
+    entries = _PackedRecords()
     provider_names: dict[str, str] = {}
     for provider_key, provider_raw in api_payload.items():
         if not isinstance(provider_key, str) or not isinstance(provider_raw, Mapping):
@@ -550,7 +601,7 @@ def _parse_models_dev_metadata_indexes(
             ):
                 continue
             model = model_key.strip().lower()
-            entries[f"{provider}/{model}"] = copy.deepcopy(dict(raw))
+            entries[f"{provider}/{model}"] = dict(raw)
 
     candidates: dict[str, set[str]] = {}
     for canonical_key in models_payload:
@@ -851,7 +902,7 @@ def catalog_provider_models(provider_id: str) -> list[dict[str, Any]]:
             {
                 "key": key,
                 "id": key[len(prefix):],
-                "name": str(_catalog_models[key].get("name") or key[len(prefix):]),
+                "name": str(_record_name(_catalog_models, key) or key[len(prefix):]),
             }
             for key in keys
         ]
@@ -871,11 +922,10 @@ def catalog_models() -> list[dict[str, str]]:
         result: list[dict[str, str]] = []
         for key in sorted(_catalog_models):
             provider, model_id = key.split("/", 1)
-            raw = _catalog_models[key]
             result.append({
                 "key": key,
                 "id": model_id,
-                "name": str(raw.get("name") or model_id),
+                "name": str(_record_name(_catalog_models, key) or model_id),
                 "provider_id": provider,
                 "provider_name": _catalog_provider_names.get(provider, provider),
             })

@@ -16,7 +16,6 @@
 
 import asyncio
 import os
-import json
 import signal
 import sys
 import threading
@@ -27,6 +26,10 @@ from contextlib import asynccontextmanager, contextmanager
 _PROCESS_START_NS = time.monotonic_ns()
 from src import startup_timing
 startup_timing.set_process_start_ns(_PROCESS_START_NS)
+from src import memory_reclaim
+if __name__ == "__main__":
+    # Allocator thresholds must be set before imports start worker threads.
+    memory_reclaim.configure()
 
 import uvicorn
 from uvicorn.server import HANDLED_SIGNALS
@@ -39,7 +42,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from src import (
     __version__, drain,
     affinity, apikey_limiter, auth, config, cooldown,
-    errors, failover, fingerprint, image_db, load_balancing, log_db,
+    errors, failover, fingerprint, image_db, json_bytes, load_balancing, log_db,
     model_mapping, model_metadata, model_pricing, model_state, model_validation, network,
     network_monitor, notifier, oauth_manager, probe, provider_usage, public_ip, scheduler, scorer,
     state_db, status_monitor, translation, update_checker, updater,
@@ -625,6 +628,8 @@ async def lifespan(app: FastAPI):
             print(f"[updater] resume_after_restart failed: {_exc}")
         _background_tasks.append(asyncio.create_task(openai_store.cleanup_loop()))
         _background_tasks.append(asyncio.create_task(translation.cleanup_loop()))
+        from src import search_tool_policy
+        _background_tasks.append(asyncio.create_task(search_tool_policy.replay_cleanup_loop()))
 
         # MCP 会话管理器与现有 lifespan 同生命周期；关闭时不在此处 join，
         # 由 finally 的 drain 流程统一等待在途请求。
@@ -640,6 +645,10 @@ async def lifespan(app: FastAPI):
                 print(f"[mcp] session manager failed to start: {type(exc).__name__}")
         else:
             startup_timing.log("lifespan.mcp-session-manager", status="skipped")
+
+        if memory_reclaim.is_enabled():
+            memory_reclaim.freeze_startup()
+            _background_tasks.append(asyncio.create_task(memory_reclaim.reclaim_loop()))
 
         print(f"Parrot 🦜 v{__version__} (multi-family AI protocol proxy) ready")
         print(f"  device_id: {DEVICE_ID[:16]}...")
@@ -928,12 +937,18 @@ class _DrainHttpMiddleware:
         policy_body_guard = None
         response_started = False
         released = False
+        payload_bytes = next(
+            (int(value) for name, value in scope.get("headers") or ()
+             if name == b"content-length" and value.isdigit()),
+            0,
+        )
 
         async def release_all() -> None:
             nonlocal released
             if released:
                 return
             released = True
+            memory_reclaim.note(payload_bytes)
             try:
                 if key_lease is not None:
                     await key_lease.release()
@@ -945,7 +960,8 @@ class _DrainHttpMiddleware:
                     await drain_lease.aclose()
 
         async def send_wrapped(message: Message) -> None:
-            nonlocal response_started
+            nonlocal response_started, payload_bytes
+            payload_bytes += len(message.get("body") or b"")
             if message.get("type") == "http.response.start":
                 response_started = True
                 if key_lease is not None:
@@ -1412,7 +1428,7 @@ async def proxy_messages(request: Request):
     # 2. 读请求体
     raw = await request.body()
     try:
-        body = json.loads(raw) if raw else {}
+        body = json_bytes.loads_utf8(raw) if raw else {}
     except Exception as e:
         return errors.json_error_response(
             400, errors.ErrType.INVALID_REQUEST, f"invalid json: {e}"

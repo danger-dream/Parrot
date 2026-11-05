@@ -8,13 +8,12 @@ Responses by ``AntigravityOAuthAdapter`` before the Responses toolkit.
 
 from __future__ import annotations
 
-import json
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Optional
 
-from .. import cache_hints, config, media_config, oauth_manager
+from .. import cache_hints, config, json_bytes, media_config, oauth_manager
 from ..antigravity import DispatchGuardError
 from ..oauth import antigravity as ag_provider
 from ..oauth_ids import account_key as _account_key
@@ -346,7 +345,7 @@ class AntigravityOAuthChannel(Channel):
         return UpstreamRequest(
             url=url,
             headers=headers,
-            body=json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            body=json_bytes.dumps_utf8(envelope, separators=(",", ":")),
             dynamic_tool_map=None,
             translator_ctx=translator_ctx,
             dispatch_metadata=build_dispatch_metadata(

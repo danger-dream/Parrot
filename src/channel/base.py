@@ -5,12 +5,14 @@
 
 from __future__ import annotations
 
+import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Mapping, Optional
 
 
 _FAST_MODE_BETA = "fast-mode-2026-02-01"
+_BUDGET_KEYS = ("max_output_tokens", "max_completion_tokens", "max_tokens", "thinking")
 
 
 @dataclass(frozen=True)
@@ -25,6 +27,9 @@ class UpstreamDispatchMetadata:
     outbound_model_id: str
     outbound_service_tier: str | None
     fast_mode: bool
+    # Output-limit/thinking fields (top level and nested ``response``) for the
+    # pre-dispatch budget check, so a multi-MiB body is not parsed again.
+    budget_shape: dict | None = field(default=None, compare=False, repr=False)
 
 
 def _beta_tokens(value: object) -> set[str]:
@@ -52,8 +57,14 @@ def build_dispatch_metadata(
     payload: Mapping[str, object],
     upstream_protocol: str | None,
     headers: Mapping[str, object] | None = None,
+    *,
+    wire_payload: Mapping[str, object] | None = None,
 ) -> UpstreamDispatchMetadata:
-    """Derive dispatch/logging facts before ``payload`` is serialized."""
+    """Derive dispatch/logging facts before ``payload`` is serialized.
+
+    ``wire_payload`` is the structure actually serialized when a channel
+    rewrites ``payload`` into another envelope first.
+    """
 
     protocol = str(upstream_protocol or "").strip().lower()
     model = payload.get("model")
@@ -99,10 +110,16 @@ def build_dispatch_metadata(
                 fast_mode = True
                 break
 
+    wire = payload if wire_payload is None else wire_payload
+    budget_shape = {key: wire[key] for key in _BUDGET_KEYS if key in wire}
+    response = wire.get("response")
+    if isinstance(response, Mapping):
+        budget_shape["response"] = {key: response[key] for key in _BUDGET_KEYS if key in response}
     return UpstreamDispatchMetadata(
         outbound_model_id=outbound_model_id,
         outbound_service_tier=outbound_service_tier,
         fast_mode=bool(fast_mode),
+        budget_shape=copy.deepcopy(budget_shape),
     )
 
 
