@@ -340,6 +340,12 @@ def _share(items, previous) -> None:
 
 
 def _remember(body, protocol, api_key_name, references, *, visible_body=None):
+    if protocol != "responses" and _history(body, protocol) == _history(
+        visible_body if visible_body is not None else body, protocol,
+    ):
+        # Nothing hidden to restore. Only Responses replays such a turn, to
+        # expand a previous_response_id continuation.
+        return
     now = time.monotonic()
     visible = copy.deepcopy(_history(visible_body if visible_body is not None else body, protocol))
     saved = copy.deepcopy(body)
@@ -436,6 +442,10 @@ def restore_replay(body: dict, protocol: str, api_key_name: str | None) -> dict:
         expanded_tail = _split_history_prefix(items, history, protocol) if history else None
         if expanded_tail is not None:
             if any(reference == r for item in expanded_tail for r, _ in _result_refs(item)):
+                if history == visible:
+                    # Nothing was hidden in this turn: its transcript is the
+                    # client's own and says nothing about later hidden rounds.
+                    continue
                 return body
         visible_tail = _split_history_prefix(items, visible, protocol) if visible else None
         if visible_tail is not None:

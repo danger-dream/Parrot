@@ -100,38 +100,40 @@ def test_sharing_never_changes_replay_results(protocol, monkeypatch):
     assert shared == unshared
 
 
-def test_redundant_entry_still_shadows_hidden_round_like_before():
-    protocol = "chat"
-    t1 = {"model": "m", "tools": TOOLS, "messages": [_user(protocol, "start")]}
-    a1 = _call(protocol, "c1")
+@pytest.mark.parametrize("protocol", ["chat", "anthropic", "responses"])
+def test_turn_without_hidden_round_does_not_shadow_a_later_one(protocol):
+    field = "input" if protocol == "responses" else "messages"
+    t1 = {"model": "m", "tools": TOOLS, field: [_user(protocol, "start")]}
     saved1 = copy.deepcopy(t1)
-    saved1["messages"].append(a1)
+    saved1[field].append(_call(protocol, "c1"))
     policy._remember(saved1, protocol, "k", ["c1"], visible_body=copy.deepcopy(saved1))
-    shown = saved1["messages"] + [_result(protocol, "c1", "ok1")]
+    shown = saved1[field] + [_result(protocol, "c1", "ok1")]
     hidden = [_call(protocol, "s1", "web_search"), _result(protocol, "s1", "results")]
     a2 = _call(protocol, "c2")
-    policy._remember({"model": "m", "messages": shown + hidden + [a2]}, protocol, "k", ["c2"],
-                     visible_body={"model": "m", "messages": shown + [a2]})
-    t3 = {"model": "m", "tools": TOOLS, "messages": copy.deepcopy(shown) + [a2, _result(protocol, "c2", "ok2")]}
-    assert policy.restore_replay(t3, protocol, "k") is t3
+    policy._remember({"model": "m", field: shown + hidden + [a2]}, protocol, "k", ["c2"],
+                     visible_body={"model": "m", field: shown + [a2]})
+    t3 = {"model": "m", "tools": TOOLS, field: copy.deepcopy(shown) + [a2, _result(protocol, "c2", "ok2")]}
+    restored = policy.restore_replay(t3, protocol, "k")
+    assert json.dumps(restored).count('"results"') == 1
+    assert policy.restore_replay(restored, protocol, "k") == restored
 
 
 def test_consecutive_turns_share_one_copy_of_the_history():
-    history = [_user("chat", f"message {i} " + "中" * 20000) for i in range(30)]
+    history = [_user("responses", f"message {i} " + "中" * 20000) for i in range(30)]
+    text_chars = sum(len(m["content"][0]["text"]) for m in history)
     tracemalloc.start()
     for turn in range(1, 31):
-        request = json.loads(json.dumps({"model": "m", "messages": history[:turn]}))
+        request = json.loads(json.dumps({"model": "m", "input": history[:turn]}))
         final = copy.deepcopy(request)
-        final["messages"].append(_call("chat", f"c{turn}"))
-        policy._remember(final, "chat", "k", [f"c{turn}"], visible_body=copy.deepcopy(final))
+        final["input"].append(_call("responses", f"c{turn}"))
+        policy._remember(final, "responses", "k", [f"c{turn}"], visible_body=copy.deepcopy(final))
         del request, final
     current, _ = tracemalloc.get_traced_memory()
     tracemalloc.stop()
-    one_copy = sum(len(m["content"]) * 2 for m in history)
-    assert current < 3 * one_copy
+    assert current < 3 * text_chars * 2
     entries = list(policy._REPLAY.values())
-    assert entries[-1][1]["messages"][0] is entries[0][1]["messages"][0]
-    assert entries[-1][2][5] is entries[-1][1]["messages"][5]
+    assert entries[-1][1]["input"][0] is entries[0][1]["input"][0]
+    assert entries[-1][2][5] is entries[-1][1]["input"][5]
 
 
 @pytest.mark.parametrize("a,b", [
