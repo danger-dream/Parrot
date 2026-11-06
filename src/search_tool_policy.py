@@ -10,6 +10,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import math
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -310,6 +311,34 @@ async def replay_cleanup_loop() -> None:
         _prune_replay(time.monotonic())
 
 
+def _same(a, b) -> bool:
+    """Indistinguishable JSON values: equal, with the same types and key order."""
+    if a is b:
+        return True
+    if type(a) is not type(b):
+        return False
+    if type(a) is dict:
+        return len(a) == len(b) and all(
+            ka == kb and _same(va, vb) for (ka, va), (kb, vb) in zip(a.items(), b.items())
+        )
+    if type(a) is list:
+        return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))
+    if type(a) is float:
+        return a == b and math.copysign(1.0, a) == math.copysign(1.0, b)
+    if type(a) in (str, int, bool):
+        return a == b
+    return False
+
+
+def _share(items, previous) -> None:
+    """Replace items indistinguishable from ``previous`` at the same index by those."""
+    if type(items) is not list or type(previous) is not list:
+        return
+    for index in range(min(len(items), len(previous))):
+        if _same(items[index], previous[index]):
+            items[index] = previous[index]
+
+
 def _remember(body, protocol, api_key_name, references, *, visible_body=None):
     now = time.monotonic()
     visible = copy.deepcopy(_history(visible_body if visible_body is not None else body, protocol))
@@ -317,9 +346,19 @@ def _remember(body, protocol, api_key_name, references, *, visible_body=None):
     # Colliding references, even with different hidden results for identical
     # visible prompts, must remain ambiguous rather than last-writer-wins.
     identity = _digest([visible, _history(saved, protocol)])
+    scope = _scope(body, protocol, api_key_name)
+    # Every turn re-sends the whole history as freshly parsed objects. Entries
+    # are never mutated and their items are owned by the cache, so consecutive
+    # turns can hold one copy of the identical items instead of one each.
+    field = "input" if protocol == "responses" else "messages"
+    newest = next((_REPLAY[key] for key in reversed(_REPLAY) if key[:3] == scope), None)
+    if newest is not None:
+        _share(saved.get(field), newest[1].get(field))
+        _share(visible, newest[2])
+    _share(visible, saved.get(field))
     for reference in references:
         if reference:
-            key = (*_scope(body, protocol, api_key_name), reference, identity)
+            key = (*scope, reference, identity)
             _REPLAY[key] = (now, saved, visible)
             _REPLAY.move_to_end(key)
     _prune_replay(now)
