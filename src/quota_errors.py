@@ -282,6 +282,11 @@ def zhipu_plan_excluded_retry_ms(*, now_ms: int | None = None) -> int:
     也无法自动用上。窗口取冷却阶梯里最长的有限档（默认 15 分钟）——既停止每 30
     秒一次的无效试探，又能在套餐放开后自行恢复。
     """
+    return finite_pause_until_ms(now_ms=now_ms)
+
+
+def finite_pause_until_ms(*, now_ms: int | None = None) -> int:
+    """上游没给重置时间的额度暂停：到冷却阶梯里最长的有限档为止，不做永久冻结。"""
     current = int(now_ms if now_ms is not None else time.time() * 1000)
     try:
         from . import config as _config

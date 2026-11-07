@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import copy
 import json
+import time
 import uuid
 from types import SimpleNamespace
 
@@ -307,16 +308,33 @@ def test_free_cli_model_not_replaced_by_unadvertised_sg_variant(monkeypatch):
 
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("ingress", ["chat", "responses", "anthropic"])
-async def test_nested_14018_stops_pool_without_refresh(cli, monkeypatch, stream, ingress):
+async def test_nested_14018_pauses_the_account_model_and_moves_on(cli, monkeypatch, stream, ingress):
+    from src import channel_state, cooldown
     second = dict(cli.ch.account, uid="second-fixture")
     om.add_account(second)
     fake._install_channels(cli.m, [cli.ch, WorkBuddyOAuthChannel(second)])
     async def forbidden(*args, **kwargs):
         pytest.fail("quota must not refresh credentials")
     monkeypatch.setattr(om, "force_refresh", forbidden)
+    raw, _ = fixture_round(0)
+    answered = []
+
+    def first_exhausted(req, payload):
+        # Only the first account's credits are gone: the next account serves the request.
+        answered.append(req)
+        if len(answered) == 1:
+            return httpx.Response(429, json=QUOTA)
+        return httpx.Response(200, content=raw, headers={"content-type": "text/event-stream"})
+    result, text, calls = await chat_call(cli, ingress, request_body(ingress, stream), first_exhausted)
+    assert len(calls) == 2 and result.status_code == 200, text
+    first = channel_state.effect_key(cli.ch)
+    paused = cooldown.get_state(first, "glm-fixture")
+    assert paused["cooldown_until"] > time.time() * 1000 and not paused["error_count"]
+    # Every account exhausted: one call each, never a retry on the same account, still 402.
+    cooldown.clear(first)
     result, text, calls = await chat_call(cli, ingress, request_body(ingress, stream), lambda req, payload:
         httpx.Response(429, json=QUOTA))
-    assert len(calls) == 1 and result.status_code == 402, text
+    assert len(calls) == 2 and result.status_code == 402, text
     assert "14018" in text and "balance_exhausted" in text
     assert "www.codebuddy.ai/profile/usage" not in text
 

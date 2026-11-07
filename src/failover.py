@@ -2804,9 +2804,18 @@ async def run_failover(
 
         if (getattr(ch, "provider", "") == "workbuddy" and quota_exhaustion is not None
                 and quota_exhaustion.get("code") in WORKBUDDY_QUOTA_CODES):
-            # Explicit billing exhaustion is not a transient 429. Surface the
-            # classified error without replaying across the account pool.
-            break
+            # Explicit billing exhaustion is not a transient 429: never retried on this
+            # account. The credits are this account's own (other accounts keep serving the
+            # model), so pause the account's model for a bounded window without a failure
+            # record, and let the request go on to the next candidate. 402 remains when
+            # every candidate is exhausted.
+            cooldown.record_quota_pause(
+                channel_state.effect_key(ch), resolved_model, result.error_detail,
+                cooldown_until=quota_errors.finite_pause_until_ms(),
+            )
+            retry_count += 1
+            idx += 1
+            continue
 
         # Explicit quota/entitlement/rate errors use bounded existing gates,
         # not the generic failure ladder or an account health penalty.
