@@ -320,7 +320,13 @@ def _thinking_config(payload: dict) -> dict[str, Any] | None:
     level = mapping.get(effort)
     if not level:
         return None
-    return {"thinkingLevel": level}
+    summary = reasoning.get("summary")
+    include_thoughts = True if summary is None else (
+        str(summary).strip().lower() in {"auto", "concise", "detailed"}
+        if isinstance(summary, str)
+        else False
+    )
+    return {"thinkingLevel": level, "includeThoughts": include_thoughts}
 
 
 def _claude_thinking_budget(payload: dict, reasoning: dict, effort: str) -> dict[str, Any] | None:

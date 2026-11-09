@@ -250,3 +250,80 @@ func TestCancelBackpressureAndCloseAll(t *testing.T) {
 		}
 	}
 }
+
+func TestPoolSequentialReuseAndCancelEviction(t *testing.T) {
+	var mu sync.Mutex
+	var remoteAddrs []string
+	hangNext := false
+
+	url, cfg := localServer(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		remoteAddrs = append(remoteAddrs, r.RemoteAddr)
+		shouldHang := hangNext
+		hangNext = false
+		mu.Unlock()
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "ok")
+		w.(http.Flusher).Flush()
+		if shouldHang {
+			<-r.Context().Done()
+		}
+	})
+
+	cid := newClient(cfg)
+	defer closeClient(cid)
+
+	for i := 0; i < 4; i++ {
+		rid, err := startRequest(cid, requestIn{Method: "POST", URL: url, Body: []byte("{}"), Timeout: 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := getRequest(rid)
+		_, end := auditDrain(t, s)
+		if end.Kind != "eof" {
+			t.Fatalf("req %d failed: %+v", i, end)
+		}
+		closeRequest(rid)
+	}
+
+	mu.Lock()
+	if len(remoteAddrs) != 4 {
+		t.Fatalf("expected 4 requests, got %d", len(remoteAddrs))
+	}
+	firstAddr := remoteAddrs[0]
+	for i, addr := range remoteAddrs {
+		if addr != firstAddr {
+			t.Fatalf("req %d used %s instead of reusing %s", i, addr, firstAddr)
+		}
+	}
+	hangNext = true
+	mu.Unlock()
+
+	// A cancelled stream must evict its connection rather than returning it to the idle pool.
+	rid, err := startRequest(cid, requestIn{Method: "POST", URL: url, Body: []byte("{}"), Timeout: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := getRequest(rid)
+	nextKind(t, s, "headers")
+	s.cancel()
+	closeRequest(rid)
+
+	rid2, err := startRequest(cid, requestIn{Method: "POST", URL: url, Body: []byte("{}"), Timeout: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2 := getRequest(rid2)
+	_, end2 := auditDrain(t, s2)
+	if end2.Kind != "eof" {
+		t.Fatalf("post-cancel req failed: %+v", end2)
+	}
+	closeRequest(rid2)
+
+	mu.Lock()
+	lastAddr := remoteAddrs[len(remoteAddrs)-1]
+	mu.Unlock()
+	if lastAddr == firstAddr {
+		t.Fatalf("expected fresh connection after cancelled stream, still got %s", lastAddr)
+	}
+}

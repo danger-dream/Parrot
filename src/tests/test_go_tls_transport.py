@@ -459,3 +459,70 @@ async def test_authenticated_proxy_keeps_remote_target_dns(tls_files, scheme):
         finally:
             server.close()
             await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_pooled_ss2022_h2_reuse_and_invalidation(tls_files, monkeypatch):
+    from types import SimpleNamespace
+    from src.channel.base import UpstreamRequest
+    from src.proxy.connector import SS2022Connector
+    from src.tests.test_ss_aead import _handle_ss2022_client, _start_ss_proxy
+    from src.transports import http_runtime
+
+    async with h2_server(tls_files) as state:
+        cipher = "2022-blake3-aes-128-gcm"
+        password = base64.urlsafe_b64encode(os.urandom(16)).decode()
+        ss_accepts = 0
+
+        async def handle_ss(r, w):
+            nonlocal ss_accepts
+            ss_accepts += 1
+            await _handle_ss2022_client(r, w, cipher, password)
+
+        server, port = await _start_ss_proxy(handle_ss)
+        connector = SS2022Connector("fixture-pool", "127.0.0.1", port, cipher, password)
+        monkeypatch.setattr(
+            http_runtime,
+            "_resolve_http_route_chain",
+            lambda *a, **kw: ([("fixture-pool", connector)], None),
+        )
+        orig_init = go_tls.GoTLSTransport.__init__
+
+        def init_with_ca(self, **kw):
+            kw.setdefault("ca_pem", state["pem"])
+            return orig_init(self, **kw)
+
+        monkeypatch.setattr(go_tls.GoTLSTransport, "__init__", init_with_ca)
+        channel = SimpleNamespace(tls_fingerprint=go_tls.PROFILE, internal_loopback=False)
+        try:
+            for _ in range(3):
+                opened = await http_runtime.open_response_with_proxy_chain(
+                    channel=channel,
+                    resolved_model="gemini-4-argon-medium",
+                    upstream_req=UpstreamRequest(url=state["url"], headers={}, body=b"{}"),
+                    connect_timeout=2,
+                    first_byte_timeout=2,
+                    idle_timeout=2,
+                    total_timeout=4,
+                    response_mode="non_stream",
+                    request_id=None,
+                )
+                assert opened.error is None
+                body = await http_runtime._read_response_bytes(
+                    opened.response, opened.timing, opened.round_timeouts,
+                )
+                assert body == b"local-body"
+                await http_runtime.close_response_context(opened.ctx)
+                await http_runtime.close_proxy_client(opened.proxy_client)
+
+            assert ss_accepts == 1
+            assert len(state["calls"]) == 3
+            assert len(state["active"]) == 1
+
+            go_tls.invalidate_client_pool()
+            await asyncio.wait_for(state["closed"].wait(), 2)
+        finally:
+            go_tls.invalidate_client_pool()
+            server.close()
+            await server.wait_closed()
+

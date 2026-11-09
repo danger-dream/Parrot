@@ -347,15 +347,27 @@ async def test_argon_conflicts_budget_and_ambiguous_bare_fail_without_default(m,
         await _wire(m, monkeypatch, body, "anthropic")
     wire, _, _ = await _wire(m, monkeypatch, _body("responses", BASE), models=[BASE])
     assert wire["model"] == BASE
-    assert wire["request"]["generationConfig"]["thinkingConfig"] == {"includeThoughts": False}
+    assert wire["request"]["generationConfig"]["thinkingConfig"] == {"includeThoughts": True}
 
 
 @pytest.mark.asyncio
 async def test_argon_no_summary_request_and_other_gemini_are_unchanged(m, monkeypatch):
     wire, _, _ = await _wire(m, monkeypatch, _body("responses", MODEL))
-    assert wire["request"]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "medium", "includeThoughts": False}
+    assert wire["request"]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "medium", "includeThoughts": True}
+    explicit_none = _body("responses", MODEL)
+    explicit_none["reasoning"] = {"summary": "none"}
+    wire_none, _, _ = await _wire(m, monkeypatch, explicit_none)
+    assert wire_none["request"]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "medium", "includeThoughts": False}
+    chat_none = _body("chat", MODEL)
+    chat_none["reasoning_summary"] = "none"
+    wire_chat_none, _, _ = await _wire(m, monkeypatch, chat_none, "chat")
+    assert wire_chat_none["request"]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "medium", "includeThoughts": False}
     wire, _, _ = await _wire(m, monkeypatch, _body("responses", "gemini-3-pro", "minimal"))
-    assert wire["request"]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "minimal"}
+    assert wire["request"]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "minimal", "includeThoughts": True}
+    pro_none = _body("responses", "gemini-3-pro", "minimal")
+    pro_none["reasoning"]["summary"] = "none"
+    wire_pro_none, _, _ = await _wire(m, monkeypatch, pro_none)
+    assert wire_pro_none["request"]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "minimal", "includeThoughts": False}
 
 
 def test_scheduler_resolves_before_cooldown_and_respects_selected_disabled_and_endpoint(m, monkeypatch):

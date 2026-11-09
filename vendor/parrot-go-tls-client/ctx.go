@@ -21,6 +21,7 @@ type clientState struct {
 	mu       sync.Mutex
 	closed   bool
 	requests map[uint64]*requestState
+	idle     map[string][]*idleH2Conn
 }
 type requestIn struct {
 	Method          string      `json:"method"`
@@ -79,7 +80,7 @@ func newClient(config clientConfig) uint64 {
 	handles.Lock()
 	defer handles.Unlock()
 	handles.next++
-	handles.clients[handles.next] = &clientState{config: config, requests: map[uint64]*requestState{}}
+	handles.clients[handles.next] = &clientState{config: config, requests: map[uint64]*requestState{}, idle: map[string][]*idleH2Conn{}}
 	return handles.next
 }
 func startRequest(id uint64, in requestIn) (uint64, error) {
@@ -206,7 +207,15 @@ func closeClient(id uint64) {
 		s.cancel()
 		ids = append(ids, id)
 	}
+	var idleConns []*idleH2Conn
+	for k, list := range c.idle {
+		idleConns = append(idleConns, list...)
+		delete(c.idle, k)
+	}
 	c.mu.Unlock()
+	for _, ic := range idleConns {
+		ic.close()
+	}
 	for _, id := range ids {
 		closeRequest(id)
 	}

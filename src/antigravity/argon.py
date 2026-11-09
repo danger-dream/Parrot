@@ -40,11 +40,11 @@ def intent(body: dict, ingress: str) -> tuple[str | None, bool]:
         if not isinstance(output, dict):
             _fail("Argon output_config must be an object")
         effort = output.get("effort")
-        wants_summary = mode in {"enabled", "adaptive"}
+        wants_summary = True if mode is None else mode in {"enabled", "adaptive"}
     elif ingress == "chat":
         effort = body.get("reasoning_effort")
         summary = body.get("reasoning_summary")
-        wants_summary = summary in {"auto", "concise", "detailed"} if isinstance(summary, str) else False
+        wants_summary = True if summary is None else (summary in {"auto", "concise", "detailed"} if isinstance(summary, str) else False)
     else:
         reasoning = body.get("reasoning")
         if reasoning is not None and not isinstance(reasoning, dict):
@@ -53,7 +53,7 @@ def intent(body: dict, ingress: str) -> tuple[str | None, bool]:
         if reasoning.get("budget_tokens") is not None:
             _fail("Argon does not support numeric reasoning budgets; choose low, medium or high")
         effort, summary = reasoning.get("effort"), reasoning.get("summary")
-        wants_summary = summary in {"auto", "concise", "detailed"} if isinstance(summary, str) else False
+        wants_summary = True if summary is None else (summary in {"auto", "concise", "detailed"} if isinstance(summary, str) else False)
     if effort is not None and (not isinstance(effort, str) or effort not in TIERS):
         _fail("Argon supports only explicit low, medium or high effort; no automatic fallback is performed")
     if summary is not None and (not isinstance(summary, str) or summary not in {"auto", "concise", "detailed", "none"}):

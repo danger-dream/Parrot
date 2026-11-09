@@ -131,6 +131,8 @@ class SS2022CurlProxyLease:
         self._listener_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._claimed = False
+        self._reconnect_enabled = False
+        self._bound_port: int | None = None
         self._closing = False
         self._closed = False
         self._tunnel_established = False
@@ -152,6 +154,7 @@ class SS2022CurlProxyLease:
             bound_host = str(sockets[0].getsockname()[0])
             if bound_host != "127.0.0.1":
                 raise RuntimeError("SS2022 curl bridge escaped IPv4 loopback")
+            lease._bound_port = int(sockets[0].getsockname()[1])
             return lease
         except BaseException:
             await _await_owned(lease.aclose())
@@ -160,9 +163,9 @@ class SS2022CurlProxyLease:
     @property
     def proxy_url(self) -> str:
         server = self._server
-        if server is None or not server.sockets:
+        if self._closed or server is None or (not server.sockets and self._bound_port is None):
             raise RuntimeError("SS2022 curl bridge listener is closed")
-        port = int(server.sockets[0].getsockname()[1])
+        port = int(server.sockets[0].getsockname()[1]) if server.sockets else int(self._bound_port)
         return f"http://127.0.0.1:{port}"
 
     @property
@@ -189,6 +192,18 @@ class SS2022CurlProxyLease:
     @property
     def active_handler_count(self) -> int:
         return sum(not task.done() for task in self._handlers)
+
+    @property
+    def tunnel_active(self) -> bool:
+        return bool(self._owners) and self._tunnel_established and not self._closed and not self._closing
+
+    def enable_reconnect(self) -> None:
+        self._reconnect_enabled = True
+
+    def rebind_timing(self, timing: Any, *, connect_timeout: float | None = None) -> None:
+        self._timing = timing
+        if connect_timeout is not None:
+            self._connect_timeout = max(0.001, float(connect_timeout))
 
     def safe_before_dispatch(self) -> bool:
         """No application bytes can leave before the CONNECT tunnel exists."""
@@ -311,16 +326,19 @@ class SS2022CurlProxyLease:
             if host != self._target_host or port != self._target_port:
                 await self._send_status(writer, 403, "Forbidden")
                 return
-            if self._closing or self._claimed:
+            if self._closing or (self._claimed and not self._reconnect_enabled):
                 await self._send_status(writer, 503, "Service Unavailable")
                 return
 
-            # No await between the check and claim: event-loop atomic and exactly once.
+            # No await between the check and claim: event-loop atomic and exactly once
+            # for single-use leases; reusable pooled leases keep listening for reconnects.
             self._claimed = True
-            # Python 3.13 Server.wait_closed() also waits for accepted clients;
-            # awaiting it from this client would self-deadlock. Stop accepting
-            # now and let lease.aclose() await final listener ownership later.
-            await self._stop_accepting()
+            self._connect_failed = False
+            if not self._reconnect_enabled:
+                # Python 3.13 Server.wait_closed() also waits for accepted clients;
+                # awaiting it from this client would self-deadlock. Stop accepting
+                # now and let lease.aclose() await final listener ownership later.
+                await self._stop_accepting()
             connection = create_ss_connection(
                 self._cipher,
                 self._password,

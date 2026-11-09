@@ -32,6 +32,9 @@ from ..protocols.runtime import (
 )
 from .base import metadata_from_response
 from .fingerprint import create_impersonated_client, supports_route as fingerprint_supports_route
+from . import go_tls
+
+_DEFAULT_CREATE_IMPERSONATED_CLIENT = create_impersonated_client
 from .http import HttpStreamRequest, open_stream
 from .policy import proxy_byte_snapshot, proxy_route_kwargs
 from .precommit_sse import notify_buffered_response_start
@@ -1658,45 +1661,59 @@ async def open_response_with_proxy_chain(
                         route_counter(up, down)
 
                 if fingerprint_route:
-                    fingerprint_auth = None
-                    fingerprint_owner = None
-                    if connector is not None and str(route_type) == "socks5":
-                        fingerprint_proxy = str(getattr(connector, "url", "") or "")
-                    elif connector is not None and str(route_type) == "ss2022":
-                        target_url = httpx.URL(str(upstream_req.url))
-                        if target_url.scheme != "https" or not target_url.host:
-                            raise ValueError(
-                                "SS2022 fingerprint bridge requires an HTTPS target"
-                            )
-                        target_port = int(target_url.port or 443)
-                        fingerprint_owner = await connector.acquire_curl_proxy(
-                            str(target_url.host),
-                            target_port,
-                            timeout=round_timeouts.connection + 0.5,
-                            timing=late_timing,
-                        )
-                        fingerprint_proxy = fingerprint_owner.proxy_url
-                        fingerprint_auth = fingerprint_owner.proxy_auth
-                    elif connector is None:
-                        # Preserve the legacy SOCKS setting used by the shared
-                        # client; an explicit direct connector never inherits it.
-                        fingerprint_proxy = str(network.active_socks5_url() or "")
-                    else:
-                        fingerprint_proxy = ""
-                    try:
-                        proxy_client = create_impersonated_client(
-                            fingerprint_profile,
+                    if (
+                        create_impersonated_client is _DEFAULT_CREATE_IMPERSONATED_CLIENT
+                        and go_tls.can_use_client_pool(fingerprint_profile)
+                    ):
+                        proxy_client = await go_tls.acquire_pooled_client(
+                            route_type=str(route_type),
+                            connector=connector,
+                            target_url=httpx.URL(str(upstream_req.url)),
                             timeout=client_timeout,
-                            proxy=fingerprint_proxy,
-                            proxy_auth=fingerprint_auth,
-                            trust_env=bool(connector is None and not fingerprint_proxy),
+                            connect_timeout=round_timeouts.connection + 0.5,
                             byte_counter=fingerprint_counter,
-                            route_owner=fingerprint_owner,
+                            late_timing=late_timing,
                         )
-                    except BaseException:
-                        if fingerprint_owner is not None:
-                            await _await_http_owned(fingerprint_owner.aclose())
-                        raise
+                    else:
+                        fingerprint_auth = None
+                        fingerprint_owner = None
+                        if connector is not None and str(route_type) == "socks5":
+                            fingerprint_proxy = str(getattr(connector, "url", "") or "")
+                        elif connector is not None and str(route_type) == "ss2022":
+                            target_url = httpx.URL(str(upstream_req.url))
+                            if target_url.scheme != "https" or not target_url.host:
+                                raise ValueError(
+                                    "SS2022 fingerprint bridge requires an HTTPS target"
+                                )
+                            target_port = int(target_url.port or 443)
+                            fingerprint_owner = await connector.acquire_curl_proxy(
+                                str(target_url.host),
+                                target_port,
+                                timeout=round_timeouts.connection + 0.5,
+                                timing=late_timing,
+                            )
+                            fingerprint_proxy = fingerprint_owner.proxy_url
+                            fingerprint_auth = fingerprint_owner.proxy_auth
+                        elif connector is None:
+                            # Preserve the legacy SOCKS setting used by the shared
+                            # client; an explicit direct connector never inherits it.
+                            fingerprint_proxy = str(network.active_socks5_url() or "")
+                        else:
+                            fingerprint_proxy = ""
+                        try:
+                            proxy_client = create_impersonated_client(
+                                fingerprint_profile,
+                                timeout=client_timeout,
+                                proxy=fingerprint_proxy,
+                                proxy_auth=fingerprint_auth,
+                                trust_env=bool(connector is None and not fingerprint_proxy),
+                                byte_counter=fingerprint_counter,
+                                route_owner=fingerprint_owner,
+                            )
+                        except BaseException:
+                            if fingerprint_owner is not None:
+                                await _await_http_owned(fingerprint_owner.aclose())
+                            raise
                 else:
                     # Disabled fingerprinting preserves the original custom
                     # httpcore backend for every SS2022 route.

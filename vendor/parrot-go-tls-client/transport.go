@@ -77,26 +77,62 @@ func (s *requestState) run(in requestIn) {
 		connectCtx, cancelConnect = context.WithTimeout(s.ctx, seconds(connectTimeout))
 	}
 	s.phase.Store("connect")
-	conn, err := dialLS(connectCtx, s.owner.config, req.URL, in)
-	if err != nil {
-		if connectCtx.Err() == context.DeadlineExceeded && s.ctx.Err() == nil {
-			s.timeoutPhase.Store("connect")
+	poolKey := originPoolKey(req.URL, in.DialIPs)
+	var conn net.Conn
+	var cc *http2.ClientConn
+	if pooled := s.owner.takeIdle(poolKey); pooled != nil {
+		usable := pooled.cc.CanTakeNewRequest()
+		if usable && time.Since(pooled.lastUsed) >= idlePingThreshold {
+			pingCtx, cancelPing := context.WithTimeout(connectCtx, idlePingTimeout)
+			err := pooled.cc.Ping(pingCtx)
+			cancelPing()
+			if err != nil {
+				usable = false
+			}
 		}
-		cancelConnect()
-		finalErr = err
-		return
+		if usable && s.ctx.Err() == nil {
+			conn = pooled.conn
+			cc = pooled.cc
+		} else {
+			pooled.close()
+			if s.ctx.Err() != nil {
+				cancelConnect()
+				finalErr = s.ctx.Err()
+				return
+			}
+		}
+	}
+	if cc == nil {
+		dialedConn, err := dialLS(connectCtx, s.owner.config, req.URL, in)
+		if err != nil {
+			if connectCtx.Err() == context.DeadlineExceeded && s.ctx.Err() == nil {
+				s.timeoutPhase.Store("connect")
+			}
+			cancelConnect()
+			finalErr = err
+			return
+		}
+		transport := &http2.Transport{MaxReadFrameSize: 1048576, DisableCompression: true}
+		dialedCC, err := transport.NewClientConn(dialedConn)
+		if err != nil {
+			dialedConn.Close()
+			cancelConnect()
+			finalErr = err
+			return
+		}
+		conn = dialedConn
+		cc = dialedCC
 	}
 	cancelConnect()
-	defer conn.Close()
+	reused := false
 	stopClose := context.AfterFunc(s.ctx, func() { conn.Close() })
-	defer stopClose()
-	transport := &http2.Transport{MaxReadFrameSize: 1048576, DisableCompression: true}
-	cc, err := transport.NewClientConn(conn)
-	if err != nil {
-		finalErr = err
-		return
-	}
-	defer cc.Close()
+	defer func() {
+		if !reused {
+			stopClose()
+			cc.Close()
+			conn.Close()
+		}
+	}()
 	s.phase.Store("write")
 	var uploadTimer *time.Timer
 	if in.WriteTimeout > 0 {
@@ -163,6 +199,9 @@ func (s *requestState) run(in requestIn) {
 			return
 		}
 		if err == io.EOF {
+			if finalErr == nil && s.ctx.Err() == nil && stopClose() {
+				reused = s.owner.putIdle(poolKey, conn, cc)
+			}
 			return
 		}
 		if err != nil {
@@ -373,4 +412,86 @@ func dialLS(ctx context.Context, cfg clientConfig, target *url.URL, in requestIn
 	}
 	uc.SetDeadline(time.Time{})
 	return uc, nil
+}
+
+const (
+	maxIdleConnsPerOrigin = 4
+	idleConnTTL           = 90 * time.Second
+	idlePingThreshold     = 30 * time.Second
+	idlePingTimeout       = 1500 * time.Millisecond
+)
+
+type idleH2Conn struct {
+	conn     net.Conn
+	cc       *http2.ClientConn
+	lastUsed time.Time
+}
+
+func (ic *idleH2Conn) close() {
+	if ic.cc != nil {
+		_ = ic.cc.Close()
+	}
+	if ic.conn != nil {
+		_ = ic.conn.Close()
+	}
+}
+
+func originPoolKey(u *url.URL, dialIPs []string) string {
+	port := u.Port()
+	if port == "" {
+		port = "443"
+	}
+	base := strings.ToLower(u.Scheme) + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port)
+	if len(dialIPs) == 0 {
+		return base
+	}
+	return base + "|" + strings.Join(dialIPs, ",")
+}
+
+func (c *clientState) takeIdle(key string) *idleH2Conn {
+	var stale []*idleH2Conn
+	var chosen *idleH2Conn
+	now := time.Now()
+	c.mu.Lock()
+	if !c.closed {
+		list := c.idle[key]
+		for len(list) > 0 {
+			last := list[len(list)-1]
+			list = list[:len(list)-1]
+			if now.Sub(last.lastUsed) > idleConnTTL || !last.cc.CanTakeNewRequest() {
+				stale = append(stale, last)
+				continue
+			}
+			chosen = last
+			break
+		}
+		if len(list) == 0 {
+			delete(c.idle, key)
+		} else {
+			c.idle[key] = list
+		}
+	}
+	c.mu.Unlock()
+	for _, s := range stale {
+		s.close()
+	}
+	return chosen
+}
+
+func (c *clientState) putIdle(key string, conn net.Conn, cc *http2.ClientConn) bool {
+	if conn == nil || cc == nil || !cc.CanTakeNewRequest() {
+		return false
+	}
+	c.mu.Lock()
+	if c.closed || len(c.idle[key]) >= maxIdleConnsPerOrigin {
+		c.mu.Unlock()
+		return false
+	}
+	c.idle[key] = append(c.idle[key], &idleH2Conn{
+		conn:     conn,
+		cc:       cc,
+		lastUsed: time.Now(),
+	})
+	c.mu.Unlock()
+	return true
 }
