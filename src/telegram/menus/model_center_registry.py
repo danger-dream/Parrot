@@ -27,7 +27,7 @@ def _label(source: str) -> str:
 
 
 def entry_button(chat_id: int) -> dict | None:
-    if model_registry.current() is None:
+    if model_registry.current() is None or not hasattr(menu._CONTROL, "registry_overview"):
         return None
     overview, _revision = _overview(chat_id)
     count = len(_pending_groups(overview)) + len(overview.suggestions)
