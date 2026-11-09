@@ -13,6 +13,7 @@ const TILES: Record<string, Tile> = {
   xai: { label: 'Grok', color: '#8e8e93', glyph: 'X' },
   cursor: { label: 'Cursor', color: '#7c7c86', glyph: '▲' },
   antigravity: { label: 'Antigravity', color: '#4285f4', glyph: 'G' },
+  'google-ai-studio': { label: 'Google AI Studio', color: '#3186ff', glyph: 'G' },
   workbuddy: { label: 'WorkBuddy', color: '#14b8a6', glyph: 'W' },
   zhipu: { label: '智谱', color: '#3c6cff', glyph: '智' },
   qoder: { label: 'Qoder', color: '#a259ff', glyph: 'Q' },

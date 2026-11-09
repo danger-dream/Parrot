@@ -51,7 +51,9 @@ def _headers(auth: str, api_key: str) -> dict[str, str]:
     return {}
 
 
-def _normalize_model_ids(items: list[object], field: str) -> list[str]:
+def _normalize_model_ids(
+    items: list[object], field: str, *, strip_models_prefix: bool = False,
+) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for item in items[:MAX_MODELS + 1]:
@@ -59,6 +61,8 @@ def _normalize_model_ids(items: list[object], field: str) -> list[str]:
         if not isinstance(model_id, str):
             continue
         model_id = model_id.strip()
+        if strip_models_prefix and model_id.lower().startswith("models/"):
+            model_id = model_id[len("models/"):].strip()
         if not model_id or len(model_id) > MAX_MODEL_ID_LENGTH or model_id in seen:
             continue
         seen.add(model_id)
@@ -70,10 +74,12 @@ def _normalize_model_ids(items: list[object], field: str) -> list[str]:
     return out
 
 
-def _parse_openai_data_id(payload: object) -> list[str]:
+def _parse_openai_data_id(payload: object, *, strip_models_prefix: bool = False) -> list[str]:
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
         raise ModelsDiscoveryError("模型列表响应格式不受支持", kind="invalid_data")
-    return _normalize_model_ids(payload["data"], "id")
+    return _normalize_model_ids(
+        payload["data"], "id", strip_models_prefix=strip_models_prefix,
+    )
 
 
 def _parse_dashscope_output_model(payload: object) -> list[str]:
@@ -125,4 +131,6 @@ async def discover_models(endpoint: str, api_key: str, *, auth: str = "bearer",
         raise ModelsDiscoveryError("模型服务返回了非 JSON 响应") from exc
     if parser == "dashscope-output-model":
         return _parse_dashscope_output_model(payload)
-    return _parse_openai_data_id(payload)
+    host = (urlsplit(endpoint).hostname or "").lower()
+    strip_prefix = provider == "google-ai-studio" or host == "generativelanguage.googleapis.com"
+    return _parse_openai_data_id(payload, strip_models_prefix=strip_prefix)

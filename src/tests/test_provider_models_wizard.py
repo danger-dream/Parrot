@@ -27,11 +27,14 @@ def _factory(handler):
 
 def test_catalog_exact_endpoints_and_shape():
     assert [b.id for b in PROVIDER_CATALOG] == [
-        "zhipu", "kimi", "deepseek", "openai", "anthropic", "iflytek",
-        "alibaba-bailian", "volcengine-ark", "tencent-cloud", "jd-cloud",
+        "zhipu", "kimi", "deepseek", "openai", "anthropic", "google-ai-studio",
+        "iflytek", "alibaba-bailian", "volcengine-ark", "tencent-cloud", "jd-cloud",
         "baidu-qianfan", "xiaomi-mimo", "opencode-go", "ctyun-xirang",
         "ollama-cloud", "openrouter", "minimax", "siliconflow",
     ]
+    g_studio = get_preset("google-ai-studio", "api")
+    assert g_studio.models_url == "https://generativelanguage.googleapis.com/v1beta/openai/models"
+    assert g_studio.protocols["openai-chat"] == "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
     coding = get_preset("zhipu", "coding-cn")
     # 模型目录必须用返回 {"data":[{"id":...}]} 的标准 /models 端点：/api/v1/models
     # 返回 {"models":[{"slug":...}]}，与 openai-data-id 解析器不匹配。
@@ -151,6 +154,21 @@ def test_discovery_stable_dedupe_auth_and_redirect_refusal():
     ))
     assert models == ["qwen-a", "qwen-b"]
 
+    def gemini_openai(request):
+        return httpx.Response(200, json={
+            "object": "list",
+            "data": [
+                {"id": "models/gemini-4-argon", "object": "model"},
+                {"id": "models/gemini-3.8-flash", "object": "model"},
+                {"id": "gemini-4-argon", "object": "model"},
+            ],
+        })
+    g_models = asyncio.run(discover_models(
+        "https://generativelanguage.googleapis.com/v1beta/openai/models", "ai-studio-key",
+        provider="google-ai-studio", client_factory=_factory(gemini_openai),
+    ))
+    assert g_models == ["gemini-4-argon", "gemini-3.8-flash"]
+
     def redirect(request):
         return httpx.Response(302, headers={"location": "https://other.test/models"})
     with pytest.raises(ModelsDiscoveryError, match="重定向") as exc:
@@ -198,7 +216,7 @@ def test_provider_and_preset_picker_buttons_use_catalog_brand_custom_icons(monke
         "volcengine-ark", "baidu-qianfan", "xiaomi-mimo", "ctyun-xirang",
         "openrouter",
     }
-    unsupported = {"iflytek", "opencode-go", "siliconflow"}
+    unsupported = {"google-ai-studio", "iflytek", "opencode-go", "siliconflow"}
     catalog = SimpleNamespace(providers=tuple(PROVIDER_CATALOG))
     monkeypatch.setattr(channel_wizard, "_catalog", lambda *_args, **_kwargs: catalog)
 

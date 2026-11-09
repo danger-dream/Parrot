@@ -157,6 +157,13 @@ PROVIDER_CATALOG: tuple[ProviderBrand, ...] = (
         }, models_auth="anthropic-x-api-key"),
     )),
 
+    # 3. Google AI Studio：Gemini Developer API 官方 OpenAI 兼容层端点。
+    ProviderBrand("google-ai-studio", "Google AI Studio", (
+        _preset("api", "Gemini API（OpenAI 兼容）", "https://generativelanguage.googleapis.com/v1beta/openai/models", {
+            "openai-chat": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        }),
+    )),
+
     # 3. 科大讯飞：星火、星辰 MaaS 与 Astron 套餐使用不同 key/hostname。
     ProviderBrand("iflytek", "科大讯飞（星辰/星火）", (
         _preset("spark-http", "讯飞星火 HTTP API", None, {
