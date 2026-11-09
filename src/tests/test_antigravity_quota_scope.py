@@ -453,3 +453,79 @@ def test_reason_in_message_or_model_metadata_is_not_account_scope():
          "metadata": {"reason": "INSUFFICIENT_G1_CREDITS_BALANCE", "model": "all-models"}},
     ]}}
     assert parse_antigravity_429(payload)["account_quota_exhausted"] is False
+
+
+@pytest.mark.asyncio
+async def test_allow_credits_retries_429_with_enabled_credit_types_and_injects_until_reset(m, monkeypatch):
+    _setup(m)
+    from src import failover, scheduler, cooldown
+    from src.protocols.runtime import AttemptResult
+    om = m["oauth_manager"]
+    ak = _add_ag_account(om, models=["gemini-4-argon-medium"])
+    m["config"].update(lambda cfg: cfg["oauthAccounts"][0].update(allowCredits=True))
+    usage = _usage(
+        m["ag"],
+        known=True,
+        available=True,
+        credit_type="GOOGLE_ONE_AI",
+        credit_amount=2500.0,
+        minimum_credit_amount=50.0,
+    )
+    m["state_db"].quota_save(ak, om.flatten_usage(usage), email="state@gmail.com")
+    assert om.antigravity_credits_usable(ak) is True
+
+    ch = m["AntigravityOAuthChannel"](om.get_account(ak))
+    async def token(_): return "synthetic-token"
+    monkeypatch.setattr(om, "ensure_channel_token", token)
+
+    # 1. Before exhaustion, enabledCreditTypes is NOT injected.
+    req_initial = await ch.build_upstream_request(
+        {"model": "gemini-4-argon-medium", "input": "hi"},
+        "gemini-4-argon-medium", ingress_protocol="responses",
+    )
+    assert "enabledCreditTypes" not in json.loads(req_initial.body)
+
+    # 2. On 429 QUOTA_EXHAUSTED, failover retries same channel with enabledCreditTypes=["GOOGLE_ONE_AI"].
+    get = m["config"].get
+    _patch_failover_runtime(monkeypatch, failover)
+    monkeypatch.setattr(m["config"], "get", get)
+    envelopes = []
+    async def attempt(channel, model, attempt_body, *a, **k):
+        built = await channel.build_upstream_request(attempt_body, model, ingress_protocol="responses")
+        env = json.loads(built.body)
+        envelopes.append(env)
+        if len(envelopes) == 1:
+            raw = _google("3600s", "QUOTA_EXHAUSTED")
+            return AttemptResult(outcome="http_error", http_status=429, error_detail=raw, full_response_text=raw,
+                                 translator_ctx=built.translator_ctx)
+        return AttemptResult(outcome="success", success=True, http_status=200,
+                             response=JSONResponse({"ok": True}), translator_ctx=built.translator_ctx)
+    monkeypatch.setattr(failover, "_try_channel", attempt)
+    route = scheduler.ScheduleResult([(ch, "gemini-4-argon-medium")], None, False)
+    resp = await failover.run_failover(route, {"model": "gemini-4-argon-medium", "input": "hi"},
+                                       "ag-credits", "key", "ip", False, time.time(), ingress_protocol="responses")
+    assert resp.status_code == 200
+    assert len(envelopes) == 2
+    assert "enabledCreditTypes" not in envelopes[0]
+    assert envelopes[1]["enabledCreditTypes"] == ["GOOGLE_ONE_AI"]
+    assert not cooldown.is_blocked(ch.key, "gemini-4-argon-medium")
+
+    # 3. Subsequent requests during the exhausted window automatically inject enabledCreditTypes.
+    req_after = await ch.build_upstream_request(
+        {"model": "gemini-4-argon-medium", "input": "next"},
+        "gemini-4-argon-medium", ingress_protocol="responses",
+    )
+    assert json.loads(req_after.body)["enabledCreditTypes"] == ["GOOGLE_ONE_AI"]
+
+    # 4. Turning on allowCredits clears existing exact-model quota pauses and records exhausted window.
+    from src.antigravity import quota as ag_quota
+    m["config"].update(lambda cfg: cfg["oauthAccounts"][0].update(allowCredits=False, antigravity_quota_exhausted_until={}))
+    ag_quota.apply_request_429(ch.state_key, "gemini-4-argon-medium", _google("3600s", "QUOTA_EXHAUSTED"),
+                               account_key=ak, expected_state_key=ch.state_key)
+    assert cooldown.is_blocked(ch.key, "gemini-4-argon-medium")
+    m["config"].update(lambda cfg: cfg["oauthAccounts"][0].update(allowCredits=True))
+    assert ag_quota.clear_quota_pauses_for_credits(ak) == 1
+    assert not cooldown.is_blocked(ch.key, "gemini-4-argon-medium")
+    assert ag_quota.should_inject_credits(ak, "gemini-4-argon-medium") is True
+
+

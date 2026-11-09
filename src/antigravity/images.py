@@ -385,12 +385,19 @@ async def request(
     if current_id != account_id:
         raise ValueError("selected Antigravity image account changed during token refresh")
     gemini = build_request(parsed, prompt=prompt, n=n, action=action)
+    from . import quota as ag_quota
+    use_credits = ag_quota.should_inject_credits(
+        channel.account_key,
+        source.upstream,
+        force=bool(getattr(parsed, "_parrot_antigravity_use_credits", False)),
+    )
     envelope = wrap_cloud_code(
         gemini,
         model=source.upstream,
         project_id=channel.project_id,
         stream=False,
         session_id="",
+        enabled_credit_types=(ag_provider.CREDIT_TYPE,) if use_credits else None,
     )
     url = f"{channel.base_url}/{ag_provider.API_VERSION}:generateContent"
     timeout_seconds = float(cfg.get("requestTimeoutSeconds") or 180)

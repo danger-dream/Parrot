@@ -239,9 +239,9 @@ def _antigravity(usage: dict) -> list[dict | None]:
         prefix = "旧数据已保留；" if block.get("quota_groups_stale") else ""
         tail.append(item("模型配额刷新", note=prefix + str(error.get("kind") or "failed")))
     if block.get("known"):
-        tail.append(item("积分", remaining=block.get("credit_amount"), unit="credits",
-                         note=("可用" if block.get("available") else "已耗尽")
-                         + (f" · 最低 {block.get('minimum_credit_amount')}" if block.get("minimum_credit_amount") is not None else "")))
+        tail.append(item("积分", remaining=block.get("credit_amount"), unit="credits"))
+    elif str(block.get("credit_type") or "").strip().upper() == "GOOGLE_ONE_AI" and block.get("minimum_credit_amount") is not None:
+        tail.append(item("积分", remaining=0, unit="credits"))
     sections.append(_section("antigravityCredits", "积分", tail))
     return sections
 

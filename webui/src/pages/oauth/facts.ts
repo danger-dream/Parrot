@@ -111,6 +111,12 @@ export function planFacts(
     case 'antigravity': {
       const text = p.textModelCount ?? a.modelCount
       out.push({ label: '模型', value: `文本 ${text}${p.imageModelCount ? ` · 出图 ${p.imageModelCount}` : ''}` })
+      const credits = sectionItem(sections, 'antigravityCredits', '积分')
+      if (credits) {
+        const r = num(credits.remaining)
+        const value = r !== null ? `剩余 ${amount(r)} 积分` : credits.note || '—'
+        out.push({ label: '积分', value })
+      }
       if (d?.workspaceId) out.push({ label: 'Project', value: d.workspaceId, mono: true })
       break
     }
@@ -161,7 +167,7 @@ function itemRemainingPct(it: UsageItem): number | null {
 }
 
 function isQuotaWindowItem(s: UsageSection, it: UsageItem): boolean {
-  if (s.id === 'claudeReset' || s.id === 'credits') return false
+  if (s.id === 'claudeReset' || s.id === 'credits' || s.id === 'antigravityCredits') return false
   if (it.label === '套餐' || it.note === 'resetsAt=最近到期') return false
   return itemRemainingPct(it) !== null
 }
@@ -184,7 +190,7 @@ export function hitWindowKeys(
       const d = it.resetsAt ? new Date(it.resetsAt).getTime() : NaN
       const resetMs = Number.isFinite(d) ? d : null
       candidates.push({ key, rem, resetMs })
-      if (rem <= 0) hits.add(key)
+      if (rem <= 0 || (s.id.startsWith('antigravityGroup') && rem < 1)) hits.add(key)
     }
   }
   if (!opts.quotaPaused || !candidates.length) return hits

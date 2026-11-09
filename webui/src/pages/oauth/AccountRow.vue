@@ -58,7 +58,7 @@ function itemNote(it: Item): string {
 }
 const quotas = computed(() => {
   const items = (card.value?.usageSections || [])
-    .filter((s) => s.id !== 'credits' && s.id !== 'claudeReset')
+    .filter((s) => s.id !== 'credits' && s.id !== 'antigravityCredits' && s.id !== 'claudeReset')
     .map((s) => (s.id === 'qoderCredits' ? { ...s, items: s.items.filter((i) => i.label !== '套餐') } : s))
     .flatMap((s) => s.items.map((it) => ({ ...it, label: quotaLabel(s, it), hit: hitKeys.value.has(`${s.id}:${it.label}`) })))
   const bars = items.filter((i) => remaining(i) != null).slice(0, 6)

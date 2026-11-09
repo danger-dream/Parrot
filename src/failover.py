@@ -2241,6 +2241,7 @@ async def run_failover(
     codex_ws_recovered: set[str] = set()
     codex_http_fallback: set[str] = set()
     retried_without_context_1m: set[tuple[str, str]] = set()
+    retried_with_antigravity_credits: set[tuple[str, str]] = set()
     retried_without_encrypted_content = False
     retried_without_anthropic_thinking = False
     last_result: Optional[AttemptResult] = None
@@ -2383,6 +2384,8 @@ async def run_failover(
                 # Keep the trusted scheduling model for AG's late permission
                 # checks. Wire/response/billing still use the resolved tier.
                 attempt_body = {**attempt_body, "_client_visible_model": resolved_model}
+            if (ch.key, resolved_model) in retried_with_antigravity_credits:
+                attempt_body = {**attempt_body, "_parrot_antigravity_use_credits": True}
             attempt_body["_codex_turn_serialization_required"] = True
             attempt_handed_off = True
             if paused_result is not None:
@@ -2791,13 +2794,27 @@ async def run_failover(
         # after the existing short retry budget and only before stream commit.
         if str(getattr(ch, "provider", "")) == "antigravity" and result.http_status == 429:
             from .antigravity.quota import apply_request_429
-            apply_request_429(
+            ag_credits_key = (ch.key, resolved_model)
+            used_credits = (
+                ag_credits_key in retried_with_antigravity_credits
+                or bool((result.translator_ctx or {}).get("antigravity_used_credits"))
+            )
+            should_retry_credits = apply_request_429(
                 channel_state.effect_key(ch), resolved_model,
                 result.full_response_text or result.error_detail,
                 account_key=ch.account_key,
                 expected_state_key=getattr(ch, "state_key", None),
                 retry_after=result.retry_after_seconds,
+                used_credits=used_credits,
             )
+            if should_retry_credits and ag_credits_key not in retried_with_antigravity_credits:
+                retried_with_antigravity_credits.add(ag_credits_key)
+                print(
+                    f"[failover] Antigravity model quota exhausted on {ch.key}/{resolved_model}; "
+                    "retrying same channel with GOOGLE_ONE_AI credits"
+                )
+                retry_count += 1
+                continue
             retry_count += 1
             idx += 1
             continue

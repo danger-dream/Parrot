@@ -313,6 +313,11 @@ class AntigravityOAuthChannel(Channel):
             payload["reasoning"] = {"summary": "auto" if argon_config["includeThoughts"] else "none"}
             if argon_config.get("thinkingLevel"):
                 payload["reasoning"]["effort"] = argon_config["thinkingLevel"]
+        from ..antigravity import quota as ag_quota
+        force_credits = bool(requested_body.get("_parrot_antigravity_use_credits"))
+        use_credits = ag_quota.should_inject_credits(
+            self.account_key, resolved_model, force=force_credits,
+        )
         payload = await remote_image.prepare_antigravity_images(payload, tool_outputs=True)
         payload = provider_registry.filter_request_payload(
             self, payload, protocol="openai-responses",
@@ -324,7 +329,9 @@ class AntigravityOAuthChannel(Channel):
             project_id=self.project_id,
             stream=stream,
             session_id=_session_anchor(requested_body, payload),
+            enabled_credit_types=(ag_provider.CREDIT_TYPE,) if use_credits else None,
         )
+        translator_ctx["antigravity_used_credits"] = use_credits
         translator_ctx["antigravity_stream"] = antigravity_codec.GeminiStreamToResponses(
             model=resolved_model,
             request_body=requested_body if ingress_protocol == "responses" else payload,

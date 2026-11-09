@@ -108,7 +108,7 @@ class OAuthAccountMutationControlMixin:
         account = self._account(account_id)
         if revision(account) != revision(expected_account):
             raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
-        if self.backend.provider_of(account) != "openai" or allow_credits is not False:
+        if self.backend.provider_of(account) not in {"openai", "antigravity"} or allow_credits is not False:
             raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
         outcome = self.backend.update_account_conditional(account_id, expected_account, allow_credits=False)
         self._raise_conditional_status(outcome)
@@ -138,7 +138,7 @@ class OAuthAccountMutationControlMixin:
         """Toggle workspace-local spending consent, then re-evaluate quota."""
         self._require(context, Capability.WRITE)
         account = self._legacy_account(account_id)
-        if self.backend.provider_of(account) != "openai":
+        if self.backend.provider_of(account) not in {"openai", "antigravity"}:
             raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
         allowed = account.get("allowCredits") is not True
         result = self.backend.update_account_conditional(
@@ -459,9 +459,9 @@ class OAuthAccountMutationControlMixin:
             if expected_revision and expected_revision != revision(current):
                 raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
             allow_credits = getattr(command, "allow_credits", None)
-            if allow_credits is not None and self.backend.provider_of(current) != "openai":
+            if allow_credits is not None and self.backend.provider_of(current) not in {"openai", "antigravity"}:
                 raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE, fields=[
-                    ErrorField("allowCredits", "OPENAI_ONLY", "allowCredits applies to OpenAI accounts only")])
+                    ErrorField("allowCredits", "OPENAI_ONLY", "allowCredits applies to OpenAI and Antigravity accounts only")])
             outcome = self.backend.update_account_conditional(
                 account_id,
                 current,
@@ -476,6 +476,12 @@ class OAuthAccountMutationControlMixin:
                 # Turning them on lifts a pause only after a fresh usage read
                 # (refreshOAuthUsage), never from a stale cached snapshot.
                 self.backend.evaluate_cached_quota(account_id)
+            elif allow_credits is True and self.backend.provider_of(current) == "antigravity":
+                try:
+                    from src.antigravity import quota as ag_quota
+                    ag_quota.clear_quota_pauses_for_credits(account_id)
+                except Exception:
+                    pass
             result = self.get_account(context, account_id)
         except BaseException:
             self._audit(context, "oauth.account.update", account_id, "failed")

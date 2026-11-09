@@ -483,14 +483,45 @@ def test_rolling_window_card_stats_keep_one_cache_key():
 
 
 def test_antigravity_windows_are_ordered_and_use_seven_day_label():
+    from datetime import datetime, timezone
     from src.management_control.oauth.usage_sections import _antigravity
+    from src.management_control.oauth.account_card import OAuthAccountCardMixin, _with_window_local
 
-    usage = {"antigravity": {"quota_groups": [{"display_name": "Gemini Models", "buckets": [
-        {"window": "weekly", "remaining_fraction": 0.5},
-        {"window": "5h", "remaining_fraction": 1.0},
-    ]}]}}
-    group = _antigravity(usage)[0]
+    usage = {"antigravity": {
+        "credit_type": "GOOGLE_ONE_AI",
+        "minimum_credit_amount": 50.0,
+        "quota_groups": [
+            {"display_name": "Gemini Models", "buckets": [
+                {"window": "weekly", "remaining_fraction": 0.5, "reset_time": "2026-11-16T00:00:00Z"},
+                {"window": "5h", "remaining_fraction": 1.0, "reset_time": "2026-11-09T20:00:00Z"},
+            ]},
+            {"display_name": "Gemini 4 Argon", "buckets": [
+                {"window": "weekly", "remaining_fraction": 0.006, "reset_time": "2026-11-15T03:25:52Z"},
+            ]},
+        ],
+    }}
+    sections = tuple(_antigravity(usage))
+    group = sections[0]
     assert [item["label"] for item in group["items"]] == ["5 小时", "7 天"]
+    credits_sec = next(s for s in sections if s["id"] == "antigravityCredits")
+    assert credits_sec["items"][0]["remaining"] == 0
+    assert credits_sec["items"][0].get("note") is None
+
+    seen = []
+    class Backend:
+        def tokens_for_channel_models(self, channel, models, since):
+            seen.append((channel, tuple(models)))
+            return {"total": 12, "success_count": 12, "input": 1000, "output": 200, "cache_read": 5000, "cost_ticks": 100, "costed_success": 12}
+
+    card = OAuthAccountCardMixin()
+    card.backend = Backend()
+    account = {"models": ["gemini-3.8-flash-high", "gemini-4-argon-medium"]}
+    now = datetime(2026, 11, 9, 15, 0, tzinfo=timezone.utc).timestamp()
+    windows = card._antigravity_windows("antigravity:u@x:p", account, sections, now, True)
+    enriched = _with_window_local(sections, windows)
+    assert enriched[0]["items"][0]["local"]["total"] == 12
+    assert enriched[1]["items"][0]["local"]["total"] == 12
+    assert ("oauth:antigravity:u@x:p", ("gemini-3.8-flash-high",)) in seen
 
 
 def test_claude_fable_window_counts_only_fable_models():

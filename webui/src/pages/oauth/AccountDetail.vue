@@ -505,9 +505,9 @@ function cooldownText(e: RuntimeErr): string {
             <Select :model-value="route.value" :options="route.options" :disabled="!route.ready || route.saving" width="172px" @update:model-value="route.set" />
           </SettingRow>
           <SettingRow
-            v-if="provider === 'openai' && data.allowCredits !== null && data.allowCredits !== undefined"
+            v-if="(provider === 'openai' || provider === 'antigravity') && data.allowCredits !== null && data.allowCredits !== undefined"
             title="允许使用积分"
-            hint="额度用尽后继续消耗账号积分。关闭会立即重新检查额度；开启要等下次刷新额度后才解除暂停"
+            :hint="provider === 'antigravity' ? '模型配额用尽后自动注入 GOOGLE_ONE_AI 积分继续调用；积分耗尽后自动回退冷却' : '额度用尽后继续消耗账号积分。关闭会立即重新检查额度；开启要等下次刷新额度后才解除暂停'"
           >
             <Switch :model-value="data.allowCredits" :loading="busy === 'credits'" label="允许使用积分" @update:model-value="setAllowCredits" />
           </SettingRow>

@@ -834,8 +834,8 @@ def format_credits_usage_text(block: dict | None) -> str:
         )
     minimum = block.get("minimum_credit_amount")
     if minimum is not None:
-        return f"上游未返回剩余额度（最低 {format_credit_amount(minimum)}）"
-    return "上游未返回剩余额度"
+        return "剩余 0 积分"
+    return "尚未获取"
 
 
 # ─── quota buckets（retrieveUserQuota 家族） ─────────────────────

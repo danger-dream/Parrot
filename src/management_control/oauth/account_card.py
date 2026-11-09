@@ -164,20 +164,59 @@ def weekly_projection(provider: str, row: dict | None, stats_7d: dict | None) ->
 
 
 _WINDOW_LABELS = {"5 小时": "fiveHour", "7 天": "sevenDay", "Fable 7 天": "fable"}
+_AG_WINDOW_SECONDS = {"5 小时": 5 * 3600, "7 天": 7 * 86400, "每日": 86400, "每月": 30 * 86400}
+
+
+def _antigravity_group_models(account: dict, group_title: str, all_titles: list[str]) -> tuple[str, ...]:
+    """Return the exact wire model IDs belonging to an Antigravity quota group."""
+    configured = [str(m).strip() for m in account.get("models") or [] if str(m).strip()]
+    catalog_ids = [
+        str(r.get("id") or "").strip()
+        for r in ((account.get("account_model_catalog") or {}).get("models") or [])
+        if isinstance(r, dict) and str(r.get("id") or "").strip()
+    ]
+    universe = sorted(set(configured) | set(catalog_ids))
+    title_low = str(group_title or "").strip().lower()
+    has_separate_argon = any("argon" in str(t).lower() for t in all_titles)
+    if "argon" in title_low:
+        matched = [m for m in universe if "argon" in m.lower()]
+        for bare in ("gemini-4-argon", "gemini-4-argon-low", "gemini-4-argon-medium", "gemini-4-argon-high"):
+            if bare not in matched:
+                matched.append(bare)
+        return tuple(matched)
+    if "claude" in title_low or "gpt" in title_low or "3p" in title_low:
+        return tuple(m for m in universe if "claude" in m.lower() or "gpt" in m.lower())
+    if "gemini" in title_low:
+        matched = [
+            m for m in universe
+            if "gemini" in m.lower() and (not has_separate_argon or "argon" not in m.lower())
+        ]
+        if not has_separate_argon and "gemini-4-argon" not in matched:
+            matched.append("gemini-4-argon")
+        return tuple(matched)
+    return ()
 
 
 def _with_window_local(sections, windows: dict) -> tuple:
     """TG prints the local Parrot usage under each 5h / 7d bar: attach it as ``local``."""
     out = []
     for section in sections:
-        if section.get("id") != "windows":
+        sec_id = str(section.get("id") or "")
+        if sec_id == "windows":
+            items = []
+            for entry in section["items"]:
+                window = windows.get(_WINDOW_LABELS.get(entry.get("label"), ""))
+                items.append({**entry, "local": window.get("stats") if window else None})
+            out.append({**section, "items": items})
+        elif sec_id.startswith("antigravityGroup"):
+            items = []
+            for entry in section["items"]:
+                wkey = f"{sec_id}:{entry.get('label')}"
+                window = windows.get(wkey)
+                items.append({**entry, "local": window.get("stats") if window else None})
+            out.append({**section, "items": items})
+        else:
             out.append(section)
-            continue
-        items = []
-        for entry in section["items"]:
-            window = windows.get(_WINDOW_LABELS.get(entry.get("label"), ""))
-            items.append({**entry, "local": window.get("stats") if window else None})
-        out.append({**section, "items": items})
     return tuple(out)
 
 
@@ -291,6 +330,43 @@ class OAuthAccountCardMixin:
                                            models=models, scope="fable")
         return {"fable": {"since": datetime.fromtimestamp(since, timezone.utc), "stats": stats,
                           "stats_loading": loading}}
+
+    def _antigravity_windows(self, account_id: str, account: dict, sections: tuple, now_ts: float, blocking: bool) -> dict:
+        """Local usage per Antigravity quota group/window (Gemini, Claude/GPT, Gemini 4 Argon)."""
+        group_sections = [s for s in sections if isinstance(s, dict) and str(s.get("id") or "").startswith("antigravityGroup")]
+        if not group_sections:
+            return {}
+        all_titles = [str(s.get("title") or "") for s in group_sections]
+        out: dict[str, dict] = {}
+        for sec in group_sections:
+            sec_id = str(sec.get("id") or "")
+            models = _antigravity_group_models(account, str(sec.get("title") or ""), all_titles)
+            if not models:
+                continue
+            for entry in sec.get("items") or []:
+                if not isinstance(entry, dict):
+                    continue
+                label = str(entry.get("label") or "")
+                seconds = _AG_WINDOW_SECONDS.get(label)
+                if not seconds:
+                    continue
+                reset = entry.get("resets_at")
+                since = window_since(reset, seconds, now_ts)
+                rolling = seconds if since == now_ts - seconds else None
+                wkey = f"{sec_id}:{label}"
+                try:
+                    stats, loading = self._local_stats(
+                        account_id, since, blocking, rolling_seconds=rolling,
+                        models=models, scope=wkey,
+                    )
+                except Exception:
+                    continue
+                out[wkey] = {
+                    "since": datetime.fromtimestamp(since, timezone.utc),
+                    "stats": stats,
+                    "stats_loading": loading,
+                }
+        return out
 
     def _plan_facts(self, provider: str, account: dict, row: dict) -> dict:
         raw = _raw(row)
@@ -446,6 +522,8 @@ class OAuthAccountCardMixin:
                                  "stats_loading": window_loading}
         if provider == "claude":
             windows.update(self._fable_window(account_id, account, row, now_ts, blocking))
+        if provider == "antigravity":
+            windows.update(self._antigravity_windows(account_id, account, sections, now_ts, blocking))
         projection = weekly_projection(provider, row, (windows.get("sevenDay") or {}).get("stats"))
         sections = _with_window_local(sections, windows)
         return {

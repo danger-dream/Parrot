@@ -29,7 +29,7 @@ const facts = computed(() => planFacts(a.value, card.value?.plan, card.value?.us
 /** OpenAI credits / reset cards appear as facts; the Qoder 套餐 row is the subtitle. */
 const sections = computed(() =>
   (card.value?.usageSections || [])
-    .filter((s) => s.id !== 'credits' && s.id !== 'claudeReset')
+    .filter((s) => s.id !== 'credits' && s.id !== 'antigravityCredits' && s.id !== 'claudeReset')
     .map((s) => (s.id === 'qoderCredits' ? { ...s, items: s.items.filter((i) => i.label !== '套餐') } : s))
     .filter((s) => s.items.length),
 )

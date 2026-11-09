@@ -76,14 +76,14 @@ class OAuthQueryControlMixin:
                                             provider_snapshot=snapshot)
         except Exception:
             sections = ()  # Presentation-only; never fail the account detail.
-        account = self.backend.get_account_exact(account_id) if provider is OAuthProvider.OPENAI else None
+        account = self.backend.get_account_exact(account_id) if provider in (OAuthProvider.OPENAI, OAuthProvider.ANTIGRAVITY) else None
         return {
             "workbuddy": self.backend.workbuddy_snapshot(account_id) if provider is OAuthProvider.WORKBUDDY else None,
             "zhipu": zhipu,
             "qoder": self.backend.qoder_snapshot(account_id) if provider is OAuthProvider.QODER else None,
             "usage_sections": sections,
             "usage_fetched_at": _time(row.get("fetched_at")),
-            "allow_credits": (account or {}).get("allowCredits") is True if provider is OAuthProvider.OPENAI else None,
+            "allow_credits": (account or {}).get("allowCredits") is True if provider in (OAuthProvider.OPENAI, OAuthProvider.ANTIGRAVITY) else None,
         }
 
     def _refresh_enabled_for(self, provider: str) -> bool:

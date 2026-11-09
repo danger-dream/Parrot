@@ -683,6 +683,7 @@ def wrap_cloud_code(
     project_id: str,
     stream: bool = False,
     session_id: str | None = None,
+    enabled_credit_types: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Wrap a Gemini generateContent body in the Cloud Code envelope."""
     request = dict(gemini or {})
@@ -718,7 +719,7 @@ def wrap_cloud_code(
     _sanitize_request_schemas(request, model=model)
     _sanitize_thought_signatures(request)
 
-    envelope = {
+    envelope: dict[str, Any] = {
         "project": project_id,
         "model": model,
         "userAgent": "antigravity",
@@ -729,6 +730,10 @@ def wrap_cloud_code(
         ),
         "request": request,
     }
+    if enabled_credit_types:
+        cleaned_types = [str(t).strip() for t in enabled_credit_types if str(t).strip()]
+        if cleaned_types:
+            envelope["enabledCreditTypes"] = cleaned_types
     _ = stream
     return envelope
 

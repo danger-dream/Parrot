@@ -343,12 +343,35 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
                         cooldown.clear_on_success(effect_key, source.upstream)
                     elif response.status_code == 429:
                         from ..antigravity.quota import apply_request_429
-                        apply_request_429(
+                        used_credits = bool(getattr(attempt_parsed, '_parrot_antigravity_use_credits', False))
+                        should_retry_credits = apply_request_429(
                             effect_key, source.upstream, response.text,
                             account_key=source.key.removeprefix('oauth:'),
                             expected_state_key=getattr(source, 'state_key', None),
                             retry_after=response.headers.get('retry-after'),
+                            used_credits=used_credits,
                         )
+                        if should_retry_credits and not used_credits and calls < max_calls:
+                            if await concurrency.try_acquire(effect_key):
+                                try:
+                                    calls += 1
+                                    usages.append(None)
+                                    import copy as _copy
+                                    retry_parsed = _copy.copy(attempt_parsed)
+                                    retry_parsed._parrot_antigravity_use_credits = True
+                                    response = await _send(source, retry_parsed, action=action, n=n, cfg=cfg)
+                                finally:
+                                    concurrency.release(effect_key)
+                                if 200 <= response.status_code < 300:
+                                    cooldown.clear_on_success(effect_key, source.upstream)
+                                elif response.status_code == 429:
+                                    apply_request_429(
+                                        effect_key, source.upstream, response.text,
+                                        account_key=source.key.removeprefix('oauth:'),
+                                        expected_state_key=getattr(source, 'state_key', None),
+                                        retry_after=response.headers.get('retry-after'),
+                                        used_credits=True,
+                                    )
                 if response.status_code in SAFE_REJECTIONS:
                     sources.remove(source)
                     continue

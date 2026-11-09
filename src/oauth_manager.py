@@ -2444,6 +2444,39 @@ def _openai_credits_available(block: dict) -> bool:
     return credits.get("has_credits") is True or (balance is not None and balance > 0)
 
 
+def antigravity_credits_usable(account_key: str, usage: dict | None = None) -> bool:
+    """Return whether Antigravity GOOGLE_ONE_AI credits are opted-in and usable.
+
+    Mirrors ``openai_credits_usable``:
+    - requires explicit ``allowCredits is True`` on the account;
+    - refuses when the account was disabled by ``INSUFFICIENT_G1_CREDITS_BALANCE``;
+    - accepts either a known positive credit balance (``available is True``) or
+      an upstream ``availableCredits`` entry for ``GOOGLE_ONE_AI`` (Google's
+      ``loadCodeAssist`` often returns ``creditType="GOOGLE_ONE_AI"`` and
+      ``minimumCreditAmountForUsage`` without exposing ``creditAmount``).
+    """
+    acc = get_account(account_key)
+    if not acc or provider_of(acc) != "antigravity" or acc.get("allowCredits") is not True:
+        return False
+    obs = acc.get(_QUOTA_OBSERVATION_FIELD)
+    if (
+        acc.get("disabled_reason") == "quota"
+        and isinstance(obs, dict)
+        and obs.get("source") == "antigravity_account_quota"
+        and obs.get("reason") == "INSUFFICIENT_G1_CREDITS_BALANCE"
+    ):
+        return False
+    if usage is None:
+        row = state_db.quota_load(account_key) or {}
+        usage = _raw_usage_from_flat(row)
+    block = (usage.get("antigravity") if isinstance(usage, dict) else None) or {}
+    if not isinstance(block, dict):
+        return False
+    if block.get("known") is True:
+        return block.get("available") is True
+    return False
+
+
 def openai_credits_usable(account_key: str, usage: dict | None = None,
                           *, snapshot: dict | None = None) -> bool:
     """Shared opt-in gate for WHAM, cached quota and response-header decisions.
@@ -3250,6 +3283,9 @@ def _evaluate_antigravity_credits(
                 "disabled_until": result.get("disabled_until")}
     if not fresh:
         return {**base, "action": "quota_stale_keep_disabled" if reason == "quota" else "kept_enabled"}
+    if antigravity_credits_usable(account_key, usage):
+        from .antigravity import quota as ag_quota
+        ag_quota.clear_quota_pauses_for_credits(account_key)
     if reason != "quota":
         return {**base, "action": "kept_enabled"}
 
@@ -4058,13 +4094,16 @@ def _replace_exact_identity_in_config(
     if provider != "cursor" or not incoming.get("models"):
         if "models" in current:
             replacement["models"] = copy.deepcopy(current["models"])
+    if provider in {"openai", "antigravity"}:
+        # Spending consent is local to this workspace, never a login default.
+        if "allowCredits" in current:
+            replacement["allowCredits"] = current["allowCredits"]
+        if "antigravity_quota_exhausted_until" in current:
+            replacement["antigravity_quota_exhausted_until"] = copy.deepcopy(current["antigravity_quota_exhausted_until"])
     if provider == "openai":
         from .openai.codex_identity import account_identity_from_account
 
         replacement.pop("codexDeviceConvergenceEnabled", None)
-        # Spending consent is local to this workspace, never a login default.
-        if "allowCredits" in current:
-            replacement["allowCredits"] = current["allowCredits"]
         for key in ("codexIdentity", "codexDeviceInstallationId"):
             if key not in entry and key in current:
                 replacement[key] = copy.deepcopy(current[key])
@@ -4366,7 +4405,7 @@ def _add_account_serialized(
             "redirect_uri": entry.get("redirect_uri") or xai_provider.redirect_uri(),
         })
     # Antigravity 专属字段。project_id 是身份主键的一部分，缺了不许保存。
-    elif provider == "antigravity":
+    if provider == "antigravity":
         project_id = _antigravity_project_id(entry)
         if not project_id:
             raise ValueError("antigravity account requires project_id")
@@ -4376,6 +4415,10 @@ def _add_account_serialized(
             "token_endpoint": entry.get("token_endpoint") or antigravity_provider.token_url(),
             "redirect_uri": entry.get("redirect_uri") or antigravity_provider.redirect_uri(),
         })
+        if "allowCredits" in entry:
+            normalized["allowCredits"] = bool(entry.get("allowCredits"))
+        if isinstance(entry.get("antigravity_quota_exhausted_until"), dict):
+            normalized["antigravity_quota_exhausted_until"] = copy.deepcopy(entry["antigravity_quota_exhausted_until"])
         # Omission on re-login preserves an existing explicit generation route.
         if "request_base_url" in entry or "requestBaseUrl" in entry:
             normalized["request_base_url"] = str(entry.get("request_base_url") or entry.get("requestBaseUrl") or "")
@@ -4572,6 +4615,7 @@ def _add_account_serialized(
                     "last_model_sync_client_version", "last_model_sync_profile",
                     "last_model_sync_attempt_client_version", "last_model_sync_attempt_profile",
                     "models_etag", "models_etag_client_version", "models_etag_profile",
+                    "allowCredits", "antigravity_quota_exhausted_until",
                 ) if key in target
             }
             keep_max = target.get("maxConcurrent")
