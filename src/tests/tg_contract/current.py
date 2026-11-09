@@ -38,7 +38,7 @@ WEBUI_OVERRIDE_CASE_IDS = (
     'TG-SYS-08.006-limiter-durations',
 )
 # Round 2: OpenAI-protocol API channels honour maxConcurrent (edit page label).
-WEBUI_CHANNEL_OVERRIDE_CASE_IDS = ('TG-CH-04.edit-fields-success',)
+WEBUI_CHANNEL_OVERRIDE_CASE_IDS = ('TG-CH-04.edit-fields-success', 'TG-CH-02.brands-live-discovery-cancel')
 WEBUI_OVERRIDE_IDS_BY_SEGMENT = {
     'system.jsonl': WEBUI_OVERRIDE_CASE_IDS,
     'channels_apikey.jsonl': WEBUI_CHANNEL_OVERRIDE_CASE_IDS,
