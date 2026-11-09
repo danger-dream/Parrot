@@ -27,10 +27,10 @@ def _factory(handler):
 
 def test_catalog_exact_endpoints_and_shape():
     assert [b.id for b in PROVIDER_CATALOG] == [
-        "zhipu", "kimi", "deepseek", "openai", "anthropic", "google-ai-studio",
+        "zhipu", "kimi", "deepseek", "openai", "anthropic",
         "iflytek", "alibaba-bailian", "volcengine-ark", "tencent-cloud", "jd-cloud",
         "baidu-qianfan", "xiaomi-mimo", "opencode-go", "ctyun-xirang",
-        "ollama-cloud", "openrouter", "minimax", "siliconflow",
+        "ollama-cloud", "openrouter", "minimax", "siliconflow", "google-ai-studio",
     ]
     g_studio = get_preset("google-ai-studio", "api")
     assert g_studio.models_url == "https://generativelanguage.googleapis.com/v1beta/openai/models"

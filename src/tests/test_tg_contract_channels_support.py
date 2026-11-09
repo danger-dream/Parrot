@@ -47,7 +47,7 @@ WEBUI_OVERRIDES = (
     Path(__file__).parent
     / "fixtures/tg_contract/webui-2026-10-22/overrides/channels_apikey.jsonl"
 )
-WEBUI_OVERRIDE_CASE_IDS = ("TG-CH-04.edit-fields-success",)
+WEBUI_OVERRIDE_CASE_IDS = ("TG-CH-04.edit-fields-success", "TG-CH-02.brands-live-discovery-cancel")
 
 
 def current_cases() -> list[dict[str, Any]]:

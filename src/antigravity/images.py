@@ -387,7 +387,7 @@ async def request(
     gemini = build_request(parsed, prompt=prompt, n=n, action=action)
     from . import quota as ag_quota
     use_credits = ag_quota.should_inject_credits(
-        channel.account_key,
+        getattr(channel, "account_key", None) or account_id,
         source.upstream,
         force=bool(getattr(parsed, "_parrot_antigravity_use_credits", False)),
     )

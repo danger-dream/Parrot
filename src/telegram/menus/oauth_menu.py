@@ -3600,12 +3600,6 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         credit_mark = "✅" if acc.get("allowCredits") is True else "⬜"
         rows.append([ui.btn("♻️ 重置额度", f"oa:reset_quota_ask:{payload}"),
                      ui.btn(f"{credit_mark} 允许使用积分", f"oa:credits:{payload}")])
-    elif prov == "antigravity":
-        credit_mark = "✅" if acc.get("allowCredits") is True else "⬜"
-        ag_row = [ui.btn(f"{credit_mark} 允许使用积分", f"oa:credits:{payload}")]
-        if acc.get("disabled_reason") == "quota":
-            ag_row.insert(0, ui.btn("♻️ 清本地配额禁用", f"oa:reset_quota:{payload}"))
-        rows.append(ag_row)
     elif acc.get("disabled_reason") == "quota":
         # Context-only recovery action; it does not disturb the normal fixed rows.
         rows.append([ui.btn("♻️ 清本地配额禁用", f"oa:reset_quota:{payload}")])
