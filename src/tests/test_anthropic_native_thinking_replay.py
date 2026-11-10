@@ -71,7 +71,7 @@ def assert_fallback(sent):
     assert sent["thinking"] == {"type": "adaptive"}
     assert all(b["type"] not in ("thinking", "redacted_thinking") for m in sent["messages"] for b in m["content"])
     assistant = next(m for m in sent["messages"] if m["role"] == "assistant")
-    assert assistant["content"] == message()["content"][3:]
+    assert cc_mimicry._restore_tool_names_in_obj(assistant["content"], cc_mimicry._build_dynamic_tool_map(["lookup"])) == message()["content"][3:]
     assert sent["messages"][-1]["content"] == [{"type": "tool_result", "tool_use_id": "call_1", "content": "7"}]
 
 
@@ -206,12 +206,12 @@ def test_mimicry_replays_all_signed_thinking_verbatim(active_tool_turn):
         active = {**active, "content": active["content"][:4]}
         messages[3] = active
     body = {"model": "claude-opus-5-5", "messages": copy.deepcopy(messages), "stream": True}
-    payload, _ = cc_mimicry.transform_request(cc_mimicry.ensure_request_context(body), session_id="s")
+    payload, aliases = cc_mimicry.transform_request(cc_mimicry.ensure_request_context(body), session_id="s")
     def blocks(msg):
         return [{k: v for k, v in b.items() if k != "cache_control"} for b in msg["content"]]
     assistants = [m for m in payload["messages"] if m["role"] == "assistant"]
     assert blocks(assistants[-2]) == old["content"]
-    assert blocks(assistants[-1]) == active["content"]
+    assert cc_mimicry._restore_tool_names_in_obj(blocks(assistants[-1]), aliases) == active["content"]
 
 
 def test_routing_preserves_tagged_carriers_but_openai_boundary_removes_them():
@@ -366,7 +366,7 @@ async def test_default_thinking_explicit_and_stored_histories_are_equivalent(mod
     for payload in sent:
         if adaptive:
             assert payload["thinking"]["type"] == "adaptive"
-            assert payload["output_config"]["effort"] == "high"
+            assert payload["output_config"]["effort"] == ("medium" if model in {"claude-sonnet-5-5", "claude-opus-5-5"} else "high")
         elif history_kind == "complete":
             assert payload["thinking"]["type"] == "enabled"
         else:
@@ -376,7 +376,7 @@ async def test_default_thinking_explicit_and_stored_histories_are_equivalent(mod
         if history_kind == "complete":
             assert assistant["content"][:3] == message()["content"][:3]
         else:
-            assert assistant["content"] == message()["content"][3:]
+            assert cc_mimicry._restore_tool_names_in_obj(assistant["content"], cc_mimicry._build_dynamic_tool_map(["lookup"])) == message()["content"][3:]
         assert payload["messages"][-1]["content"][0]["content"] == "7"
         assert replay.DROP_HISTORY_KEY not in payload
 

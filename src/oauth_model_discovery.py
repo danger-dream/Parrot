@@ -287,6 +287,7 @@ def discover_openai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: 
 
 
 def discover_claude(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str = "") -> DiscoveryResult:
+    from .transform.cc_mimicry import CLI_USER_AGENT, CC_VERSION
     deadline = _Deadline(timeout)
     token = str(account.get("access_token") or "")
     if not token:
@@ -297,6 +298,7 @@ def discover_claude(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: 
         "accept": "application/json",
         "anthropic-version": "2023-06-01",
         "anthropic-beta": "oauth-2025-04-20",
+        "user-agent": CLI_USER_AGENT,
     }
     all_records: list[dict] = []
     seen_urls: set[str] = set()
@@ -347,7 +349,7 @@ def discover_claude(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: 
             "reasoning": ("reasoning",), "reasoningEfforts": ("reasoningEfforts",),
             "supportsImages": ("supportsImages",), "createdAt": ("created_at", "createdAt"),
         }))
-    return DiscoveryResult(models, _catalog(normalized), "upstream:anthropic")
+    return DiscoveryResult(models, _catalog(normalized), "upstream:anthropic", client_version=CC_VERSION)
 
 
 def discover_xai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str = "") -> DiscoveryResult:

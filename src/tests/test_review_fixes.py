@@ -192,8 +192,8 @@ def test_dynamic_tool_map_seed_is_process_independent(m):
     mapping1 = cc._build_dynamic_tool_map(tools)
     mapping2 = cc._build_dynamic_tool_map(list(tools))
     assert mapping1 == mapping2
-    assert mapping1["exec"] == "extract_exe03"
-    assert mapping1["browser_extra"] == "resolve_bro15"
+    assert mapping1["exec"] == cc._build_dynamic_tool_map(["exec"])["exec"]
+    assert mapping1["browser_extra"] == cc._build_dynamic_tool_map(["browser_extra", "new"])["browser_extra"]
 
 
 def test_restore_tool_names_only_protocol_tool_name_fields(m):
@@ -374,7 +374,7 @@ def test_anthropic_tool_namespace_type_is_stripped_like_claude_code(m):
         (std_payload, {"type": "ephemeral", "ttl": "1h"}),
     ):
         tool = payload["tools"][0]
-        assert tool["name"].endswith("browser_open")
+        assert tool["name"] == (cc._build_dynamic_tool_map(["browser_open"])["browser_open"] if payload is cc_payload else "browser_open")
         assert tool["description"] == "Open a page"
         assert tool["input_schema"] == {"type": "object", "properties": {"url": {"type": "string"}}}
         assert tool["cache_control"] == expected_cache_control

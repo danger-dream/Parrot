@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 from .. import error_reporting, ui
 from ...management_control.oauth.menu_bridge import control, telegram_context
@@ -50,6 +51,16 @@ def block(usage):
         lines.append(f"5h重置：可用={_esc(juniper.get('available'))} · eligible={_esc(juniper.get('eligible'))} · 组={_esc(juniper.get('arm'))}\n"
                      f"每周 {_esc(juniper.get('resets_per_week', 1))} 次，<b>消耗周额度份额</b>；原因：{_esc(juniper.get('ineligible_reason') or '—')}\n"
                      f"下次可用：{_esc(juniper.get('next_available_at'))} · 周重置日：{_esc(juniper.get('weekly_resets_at'))}")
+    for program, observation in (usage.get("claude_reset_queries") or {}).items() if isinstance(usage, dict) else []:
+        stamp, retry = observation.get("fetched_at"), observation.get("retry_at")
+        def when(value):
+            return datetime.fromtimestamp(value / 1000, timezone.utc).isoformat()
+        if stamp:
+            lines.append(f"{_esc(program)} 数据时间：{_esc(when(stamp))}")
+        if observation.get("state") == "error":
+            lines.append("查询失败，保留上次成功数据；不代表零额度或无资格。")
+        if retry:
+            lines.append(f"查询限流，冷却至 {_esc(when(retry))}；到期不保证上游已解除限流。")
     return "\n".join(lines)
 
 

@@ -147,7 +147,7 @@ async def test_sonnet_55_adaptive_capabilities(auth, model):
     }, model)
     wire = decoded(req)
     assert wire["thinking"] == {"type": "adaptive", "display": "omitted"}
-    assert wire["output_config"] == {"effort": "high"}
+    assert wire["output_config"] == {"effort": "medium"}
     assert wire["context_management"] == {
         "edits": [{"type": "clear_thinking_20251015", "keep": "all"}],
     }

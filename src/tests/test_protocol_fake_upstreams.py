@@ -2341,6 +2341,9 @@ async def test_cc_v258_529_reuses_body_context_and_isolates_concurrent_requests(
         billing = wire["system"][0]["text"]
         prompt_match = re.search(r"cc_prompt_id=([0-9a-f-]{36});", billing)
         cch_match = re.search(r"cch=([0-9a-f]{5});", billing)
+        from src.transform import cc_mimicry
+        assert cch_match.group(1) == cc_mimicry.compute_cch(wire)
+        assert req.headers["x-claude-code-prompt-id"] == prompt_match.group(1)
         captured[label].append({
             "sha": hashlib.sha256(req.content).hexdigest(),
             "session": req.headers["x-claude-code-session-id"],

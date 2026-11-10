@@ -11,38 +11,29 @@ from src.telegram.menus import claude_reset_menu as menu
 from src.tests.test_claude_reset import env
 
 
-@pytest.mark.parametrize("failed", [None, "cedar_ember", "juniper_tide"])
-def test_regular_refresh_fetches_each_missing_program_independently(env, monkeypatch, failed):
+def test_regular_refresh_does_not_fan_out_and_reuses_explicit_status(env, monkeypatch):
     calls = []
     def get(url, **kw):
         calls.append(url)
         program = "cedar_ember" if "?cedar_ember" in url else "juniper_tide" if "?at_wall" in url else None
-        if program == failed and program:
-            return httpx.Response(429, request=httpx.Request("GET", url))
         value = {program: copy.deepcopy(env.usage[program])} if program else {
             key: copy.deepcopy(value) for key, value in env.usage.items() if key not in cr.PROGRAMS}
         return httpx.Response(200, json=value, request=httpx.Request("GET", url))
     monkeypatch.setattr(cr.network, "get_sync", get)
-    # Both manual-refresh staging and background snapshot call the same fetch.
     for staged in (False, True):
-        calls.clear()
         result = env.control.refresh_usage_now(env.ctx, env.key, on_stage=(lambda *a: None) if staged else None)
         assert "error" not in result
-        row = state_db.quota_load(env.key)
-        raw = json.loads(row["raw_data"])
+        raw = json.loads(state_db.quota_load(env.key)["raw_data"])
         assert raw["five_hour"] == env.usage["five_hour"]
         assert raw["extra_usage"] == env.usage["extra_usage"]
-        assert row["extra_used"] == 12.34  # Existing cache uses dollars; raw spend stays 1234 cents.
-        for program in cr.PROGRAMS:
-            assert raw["claude_reset_queries"][program]["state"] == ("error" if program == failed else "known")
-            if program != failed:
-                assert raw[program] == env.usage[program]
-        text = menu.cached_block(row)
-        assert "状态未知" not in text
-        assert ("查询失败" in text) == bool(failed)
-        if failed:
-            assert "HTTP 429" in text
-        assert len(calls) == 3 and not env.posts
+        assert "cedar_ember" not in raw
+    assert len(calls) == 1
+    env.control.refresh_claude_reset_status(env.ctx, env.key)
+    env.control.refresh_usage_now(env.ctx, env.key)
+    raw = json.loads(state_db.quota_load(env.key)["raw_data"])
+    assert raw["cedar_ember"] == env.usage["cedar_ember"]
+    assert raw["claude_reset_queries"]["cedar_ember"]["state"] == "cached"
+    assert len(calls) == 2 and not env.posts
 
 
 @pytest.mark.parametrize("value,state,word", [({}, "not_provided", "官方未返回"),
@@ -76,7 +67,7 @@ def test_explicit_query_one_failure_still_displays_other_program_and_incident(en
     monkeypatch.setattr(cr.network, "get_sync", get)
     menu.ask(42, 2, "cb", ui.register_code(env.key))
     text = edits[-1][0][2]
-    assert "故障编号" in text and "5h重置：可用=True" in text
+    assert "查询失败" in text and "5h重置：可用=True" in text
     assert "private-credential" not in text + capsys.readouterr().out
     assert not env.posts
 

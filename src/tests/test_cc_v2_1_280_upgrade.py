@@ -32,19 +32,19 @@ from src.transform import cc_mimicry as m
 from src.transports import http_runtime
 
 
-BODIES = Path("/opt/workspace/claude-code-cch/v2.1.280/bodies_representative")
+BODIES = Path(__file__).parent / "fixtures" / "cc280"
 BODY_FILES = sorted(BODIES.glob("*.bin")) if BODIES.is_dir() else []
 CORPUS_SKIP = pytest.mark.skipif(not BODY_FILES, reason=f"v280 fixtures not present: {BODIES}")
 
 MAIN_BETAS = (
     "claude-code-20250219,interleaved-thinking-2025-05-14,"
     "thinking-token-count-2026-05-13,context-management-2025-06-27,"
-    "prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,"
+    "prompt-caching-scope-2026-01-05,"
     "mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,"
     "effort-2025-11-24,"
     "thinking-binding-controls-2026-08-01,cache-diagnosis-2026-04-07"
 )
-FABLE_BETAS = MAIN_BETAS.replace(
+FABLE_BETAS = MAIN_BETAS.replace("mid-conversation-tool-changes", "per-turn-control-2026-07-01,mid-conversation-tool-changes").replace(
     "thinking-binding-controls-2026-08-01",
     "server-side-fallback-2026-06-01,fallback-credit-2026-06-01,"
     "thinking-binding-controls-2026-08-01",
@@ -106,16 +106,17 @@ def _fixture_billing(body: dict) -> str:
 
 
 def test_v282_constants_and_stainless_versions():
-    assert m.CC_VERSION == "2.1.282"
+    assert m.CC_VERSION == "2.1.321"
     assert m.FINGERPRINT_SALT == "59cf53e54c78"
     assert m.FINGERPRINT_INDICES == (4, 7, 20)
     assert m.CCH_SEED == 0x4D659218E32A3268
-    assert m.CLI_USER_AGENT == "claude-cli/2.1.282 (external, sdk-cli)"
-    assert m._STAINLESS_HEADERS["X-Stainless-Package-Version"] == "0.112.1"
-    assert m._STAINLESS_HEADERS["X-Stainless-Runtime-Version"] == "v26.3.0"
+    assert m.CLI_USER_AGENT == "claude-cli/2.1.321 (external, sdk-cli)"
+    assert m._STAINLESS_HEADERS["X-Stainless-Package-Version"] == "0.128.0"
+    assert m._STAINLESS_HEADERS["X-Stainless-Runtime-Version"] == "v26.12.1"
 
 
-def test_fingerprint_fixed_vectors_and_utf16_emoji():
+def test_fingerprint_fixed_vectors_and_utf16_emoji(monkeypatch):
+    monkeypatch.setattr(m, "CC_VERSION", "2.1.282")
     assert m.compute_fingerprint(_messages("say hi")) == "a7a"
     assert m.compute_fingerprint(_messages("what is 2+2")) == "8d5"
     emoji = "ab🚀d🚀f🚀hijklmnopqr🚀t"
@@ -130,7 +131,8 @@ def test_fingerprint_selected_lone_surrogate_hashes_as_replacement_character():
     assert m.compute_fingerprint(_messages(text)) == expected
 
 
-def test_fingerprint_selects_first_valid_non_meta_text_before_injection():
+def test_fingerprint_selects_first_valid_non_meta_text_before_injection(monkeypatch):
+    monkeypatch.setattr(m, "CC_VERSION", "2.1.282")
     messages = [
         {"role": "user", "isMeta": True, "content": "ignored explicit meta"},
         {"role": "user", "content": [
@@ -159,16 +161,14 @@ def test_fingerprint_matches_all_v280_representative_bodies(monkeypatch):
         assert m.compute_fingerprint(body["messages"]) == expected, path.name
 
 
-def test_v282_captured_fingerprint_and_cch():
-    root = Path("/opt/workspace/claude-code-cch/v2.1.282-full")
-    files = [*sorted((root / "bodies").glob("*.bin")),
-             *sorted((root / "bodies_netns").glob("*.bin"))]
-    if not files:
-        pytest.skip("v282 local captures not present")
+def test_v321_captured_fingerprint_and_cch():
+    root = Path(__file__).parent / "fixtures" / "cc321"
+    files = [p for p in root.glob("*.json") if p.name != "manifest.json"]
+    assert len(files) == 18
     for path in files:
         body = json.loads(path.read_bytes())
         billing = _fixture_billing(body)
-        fp = re.search(r"cc_version=2\.1\.282\.([0-9a-f]{3})", billing).group(1)
+        fp = re.search(r"cc_version=2\.1\.321\.([0-9a-f]{3})", billing).group(1)
         cch = re.search(r"cch=([0-9a-f]{5});", billing).group(1)
         assert m.compute_fingerprint(body["messages"]) == fp, path
         assert m.compute_cch(body) == cch, path
@@ -300,7 +300,7 @@ def test_fable_api_key_main_profile_and_wire_order(dynamic_cch):
     }
     assert payload["output_config"] == {"effort": "high"}
     assert payload["max_tokens"] == 64000
-    assert re.search(r"cc_prompt_id=[0-9a-f-]{36}; cc_turn_origin=sdk;$", _billing(payload))
+    assert re.search(r"cc_prompt_id=[0-9a-f-]{36}; cc_turn_origin=sdk; cc_prompt_index=0; cc_turn_index=1;$", _billing(payload))
     assert request[m.PARROT_CC_PROMPT_ID_KEY] in _billing(payload)
 
 
@@ -352,6 +352,8 @@ def test_v282_default_profiles_without_network_experiments(dynamic_cch, model, e
         "fake", auth_scheme="api_key" if auth_mode == "api_key" else "bearer",
         auth_mode=auth_mode, model=model, payload=payload,
     )
+    if model == "claude-fable-5.1" and auth_mode != "compatible":
+        expected = expected.replace("mid-conversation-tool-changes", "per-turn-control-2026-07-01,mid-conversation-tool-changes")
     if auth_mode == "oauth":
         expected = expected.replace("claude-code-20250219", "claude-code-20250219," + m.OAUTH_BETA)
     assert headers["anthropic-beta"] == expected
@@ -505,7 +507,11 @@ def test_downstream_billing_passes_through_system_and_keeps_messages_stable(
             body, session_id=body[m.PARROT_CC_SESSION_ID_KEY], auth_mode="oauth",
         )
         wire = json.loads(m.sign_body(payload))
-        assert wire["system"][0]["text"] == billing
+        if cch_mode == "dynamic":
+            assert re.sub(r"cch=[0-9a-f]{5}", "cch=00000", wire["system"][0]["text"]) == re.sub(r"cch=[0-9a-f]{5}", "cch=00000", billing)
+            assert re.search(r"cch=([0-9a-f]{5})", wire["system"][0]["text"])[1] == m.compute_cch(wire)
+        else:
+            assert wire["system"][0]["text"] == billing
         assert sum(
             str(block.get("text", "")).startswith("x-anthropic-billing-header:")
             for block in wire["system"]
@@ -523,7 +529,7 @@ def test_without_downstream_billing_parrot_generates_its_own(dynamic_cch):
     payload, _ = m.transform_request(
         body, session_id=body[m.PARROT_CC_SESSION_ID_KEY], auth_mode="oauth",
     )
-    assert _billing(payload).startswith("x-anthropic-billing-header: cc_version=2.1.282.")
+    assert _billing(payload).startswith("x-anthropic-billing-header: cc_version=2.1.321.")
     assert "cch=00000" in _billing(payload)
     assert payload["messages"][0]["content"][0]["text"] == "stable instructions"
 
@@ -688,7 +694,7 @@ def test_application_and_httpx_raw_header_order_and_encoding(dynamic_cch):
         "X-Stainless-Package-Version", "X-Stainless-Retry-Count",
         "X-Stainless-Runtime", "X-Stainless-Runtime-Version", "X-Stainless-Timeout",
         "anthropic-beta", "anthropic-dangerous-direct-browser-access",
-        "anthropic-version", "x-api-key", "x-app", "x-claude-code-request-class",
+        "anthropic-version", "x-api-key", "x-app", "x-claude-code-prompt-id", "x-claude-code-request-class",
         "x-client-request-id",
     ]
     assert list(headers)[:len(expected_application)] == expected_application

@@ -23,24 +23,35 @@ const errors = reactive<Record<ClaudeProgram, string>>({ cedar_ember: '', junipe
 const loading = ref(false)
 const executing = ref<ClaudeProgram | ''>('')
 const result = ref<ClaudeResetResult | null>(null)
+let queryEpoch = 0
 
 /** Step 1 — explanation: read-only plans for both programs (never consumes anything). */
 async function query(): Promise<void> {
+  if (loading.value) return
   loading.value = true
+  const epoch = ++queryEpoch
+  const accountId = props.accountId
   result.value = null
   await Promise.all(
     PROGRAMS.map(async (program) => {
       errors[program] = ''
-      plans[program] = null
+      if (plans[program]) plans[program] = { ...plans[program]!, available: false, planToken: null }
       try {
-        plans[program] = (await api.post<ClaudeResetPlan>(accountPath(props.accountId, '/claude-reset/plans'), { program })).data
+        const data = (await api.post<ClaudeResetPlan>(accountPath(accountId, '/claude-reset/plans'), { program })).data
+        if (epoch === queryEpoch) plans[program] = data
       } catch (err) {
-        errors[program] = errorLine(err).replace(/[。.]\s*$/, '')
+        if (epoch === queryEpoch) errors[program] = errorLine(err).replace(/[。.]\s*$/, '')
       }
     }),
   )
-  loading.value = false
+  if (epoch === queryEpoch) loading.value = false
 }
+watch(() => props.accountId, () => {
+  queryEpoch++
+  loading.value = false
+  for (const program of PROGRAMS) { plans[program] = null; errors[program] = '' }
+  if (props.open) void query()
+})
 watch(
   () => props.open,
   (o) => o && query(),
@@ -52,7 +63,17 @@ const status = computed<Rec>(() => ({ ...(plans.juniper_tide?.status || {}), ...
 const cedar = computed(() => pick<Rec>(status.value, 'cedarEmber') || null)
 const juniper = computed(() => pick<Rec>(status.value, 'juniperTide') || null)
 const grants = computed(() => ((pick<Rec[]>(cedar.value, 'grants') || []) as Rec[]).filter((g) => g && typeof g === 'object'))
-const queries = computed(() => (pick<Rec>(status.value, 'claudeResetQueries') || {}) as Rec)
+const queries = computed(() => ({
+  ...(pick<Rec>(plans.juniper_tide?.status, 'claudeResetQueries') || {}),
+  ...(pick<Rec>(plans.cedar_ember?.status, 'claudeResetQueries') || {}),
+}) as Rec)
+
+function queryNote(program: ClaudeProgram): string {
+  const q = pick<Rec>(queries.value, program === 'cedar_ember' ? 'cedarEmber' : 'juniperTide') || {}
+  const fetched = pick(q, 'fetchedAt')
+  const retry = pick(q, 'retryAt')
+  return `${fetched ? `数据时间：${when(fetched)}。` : ''}${retry ? `查询限流，冷却至 ${when(retry)}；到期不保证上游已解除限流。` : ''}${pick(q, 'state') === 'error' ? '查询失败，保留上次成功数据；不代表零额度或无资格。' : ''}`
+}
 
 function missing(program: ClaudeProgram): string {
   const q = (pick<Rec>(queries.value, program === 'cedar_ember' ? 'cedarEmber' : 'juniperTide') || pick<Rec>(queries.value, program) || {}) as Rec
@@ -171,7 +192,8 @@ const LOCAL_ACTION: Record<string, string> = {
             <Badge v-else-if="errors.cedar_ember" tone="red">查询失败</Badge>
           </header>
           <p v-if="errors.cedar_ember" class="err"><TriangleAlert /> {{ errors.cedar_ember }}。没有发送任何消耗请求。</p>
-          <template v-else-if="cedar">
+          <p class="small faint">{{ queryNote('cedar_ember') }}</p>
+          <template v-if="cedar">
             <p class="small">
               共 <b>{{ grants.length }}</b> 张 · 有资格：{{ yes(pick(cedar, 'eligible')) }} · 已撞限：{{ yes(pick(cedar, 'atLimit')) }}
               <template v-if="pick(cedar, 'ineligibleReason')"> · 原因：{{ claudeReason(String(pick(cedar, 'ineligibleReason'))) }}</template>
@@ -211,7 +233,8 @@ const LOCAL_ACTION: Record<string, string> = {
             <Badge v-else-if="errors.juniper_tide" tone="red">查询失败</Badge>
           </header>
           <p v-if="errors.juniper_tide" class="err"><TriangleAlert /> {{ errors.juniper_tide }}。没有发送任何消耗请求。</p>
-          <template v-else-if="juniper">
+          <p class="small faint">{{ queryNote('juniper_tide') }}</p>
+          <template v-if="juniper">
             <p class="small">
               当前可用：{{ yes(pick(juniper, 'available')) }} · 有资格：{{ yes(pick(juniper, 'eligible')) }} · 每周 {{ pick(juniper, 'resetsPerWeek') ?? 1 }} 次
               <template v-if="pick(juniper, 'ineligibleReason')"> · 原因：{{ claudeReason(String(pick(juniper, 'ineligibleReason'))) }}</template>

@@ -421,6 +421,8 @@ def quota_save(account_key:str,data:dict[str,Any],*,email:str|None=None,expected
                 d[target] = row
                 return
             row["codex_wham_gate_retired"] = False
+        if target.startswith("claude:") and int(data.get("fetched_at", now_ms())) < int(row.get("fetched_at") or 0):
+            return
         updates={k:data.get(k) for k in cols}
         if target.startswith(("openai:", "claude:")):
             # A partial active read is not evidence that an omitted window

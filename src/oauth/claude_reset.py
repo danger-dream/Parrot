@@ -22,6 +22,7 @@ import httpx
 
 from .. import config, network, state_db
 from ..transform.cc_mimicry import CLI_USER_AGENT
+from . import claude_usage_queries as queries
 
 PROGRAMS = ("cedar_ember", "juniper_tide")
 _locks: dict[str, threading.Lock] = {}
@@ -49,6 +50,9 @@ def eligibility(status: dict, program: str, grant_id: str | None = None) -> str 
     """Conservative local gate; preserve server reasons, never infer entitlement."""
     if program not in PROGRAMS:
         return "unknown_program"
+    observation = (status.get("claude_reset_queries") or {}).get(program) or {}
+    if observation.get("state") in {"error", "cached"}:
+        return "query_cooldown" if observation.get("retry_at") else "status_refresh_required"
     block = status.get(program)
     if not isinstance(block, dict):
         return "status_unknown"
@@ -123,7 +127,7 @@ def _get_status_sync(token, account_key, program):
 
 
 def _observed_blocks(value, program):
-    names = [name for name in PROGRAMS if name == program or isinstance(value.get(name), dict)]
+    names = [program]
     blocks = {name: copy.deepcopy(value.get(name)) if isinstance(value.get(name), dict) else None for name in names}
     blocks["claude_reset_queries"] = {name: {
         "state": "known" if isinstance(value.get(name), dict) else "not_provided" if value.get(name) is None else "invalid_response",
@@ -133,38 +137,32 @@ def _observed_blocks(value, program):
 
 
 async def enrich_usage(token, account_key, usage, *, expected):
-    """Read missing opt-in blocks without replacing spend/window evidence.
+    """Attach cached opt-in blocks without extra GETs or replacing spend/windows.
 
-    Ordinary /usage usually omits both blocks. Fetch them independently; a
-    failure must not discard usable quota or pretend the account has zero cards.
+    Explicit status queries retain opt-in discovery; ordinary polling must not
+    multiply every successful usage read into three upstream requests.
     """
     if not isinstance(usage, dict):
         return usage
     result = copy.deepcopy(usage)
-    missing = [name for name in PROGRAMS if not isinstance(result.get(name), dict)]
-    if not missing:
-        return result
-
-    async def fetch(program):
-        try:
-            value = await asyncio.to_thread(_get_status_sync, token, account_key, program)
-            return _observed_blocks(value, program)
-        except Exception as exc:
-            status_code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
-            print(f"[claude-reset] query failed: program={program} type={type(exc).__name__} http={status_code}")
-            return {"claude_reset_queries": {program: {"state": "error", "http_status": status_code,
-                "error_type": type(exc).__name__, "fetched_at": int(time.time() * 1000)}}}
-
-    for blocks in await asyncio.gather(*(fetch(program) for program in missing)):
-        observations = blocks.pop("claude_reset_queries")
-        # Do not let one endpoint's absent secondary block erase the other one.
-        result.update(blocks)
-        result.setdefault("claude_reset_queries", {}).update(observations)
+    # Ordinary reads never fan out into opt-in GETs. Explicit status reads
+    # populate this cache; only their status blocks (never spend/windows) attach.
+    for program in PROGRAMS:
+        if isinstance(result.get(program), dict):
+            continue
+        value, stamp, until = queries.peek(expected, token, program)
+        if value is not None:
+            blocks = _observed_blocks(value, program)
+            blocks["claude_reset_queries"][program].update(
+                state="cached", fetched_at=int(stamp * 1000),
+                retry_at=int(until * 1000) if until > time.time() else None)
+            result.update({k: v for k, v in blocks.items() if k != "claude_reset_queries"})
+            result.setdefault("claude_reset_queries", {}).update(blocks["claude_reset_queries"])
     _current(account_key, expected)
     return result
 
 
-async def status(account_key: str, program: str = "cedar_ember", *, expected=None) -> dict:
+async def status(account_key: str, program: str = "cedar_ember", *, expected=None, fresh=False) -> dict:
     if program not in PROGRAMS:
         raise ValueError("unknown_program")
     manager = _manager()
@@ -186,9 +184,42 @@ async def status(account_key: str, program: str = "cedar_ember", *, expected=Non
                         row["generationId"] = channel_state.generation_id(expected)
             config.update(persist_generation)
     token = await manager.ensure_valid_token(key, expected_state_key=expected)
+    async def read():
+        def fetch():
+            _current(key, expected)
+            return _get_status_sync(token, key, program)
+        return await asyncio.to_thread(queries.read, expected, token, program, fetch, fresh=fresh)
+
+    try:
+        try:
+            value, stamp, cached = await read()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 401:
+                raise
+            _, current_account = _current(key, expected)
+            current_token = current_account.get("access_token")
+            token = current_token if current_token and current_token != token else await manager.force_refresh(key, expected_state_key=expected)
+            value, stamp, cached = await read()
+        blocks = _observed_blocks(value, program)
+        blocks["claude_reset_queries"][program].update(
+            fetched_at=int(stamp * 1000), cached=cached)
+    except Exception as exc:
+        if fresh:
+            raise  # No stale eligibility may authorize a consuming POST.
+        value, stamp, until = queries.peek(expected, token, program)
+        blocks = _observed_blocks(value, program) if value is not None else {}
+        code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else 429 if isinstance(exc, queries.CoolingDown) else None
+        blocks["claude_reset_queries"] = {program: {
+            "state": "error", "http_status": code,
+            "fetched_at": int(stamp * 1000) if stamp else None,
+            "retry_at": int(until * 1000) if until > time.time() else None,
+        }}
+    key, account = _current(key, expected)
+    if account.get("access_token") != token:
+        raise ValueError("stale_credentials")
     # Old accounts did not store organization.uuid. Discover it from profile,
     # never account.uuid, and do not use token-save's auth-error recovery side effect.
-    if not account.get("claude_organization_uuid"):
+    if not account.get("claude_organization_uuid") and blocks["claude_reset_queries"][program]["state"] != "error":
         profile = await asyncio.to_thread(manager._profile_sync, token, account_key=key)
         organization = (profile.get("organization") or {}).get("uuid")
         with manager.account_generation_guard(expected) as current:
@@ -201,17 +232,12 @@ async def status(account_key: str, program: str = "cedar_ember", *, expected=Non
                         if manager.get_account_key(row) == key:
                             row["claude_organization_uuid"] = str(organization)
                 config.update(save)
-    try:
-        value = await asyncio.to_thread(_get_status_sync, token, key, program)
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code != 401:
-            raise
-        token = await manager.force_refresh(key, expected_state_key=expected)
-        value = await asyncio.to_thread(_get_status_sync, token, key, program)
-    key, account = _current(key, expected)
-    blocks = _observed_blocks(value, program)
-    # Do NOT flatten this skip_spend response or overwrite fresh window evidence.
-    state_db.quota_patch_claude_reset_status(key, blocks, expected_state_key=expected)
+    with manager.account_generation_guard(expected):
+        key, account = _current(key, expected)
+        if account.get("access_token") != token:
+            raise ValueError("stale_credentials")
+        # Do NOT flatten skip_spend or overwrite fresh window evidence.
+        state_db.quota_patch_claude_reset_status(key, blocks, expected_state_key=expected)
     return {**blocks, "organization_uuid": account.get("claude_organization_uuid") or "",
             "generation": expected}
 
@@ -340,7 +366,7 @@ async def redeem(account_key: str, program: str, *, expected: str,
 
 async def _redeem_locked(key, program, expected, org, grant_id, operation_id, journal_key):
     manager = _manager()
-    fresh = await status(key, program, expected=expected)
+    fresh = await status(key, program, expected=expected, fresh=True)
     key, account = _current(key, expected)
     if not org or account.get("claude_organization_uuid") != org:
         return {"result": "ineligible", "reason": "organization_missing_or_changed"}
@@ -410,6 +436,9 @@ async def _redeem_locked(key, program, expected, org, grant_id, operation_id, jo
     body = {"program": program}
     if program == "cedar_ember":
         body.update(grant_id=grant_id, request_id=record["request_id"])
+    # A competing management/background read may have learned a cooldown since
+    # the fresh eligibility check. Do not knowingly dispatch through it.
+    queries.check_cooldown(expected)
     # Durable before dispatch: after a crash we cannot claim "not sent".
     state_db.claude_reset_operation_save(journal_key, record)
     try:
@@ -431,6 +460,7 @@ async def _redeem_locked(key, program, expected, org, grant_id, operation_id, jo
     except Exception as exc:
         response = {"result": "unconfirmed", "reason": "reset_unconfirmed",
                     "error_type": type(exc).__name__}
+    queries.invalidate(expected)  # Never use pre-consumption quota to resume routing.
     uncertain = response.get("result") == "unconfirmed" or response.get("reason") in {"stamp_indeterminate", "reset_unconfirmed"}
     record.update(status="unknown" if uncertain else "settled", response=response)
     state_db.claude_reset_operation_save(journal_key, record)

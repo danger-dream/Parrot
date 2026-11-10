@@ -164,7 +164,8 @@ async def test_request_scoped_restore_state_is_wired_and_isolated(monkeypatch, o
     assert isinstance(one.dynamic_tool_map, cc_mimicry.ToolNameRestoreMap)
     assert one.dynamic_tool_map is not two.dynamic_tool_map
     raw = b'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"cc_sess_list","input":{}}}\n\n'
-    split = raw.index(b"sess") + 2
+    raw = raw.replace(b"cc_sess_list", json.loads(one.body)["tools"][0]["name"].encode())
+    split = len(raw) // 2
     assert await registry.restore_response_bytes(channel, raw[:split], dynamic_map=one.dynamic_tool_map) == b""
     full = await registry.restore_response_bytes(channel, raw, dynamic_map=two.dynamic_tool_map)
     rest = await registry.restore_response_bytes(channel, raw[split:], dynamic_map=one.dynamic_tool_map)

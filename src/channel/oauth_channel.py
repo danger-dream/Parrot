@@ -124,9 +124,11 @@ class OAuthChannel(Channel):
         headers = cc_mimicry.build_upstream_headers(
             access_token, session_id=sid, auth_scheme="bearer", auth_mode="oauth",
             model=resolved_model, payload=payload,
+            prompt_id=body_with_model.get(cc_mimicry.PARROT_CC_PROMPT_ID_KEY),
             downstream_betas=downstream_betas, original_model=original_model,
             wants_context_1m=wants_context_1m,
             wants_fast_mode=wants_fast_mode, side_query=side_query)
+        cc_mimicry.apply_cc_wire_context(headers, body_with_model, dynamic_map)
 
         return UpstreamRequest(
             url=f"{cc_mimicry.ANTHROPIC_API_BASE}/v1/messages?beta=true",

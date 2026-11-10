@@ -1386,8 +1386,21 @@ async def _fetch_claude_usage(account_key: str) -> dict:
     expected = account_state_key(account)
     access_token = await ensure_valid_token(account_key, expected_state_key=expected)
     _bind_usage_request(account_key, access_token)
+    from .oauth import claude_usage_queries
+
+    async def read_usage():
+        def fetch():
+            with account_generation_guard(expected) as current:
+                if not current:
+                    raise ValueError("stale_generation")
+            return _usage_sync(access_token, account_key=account_key)
+        value, stamp, cached = await asyncio.to_thread(
+            claude_usage_queries.read, expected, access_token, "usage", fetch)
+        value["claude_usage_query"] = {"fetched_at": int(stamp * 1000), "cached": cached}
+        return value
+
     try:
-        usage = await asyncio.to_thread(_usage_sync, access_token, account_key=account_key)
+        usage = await read_usage()
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code != 401:
             raise
@@ -1409,7 +1422,11 @@ async def _fetch_claude_usage(account_key: str) -> dict:
             if not current:
                 raise
         _bind_usage_request(account_key, access_token)
-        usage = await asyncio.to_thread(_usage_sync, access_token, account_key=account_key)
+        usage = await read_usage()
+    with account_generation_guard(expected) as current:
+        current_account = get_account(channel_state.resolve(expected).removeprefix("oauth:")) if current else None
+        if not current_account or current_account.get("access_token") != access_token:
+            raise ValueError("stale_credentials")
     from .oauth import claude_reset
     return await claude_reset.enrich_usage(access_token, account_key, usage, expected=expected)
 
@@ -2160,7 +2177,7 @@ def flatten_usage(usage: dict) -> dict:
     extra = usage.get("extra_usage") or {}
 
     return {
-        "fetched_at": int(datetime.now(timezone.utc).timestamp() * 1000),
+        "fetched_at": (usage.get("claude_usage_query") or {}).get("fetched_at", int(datetime.now(timezone.utc).timestamp() * 1000)),
         "codex_active_observed_at": (usage.get("openai") or {}).get("quota_observed_at"),
         "five_hour_util": _util_pct(fh),
         "five_hour_reset": fh.get("resets_at"),
@@ -3349,6 +3366,8 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict, *,
         if not current:
             return {"action": "noop_stale", "utils": extract_utils_percent(usage),
                     "any_over": False, "hit_windows": [], "disabled_until": None}
+        if provider_of(account_key) == "claude" and (usage.get("claude_usage_query") or {}).get("cached"):
+            fresh = False
         result = _evaluate_and_toggle_by_usage_current(account_key, usage, threshold=threshold, fresh=fresh)
         if fresh and provider_of(account_key) == "openai":
             from .openai import credit_notifications

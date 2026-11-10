@@ -1,8 +1,8 @@
-"""Claude Code messages mimicry for the empirically verified v2.1.282 wire model.
+"""Claude Code messages mimicry for the empirically verified v2.1.321 wire model.
 
 The protocol-critical pieces in this module (fingerprint, billing attribution,
 CCH hash view, body profiles and headers) are validated against captured
-v2.1.280/v2.1.282 fixtures.  Parrot-specific compatibility behaviour remains bounded to
+v2.1.280/v2.1.321 fixtures.  Parrot-specific compatibility behaviour remains bounded to
 this transform and private ``_parrot_*`` request context never reaches the wire.
 """
 
@@ -25,7 +25,7 @@ from .cc_model_profile import canonical_model, default_thinking, model_profile
 # 所以 BASE_DIR = cc_mimicry.py 所在目录向上两级
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-CC_VERSION = "2.1.282"
+CC_VERSION = "2.1.321"
 FINGERPRINT_SALT = "59cf53e54c78"
 FINGERPRINT_INDICES = (4, 7, 20)
 CC_ENTRYPOINT = "sdk-cli"
@@ -52,6 +52,8 @@ STRUCTURED_OUTPUTS_BETA = "structured-outputs-2025-12-15"
 CACHE_DIAGNOSIS_BETA = "cache-diagnosis-2026-04-07"
 EXTENDED_CACHE_TTL_BETA = "extended-cache-ttl-2025-04-11"
 OAUTH_BETA = "oauth-2025-04-20"
+THINKING_DISPLAY_UPDATES_BETA = "thinking-display-updates-2026-08-18"
+TOOL_PROVENANCE_BETA = "tool-provenance-2026-10-26"
 
 # Public compatibility surface: a superset used only when a caller explicitly
 # supplies ``betas=``.  Normal requests select one exact profile below.
@@ -64,7 +66,7 @@ BETAS = [
     SERVER_SIDE_FALLBACK_BETA, FALLBACK_CREDIT_BETA,
     THINKING_BINDING_CONTROLS_BETA, PER_TURN_CONTROL_BETA, TIMING_BETA,
     INLINE_TOOLS_BETA, STRUCTURED_OUTPUTS_BETA, CACHE_DIAGNOSIS_BETA,
-    EXTENDED_CACHE_TTL_BETA, OAUTH_BETA,
+    EXTENDED_CACHE_TTL_BETA, OAUTH_BETA, THINKING_DISPLAY_UPDATES_BETA, TOOL_PROVENANCE_BETA,
 ]
 
 # v282 offline/default SDK profiles. Network-controlled advisor/dispatch
@@ -107,10 +109,12 @@ PARROT_WANTS_CONTEXT_1M_KEY = "_parrot_wants_context_1m"
 PARROT_WANTS_FAST_MODE_KEY = "_parrot_wants_fast_mode"
 PARROT_CC_SESSION_ID_KEY = "_parrot_claude_code_session_id"
 PARROT_CC_PROMPT_ID_KEY = "_parrot_cc_prompt_id"
+PARROT_CC_WIRE_CONTEXT_KEY = "_parrot_cc_wire_context"
 
 CC_REQUEST_CONTEXT_KEYS = frozenset({
     PARROT_CC_SESSION_ID_KEY,
     PARROT_CC_PROMPT_ID_KEY,
+    PARROT_CC_WIRE_CONTEXT_KEY,
 })
 
 ONE_M_CONTEXT_TOKENS = 1_000_000
@@ -227,6 +231,149 @@ def _valid_prompt_id(value) -> str | None:
         return None
 
 
+def capture_cc_headers(body, headers):
+    """Accept bounded client-supplied CC context, not invented telemetry.
+
+    Session + CC identity restrict this to explicit CC ingress. These claims
+    are not authentication/authorization evidence. Never forward arbitrary
+    headers or a caller's private body context as trusted wire metadata.
+    """
+    body.pop(PARROT_CC_WIRE_CONTEXT_KEY, None)
+    sid = _valid_prompt_id(headers.get("x-claude-code-session-id"))
+    if not sid or not str(headers.get("user-agent", "")).startswith("claude-cli/"):
+        return
+    context = {}
+    prompt = _valid_prompt_id(headers.get("x-claude-code-prompt-id"))
+    if prompt:
+        body[PARROT_CC_PROMPT_ID_KEY] = prompt
+    raw = headers.get("x-claude-code-sandy-plover", "")
+    try:
+        items = json.loads(raw) if len(raw) <= 7168 else None
+        if isinstance(items, list) and len(items) <= 64 and all(
+            isinstance(x, dict) and isinstance(x.get("name"), str)
+            and 0 < len(x["name"].encode("utf-8")) <= 256 for x in items
+        ):
+            context["sandy"] = items
+    except (ValueError, TypeError, UnicodeError):
+        pass
+    raw = headers.get("x-claude-code-prev-tool-durations", "")
+    if isinstance(raw, str) and 0 < len(raw) <= 4096 and "\r" not in raw and "\n" not in raw:
+        from urllib.parse import unquote
+        pairs = raw.split(";")
+        if len(pairs) <= 32 and all(re.fullmatch(r"[^=;]+=[0-9]+", pair) for pair in pairs):
+            context["durations"] = [(unquote(pair.rsplit("=", 1)[0]), pair.rsplit("=", 1)[1]) for pair in pairs]
+    if context:
+        body[PARROT_CC_WIRE_CONTEXT_KEY] = context
+
+
+def apply_cc_wire_context(headers, body, mapping, *, official=True):
+    """Map only supplied telemetry names; missing context means no header."""
+    if not official or headers.get("x-claude-code-request-class") != "main":
+        return
+    context = body.get(PARROT_CC_WIRE_CONTEXT_KEY) or {}
+    if not isinstance(context, dict):
+        return
+    mapping = mapping or {}
+    sandy = context.get("sandy")
+    if isinstance(sandy, list) and len(sandy) <= 64 and all(
+        isinstance(item, dict) and isinstance(item.get("name"), str) for item in sandy
+    ):
+        items = [{**item, "name": mapping.get(item["name"], item["name"])} for item in context["sandy"]]
+        raw = json.dumps(items, ensure_ascii=True, separators=(",", ":"))
+        if len(raw) <= 7168:
+            headers["x-claude-code-sandy-plover"] = raw
+    durations = context.get("durations")
+    if isinstance(durations, list) and len(durations) <= 32 and all(
+        isinstance(pair, (list, tuple)) and len(pair) == 2
+        and all(isinstance(v, str) for v in pair) and re.fullmatch(r"[0-9]+", pair[1]) for pair in durations
+    ):
+        from urllib.parse import quote
+        raw = ";".join(quote(mapping.get(name, name), safe="!$&'()*+-./:_~") + "=" + value
+                       for name, value in context["durations"])
+        if len(raw) <= 4096:
+            headers["x-claude-code-prev-tool-durations"] = raw
+
+
+def _billing_prompt_id(body):
+    billing, _ = split_downstream_billing_block(body.get("system"))
+    text = billing.get("text", "") if billing else ""
+    match = re.search(r"(?:^|;\s*)cc_prompt_id=([^;]+)", text)
+    return _valid_prompt_id(match[1]) if match else None
+
+
+def _is_sdk_prompt(message):
+    """A mixed tool-result + text turn is still a tool continuation."""
+    if message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if not isinstance(content, list):
+        return False
+    if any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content):
+        return False
+    return any(isinstance(block, dict) and block.get("type") in {"text", "image", "document"}
+               for block in content)
+
+
+def _prompt_identity_view(message):
+    """Exclude protocol cache hints only; never walk arbitrary user payloads.
+
+    Return a separate hash view, leaving the actual message and nested image,
+    document or other user data untouched.
+    """
+    view = {key: value for key, value in message.items() if key != "cache_control"}
+    if isinstance(view.get("content"), list):
+        view["content"] = [
+            {key: value for key, value in block.items() if key != "cache_control"}
+            if isinstance(block, dict) else block for block in view["content"]
+        ]
+    return view
+
+
+def _sdk_turn_position(messages):
+    """Count intact supplied SDK history, never HTTP attempts or tool results.
+
+    Partial/compacted histories have no knowable absolute position. No shared
+    mutable session counter: retries, forks and concurrent clients cannot race.
+    """
+    count = 0
+    for message in messages or []:
+        if not isinstance(message, dict) or message.get("isCompactSummary") or message.get("isMeta"):
+            return None
+        content = message.get("content")
+        if isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "compaction" for b in content):
+            return None
+        if message.get("role") != "user":
+            if count == 0:
+                return None
+            continue
+        if _is_sdk_prompt(message):
+            count += 1
+        elif count == 0:
+            return None
+    return count or None
+
+
+def _history_previous_message_id(body):
+    # Only input history, never a global last message_start from a failed stream.
+    if not body.get(PARROT_CC_SESSION_ID_KEY):
+        return None
+    for message in reversed(body.get("messages") or []):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        if any(message.get(k) for k in ("isApiErrorMessage", "isVirtual", "isSynthetic")):
+            continue
+        # CC321's $i constant is exactly "<synthetic>". Do not guess from
+        # substrings in ordinary provider model names; virtual uses isVirtual.
+        if message.get("model") == "<synthetic>":
+            continue
+        value = message.get("id")
+        if isinstance(value, str) and re.fullmatch(r"msg_[A-Za-z0-9_-]+", value):
+            return value
+    return None
+
+
 def ensure_request_context(body: dict) -> dict:
     """Return a shallow request copy with stable logical-request CC context."""
     out = dict(body or {})
@@ -234,7 +381,15 @@ def ensure_request_context(body: dict) -> dict:
     if not sid:
         sid = str(uuid.uuid4())
     out[PARROT_CC_SESSION_ID_KEY] = sid
-    prompt_id = _valid_prompt_id(out.get(PARROT_CC_PROMPT_ID_KEY))
+    prompt_id = _billing_prompt_id(out) or _valid_prompt_id(out.get(PARROT_CC_PROMPT_ID_KEY))
+    if prompt_id is None and body.get(PARROT_CC_SESSION_ID_KEY):
+        history = body.get("messages") or []
+        position = _sdk_turn_position(history)
+        if position is not None:
+            users = [m for m in history if _is_sdk_prompt(m)]
+            material = json.dumps([sid, position, _prompt_identity_view(users[-1])],
+                                  sort_keys=True, ensure_ascii=True)
+            prompt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, material))
     out[PARROT_CC_PROMPT_ID_KEY] = prompt_id or str(uuid.uuid4())
     return out
 
@@ -483,6 +638,7 @@ _ANTHROPIC_TOOL_ALLOWED_KEYS = {
     "strict",
     "eager_input_streaming",
     "defer_loading",
+    "ownership_metadata",
 }
 _ANTHROPIC_SERVER_TOOL_TYPE_PREFIXES = (
     "web_search_",
@@ -513,7 +669,7 @@ def _is_anthropic_server_tool(tool):
     if not isinstance(tool, dict):
         return False
     t = tool.get("type")
-    return isinstance(t, str) and bool(t) and t not in {"function", "namespace"}
+    return isinstance(t, str) and bool(t) and t not in {"function", "namespace", "custom"}
 
 
 def _normalize_anthropic_tool(tool, *, preserve_cache_control=False):
@@ -623,20 +779,16 @@ def _stable_tool_names_seed(tool_names) -> int:
 
 
 def _build_dynamic_tool_map(tool_names, threshold=5):
-    """当 tools 数量超过 threshold 时，生成原名→假名的动态映射。
-    返回 dict 或 None（无需映射时）。
+    """Content-addressed aliases, stable even across the old threshold.
+
+    ``threshold`` remains a compatibility argument; membership never changes
+    the mapping of an existing tool, including small/empty tool sets.
     """
-    if len(tool_names) <= threshold:
-        return None
-    mapping = {}
-    available = list(_FAKE_PREFIXES)
-    rng = random.Random(_stable_tool_names_seed(tool_names))  # 跨进程稳定，避免重启打碎 prompt cache
-    rng.shuffle(available)
-    for i, name in enumerate(tool_names):
-        prefix = available[i % len(available)]
-        fake = f"{prefix}{name[:3]}{i:02d}"
-        mapping[name] = fake
-    return mapping
+    # A name's alias must not depend on membership, order or list length.
+    # No shared mutable registry: concurrent sessions and retries are isolated.
+    return {name: "Tool_" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:48]
+            for name in tool_names} or None
+
 
 
 def _sanitize_tool_name(name, dynamic_map=None):
@@ -679,6 +831,14 @@ def _restore_tool_names_in_obj(obj, dynamic_map=None):
         if "name" in out:
             out["name"] = _restore_tool_name_value(out["name"], dynamic_map)
         return out
+    if obj.get("type") == "tool_reference":
+        return {**obj, "tool_name": _restore_tool_name_value(obj.get("tool_name"), dynamic_map)}
+    if obj.get("type") == "tool_addition" and isinstance(obj.get("tool"), dict):
+        tool = obj["tool"]
+        definition = tool.get("definition")
+        if isinstance(definition, dict) and "name" in definition:
+            return {**obj, "tool": {**tool, "definition": {**definition,
+                "name": _restore_tool_name_value(definition["name"], dynamic_map)}}}
     return {k: _restore_tool_names_in_obj(v, dynamic_map) for k, v in obj.items()}
 
 
@@ -703,7 +863,8 @@ def _restore_tool_names_in_json_bytes(data, dynamic_map=None):
     try:
         obj = json.loads(data)
     except Exception:
-        return _restore_tool_names_in_name_fields_bytes(data, dynamic_map)
+        # Without a parsed protocol boundary a name may be arbitrary input data.
+        return data
     obj = _restore_tool_names_in_obj(obj, dynamic_map)
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
@@ -870,6 +1031,11 @@ def transform_request(body, email="", session_id=None, *, auth_mode="api_key", s
         fingerprint_value=fingerprint_value,
         prompt_id=prompt_id,
     )
+    if downstream_billing is None and not side_query:
+        turn = _sdk_turn_position(original_messages)
+        block = _generated_billing_block({"system": system_blocks})
+        if block is not None and turn is not None:
+            block["text"] += f" cc_prompt_index=0; cc_turn_index={turn};"
     if downstream_billing is not None:
         # The client's attribution stays in system verbatim; relocated into
         # messages[0], its per-request cch would break the cache prefix.
@@ -886,24 +1052,28 @@ def transform_request(body, email="", session_id=None, *, auth_mode="api_key", s
             yield block
             if block.get("type") == "tool_result":
                 yield from protocol_blocks(block.get("content"))
+    def name_slot(block):
+        if block.get("type") == "tool_use":
+            return block, "name"
+        if block.get("type") == "tool_reference":
+            return block, "tool_name"
+        if block.get("type") == "tool_addition" and isinstance(block.get("tool"), dict):
+            definition = block["tool"].get("definition")
+            if isinstance(definition, dict) and "input_schema" in definition:
+                return definition, "name"
+        return block, None
     for message in messages:
         for block in protocol_blocks(message.get("content")):
-            field = "name" if block.get("type") == "tool_use" else "tool_name" if block.get("type") == "tool_reference" else None
+            block, field = name_slot(block)
             if field and block.get(field) and block[field] not in tool_names:
                 tool_names.append(block[field])
     proposed = _build_dynamic_tool_map(tool_names) or {name: _sanitize_tool_name(name) for name in tool_names}
-    # Reserve original names first so an alias never impersonates a distinct tool.
-    reserved = set(tool_names)
-    dynamic_tool_map = {}
-    for name in tool_names:
-        fake = proposed[name]
-        while fake != name and fake in reserved:
-            fake += "_"
-        reserved.add(fake)
-        dynamic_tool_map[name] = fake
+    # Every ordinary tool is mapped independently. Reserving the current input
+    # name set would reintroduce membership-dependent aliases on collisions.
+    dynamic_tool_map = proposed
     for message in messages:
         for block in protocol_blocks(message.get("content")):
-            field = "name" if block.get("type") == "tool_use" else "tool_name" if block.get("type") == "tool_reference" else None
+            block, field = name_slot(block)
             if field and block.get(field):
                 block[field] = _sanitize_tool_name(block[field], dynamic_tool_map)
 
@@ -978,12 +1148,12 @@ def transform_request(body, email="", session_id=None, *, auth_mode="api_key", s
     elif side_query:
         payload["output_config"] = json.loads(json.dumps(_SIDE_QUERY_OUTPUT_CONFIG))
     elif profile is not None and profile.effort:
-        payload["output_config"] = {"effort": "high"}
+        payload["output_config"] = {"effort": profile.default_effort}
 
     if "diagnostics" in body:
         payload["diagnostics"] = body["diagnostics"]
     elif not side_query and profile is not None and profile.thinking == "adaptive":
-        payload["diagnostics"] = {"previous_message_id": None}
+        payload["diagnostics"] = {"previous_message_id": _history_previous_message_id(body)}
 
     # The provider allowlist already validated these explicit Anthropic controls.
     # Mimicry must not silently discard their semantics (including on bridges).
@@ -1125,10 +1295,20 @@ def _generated_cch_offset(body_bytes: bytes, payload_dict) -> int | None:
 def sign_body(payload_dict):
     # Serialize the final wire body exactly once.  Hash normalization is a
     # separate view and never becomes the transmitted payload.
-    body_bytes = json_bytes.dumps_utf8(payload_dict, separators=(",", ":"))
     cfg = load_config()
     if _normalize_cch_mode(cfg.get("cch_mode", "dynamic")) != "dynamic":
-        return body_bytes
+        return json_bytes.dumps_utf8(payload_dict, separators=(",", ":"))
+    # Attribution may be downstream-owned, but the modified body is ours to
+    # sign. Zero only billing CCH, never arbitrary message/input text.
+    payload_dict = _replace_generated_billing_cch(payload_dict, "00000")
+    billing = _generated_billing_block(payload_dict)
+    if billing is not None and not _CCH_IN_BILLING_RE.search(billing["text"]):
+        text = billing["text"].rstrip()
+        payload_dict = {**payload_dict, "system": [
+            {**billing, "text": text + ("" if text.endswith(";") else ";") + " cch=00000;"},
+            *payload_dict["system"][1:],
+        ]}
+    body_bytes = json_bytes.dumps_utf8(payload_dict, separators=(",", ":"))
     offset = _generated_cch_offset(body_bytes, payload_dict)
     if offset is None:
         return body_bytes
@@ -1145,10 +1325,10 @@ _STAINLESS_HEADERS = {
     "X-Stainless-Arch": "x64",
     "X-Stainless-Lang": "js",
     "X-Stainless-OS": "Linux",
-    "X-Stainless-Package-Version": "0.112.1",
+    "X-Stainless-Package-Version": "0.128.0",
     "X-Stainless-Retry-Count": "0",
     "X-Stainless-Runtime": "node",
-    "X-Stainless-Runtime-Version": "v26.3.0",
+    "X-Stainless-Runtime-Version": "v26.12.1",
     "X-Stainless-Timeout": "600",
 }
 
@@ -1355,6 +1535,8 @@ def _is_opus_4_plus_model(model) -> bool:
 def model_supports_context_1m(model) -> bool:
     """CC 1M context 能力口径：Opus 4+ 默认可开；Sonnet 4.5/4.6 仅显式可开。"""
     m = str(model or "").lower()
+    if canonical_model(m) in {"claude-fable-5-2", "claude-mythos-5-2", "claude-haiku-5-5"}:
+        return True
     if _is_opus_4_plus_model(m):
         return True
     return m.startswith(("claude-sonnet-4-5", "claude-sonnet-4-6"))
@@ -1405,6 +1587,17 @@ def _insert_beta_after(out: list[str], beta: str, after: str) -> None:
     out.insert(index, beta)
 
 
+def _has_tool_ownership(payload):
+    if any(isinstance(t, dict) and "ownership_metadata" in t for t in payload.get("tools", [])):
+        return True
+    for message in payload.get("messages", []):
+        for block in message.get("content", []) if isinstance(message.get("content"), list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_addition":
+                if "ownership_metadata" in (block.get("tool") or {}).get("definition", {}):
+                    return True
+    return False
+
+
 def _wire_beta_profile(model=None, payload=None, *, auth_mode="api_key", side_query=None) -> list[str]:
     if side_query is None:
         side_query = _is_side_query_request(
@@ -1439,6 +1632,12 @@ def _wire_beta_profile(model=None, payload=None, *, auth_mode="api_key", side_qu
             # thinking. Do not extend this exception to other legacy models.
             allowed.update(_HAIKU_MAIN_BETAS)
         out = [beta for beta in out if beta in allowed]
+    out = [b for b in out if b != MID_CONVERSATION_SYSTEM_BETA]
+    if not side_query and auth_mode != "compatible" and canonical_model(model) in {
+        "claude-fable-5-1", "claude-fable-5-2", "claude-opus-5-5",
+        "claude-sonnet-5-5", "claude-mythos-5-2", "claude-haiku-5-5",
+    }:
+        _insert_beta_before(out, PER_TURN_CONTROL_BETA, MID_CONVERSATION_TOOL_CHANGES_BETA)
     payload = payload if isinstance(payload, dict) else {}
     if "fallbacks" in payload:
         # Explicit downstream fallback remains supported, but v282 no longer
@@ -1464,6 +1663,20 @@ def _wire_beta_profile(model=None, payload=None, *, auth_mode="api_key", side_qu
         for beta in (INTERLEAVED_THINKING_BETA, THINKING_TOKEN_COUNT_BETA):
             _insert_beta_before(out, beta, CACHE_DIAGNOSIS_BETA)
 
+    if isinstance(thinking, dict) and thinking.get("type") in {"enabled", "adaptive"} and thinking.get("display") == "updates":
+        _insert_beta_before(out, THINKING_DISPLAY_UPDATES_BETA, CACHE_DIAGNOSIS_BETA)
+    # Explicit metadata opts into a wire capability, not account entitlement.
+    # Preserve it and pair its beta on compatible relays too; never synthesize
+    # ownership just because OAuth happened to advertise it in a capture.
+    if any(isinstance(b, dict) and b.get("type") == "tool_addition"
+           for message in payload.get("messages", [])
+           for b in (message.get("content") if isinstance(message.get("content"), list) else [])):
+        _insert_beta_before(out, MID_CONVERSATION_TOOL_CHANGES_BETA, ADVANCED_TOOL_USE_BETA)
+    if _has_tool_ownership(payload):
+        _insert_beta_before(out, TOOL_PROVENANCE_BETA, THINKING_TOKEN_COUNT_BETA)
+    if any(isinstance(t, dict) and str(t.get("type", "")).startswith("advisor_")
+           for t in payload.get("tools", [])):
+        _insert_beta_before(out, ADVISOR_TOOL_BETA, CACHE_DIAGNOSIS_BETA)
     if auth_mode == "oauth":
         # Keep explicit fallback capabilities and the OAuth marker immediately
         # after claude-code. Do not opt OAuth into the advisor experiment.
@@ -1523,7 +1736,7 @@ def build_upstream_headers(access_token, session_id=None, betas=None, *, auth_sc
                            auth_mode=None, model=None, payload=None, downstream_betas=None,
                            original_model=None, wants_context_1m=None,
                            wants_fast_mode=None, allow_any_model_context_1m=False,
-                           side_query=None):
+                           side_query=None, prompt_id=None):
     """Build the ordered v282 application headers for one Messages attempt.
 
     ``auth_mode`` controls only evidence-backed beta differences; third-party
@@ -1562,6 +1775,9 @@ def build_upstream_headers(access_token, session_id=None, betas=None, *, auth_sc
         headers["x-api-key"] = access_token
     headers["x-app"] = "cli"
     if not side_query:
+        prompt_id = _billing_prompt_id(payload or {}) or _valid_prompt_id(prompt_id)
+        if prompt_id:
+            headers["x-claude-code-prompt-id"] = prompt_id
         headers["x-claude-code-request-class"] = "main"
     headers["x-client-request-id"] = str(uuid.uuid4())
     # httpx always decodes gzip/deflate.  Brotli/zstd are not declared because

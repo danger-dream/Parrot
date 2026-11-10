@@ -20,6 +20,8 @@ from src.management_auth.principal import Capability
 
 @pytest.fixture
 def env(monkeypatch):
+    monkeypatch.setattr(cr.queries, "MIN_INTERVAL", 0)
+    cr.queries._accounts.clear()
     state_db.init()
     config.update(lambda cfg: cfg.update(oauthAccounts=[], oauth={"mockMode": True},
                                          quotaMonitor={"disableThresholdPercent": 95}))
@@ -103,7 +105,7 @@ def test_wire_confirmed_only_and_duplicate_capability(env, program):
         assert body["grant_id"] == "g_one"
         assert 1 <= len(body["request_id"]) <= 64
     assert call["timeout"] == 25
-    assert call["headers"]["User-Agent"] == "claude-cli/2.1.282 (external, sdk-cli)"
+    assert call["headers"]["User-Agent"] == cr.CLI_USER_AGENT
     with pytest.raises(ManagementError):
         env.control.execute_claude_reset(env.ctx, env.key, token)
     assert len(env.posts) == 1
@@ -181,7 +183,7 @@ def test_org_is_profile_organization_not_account_uuid(env):
     om.add_account({k: v for k, v in env.entry.items() if k != "claude_organization_uuid"})
     final_plan(env)
     assert om.get_account(env.key)["claude_organization_uuid"] == "org-actual"
-    assert env.gets[0][0] == om.OAUTH_PROFILE_URL
+    assert any(url == om.OAUTH_PROFILE_URL for url, _ in env.gets)
     assert om.extract_claude_plan_info({"account": {"uuid": "wrong"}, "organization": {"uuid": "right"}})["claude_organization_uuid"] == "right"
 
 

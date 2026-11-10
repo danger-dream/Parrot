@@ -1,0 +1,74 @@
+{
+  "base-01.json": {
+    "source": "/opt/src-space/rev/cc-rev/corpus/v2.1.321-full/bodies_base/cc_body_1.bin",
+    "sha256": "2a0c1b8db8ac42d8edd73993cc6a76511a9d36704b6d8c345a93d65a3d264fb6"
+  },
+  "matrix-01.json": {
+    "source": "/opt/src-space/rev/cc-rev/corpus/v2.1.321-full/bodies_matrix/cc_body_1.bin",
+    "sha256": "916f9a0eac291e84850a066fa7c6050a58d786828a6ae812e799a1019770da30"
+  },
+  "matrix-02.json": {
+    "source": "/opt/src-space/rev/cc-rev/corpus/v2.1.321-full/bodies_matrix/cc_body_8.bin",
+    "sha256": "bf491adc288f8cbab415735169aad4567249b97a1fc463ffd861e62cc62d4d89"
+  },
+  "matrix-03.json": {
+    "source": "/opt/src-space/rev/cc-rev/corpus/v2.1.321-full/bodies_matrix/cc_body_15.bin",
+    "sha256": "8ac4937bacebd9015106d970e5d28f0cff4fc5059170df0484537da3cee08aa4"
+  },
+  "matrix-04.json": {
+    "source": "/opt/src-space/rev/cc-rev/corpus/v2.1.321-full/bodies_matrix/cc_body_22.bin",
+    "sha256": "c8b2e4eb67e293fdadf2f10b12940d38748f8b6ab614df428fa4273fed4ec9a5"
+  },
+  "matrix-05.json": {
+    "source": "/opt/src-space/rev/cc-rev/corpus/v2.1.321-full/bodies_matrix/cc_body_29.bin",
+    "sha256": "f556ded89ce3568f3fdd9525951ecb85cd7a6ffb94d9bc26220b6c8d1988272b"
+  },
+  "matrix-06.json": {
+    "source": "/opt/src-space/rev/cc-rev/corpus/v2.1.321-full/bodies_matrix/cc_body_36.bin",
+    "sha256": "172fc950ca7d6c81faec2620e40ed3782956bb73c1c05eb0bf3f8987d3d97b74"
+  },
+  "matrix-07.json": {
+    "source": "/opt/src-space/rev/cc-rev/corpus/v2.1.321-full/bodies_matrix/cc_body_43.bin",
+    "sha256": "4e912b804d2c797a642c9de06e484d76579b18da24f973167347a4332d28701b"
+  },
+  "dyn-01.json": {
+    "source": "/opt/src-space/rev/cc-rev/corpus/v2.1.321-full/bodies_dyn/cc_body_1.bin",
+    "sha256": "aafd0f47388534315b5a3e58d26e8e6fb7a1951243de43e4c993dfc139db2198"
+  },
+  "dyn-02.json": {
+    "source": "/opt/src-space/rev/cc-rev/corpus/v2.1.321-full/bodies_dyn/cc_body_2.bin",
+    "sha256": "2a96cbe29fef624a99e242e6c26222dc61c8391a05c48e037841f83ec5a65279"
+  },
+  "dyn-03.json": {
+    "source": "/opt/src-space/rev/cc-rev/corpus/v2.1.321-full/bodies_dyn/cc_body_1416.bin",
+    "sha256": "5eb9ac575acab60b45c7b936f1ba6531b563730e2d44317bb3ef1ea8ae4db070"
+  },
+  "4t-01.json": {
+    "source": "/opt/src-space/rev/cc-rev/corpus/v2.1.321-full/bodies_4t/cc_body_1.bin",
+    "sha256": "7e62f056f54e4f24e47aa900014f723a2d73cb5666839913b05305f648b00c5e"
+  },
+  "4t-02.json": {
+    "source": "/opt/src-space/rev/cc-rev/corpus/v2.1.321-full/bodies_4t/cc_body_2.bin",
+    "sha256": "565b6d553dbf49c3747e6e99840bc7d3f79a852ca506e7a60c246e1049dd3daa"
+  },
+  "4t-03.json": {
+    "source": "/opt/src-space/rev/cc-rev/corpus/v2.1.321-full/bodies_4t/cc_body_1414.bin",
+    "sha256": "4e95a6a564b7b77520b32ca975ad11c34883b6c66b08e03427c3ad769b44bff6"
+  },
+  "oauth-01.json": {
+    "source": "/opt/src-space/openbear/workspace/artifacts/cc321-audit-20261110/models-auth/oauth-local/oauth/request-01.body.json",
+    "sha256": "cba7fab22552144c674acb4e534e470c0d2457d1a10bb8ab1cf91f7c20f41e56"
+  },
+  "oauth-02.json": {
+    "source": "/opt/src-space/openbear/workspace/artifacts/cc321-audit-20261110/models-auth/oauth-local/oauth/request-02.body.json",
+    "sha256": "d4012e9a11cae9a4ec767938ba1012e6f4fa8d6ca0c5ede5bf11aa425788a674"
+  },
+  "api-key-01.json": {
+    "source": "/opt/src-space/openbear/workspace/artifacts/cc321-audit-20261110/models-auth/oauth-local/api-key/request-01.body.json",
+    "sha256": "4ca1122bad7f95ee906a3dd332ad8d8c946a3cba6d01b882e49d19c8fdd37144"
+  },
+  "api-key-02.json": {
+    "source": "/opt/src-space/openbear/workspace/artifacts/cc321-audit-20261110/models-auth/oauth-local/api-key/request-02.body.json",
+    "sha256": "35ae1bb24bfdf7d3d07846f7612eb76b8647711fb84306722af8cbe7d7337ecf"
+  }
+}

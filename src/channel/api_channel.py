@@ -259,10 +259,12 @@ class ApiChannel(Channel):
                 self.api_key, session_id=sid, betas=betas,
                 auth_scheme=auth_scheme, auth_mode=auth_mode,
                 model=resolved_model, payload=payload,
+                prompt_id=body_with_model.get(cc_mimicry.PARROT_CC_PROMPT_ID_KEY),
                 downstream_betas=downstream_betas, original_model=original_model,
                 wants_context_1m=wants_context_1m,
                 wants_fast_mode=wants_fast_mode,
                 allow_any_model_context_1m=True, side_query=side_query)
+            cc_mimicry.apply_cc_wire_context(headers, body_with_model, dynamic_map, official=official_anthropic)
         else:
             payload = standard.standard_transform(body_with_model)
             if self.omit_temperature:

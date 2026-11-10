@@ -51,6 +51,7 @@ PARROT_INTERNAL_REQ_FIELDS: frozenset[str] = frozenset({
 CC_REQUEST_CONTEXT_FIELDS: frozenset[str] = frozenset({
     "_parrot_claude_code_session_id",
     "_parrot_cc_prompt_id",
+    "_parrot_cc_wire_context",
 })
 
 

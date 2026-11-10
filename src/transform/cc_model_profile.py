@@ -17,9 +17,14 @@ class CCModelProfile:
     thinking: str | None = None
     effort: bool = False
     context_management: bool = False
+    default_effort: str = "high"
 
 
 _PROFILES = {
+    "claude-fable-5-2": CCModelProfile(128000, "adaptive", True, True, "medium"),
+    "claude-haiku-5-5": CCModelProfile(128000, "adaptive", True, True, "medium"),
+    "claude-mythos-5-2": CCModelProfile(128000, "adaptive", True, True, "medium"),
+
     "claude-3-5-haiku": CCModelProfile(8192),
     "claude-3-5-sonnet": CCModelProfile(8192),
     "claude-3-7-sonnet": CCModelProfile(32000),
@@ -28,22 +33,26 @@ _PROFILES = {
     "claude-sonnet-4-5": CCModelProfile(32000, "enabled", context_management=True),
     "claude-sonnet-4-6": CCModelProfile(32000, "adaptive", True, True),
     "claude-sonnet-5": CCModelProfile(64000, "adaptive", True, True),
-    "claude-sonnet-5-5": CCModelProfile(128000, "adaptive", True, True),
+    "claude-sonnet-5-5": CCModelProfile(128000, "adaptive", True, True, "medium"),
     "claude-opus-4-0": CCModelProfile(32000, "enabled", context_management=True),
     "claude-opus-4-1": CCModelProfile(32000, "enabled", context_management=True),
     # L_ explicitly permits effort on Opus 4.5, but vCt rejects adaptive.
     "claude-opus-4-5": CCModelProfile(32000, "enabled", True, True),
     "claude-opus-4-6": CCModelProfile(64000, "adaptive", True, True),
-    "claude-opus-4-7": CCModelProfile(64000, "adaptive", True, True),
+    "claude-opus-4-7": CCModelProfile(64000, "adaptive", True, True, "xhigh"),
     "claude-opus-4-8": CCModelProfile(64000, "adaptive", True, True),
     "claude-opus-5": CCModelProfile(64000, "adaptive", True, True),
-    "claude-opus-5-5": CCModelProfile(128000, "adaptive", True, True),
+    "claude-opus-5-5": CCModelProfile(128000, "adaptive", True, True, "medium"),
     "claude-fable-5": CCModelProfile(64000, "adaptive", True, True),
     "claude-fable-5-1": CCModelProfile(64000, "adaptive", True, True),
     "claude-mythos-5": CCModelProfile(64000, "adaptive", True, True),
     "claude-mythos-5-1": CCModelProfile(64000, "adaptive", True, True),
 }
 _ALIASES = {
+    "claude-fable-5.2": "claude-fable-5-2",
+    "claude-haiku-5.5": "claude-haiku-5-5",
+    "claude-mythos-5.2": "claude-mythos-5-2",
+
     "claude-sonnet-4": "claude-sonnet-4-0",
     "claude-sonnet-5.5": "claude-sonnet-5-5",
     "claude-opus-4": "claude-opus-4-0",

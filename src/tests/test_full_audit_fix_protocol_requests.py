@@ -89,13 +89,14 @@ async def test_mimicry_tool_name_collision_and_wrong_restoration():
     body={'model':'claude-sonnet-4-6','messages':[{'role':'user','content':'hi'}],
         'tools':[{'name':'cc_ses_lookup','input_schema':{'type':'object'}}]}
     request=await ch.build_upstream_request(body,body['model'])
-    assert json.loads(request.body)['tools'][0]['name']=='cc_ses_lookup'
-    wire={'type':'message','content':[{'type':'tool_use','id':'t1','name':'cc_ses_lookup','input':{}}]}
+    alias = json.loads(request.body)['tools'][0]['name']
+    wire={'type':'message','content':[{'type':'tool_use','id':'t1','name':alias,'input':{}}]}
     out=json.loads(await ch.restore_response(json.dumps(wire).encode(),request.dynamic_tool_map))
     assert out['content'][0]['name']=='cc_ses_lookup'
     body['tools'].append({'name':'session_lookup','input_schema':{'type':'object'}})
     request=await ch.build_upstream_request(body,body['model'])
     assert len({t['name'] for t in json.loads(request.body)['tools']})==2
+    assert json.loads(request.body)['tools'][0]['name'] == alias
 
 @pytest.mark.asyncio
 async def test_tool_call_id_sanitization_collision():
