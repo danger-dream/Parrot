@@ -466,11 +466,30 @@ def _input_items_to_messages(
             # array 时若直接放进 chat tool message.content，chat 上游会 400
             # （tool message 只允许 string 或 array<{type:text}>）。
             # 这里统一拍扁为字符串，仅取 input_text/output_text/text 部分。
-            messages.append({
-                "role": "tool",
-                "tool_call_id": item.get("call_id") or "",
-                "content": _flatten_function_call_output(item.get("output")),
-            })
+            call_id = str(item.get("call_id") or "").strip()
+            item_name = str(item.get("name") or item.get("tool_name") or "").strip()
+            flat_text = _flatten_function_call_output(item.get("output"))
+            has_matching_call = bool(call_id) and any(
+                isinstance(m, dict)
+                and m.get("role") == "assistant"
+                and any(
+                    isinstance(tc, dict) and tc.get("id") == call_id
+                    for tc in (m.get("tool_calls") or [])
+                )
+                for m in messages
+            )
+            if not has_matching_call and (
+                not call_id or call_id.startswith("fco_") or item_name.startswith("codex_apps_")
+            ):
+                if flat_text:
+                    label = f"[{item_name}]\n{flat_text}" if item_name else flat_text
+                    messages.append({"role": "user", "content": label})
+            else:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": flat_text,
+                })
 
         elif t == "custom_tool_call":
             # 02-bug-findings #27 反向：responses CustomToolCall

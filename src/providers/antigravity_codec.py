@@ -566,7 +566,21 @@ def responses_to_gemini(payload: dict) -> dict[str, Any]:
 
         if typ == "function_call_output":
             call_id = str(item.get("call_id") or "")
-            name = call_names.get(call_id) or str(item.get("name") or "tool")
+            raw_name = str(item.get("name") or "")
+            if (not call_id or call_id not in call_names) and (
+                not call_id or call_id.startswith("fco_") or raw_name.startswith("codex_apps_")
+            ):
+                response, image_parts = _tool_output_parts(item.get("output"))
+                text_val = response if isinstance(response, str) else str(response)
+                label = f"[{raw_name}]\n{text_val}" if raw_name else text_val
+                parts_list: list[dict[str, Any]] = []
+                if label:
+                    parts_list.append({"text": label})
+                parts_list.extend(image_parts)
+                if parts_list:
+                    contents.append({"role": "user", "parts": parts_list})
+                continue
+            name = call_names.get(call_id) or raw_name or "tool"
             response, image_parts = _tool_output_parts(item.get("output"))
             function_response: dict[str, Any] = {
                 "name": name,

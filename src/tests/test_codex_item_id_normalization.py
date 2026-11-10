@@ -95,3 +95,75 @@ def test_encrypted_reasoning_remains_self_contained_without_item_id():
         reasoning = next(item for item in out["input"] if item.get("type") == "reasoning")
         assert reasoning["encrypted_content"] == encrypted
         assert "id" not in reasoning
+
+
+def test_callless_named_function_call_output_is_not_coerced_to_call_id():
+    """Codex Desktop injects standalone context items such as codex_apps_open_page
+    and codex_apps_selected_page_part as function_call_output with an fco_* id
+    and name, without a preceding function_call. Copying id into call_id causes
+    upstream Responses to fail with 400 No tool call found.
+    """
+    out = _apply([
+        {
+            "type": "function_call_output",
+            "id": "fco_01a1ba42-a1ab-76a0-8239-e99c9ed8d808",
+            "name": "codex_apps_open_page",
+            "output": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "id": "fco_01a1ba42-a1ab-76a0-8239-e99c9ed8d809",
+            "call_id": "fco_01a1ba42-a1ab-76a0-8239-e99c9ed8d809",
+            "name": "codex_apps_selected_page_part",
+            "output": "{}",
+        },
+        {"type": "message", "role": "user", "content": "hi"},
+    ])
+    outputs = [i for i in out["input"] if i.get("type") == "function_call_output"]
+    assert len(outputs) == 2
+    assert "call_id" not in outputs[0]
+    assert outputs[0]["name"] == "codex_apps_open_page"
+    assert "call_id" not in outputs[1]
+    assert outputs[1]["name"] == "codex_apps_selected_page_part"
+
+
+def test_callless_fco_converted_to_user_context_across_chat_anthropic_and_gemini():
+    from src.openai.transform import responses_to_anthropic, responses_to_chat
+    from src.providers import antigravity_codec
+
+    body = {
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "type": "function_call_output",
+                "id": "fco_01a1ba42-a1ab-76a0-8239-e99c9ed8d808",
+                "name": "codex_apps_open_page",
+                "output": "page: index.ts",
+            },
+            {"type": "message", "role": "user", "content": "explain"},
+        ],
+    }
+    chat_out = responses_to_chat.translate_request(deepcopy(body))
+    assert [m["role"] for m in chat_out["messages"]] == ["user", "user"]
+    assert "[codex_apps_open_page]" in chat_out["messages"][0]["content"]
+
+    anth_out = responses_to_anthropic.translate_request(deepcopy(body))
+    assert all(m["role"] == "user" for m in anth_out["messages"])
+    assert not any(
+        isinstance(b, dict) and b.get("type") == "tool_result"
+        for m in anth_out["messages"]
+        for b in (m.get("content") if isinstance(m.get("content"), list) else [])
+    )
+
+    gem_out = antigravity_codec.responses_to_gemini(deepcopy(body))
+    assert not any(
+        "functionResponse" in p
+        for c in gem_out.get("contents", [])
+        for p in c.get("parts", [])
+    )
+    assert any(
+        "[codex_apps_open_page]" in str(p.get("text", ""))
+        for c in gem_out.get("contents", [])
+        for p in c.get("parts", [])
+    )
+

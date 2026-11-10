@@ -376,6 +376,13 @@ _CODEX_TOOL_CALL_TYPES = {
     "tool_search_output",
 }
 
+_CODEX_TOOL_OUTPUT_TYPES = {
+    "function_call_output",
+    "mcp_tool_call_output",
+    "custom_tool_call_output",
+    "tool_search_output",
+}
+
 _CODEX_INPUT_ITEM_TYPES_REQUIRING_NAME = {
     "function_call",
     "custom_tool_call",
@@ -385,6 +392,10 @@ _CODEX_INPUT_ITEM_TYPES_REQUIRING_NAME = {
 
 def _is_codex_tool_call_item_type(item_type: str) -> bool:
     return item_type in _CODEX_TOOL_CALL_TYPES
+
+
+def _is_codex_tool_output_item_type(item_type: str) -> bool:
+    return item_type in _CODEX_TOOL_OUTPUT_TYPES
 
 
 def _codex_input_item_requires_name(item_type: str) -> bool:
@@ -515,6 +526,17 @@ def _filter_codex_input(
     preserve_references: bool,
     preserve_reasoning_ids: bool = False,
 ) -> list[Any]:
+    known_call_ids: set[str] = set()
+    for candidate in input_items:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_type = str(candidate.get("type") or "")
+        if _is_codex_tool_call_item_type(candidate_type) and not _is_codex_tool_output_item_type(candidate_type):
+            for raw_id in (candidate.get("call_id"), candidate.get("id")):
+                cid = _first_non_empty_string(raw_id)
+                if cid:
+                    known_call_ids.add(cid)
+
     filtered: list[Any] = []
     for item in input_items:
         if not isinstance(item, dict):
@@ -559,10 +581,38 @@ def _filter_codex_input(
 
         if _is_codex_tool_call_item_type(typ):
             call_id = _first_non_empty_string(new_item.get("call_id"))
-            if not call_id:
-                call_id = _first_non_empty_string(new_item.get("id"))
+            item_name = _first_non_empty_string(new_item.get("name"), new_item.get("tool_name"))
+            if _is_codex_tool_output_item_type(typ):
                 if call_id:
-                    new_item["call_id"] = call_id
+                    # Codex Desktop injects standalone page context (e.g.
+                    # codex_apps_open_page) as function_call_output with an fco_*
+                    # item id and no preceding function_call.  If an unmated fco_*
+                    # id was placed in call_id, strip call_id and keep a name so
+                    # upstream accepts it as a standalone named output item.
+                    if call_id not in known_call_ids and (
+                        call_id.startswith("fco_") or item_name.startswith("codex_apps_")
+                    ):
+                        new_item.pop("call_id", None)
+                        if not item_name:
+                            new_item["name"] = "codex_apps_context"
+                else:
+                    # Do not copy a tool output item's own id (e.g. fco_*) into
+                    # call_id unless it has no name and matches a known tool call.
+                    cand_id = _first_non_empty_string(new_item.get("id"))
+                    if (
+                        cand_id
+                        and not item_name
+                        and cand_id in known_call_ids
+                        and not cand_id.startswith("fco_")
+                    ):
+                        new_item["call_id"] = cand_id
+                    else:
+                        new_item.pop("call_id", None)
+            else:
+                if not call_id:
+                    call_id = _first_non_empty_string(new_item.get("id"))
+                    if call_id:
+                        new_item["call_id"] = call_id
             # Responses call_id is an opaque correlation key.  In particular,
             # values that don't start with ``fc`` must still link a call to its
             # function_call_output exactly as supplied by the client/provider.
