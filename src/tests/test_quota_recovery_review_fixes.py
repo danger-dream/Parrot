@@ -148,10 +148,16 @@ def test_claude_empty_without_cache_and_stale_low_cannot_resume(env):
 
 
 @pytest.mark.parametrize("age", [30, 601])
-def test_new_confirmed_cedar_grant_is_not_blocked_by_old_unknown(env, age):
+def test_new_confirmed_cedar_grant_is_not_blocked_by_old_unknown(env, monkeypatch, age):
+    clock = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
     env.post_effect = lambda: (_ for _ in ()).throw(httpx.ReadTimeout("lost response"))
     first = execute(env)
     assert first["result"] == "unconfirmed"
+    # The uncertain POST is followed by a successful status read of g_one.
+    # Expire that query cache before confirming a DIFFERENT grant; changing only
+    # journal.created_at does not age the query cache or confirm g_new.
+    clock[0] += cr.queries.TTL + 1
     journal = cr._journal_key(om.account_state_key(om.get_account(env.key)), "cedar_ember", env.org)
     record = state_db.claude_reset_operation_load(journal)
     record["created_at"] = time.time() - age
@@ -159,11 +165,54 @@ def test_new_confirmed_cedar_grant_is_not_blocked_by_old_unknown(env, age):
     env.post_effect = None
     env.usage["cedar_ember"]["grants"][0]["id"] = "g_new"
     env.usage["cedar_ember"]["next_grant_id"] = "g_new"
-    out = execute(env)
+    gets_before = len(env.gets)
+    plan = env.control.plan_claude_reset(env.ctx, env.key, "cedar_ember")
+    assert plan["available"]
+    assert len(env.gets) == gets_before + 1
+    assert plan["status"]["claude_reset_queries"]["cedar_ember"]["cached"] is False
+    assert plan["status"]["cedar_ember"]["next_grant_id"] == "g_new"
+    final = env.control.confirm_claude_reset(env.ctx, env.key, plan["plan_token"])
+    assert final["grant_id"] == "g_new"
+    out = env.control.execute_claude_reset(env.ctx, env.key, final["plan_token"])
     assert out["result"] == "reset"
     assert len(env.posts) == 2
     assert env.posts[1][1]["json"]["grant_id"] == "g_new"
     assert env.posts[1][1]["json"]["request_id"] != first["request_id"]
+
+
+@pytest.mark.parametrize("age,result,reason", [
+    (30, "ineligible", "not_next_grant"),
+    (601, "unconfirmed", "pending_requires_reconciliation"),
+])
+def test_cached_old_cedar_plan_cannot_silently_consume_new_grant(env, monkeypatch, age, result, reason):
+    clock = time.time()
+    monkeypatch.setattr(time, "time", lambda: clock)
+    env.post_effect = lambda: (_ for _ in ()).throw(httpx.ReadTimeout("lost response"))
+    first = execute(env)
+    assert first["result"] == "unconfirmed"
+    journal = cr._journal_key(om.account_state_key(om.get_account(env.key)), "cedar_ember", env.org)
+    record = state_db.claude_reset_operation_load(journal)
+    record["created_at"] = clock - age
+    state_db.claude_reset_operation_save(journal, record)
+    env.post_effect = None
+    env.usage["cedar_ember"]["grants"][0]["id"] = "g_new"
+    env.usage["cedar_ember"]["next_grant_id"] = "g_new"
+
+    gets_before = len(env.gets)
+    plan = env.control.plan_claude_reset(env.ctx, env.key, "cedar_ember")
+    assert plan["available"]
+    assert len(env.gets) == gets_before
+    assert plan["status"]["claude_reset_queries"]["cedar_ember"]["cached"] is True
+    assert plan["status"]["cedar_ember"]["next_grant_id"] == "g_one"
+    final = env.control.confirm_claude_reset(env.ctx, env.key, plan["plan_token"])
+    assert final["grant_id"] == "g_one"
+    out = env.control.execute_claude_reset(env.ctx, env.key, final["plan_token"])
+    # Redeem reads fresh g_new but cannot substitute it for the confirmed g_one.
+    assert len(env.gets) == gets_before + 1
+    assert (out["result"], out["reason"]) == (result, reason)
+    assert len(env.posts) == 1
+    assert env.posts[0][1]["json"]["grant_id"] == "g_one"
+    assert state_db.claude_reset_operation_load(journal) == record
 
 
 def test_expired_same_cedar_grant_remains_uncertain_not_blindly_replayed(env):

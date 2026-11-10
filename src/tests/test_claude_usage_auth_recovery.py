@@ -53,15 +53,14 @@ async def test_usage_401_refreshes_persists_and_retries_once(account, monkeypatc
     if second_status == 200:
         observed = await oauth.fetch_usage_snapshot(key)
         assert observed["five_hour"] == fresh["five_hour"]
-        assert all(row["state"] == "not_provided" for row in observed["claude_reset_queries"].values())
-        assert [call["headers"]["Authorization"] for call in reset_gets] == ["Bearer fake-new-at"] * 2
+        # Ordinary usage no longer fans out into opt-in reset-status reads.
+        assert "claude_reset_queries" not in observed
     else:
         with pytest.raises(httpx.HTTPStatusError):
             await oauth.fetch_usage_snapshot(key)
     assert [call["headers"]["Authorization"] for call in gets] == ["Bearer fake-old-at", "Bearer fake-new-at"]
     assert len(posts) == 1
-    if second_status == 401:
-        assert reset_gets == []
+    assert reset_gets == []
     saved = oauth.get_account(key)
     assert saved["access_token"] == "fake-new-at"
     assert saved["refresh_token"] == "fake-new-rt"
@@ -102,7 +101,8 @@ async def test_usage_reuses_concurrently_rotated_token(account, monkeypatch):
     monkeypatch.setattr(oauth, "force_refresh", unexpected)
     assert (await oauth.fetch_usage(key))["five_hour"]["utilization"] == 2
     assert calls == ["Bearer fake-old-at", "Bearer fake-concurrent-at"]
-    assert reset_calls == ["Bearer fake-concurrent-at"] * 2
+    assert reset_calls == []
+    assert oauth.get_account(key)["access_token"] == "fake-concurrent-at"
 
 
 @pytest.mark.asyncio
@@ -132,5 +132,5 @@ def test_bootstrap_oauth_identity_is_current(monkeypatch):
         return response(url, 200, {})
     monkeypatch.setattr(oauth.network, "get_sync", get)
     oauth._bootstrap_sync("fake-bootstrap-token")
-    assert calls[0]["headers"]["User-Agent"] == "claude-code/2.1.282"
+    assert calls[0]["headers"]["User-Agent"] == "claude-code/2.1.321"
     assert calls[0]["headers"]["anthropic-beta"] == "oauth-2025-04-20"
