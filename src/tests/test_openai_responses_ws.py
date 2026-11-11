@@ -138,6 +138,8 @@ def _setup(m):
     }
     m["config"]._cache = cfg
     m["config"]._mtime = m["config"]._current_mtime()
+    from src.model_registry import runtime as _model_registry
+    _model_registry.rebuild(cfg)
     return cfg
 
 

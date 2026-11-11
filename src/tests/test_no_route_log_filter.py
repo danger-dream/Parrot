@@ -42,7 +42,9 @@ def route_env(monkeypatch):
     notices = []
     monkeypatch.setattr(responses_ws.notifications, "routing_unavailable", lambda **kw: notices.append(kw))
     registry.rebuild_from_config()
-    return cfg, notices
+    yield cfg, notices
+    from src.model_registry import runtime as _model_registry
+    _model_registry.rebuild({"modelRegistry": {"enabled": False}})
 
 
 def _request(body):

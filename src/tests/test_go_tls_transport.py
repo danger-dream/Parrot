@@ -377,6 +377,10 @@ async def test_sync_helper_reuses_network_route_and_serializes_json(tls_files, m
                           "proxy_model": "", "proxy_provider": "antigravity"}]
         assert state["calls"][0]["content-type"] == "application/json"
         assert state["calls"][0]["x-fixture"] == "ok"
+        for _ in range(50):
+            if not state["active"]:
+                break
+            await asyncio.sleep(0.01)
         assert not state["active"]
 
 
