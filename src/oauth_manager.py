@@ -79,6 +79,7 @@ from .transform.cc_mimicry import (
     CLAUDE_CODE_USER_AGENT,
     FIRST_PARTY_ACCEPT,
     FIRST_PARTY_ACCEPT_ENCODING,
+    INTERACTIVE_CLI_USER_AGENT,
     OAUTH_BETA,
     first_party_oauth_headers,
 )

@@ -37,6 +37,15 @@ class ClaudeResetControlMixin:
         selected_grant = None
         if program == "cedar_ember":
             selected_grant, reason = self.backend.claude_reset_select_grant(observation, grant_id)
+            if reason is not None and grant_id is None:
+                fallback_reason = self.backend.claude_reset_eligibility(observation, program)
+                if fallback_reason is None:
+                    cedar_obs = observation.get("cedar_ember") if isinstance(observation.get("cedar_ember"), dict) else {}
+                    next_id = cedar_obs.get("next_grant_id")
+                    selected_grant = {"id": next_id} if isinstance(next_id, str) and next_id else None
+                    reason = None if selected_grant is not None else "no_grant"
+                else:
+                    reason = fallback_reason
         else:
             reason = self.backend.claude_reset_eligibility(observation, program)
         if reason or not observation.get("organization_uuid"):
