@@ -111,6 +111,7 @@ def test_v282_constants_and_stainless_versions():
     assert m.FINGERPRINT_INDICES == (4, 7, 20)
     assert m.CCH_SEED == 0x4D659218E32A3268
     assert m.CLI_USER_AGENT == "claude-cli/2.1.321 (external, sdk-cli)"
+    assert m.INTERACTIVE_CLI_USER_AGENT == "claude-cli/2.1.321 (external, cli)"
     assert m._STAINLESS_HEADERS["X-Stainless-Package-Version"] == "0.128.0"
     assert m._STAINLESS_HEADERS["X-Stainless-Runtime-Version"] == "v26.12.1"
 
@@ -655,7 +656,12 @@ def test_oauth_refresh_request_always_carries_supplied_scope_without_custom_ua(m
         scope=oauth_manager.OAUTH_SCOPES,
     )
     assert calls[0][1]["json"]["scope"] == oauth_manager.OAUTH_SCOPES
-    assert calls[0][1]["headers"] == {"Content-Type": "application/json"}
+    assert calls[0][1]["headers"] == {
+        "Accept": m.FIRST_PARTY_ACCEPT,
+        "Content-Type": "application/json",
+        "User-Agent": m.AXIOS_USER_AGENT,
+        "Accept-Encoding": m.FIRST_PARTY_ACCEPT_ENCODING,
+    }
 
 
 def test_oauth_usage_profile_and_bootstrap_v280_headers(monkeypatch):
@@ -674,12 +680,21 @@ def test_oauth_usage_profile_and_bootstrap_v280_headers(monkeypatch):
     usage_headers = calls[0][1]["headers"]
     profile_headers = calls[1][1]["headers"]
     bootstrap_headers = calls[2][1]["headers"]
-    assert usage_headers["User-Agent"] == m.CLI_USER_AGENT
-    assert usage_headers["anthropic-beta"] == m.OAUTH_BETA
-    assert profile_headers["User-Agent"] == m.CLI_USER_AGENT
+    assert list(usage_headers.items()) == [
+        ("Accept", m.FIRST_PARTY_ACCEPT),
+        ("User-Agent", m.INTERACTIVE_CLI_USER_AGENT),
+        ("Authorization", "Bearer access"),
+        ("anthropic-beta", m.OAUTH_BETA),
+        ("Content-Type", "application/json"),
+        ("Accept-Encoding", m.FIRST_PARTY_ACCEPT_ENCODING),
+    ]
+    assert profile_headers["User-Agent"] == m.CLAUDE_CODE_USER_AGENT
+    assert profile_headers["Accept"] == m.FIRST_PARTY_ACCEPT
     assert profile_headers["Cache-Control"] == "no-cache"
     assert "anthropic-beta" not in profile_headers
-    assert bootstrap_headers["User-Agent"] == f"claude-code/{m.CC_VERSION}"
+    assert calls[1][1]["timeout"] == 10
+    assert bootstrap_headers["User-Agent"] == m.CLAUDE_CODE_USER_AGENT
+    assert bootstrap_headers["Accept"] == m.FIRST_PARTY_ACCEPT
 
 
 def test_application_and_httpx_raw_header_order_and_encoding(dynamic_cch):

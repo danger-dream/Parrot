@@ -44,7 +44,8 @@ from src import (
     affinity, apikey_limiter, auth, config, cooldown,
     errors, failover, fingerprint, image_db, json_bytes, load_balancing, log_db,
     model_mapping, model_metadata, model_pricing, model_state, model_validation, network,
-    network_monitor, notifier, oauth_manager, probe, provider_usage, public_ip, scheduler, scorer,
+    network_monitor, notifier, oauth_manager, probe, provider_usage, public_ip, request_body,
+    scheduler, scorer,
     state_db, status_monitor, translation, update_checker, updater,
     upstream,
 )
@@ -814,6 +815,8 @@ def _request_body_limit_error_response(
         )
     if aggregate_pressure:
         resp.headers["Retry-After"] = "1"
+    else:
+        resp.headers["x-should-retry"] = "false"
     return resp
 
 
@@ -1152,7 +1155,9 @@ async def list_models(request: Request):
     """
     key_name, allowed_models, err = auth.validate(request.headers)
     if err:
-        return errors.json_error_response(401, errors.ErrType.AUTH, err)
+        return errors.json_error_response(
+            401, errors.ErrType.AUTH, err, headers=errors.NO_RETRY_HEADERS,
+        )
 
     from src import image_catalog, model_names
     scoped = auth.allowed_channels(key_name) is not None
@@ -1424,26 +1429,40 @@ async def proxy_messages(request: Request):
     # 1. API Key 验证
     key_name, allowed_models, err = auth.validate(request.headers)
     if err:
-        return errors.json_error_response(401, errors.ErrType.AUTH, err)
+        return errors.json_error_response(
+            401, errors.ErrType.AUTH, err, headers=errors.NO_RETRY_HEADERS,
+        )
 
     # 2. 读请求体
-    raw = await request.body()
+    try:
+        raw = await request_body.read_decoded_request_body(request)
+    except request_body.RequestBodyDecodeError as exc:
+        return errors.json_error_response(
+            exc.status,
+            errors.ErrType.REQUEST_TOO_LARGE if exc.status == 413 else errors.ErrType.INVALID_REQUEST,
+            exc.message,
+            code=exc.code,
+            headers=errors.NO_RETRY_HEADERS,
+        )
     try:
         body = json_bytes.loads_utf8(raw) if raw else {}
     except Exception as e:
         return errors.json_error_response(
-            400, errors.ErrType.INVALID_REQUEST, f"invalid json: {e}"
+            400, errors.ErrType.INVALID_REQUEST, f"invalid json: {e}",
+            headers=errors.NO_RETRY_HEADERS,
         )
 
     if not isinstance(body, dict):
         return errors.json_error_response(
-            400, errors.ErrType.INVALID_REQUEST, "request body must be a JSON object"
+            400, errors.ErrType.INVALID_REQUEST, "request body must be a JSON object",
+            headers=errors.NO_RETRY_HEADERS,
         )
     try:
         body["model"] = model_validation.require_explicit_model(body)
     except model_validation.ExplicitModelError as exc:
         return errors.json_error_response(
             400, errors.ErrType.INVALID_REQUEST, exc.message,
+            headers=errors.NO_RETRY_HEADERS,
         )
 
     from src import search_tool_policy
@@ -1453,7 +1472,10 @@ async def proxy_messages(request: Request):
     try:
         search_tool_policy.validate(body)
     except SearchPolicyError as exc:
-        return errors.json_error_response(400, errors.ErrType.INVALID_REQUEST, exc.message)
+        return errors.json_error_response(
+            400, errors.ErrType.INVALID_REQUEST, exc.message,
+            headers=errors.NO_RETRY_HEADERS,
+        )
 
     # 2.1 保存下游显式能力信号，再做模型映射：
     #     - anthropic-beta 可显式请求 context-1m；
@@ -1494,7 +1516,8 @@ async def proxy_messages(request: Request):
     body[PARROT_WANTS_FAST_MODE_KEY] = explicit_fast_mode or None
     if not model:
         return errors.json_error_response(
-            400, errors.ErrType.INVALID_REQUEST, "model is required"
+            400, errors.ErrType.INVALID_REQUEST, "model is required",
+            headers=errors.NO_RETRY_HEADERS,
         )
 
     from src import api_key_policy
@@ -1508,12 +1531,16 @@ async def proxy_messages(request: Request):
             403, errors.ErrType.PERMISSION,
             f"Model '{model}' is not allowed for this API key "
             f"(allowed: {', '.join(allowed_models) or 'none'})",
+            headers=errors.NO_RETRY_HEADERS,
         )
 
     try:
         guard_collection_fields(body, "messages", "tools")
     except GuardError as exc:
-        return errors.json_error_response(400, errors.ErrType.INVALID_REQUEST, exc.message)
+        return errors.json_error_response(
+            400, errors.ErrType.INVALID_REQUEST, exc.message,
+            headers=errors.NO_RETRY_HEADERS,
+        )
 
     is_stream = bool(body.get("stream", False))
     messages = body.get("messages") or []
@@ -1576,7 +1603,8 @@ async def proxy_messages(request: Request):
                 total_ms=int((time.monotonic() - start_monotonic) * 1000),
             )
             return errors.json_error_response(
-                400, errors.ErrType.INVALID_REQUEST, msg
+                400, errors.ErrType.INVALID_REQUEST, msg,
+                headers=errors.NO_RETRY_HEADERS,
             )
 
         msg = f"No available upstream channels for model: {model}"
@@ -1597,7 +1625,10 @@ async def proxy_messages(request: Request):
         from src import notifications
         notifications.routing_unavailable(ingress="anthropic", model=model, exclusions=result.exclusions,
                                            api_key_name=key_name, request_id="" if skip_log else request_id)
-        return errors.json_error_response(status, err_type, msg)
+        return errors.json_error_response(
+            status, err_type, msg,
+            headers=errors.NO_RETRY_HEADERS if errors.is_non_retryable_http_status(status) else None,
+        )
 
     # Local token estimates are advisory, not a request-wide hard input cap.
     # Adapters may discard opaque history before sending it, and only the

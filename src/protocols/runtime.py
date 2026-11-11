@@ -97,17 +97,18 @@ def json_error_for_ingress(
     *,
     code: str | None = None,
     details: dict | None = None,
+    headers: dict[str, str] | None = None,
 ):
     if ingress == "anthropic":
         if protocol_errors.is_context_length_code_or_message(code, message):
             message = protocol_errors.context_length_error_message_for_claude_code(message)
             code = protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
         return errors.json_error_response(
-            status, anth_err_type, message, code=code, details=details,
+            status, anth_err_type, message, code=code, details=details, headers=headers,
         )
     mapped = translate_error_type(anth_err_type, ingress)
     return errors.json_error_openai(
-        status, mapped, message, code=code, details=details,
+        status, mapped, message, code=code, details=details, headers=headers,
     )
 
 
@@ -752,6 +753,24 @@ def bounded_account_quota_error(result: AttemptResult, channel: Any = None) -> d
             error_obj = obj.get("error") if isinstance(obj.get("error"), dict) else obj
             if isinstance(error_obj, dict):
                 message = str(error_obj.get("message") or obj.get("message") or detail)
+
+    if status == 429:
+        unified = (getattr(result, "translator_ctx", None) or {}).get("anthropic_unified_limit")
+        if isinstance(unified, dict) and unified.get("status") == "rejected" and not unified.get("is_using_overage"):
+            claim = str(unified.get("representative_claim") or "").strip().lower()
+            if claim in {
+                "five_hour",
+                "seven_day",
+                "seven_day_overage_included",
+                "seven_day_opus",
+                "seven_day_sonnet",
+            }:
+                return {
+                    "classification": "quota_exhausted",
+                    "code": claim,
+                    "message": message,
+                }
+
     low = " ".join((error_type, error_code, message.lower(), detail.lower()))
 
     matched = status == 402

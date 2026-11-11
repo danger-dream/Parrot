@@ -39,7 +39,7 @@ from fastapi.responses import Response
 
 from .. import (
     affinity, auth, config, errors, failover, fingerprint, json_bytes, local_web_tools,
-    log_db, model_mapping, model_validation, notifier, scheduler, translation,
+    log_db, model_mapping, model_validation, notifier, request_body, scheduler, translation,
 )
 from ..client_ip import get_client_ip
 from ..channel import registry
@@ -523,25 +523,39 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     # 1. auth
     key_name, allowed_models, err = auth.validate(request.headers)
     if err:
-        return errors.json_error_openai(401, errors.ErrTypeOpenAI.AUTH, err)
+        return errors.json_error_openai(
+            401, errors.ErrTypeOpenAI.AUTH, err, headers=errors.NO_RETRY_HEADERS,
+        )
 
     # 2. body
-    raw = await request.body()
+    try:
+        raw = await request_body.read_decoded_request_body(request)
+    except request_body.RequestBodyDecodeError as exc:
+        return errors.json_error_openai(
+            exc.status,
+            errors.ErrTypeOpenAI.INVALID_REQUEST,
+            exc.message,
+            code=exc.code,
+            headers=errors.NO_RETRY_HEADERS,
+        )
     try:
         body = json_bytes.loads_utf8(raw) if raw else {}
     except Exception as exc:
         return errors.json_error_openai(
             400, errors.ErrTypeOpenAI.INVALID_REQUEST, f"invalid json: {exc}",
+            headers=errors.NO_RETRY_HEADERS,
         )
     if not isinstance(body, dict):
         return errors.json_error_openai(
             400, errors.ErrTypeOpenAI.INVALID_REQUEST, "request body must be a JSON object",
+            headers=errors.NO_RETRY_HEADERS,
         )
     try:
         body["model"] = model_validation.require_explicit_model(body)
     except model_validation.ExplicitModelError as exc:
         return errors.json_error_openai(
             400, errors.ErrTypeOpenAI.INVALID_REQUEST, exc.message, param=exc.param,
+            headers=errors.NO_RETRY_HEADERS,
         )
     if ingress_protocol == "chat":
         from ..providers.workbuddy_replay import capture_chat_fields
@@ -579,12 +593,14 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     if not model:
         return errors.json_error_openai(
             400, errors.ErrTypeOpenAI.INVALID_REQUEST, "model is required",
+            headers=errors.NO_RETRY_HEADERS,
         )
     if allowed_models and not model_registry_runtime.permits(allowed_models, model):
         return errors.json_error_openai(
             403, errors.ErrTypeOpenAI.PERMISSION,
             f"model '{model}' is not allowed for this API key "
             f"(allowed: {', '.join(allowed_models) or 'none'})",
+            headers=errors.NO_RETRY_HEADERS,
         )
 
     # 4. CapabilityGuard
@@ -594,7 +610,10 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         else:
             guard_responses_ingress(body, store_enabled=_store_enabled())
     except GuardError as ge:
-        return errors.json_error_openai(ge.status, ge.err_type, ge.message, param=ge.param)
+        return errors.json_error_openai(
+            ge.status, ge.err_type, ge.message, param=ge.param,
+            headers=errors.NO_RETRY_HEADERS if errors.is_non_retryable_http_status(ge.status) else None,
+        )
 
     from .. import search_tool_policy
     body.pop(search_tool_policy.ROUND_KEY, None)
@@ -602,7 +621,10 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     try:
         search_tool_policy.validate(body)
     except GuardError as ge:
-        return errors.json_error_openai(ge.status, ge.err_type, ge.message, param=ge.param)
+        return errors.json_error_openai(
+            ge.status, ge.err_type, ge.message, param=ge.param,
+            headers=errors.NO_RETRY_HEADERS if errors.is_non_retryable_http_status(ge.status) else None,
+        )
 
     body = search_tool_policy.restore_replay(body, ingress_protocol, key_name)
 
@@ -701,7 +723,8 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
                 total_ms=int((time.monotonic() - start_monotonic) * 1000),
             )
             return errors.json_error_openai(
-                400, errors.ErrTypeOpenAI.INVALID_REQUEST, msg
+                400, errors.ErrTypeOpenAI.INVALID_REQUEST, msg,
+                headers=errors.NO_RETRY_HEADERS,
             )
 
         msg = f"No available upstream channels for model: {model} (ingress={ingress_protocol})"
@@ -723,7 +746,10 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         # 节流告警
         ek = notifier.escape_html
         notifications.routing_unavailable(ingress=ingress_protocol, model=model, exclusions=result.exclusions, api_key_name=key_name, request_id="" if skip_log else request_id)
-        return errors.json_error_openai(status, err_type, msg)
+        return errors.json_error_openai(
+            status, err_type, msg,
+            headers=errors.NO_RETRY_HEADERS if errors.is_non_retryable_http_status(status) else None,
+        )
 
     ts = time.strftime("%H:%M:%S", time.localtime(start_time))
     _first_list = result.candidates or result.saturated

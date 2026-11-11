@@ -391,10 +391,23 @@ class OAuthAccountCardMixin:
                          expires_at=_time(account.get("subscription_expires_at")),
                          credits=self._openai_credit_facts(row))
         elif provider == "claude":
+            cedar = raw.get("cedar_ember") if isinstance(raw.get("cedar_ember"), dict) else None
+            resets = None
+            if cedar is not None:
+                if cedar.get("eligible") is True:
+                    resets = sum(
+                        g.get("resets_left", 0)
+                        for g in (cedar.get("grants") or [])
+                        if isinstance(g, dict) and not g.get("paused")
+                        and type(g.get("resets_left")) is int and g.get("resets_left") > 0
+                    )
+                else:
+                    resets = 0
             facts.update(label=self.backend.claude_plan_label(account) or None,
                          status=account.get("subscription_status") or None,
                          billing_type=account.get("billing_type") or None,
-                         started_at=_time(account.get("subscription_created_at")))
+                         started_at=_time(account.get("subscription_created_at")),
+                         reset_credit_count=resets)
         elif provider == "xai":
             xai = raw.get("xai") if isinstance(raw.get("xai"), dict) else {}
             labels = []

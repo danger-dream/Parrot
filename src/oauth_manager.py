@@ -73,7 +73,15 @@ from .openai.codex_constants import (
     codex_workspace_routing_patch,
     current_codex_protocol_profile,
 )
-from .transform.cc_mimicry import CC_VERSION, CLI_USER_AGENT
+from .transform.cc_mimicry import (
+    AXIOS_USER_AGENT,
+    CC_VERSION,
+    CLAUDE_CODE_USER_AGENT,
+    FIRST_PARTY_ACCEPT,
+    FIRST_PARTY_ACCEPT_ENCODING,
+    OAUTH_BETA,
+    first_party_oauth_headers,
+)
 
 
 # ─── 常量 ────────────────────────────────────────────────────────
@@ -876,7 +884,12 @@ def _post_refresh_candidate(url: str, refresh_token: str, *, scope: str | None,
     resp = network.post_sync(
         url,
         json=body,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Accept": FIRST_PARTY_ACCEPT,
+            "Content-Type": "application/json",
+            "User-Agent": AXIOS_USER_AGENT,
+            "Accept-Encoding": FIRST_PARTY_ACCEPT_ENCODING,
+        },
         timeout=30,
         proxy_purpose="oauth_anthropic",
         proxy_channel=proxy_channel,
@@ -1341,12 +1354,14 @@ def _profile_sync(access_token: str, *, account_key: str = "") -> dict:
     resp = network.get_sync(
         OAUTH_PROFILE_URL,
         headers={
+            "Accept": FIRST_PARTY_ACCEPT,
+            "User-Agent": CLAUDE_CODE_USER_AGENT,
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
             "Cache-Control": "no-cache",
-            "User-Agent": CLI_USER_AGENT,
+            "Accept-Encoding": FIRST_PARTY_ACCEPT_ENCODING,
         },
-        timeout=15,
+        timeout=10,
         proxy_purpose="oauth_anthropic",
         proxy_channel=f"oauth:{account_key}" if account_key else "",
     )
@@ -1360,13 +1375,7 @@ def _usage_sync(access_token: str, *, account_key: str = "") -> dict:
         return _mock_usage()
     resp = network.get_sync(
         OAUTH_USAGE_URL,
-        headers={
-            "Accept": "application/json, text/plain, */*",
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {access_token}",
-            "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": CLI_USER_AGENT,
-        },
+        headers=first_party_oauth_headers(access_token),
         timeout=30,
         proxy_purpose="oauth_anthropic",
         proxy_channel=f"oauth:{account_key}" if account_key else "",
@@ -1474,10 +1483,12 @@ def _bootstrap_sync(access_token: str) -> dict:
     resp = network.get_sync(
         OAUTH_BOOTSTRAP_URL,
         headers={
-            "Authorization": f"Bearer {access_token}",
+            "Accept": FIRST_PARTY_ACCEPT,
             "Content-Type": "application/json",
-            "User-Agent": f"claude-code/{CC_VERSION}",
-            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": CLAUDE_CODE_USER_AGENT,
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-beta": OAUTH_BETA,
+            "Accept-Encoding": FIRST_PARTY_ACCEPT_ENCODING,
         },
         timeout=15,
         proxy_purpose="oauth_anthropic",
@@ -1965,7 +1976,9 @@ def preserve_antigravity_cached_summary(account_key: str, usage: dict) -> dict:
 
 
 def _normalize_quota_model_label(value: str) -> str:
-    return " ".join(str(value or "").lower().replace("_", " ").replace("-", " ").split())
+    return " ".join(
+        str(value or "").lower().replace("_", " ").replace("-", " ").replace(".", " ").split()
+    )
 
 
 def _is_fable_model_label(value: str) -> bool:
@@ -1994,12 +2007,16 @@ def _fable_scoped_candidates(
         if not isinstance(item, dict):
             continue
         kind = str(item.get("kind") or "")
-        if kind not in {"weekly_scoped", "seven_day_scoped"}:
-            continue
-        scope = item.get("scope") if isinstance(item.get("scope"), dict) else {}
-        model = scope.get("model") if isinstance(scope.get("model"), dict) else {}
-        name = str(model.get("display_name") or model.get("id") or "")
-        if not _is_fable_model_label(name):
+        if kind == "seven_day_overage_included":
+            matched = True
+        elif kind in {"weekly_scoped", "seven_day_scoped"}:
+            scope = item.get("scope") if isinstance(item.get("scope"), dict) else {}
+            model = scope.get("model") if isinstance(scope.get("model"), dict) else {}
+            name = str(model.get("display_name") or model.get("id") or "")
+            matched = _is_fable_model_label(name)
+        else:
+            matched = False
+        if not matched:
             continue
         saw_scoped_fable = True
         if item.get("is_active") is False and not include_inactive:
@@ -2043,9 +2060,9 @@ def fable_usage_block(usage: dict | None) -> dict:
     Explicitly inactive entries are historical and must not drive routing or
     model cooldown.  If more than one viable entry is returned, prefer an
     explicitly active entry, then the latest reset, then the highest
-    utilization.  Older or mock payloads may still expose ``seven_day_fable``
-    as a fallback.  Telegram display uses ``fable_display_block`` so a lone
-    inactive scoped window can still be shown.
+    utilization.  Older or CC 321 payloads may expose ``seven_day_fable`` or
+    ``seven_day_overage_included`` as a fallback.  Telegram display uses
+    ``fable_display_block`` so a lone inactive scoped window can still be shown.
     """
     data = usage if isinstance(usage, dict) else {}
     saw_scoped_fable, candidates = _fable_scoped_candidates(
@@ -2056,13 +2073,14 @@ def fable_usage_block(usage: dict | None) -> dict:
     if saw_scoped_fable:
         return {}
 
-    direct = data.get("seven_day_fable")
-    if (
-        isinstance(direct, dict)
-        and direct.get("is_active") is not False
-        and direct.get("utilization") is not None
-    ):
-        return direct
+    for key in ("seven_day_fable", "seven_day_overage_included"):
+        direct = data.get(key)
+        if (
+            isinstance(direct, dict)
+            and direct.get("is_active") is not False
+            and direct.get("utilization") is not None
+        ):
+            return direct
     return {}
 
 
@@ -2081,9 +2099,10 @@ def fable_display_block(usage: dict | None) -> dict:
     _saw, inactive = _fable_scoped_candidates(data, include_inactive=True)
     if inactive:
         return _pick_fable_candidate(inactive)
-    direct = data.get("seven_day_fable")
-    if isinstance(direct, dict) and direct.get("utilization") is not None:
-        return direct
+    for key in ("seven_day_fable", "seven_day_overage_included"):
+        direct = data.get(key)
+        if isinstance(direct, dict) and direct.get("utilization") is not None:
+            return direct
     return {}
 
 
@@ -6896,7 +6915,7 @@ def exchange_code(code: str, code_verifier: str, state: str) -> dict:
             "code_verifier": code_verifier,
             "state": state,
         },
-        headers={"Content-Type": "application/json", "User-Agent": CLI_USER_AGENT},
+        headers={"Content-Type": "application/json", "User-Agent": INTERACTIVE_CLI_USER_AGENT},
         timeout=15,
         proxy_purpose="oauth_anthropic",
     )

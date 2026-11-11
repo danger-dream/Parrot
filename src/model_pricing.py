@@ -47,6 +47,194 @@ _PROVIDER_ALIASES = {
     "vertex_ai": "google-vertex",
     "bedrock": "amazon-bedrock",
 }
+_ANTHROPIC_DOT_MODEL_ALIASES: Mapping[str, str] = {
+    "claude-fable-5.2": "claude-fable-5-2",
+    "claude-fable-5.1": "claude-fable-5-1",
+    "claude-haiku-5.5": "claude-haiku-5-5",
+    "claude-opus-5.5": "claude-opus-5-5",
+    "claude-sonnet-5.5": "claude-sonnet-5-5",
+    "claude-opus-4.8": "claude-opus-4-8",
+    "claude-opus-4.7": "claude-opus-4-7",
+    "claude-opus-4.6": "claude-opus-4-6",
+    "claude-sonnet-4.6": "claude-sonnet-4-6",
+    "claude-sonnet-4.5": "claude-sonnet-4-5",
+    "claude-haiku-4.5": "claude-haiku-4-5",
+    "claude-opus-4.5": "claude-opus-4-5",
+    "claude-opus-4.1": "claude-opus-4-1",
+}
+_GEN5_EFFORT_OPTIONS = [
+    {"type": "effort", "values": ["low", "medium", "high", "xhigh", "max"]},
+]
+_ANTHROPIC_MODALITIES = {
+    "input": ["text", "image", "pdf"],
+    "output": ["text"],
+}
+# Verified official Anthropic models from CC v2.1.321 static catalog (SOo) +
+# live model-catalog v4494. Applied ONLY when the loaded models.dev bundle has
+# an "anthropic" provider and has not yet published that exact model ID.
+# Internal/unreleased models (e.g. mythos) are deliberately excluded so they
+# never leak into catalog_models() or /v1/models.
+_SUPPLEMENTAL_ANTHROPIC_MODELS: Mapping[str, Mapping[str, Any]] = {
+    "claude-fable-5-2": {
+        "id": "claude-fable-5-2",
+        "name": "Claude Fable 5.2",
+        "description": "Claude Fable 5.2 model for creative writing, analysis, and agent workflows",
+        "family": "claude-fable",
+        "attachment": True,
+        "reasoning": True,
+        "reasoning_options": _GEN5_EFFORT_OPTIONS,
+        "tool_call": True,
+        "structured_output": True,
+        "temperature": False,
+        "knowledge": "2026-06",
+        "modalities": _ANTHROPIC_MODALITIES,
+        "open_weights": False,
+        "limit": {"context": 1_000_000, "output": 128_000},
+        "cost": {"input": 8, "output": 40, "cache_write": 10, "cache_read": 0.2},
+    },
+    "claude-fable-5-1": {
+        "id": "claude-fable-5-1",
+        "name": "Claude Fable 5.1",
+        "description": "Claude Fable 5.1 model for creative writing, analysis, and agent workflows",
+        "family": "claude-fable",
+        "attachment": True,
+        "reasoning": True,
+        "reasoning_options": _GEN5_EFFORT_OPTIONS,
+        "tool_call": True,
+        "structured_output": True,
+        "temperature": False,
+        "knowledge": "2026-06",
+        "modalities": _ANTHROPIC_MODALITIES,
+        "open_weights": False,
+        "limit": {"context": 1_000_000, "output": 128_000},
+        "cost": {"input": 10, "output": 50, "cache_write": 12.5, "cache_read": 0.25},
+    },
+    "claude-opus-5-5": {
+        "id": "claude-opus-5-5",
+        "name": "Claude Opus 5.5",
+        "description": "Claude Opus 5.5 model for complex coding, agents, and professional work",
+        "family": "claude-opus",
+        "attachment": True,
+        "reasoning": True,
+        "reasoning_options": _GEN5_EFFORT_OPTIONS,
+        "tool_call": True,
+        "structured_output": True,
+        "temperature": False,
+        "knowledge": "2026-06",
+        "modalities": _ANTHROPIC_MODALITIES,
+        "open_weights": False,
+        "limit": {"context": 1_000_000, "output": 128_000},
+        "cost": {"input": 4, "output": 20, "cache_write": 5, "cache_read": 0.2},
+    },
+    "claude-sonnet-5-5": {
+        "id": "claude-sonnet-5-5",
+        "name": "Claude Sonnet 5.5",
+        "description": "Claude Sonnet 5.5 model for everyday coding, planning, and agent work",
+        "family": "claude-sonnet",
+        "attachment": True,
+        "reasoning": True,
+        "reasoning_options": _GEN5_EFFORT_OPTIONS,
+        "tool_call": True,
+        "structured_output": True,
+        "temperature": False,
+        "knowledge": "2026-06",
+        "modalities": _ANTHROPIC_MODALITIES,
+        "open_weights": False,
+        "limit": {"context": 1_000_000, "output": 128_000},
+        "cost": {"input": 2, "output": 10, "cache_write": 2.5, "cache_read": 0.1},
+    },
+    "claude-haiku-5-5": {
+        "id": "claude-haiku-5-5",
+        "name": "Claude Haiku 5.5",
+        "description": "Claude Haiku 5.5 fast model with 1M context and >100k long-prompt pricing tier",
+        "family": "claude-haiku",
+        "attachment": True,
+        "reasoning": True,
+        "reasoning_options": _GEN5_EFFORT_OPTIONS,
+        "tool_call": True,
+        "structured_output": True,
+        "temperature": False,
+        "knowledge": "2026-06",
+        "modalities": _ANTHROPIC_MODALITIES,
+        "open_weights": False,
+        "limit": {"context": 1_000_000, "output": 128_000},
+        "cost": {
+            "input": 0.1,
+            "output": 0.5,
+            "cache_write": 0.125,
+            "cache_read": 0.01,
+            "tiers": [
+                {
+                    "tier": {"type": "context", "size": 100_000},
+                    "input": 0.5,
+                    "output": 2.5,
+                    "cache_write": 0.625,
+                    "cache_read": 0.05,
+                }
+            ],
+        },
+    },
+}
+
+
+def canonical_anthropic_model_id(model: Any) -> str | None:
+    """Return canonical dash-form ID only for known official Anthropic dot aliases."""
+    normalized = str(model or "").strip().lower()
+    if not normalized:
+        return None
+    return _ANTHROPIC_DOT_MODEL_ALIASES.get(normalized)
+
+
+def _supplement_official_catalog_payloads(
+    api_payload: Any,
+    models_payload: Any,
+) -> tuple[Any, Any]:
+    """Fill confirmed official Anthropic entries missing from a models.dev bundle.
+
+    Never overwrites a model already present in models.dev, and does nothing on
+    synthetic test payloads that do not include an ``anthropic`` provider.
+    """
+    if not isinstance(api_payload, Mapping) or not isinstance(models_payload, Mapping):
+        return api_payload, models_payload
+    anth_raw = api_payload.get("anthropic")
+    if not isinstance(anth_raw, Mapping):
+        return api_payload, models_payload
+    anth_models = anth_raw.get("models")
+    if not isinstance(anth_models, Mapping):
+        return api_payload, models_payload
+
+    missing_api = {
+        model_id: copy.deepcopy(dict(record))
+        for model_id, record in _SUPPLEMENTAL_ANTHROPIC_MODELS.items()
+        if model_id not in anth_models
+    }
+    missing_canonical: dict[str, dict[str, Any]] = {}
+    for model_id, record in _SUPPLEMENTAL_ANTHROPIC_MODELS.items():
+        canonical_key = f"anthropic/{model_id}"
+        if canonical_key not in models_payload and (
+            model_id in anth_models or model_id in missing_api
+        ):
+            canonical_doc = copy.deepcopy(dict(record))
+            canonical_doc["id"] = canonical_key
+            canonical_doc.pop("cost", None)
+            canonical_doc.pop("reasoning_options", None)
+            canonical_doc.pop("structured_output", None)
+            missing_canonical[canonical_key] = canonical_doc
+
+    if not missing_api and not missing_canonical:
+        return api_payload, models_payload
+
+    next_api = dict(api_payload)
+    if missing_api:
+        next_anth = dict(anth_raw)
+        merged_models = dict(anth_models)
+        merged_models.update(missing_api)
+        next_anth["models"] = merged_models
+        next_api["anthropic"] = next_anth
+    next_models = dict(models_payload)
+    if missing_canonical:
+        next_models.update(missing_canonical)
+    return next_api, next_models
 _STANDARD_SERVICE_TIERS = {"default", "standard", "auto"}
 _PRIORITY_SERVICE_TIERS = {"priority", "fast"}
 
@@ -666,7 +854,10 @@ def initialize() -> None:
         last_error: Exception | None = None
         for path, source in candidates:
             try:
-                api_payload, models_payload = _catalog_payload_parts(_load_json(path))
+                raw_api, raw_models = _catalog_payload_parts(_load_json(path))
+                api_payload, models_payload = _supplement_official_catalog_payloads(
+                    raw_api, raw_models
+                )
                 parsed, aliases, providers = _parse_models_dev_catalog(
                     api_payload, models_payload
                 )
@@ -703,7 +894,10 @@ def reload_local_catalog() -> bool:
     global _initialized, _catalog_source, _catalog_revision
     cache_path = os.path.join(config.DATA_DIR, _CACHE_FILENAME)
     try:
-        api_payload, models_payload = _catalog_payload_parts(_load_json(cache_path))
+        raw_api, raw_models = _catalog_payload_parts(_load_json(cache_path))
+        api_payload, models_payload = _supplement_official_catalog_payloads(
+            raw_api, raw_models
+        )
         parsed, aliases, providers = _parse_models_dev_catalog(
             api_payload, models_payload
         )
@@ -943,7 +1137,17 @@ def _canonical_official_from(index: Mapping[str, str], name: str) -> str | None:
             return exact
         base = index.get(f"google/{BASE}")
         return base if base == f"google/{BASE}" else None
-    return index.get(name)
+    direct = index.get(name)
+    if direct is not None:
+        return direct
+    lookup = name[len("anthropic/"):] if name.startswith("anthropic/") else (
+        name[len("claude/"):] if name.startswith("claude/") else name
+    )
+    dash_id = _ANTHROPIC_DOT_MODEL_ALIASES.get(lookup)
+    if dash_id:
+        target = f"anthropic/{dash_id}"
+        return target if index.get(target) == target else None
+    return None
 
 
 def canonical_official_model(model: str) -> str | None:
@@ -1074,6 +1278,15 @@ def _model_candidates(model: str, aliases: Mapping[str, str]) -> list[str]:
         mapped_provider = _PROVIDER_ALIASES.get(provider)
         if mapped_provider:
             candidates.append(f"{mapped_provider}/{remainder}")
+        effective_provider = mapped_provider or provider
+        if effective_provider == "anthropic":
+            dash_id = _ANTHROPIC_DOT_MODEL_ALIASES.get(remainder)
+            if dash_id:
+                candidates.append(f"anthropic/{dash_id}")
+    else:
+        dash_id = _ANTHROPIC_DOT_MODEL_ALIASES.get(normalized)
+        if dash_id:
+            candidates.append(dash_id)
     # Never strip provider or dated-version segments. models.dev prices are
     # provider/model specific; a plausible fallback can silently select a
     # different upstream tariff. Custom variants require an explicit alias.
@@ -2340,15 +2553,20 @@ async def _download_catalog_bounded(client: Any, url: str, budget: int) -> bytes
 
 
 def _candidate_from_payloads(api_payload: Any, models_payload: Any) -> CatalogCandidate:
-    parsed_catalog, aliases, providers = _parse_models_dev_catalog(
+    if not isinstance(models_payload, Mapping) or len(models_payload) < 100:
+        raise ValueError("pricing catalog models payload unexpectedly small")
+    effective_api, effective_models = _supplement_official_catalog_payloads(
         api_payload, models_payload,
     )
-    metadata_models, provider_names, official_models = (
-        _parse_models_dev_metadata_indexes(api_payload, models_payload)
+    parsed_catalog, aliases, providers = _parse_models_dev_catalog(
+        effective_api, effective_models,
     )
-    if len(parsed_catalog) < 500 or not isinstance(models_payload, Mapping) or len(models_payload) < 100:
+    metadata_models, provider_names, official_models = (
+        _parse_models_dev_metadata_indexes(effective_api, effective_models)
+    )
+    if len(parsed_catalog) < 500:
         raise ValueError(f"pricing catalog unexpectedly small: {len(parsed_catalog)}")
-    revision = _catalog_revision_for_payloads(api_payload, models_payload)
+    revision = _catalog_revision_for_payloads(effective_api, effective_models)
     return CatalogCandidate(
         api_payload=copy.deepcopy(api_payload),
         models_payload=copy.deepcopy(models_payload),
@@ -2456,17 +2674,23 @@ async def refresh_once(*, force: bool = False, client: Any = None) -> bool:
     ]:
         api_payload = json.loads(raw_api)
         models_payload = json.loads(raw_models)
-        parsed_catalog, aliases, providers = _parse_models_dev_catalog(
+        raw_parsed_catalog, _, _ = _parse_models_dev_catalog(
             api_payload, models_payload
         )
-        metadata_models, provider_names, official_models = (
-            _parse_models_dev_metadata_indexes(api_payload, models_payload)
-        )
         # 防止上游异常页或被截断的小对象覆盖可用缓存。
-        if len(parsed_catalog) < 500 or len(models_payload) < 100:
+        if len(raw_parsed_catalog) < 500 or not isinstance(models_payload, Mapping) or len(models_payload) < 100:
             raise ValueError(
-                f"pricing catalog unexpectedly small: {len(parsed_catalog)}"
+                f"pricing catalog unexpectedly small: {len(raw_parsed_catalog)}"
             )
+        effective_api, effective_models = _supplement_official_catalog_payloads(
+            api_payload, models_payload
+        )
+        parsed_catalog, aliases, providers = _parse_models_dev_catalog(
+            effective_api, effective_models
+        )
+        metadata_models, provider_names, official_models = (
+            _parse_models_dev_metadata_indexes(effective_api, effective_models)
+        )
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(
             prefix=f".{os.path.basename(cache_path)}.",
@@ -2501,7 +2725,7 @@ async def refresh_once(*, force: bool = False, client: Any = None) -> bool:
                     os.unlink(tmp_path)
             except OSError:
                 pass
-        revision = _catalog_revision_for_payloads(api_payload, models_payload)
+        revision = _catalog_revision_for_payloads(effective_api, effective_models)
         return (
             parsed_catalog, aliases, providers, metadata_models,
             provider_names, official_models, revision,

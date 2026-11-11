@@ -181,7 +181,7 @@ def test_new_confirmed_cedar_grant_is_not_blocked_by_old_unknown(env, monkeypatc
 
 
 @pytest.mark.parametrize("age,result,reason", [
-    (30, "ineligible", "not_next_grant"),
+    (30, "ineligible", "unknown_grant"),
     (601, "unconfirmed", "pending_requires_reconciliation"),
 ])
 def test_cached_old_cedar_plan_cannot_silently_consume_new_grant(env, monkeypatch, age, result, reason):
@@ -282,3 +282,58 @@ def test_account_replacement_during_401_refresh_never_receives_retry(env, monkey
     monkeypatch.setattr(cr.network, "post_sync", post)
     execute(env)
     assert len(calls) == 1
+
+
+def test_pending_first_grant_allows_independent_non_next_fable_grant_and_keeps_same_grant_idempotency(env):
+    base = copy.deepcopy(env.usage["cedar_ember"]["grants"][0])
+    fable_card = {
+        **base,
+        "id": "g_fable",
+        "label": "Fable 返还卡",
+        "type": "weekly",
+        "gives_back_weekly": True,
+        "clears": ["seven_day_overage_included"],
+    }
+    env.usage["cedar_ember"]["grants"].append(fable_card)
+    env.usage["cedar_ember"]["next_grant_id"] = "g_one"
+
+    # g_one times out -> pending/unknown journal on g_one.
+    env.post_effect = lambda: (_ for _ in ()).throw(httpx.ReadTimeout("lost response"))
+    first = execute(env, grant_id="g_one")
+    assert first["result"] == "unconfirmed"
+    assert len(env.posts) == 1 and env.posts[0][1]["json"]["grant_id"] == "g_one"
+
+    # Retrying g_one within 600s reuses the exact same request_id.
+    second = execute(env, grant_id="g_one")
+    assert second["result"] == "unconfirmed"
+    assert env.posts[1][1]["json"]["request_id"] == first["request_id"]
+
+    # Explicitly redeeming g_fable (even while next_grant_id is still g_one) succeeds with a new request_id.
+    env.post_effect = None
+    third = execute(env, grant_id="g_fable")
+    assert third["result"] == "reset"
+    assert env.posts[2][1]["json"]["grant_id"] == "g_fable"
+    assert env.posts[2][1]["json"]["request_id"] != first["request_id"]
+
+
+@pytest.mark.parametrize("fable_after,expect_blocked", [(10.0, False), (98.0, True)])
+def test_fable_seven_day_overage_included_recovery_clears_only_confirmed_fable_cooldown(env, fable_after, expect_blocked):
+    reset_iso = "2030-01-07T00:00:00Z"
+    stamp_ms = int(datetime.fromisoformat(reset_iso.replace("Z", "+00:00")).timestamp() * 1000)
+    detail = 'HTTP 429: ' + json.dumps({"error": {"type": "rate_limit_error", "message": "Fable weekly limit"}})
+    cooldown.record_error(f"oauth:{env.key}", "claude-fable-5.1", detail, cooldown_until=stamp_ms)
+    cooldown.record_error(f"oauth:{env.key}", "claude-opus-5", detail, cooldown_until=stamp_ms)
+
+    prev_usage = copy.deepcopy(env.usage)
+    prev_usage["seven_day_overage_included"] = {"utilization": 100.0, "resets_at": reset_iso}
+    state_db.quota_save(env.key, om.flatten_usage(prev_usage))
+
+    env.usage["seven_day_overage_included"] = {"utilization": fable_after, "resets_at": reset_iso}
+    env.usage["cedar_ember"]["grants"][0].update(
+        type="weekly", gives_back_weekly=True, clears=["seven_day_overage_included"],
+    )
+    out = execute(env)
+    assert out["result"] == "reset"
+    assert cooldown.is_blocked(f"oauth:{env.key}", "claude-fable-5.1") is expect_blocked
+    # Account was not disabled_reason="quota", so non-Fable model cooldown must not be touched by Fable reset.
+    assert cooldown.is_blocked(f"oauth:{env.key}", "claude-opus-5") is True

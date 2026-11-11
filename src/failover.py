@@ -15,6 +15,7 @@ from src.notifications.events import Effect
 
 import asyncio
 import json
+import math
 import os
 import random
 import re
@@ -281,28 +282,67 @@ _anthropic_snapshot_inflight: set[str] = set()
 def _maybe_record_anthropic_snapshot(ch: Channel, resp: httpx.Response) -> None:
     # 延迟 import 避免循环依赖
     from .channel.oauth_channel import OAuthChannel
-    from .anthropic.rate_limit_headers import parse_rate_limit_headers
+    from .anthropic.rate_limit_headers import (
+        is_window_exceeded,
+        parse_rate_limit_headers,
+        parse_unified_limit_signal,
+    )
 
     if not isinstance(ch, OAuthChannel):
         return
     try:
-        patch = parse_rate_limit_headers(dict(resp.headers))
-        if not patch:
+        headers = dict(resp.headers)
+        patch = parse_rate_limit_headers(headers) or {}
+        unified = parse_unified_limit_signal(headers)
+        status_code = getattr(resp, "status_code", 200)
+
+        if (
+            status_code == 429
+            and unified is not None
+            and unified.get("status") == "rejected"
+            and not unified.get("is_using_overage")
+        ):
+            rep_claim = unified.get("representative_claim")
+            u_reset = unified.get("reset_iso")
+            if rep_claim == "five_hour":
+                patch.setdefault("five_hour_util", 100.0)
+                if u_reset:
+                    patch.setdefault("five_hour_reset", u_reset)
+            elif rep_claim == "seven_day":
+                patch.setdefault("seven_day_util", 100.0)
+                if u_reset:
+                    patch.setdefault("seven_day_reset", u_reset)
+            elif rep_claim == "seven_day_overage_included":
+                patch.setdefault("fable_util", 100.0)
+                if u_reset:
+                    patch.setdefault("fable_reset", u_reset)
+
+        if not patch and unified is None:
             return
         account_key = getattr(ch, "account_key", None) or ch.email
         email = ch.email
 
-        # Keep realtime disable independent from the best-effort quota cache.
+        # Keep realtime disable/model-cooldown independent from the best-effort quota cache.
         _maybe_auto_disable_by_headers(
-            account_key, ch.email, dict(resp.headers),
+            account_key, ch.email, headers,
             provider="claude",
+            http_status=status_code,
         )
 
+        if not patch:
+            return
+
+        urgent = (
+            status_code == 429
+            or is_window_exceeded(headers, "5h")
+            or is_window_exceeded(headers, "7d")
+            or is_window_exceeded(headers, "7d_oi")
+        )
         now = time.time()
         with _anthropic_snapshot_lock:
             last = _anthropic_snapshot_last.get(account_key, 0.0)
             if (
-                now - last < _ANTHROPIC_SNAPSHOT_WRITE_INTERVAL_S
+                (not urgent and now - last < _ANTHROPIC_SNAPSHOT_WRITE_INTERVAL_S)
                 or account_key in _anthropic_snapshot_inflight
             ):
                 return
@@ -363,30 +403,147 @@ def _get_quota_disable_threshold_pct() -> float:
         return 95.0
 
 
+def _cool_claude_fable_models(
+    account_key: str,
+    acc: dict | None,
+    headers: dict | None,
+    *,
+    unified: dict | None = None,
+    resolved_model: str | None = None,
+    fallback_until_ms: int | None = None,
+    allow_fallback_pause: bool = False,
+) -> bool:
+    """Cool only Fable models on one Claude OAuth account without penalizing account health."""
+    from datetime import datetime, timezone
+    from .anthropic.rate_limit_headers import (
+        H_7D_OI_RESET,
+        _get_ci,
+        _parse_reset_epoch_s,
+        _parse_reset_iso,
+        parse_rate_limit_headers,
+    )
+
+    hdrs = headers or {}
+    reset_epoch_s = _parse_reset_epoch_s(_get_ci(hdrs, H_7D_OI_RESET))
+    reset_iso = _parse_reset_iso(_get_ci(hdrs, H_7D_OI_RESET))
+    if reset_epoch_s is None and isinstance(unified, dict) and unified.get("reset_epoch_s") is not None:
+        reset_epoch_s = int(unified["reset_epoch_s"])
+        reset_iso = unified.get("reset_iso") or reset_iso
+
+    now_ms_val = int(time.time() * 1000)
+    reset_ms = (
+        reset_epoch_s * 1000
+        if reset_epoch_s is not None and reset_epoch_s * 1000 > now_ms_val
+        else None
+    )
+    if reset_ms is None and fallback_until_ms is not None and int(fallback_until_ms) > now_ms_val:
+        reset_ms = int(fallback_until_ms)
+    if reset_ms is None and allow_fallback_pause:
+        reset_ms = quota_errors.finite_pause_until_ms(now_ms=now_ms_val)
+    if reset_ms is None:
+        return False
+
+    if not reset_iso:
+        reset_iso = datetime.fromtimestamp(reset_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    patch = parse_rate_limit_headers(hdrs) or {}
+    utilization = patch.get("fable_util") if patch.get("fable_util") is not None else 100.0
+
+    models = set(oauth_manager.claude_fable_models(acc or {}))
+    if resolved_model and oauth_manager._is_fable_model_label(resolved_model):
+        models.add(resolved_model)
+    elif not models and resolved_model:
+        models.add(resolved_model)
+    if not models:
+        return False
+
+    message = json.dumps({
+        "error": {
+            "code": "claude_fable_quota",
+            "message": "Claude Fable scoped quota reached configured threshold",
+            "scope": "fable",
+            "utilization": utilization,
+            "resets_at": reset_iso,
+        }
+    }, ensure_ascii=False, separators=(",", ":"))
+    channel_key = f"oauth:{account_key}"
+    cooled_new: list[str] = []
+    for model_name in sorted(models):
+        was_blocked = cooldown.is_blocked(channel_key, model_name)
+        cooldown.record_quota_pause(channel_key, model_name, message, cooldown_until=reset_ms)
+        if not was_blocked:
+            cooled_new.append(model_name)
+    if cooled_new:
+        try:
+            reporting.model_quota(
+                account_key,
+                pool="fable",
+                models=cooled_new,
+                used=utilization,
+                threshold=100.0,
+                reset_at=reset_iso,
+            )
+        except Exception:
+            pass
+    return True
+
+
 def _maybe_auto_disable_by_headers(account_key: str, email: str,
-                                   headers: dict, *, provider: str) -> None:
-    """Anthropic 路径：用 is_window_exceeded 判断 + set_disabled_by_quota 触发。"""
+                                   headers: dict, *, provider: str,
+                                   http_status: int | None = None) -> None:
+    """Anthropic 路径：5h/7d 超限整号禁用；仅 7d_oi(Fable) 超限时只冷却 Fable 模型。"""
     from . import oauth_manager
     from .anthropic.rate_limit_headers import (
-        is_window_exceeded, _parse_reset_iso, H_5H_RESET, H_7D_RESET,
+        H_5H_RESET,
+        H_7D_RESET,
+        _get_ci,
+        _parse_reset_iso,
+        is_window_exceeded,
+        parse_unified_limit_signal,
     )
 
     acc = oauth_manager.get_account(account_key)
     if acc is None:
         return
+
+    unified = parse_unified_limit_signal(headers)
+    is_429 = (http_status == 429)
+    if unified is not None and unified.get("is_using_overage") and not is_429:
+        return
+
+    unified_rejected = bool(unified and unified.get("status") == "rejected")
+    rep_claim = unified.get("representative_claim") if unified else None
+
+    hit_5h = is_window_exceeded(headers, "5h") or (unified_rejected and rep_claim == "five_hour")
+    hit_7d = is_window_exceeded(headers, "7d") or (unified_rejected and rep_claim == "seven_day")
+    if not (hit_5h or hit_7d):
+        hit_7d_oi = is_window_exceeded(headers, "7d_oi") or (
+            unified_rejected and rep_claim == "seven_day_overage_included"
+        )
+        if hit_7d_oi:
+            _cool_claude_fable_models(
+                account_key,
+                acc,
+                headers,
+                unified=unified,
+                allow_fallback_pause=is_429,
+            )
+        return
+
     # 已被禁用 → 不动（避免重复通知 / 覆盖已有 disabled_until）
     if acc.get("disabled_reason"):
         return
 
-    hit_5h = is_window_exceeded(headers, "5h")
-    hit_7d = is_window_exceeded(headers, "7d")
-    if not (hit_5h or hit_7d):
-        return
-
     # 撞哪个窗口锁哪个窗口：只在撞到的窗口里取 reset；两个都撞则取 max。
     # 不会出现「只 5h 撞了却用 7d reset 锁 7 天」的不合理情况。
-    reset_5h = _parse_reset_iso(headers.get(H_5H_RESET)) if hit_5h else None
-    reset_7d = _parse_reset_iso(headers.get(H_7D_RESET)) if hit_7d else None
+    reset_5h = (
+        _parse_reset_iso(_get_ci(headers, H_5H_RESET))
+        or (unified.get("reset_iso") if unified and rep_claim in (None, "five_hour") else None)
+    ) if hit_5h else None
+    reset_7d = (
+        _parse_reset_iso(_get_ci(headers, H_7D_RESET))
+        or (unified.get("reset_iso") if unified and rep_claim in (None, "seven_day") else None)
+    ) if hit_7d else None
     latest = reset_5h
     if reset_7d and (latest is None or reset_7d > latest):
         latest = reset_7d
@@ -685,9 +842,10 @@ def _json_error_for_ingress(
     *,
     code: Optional[str] = None,
     details: Optional[dict] = None,
+    headers: Optional[dict[str, str]] = None,
 ):
     return json_error_for_ingress(
-        ingress, status, anth_err_type, message, code=code, details=details,
+        ingress, status, anth_err_type, message, code=code, details=details, headers=headers,
     )
 
 
@@ -1492,6 +1650,140 @@ def _err_type_from_outcome(outcome: str, http_status: Optional[int]) -> str:
     return protocol_errors.classify_attempt_outcome(outcome, http_status).anthropic_error_type
 
 
+def _apply_claude_oauth_429_policy(
+    ch: Channel,
+    resolved_model: str,
+    result: AttemptResult,
+    *,
+    quota_exhaustion: dict | None = None,
+) -> bool:
+    """Isolate Claude OAuth 5h/7d account exhaustion vs Fable/7d_oi/scoped model quota."""
+    from datetime import datetime, timezone
+    from .channel.oauth_channel import OAuthChannel
+    from .anthropic.rate_limit_headers import (
+        is_window_exceeded,
+        parse_unified_limit_signal,
+    )
+
+    if not isinstance(ch, OAuthChannel) or result.http_status != 429:
+        return False
+    if getattr(result, "_claude_oauth_429_applied", False):
+        return True
+
+    ctx = result.translator_ctx or {}
+    headers = ctx.get("anthropic_ratelimit_headers") or {}
+    unified = ctx.get("anthropic_unified_limit") or parse_unified_limit_signal(headers)
+    account_key = getattr(ch, "account_key", None) or ch.email
+    acc = oauth_manager.get_account(account_key) or {}
+
+    unified_rejected = bool(unified and unified.get("status") == "rejected")
+    rep_claim = unified.get("representative_claim") if isinstance(unified, dict) else None
+
+    hit_5h = is_window_exceeded(headers, "5h") or (unified_rejected and rep_claim == "five_hour")
+    hit_7d = is_window_exceeded(headers, "7d") or (unified_rejected and rep_claim == "seven_day")
+    if hit_5h or hit_7d:
+        result._claude_oauth_429_applied = True
+        with oauth_manager.account_generation_guard(getattr(ch, "state_key", None)) as current:
+            if current:
+                _maybe_auto_disable_by_headers(
+                    account_key,
+                    ch.email,
+                    headers,
+                    provider="claude",
+                    http_status=429,
+                )
+        return True
+
+    detail_low = f"{result.full_response_text or ''} {result.error_detail or ''}".lower()
+    is_fable_req = oauth_manager._is_fable_model_label(resolved_model)
+    hit_7d_oi = is_window_exceeded(headers, "7d_oi") or rep_claim == "seven_day_overage_included"
+    fable_credit_wall = is_fable_req and (
+        quota_exhaustion is not None
+        or any(
+            marker in detail_low
+            for marker in (
+                "usage credits are required",
+                "extra usage",
+                "fable limit",
+                "fable quota",
+                "overage",
+            )
+        )
+        or bool(isinstance(unified, dict) and unified.get("overage_disabled_reason"))
+    )
+    if hit_7d_oi or fable_credit_wall:
+        result._claude_oauth_429_applied = True
+        with oauth_manager.account_generation_guard(getattr(ch, "state_key", None)) as current:
+            if current:
+                _cool_claude_fable_models(
+                    account_key,
+                    acc,
+                    headers,
+                    unified=unified,
+                    resolved_model=resolved_model,
+                    fallback_until_ms=result.cooldown_until,
+                    allow_fallback_pause=True,
+                )
+        return True
+
+    if rep_claim in {"seven_day_opus", "seven_day_sonnet"}:
+        result._claude_oauth_429_applied = True
+        now_ms_val = int(time.time() * 1000)
+        reset_epoch_s = unified.get("reset_epoch_s") if isinstance(unified, dict) else None
+        reset_ms = (
+            int(reset_epoch_s) * 1000
+            if reset_epoch_s is not None and int(reset_epoch_s) * 1000 > now_ms_val
+            else (
+                int(result.cooldown_until)
+                if result.cooldown_until is not None and int(result.cooldown_until) > now_ms_val
+                else quota_errors.finite_pause_until_ms(now_ms=now_ms_val)
+            )
+        )
+        reset_iso = (
+            (unified.get("reset_iso") if isinstance(unified, dict) else None)
+            or datetime.fromtimestamp(reset_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        )
+        family_tok = "opus" if rep_claim == "seven_day_opus" else "sonnet"
+        scoped_models = {
+            m.strip()
+            for m in (acc.get("models") or [])
+            if isinstance(m, str) and m.strip() and family_tok in m.lower()
+        }
+        if resolved_model:
+            scoped_models.add(resolved_model)
+        msg = json.dumps({
+            "error": {
+                "code": f"claude_{family_tok}_quota",
+                "message": f"Claude {family_tok.title()} scoped weekly quota exhausted",
+                "scope": family_tok,
+                "resets_at": reset_iso,
+            }
+        }, ensure_ascii=False, separators=(",", ":"))
+        with oauth_manager.account_generation_guard(getattr(ch, "state_key", None)) as current:
+            if current:
+                for model_name in sorted(scoped_models):
+                    cooldown.record_quota_pause(
+                        channel_state.effect_key(ch),
+                        model_name,
+                        msg,
+                        cooldown_until=reset_ms,
+                    )
+        return True
+
+    return False
+
+
+def _is_anthropic_protocol_channel(channel: Channel | None) -> bool:
+    if channel is None:
+        return False
+    from .channel.oauth_channel import OAuthChannel
+    if isinstance(channel, OAuthChannel):
+        return True
+    if str(getattr(channel, "protocol", "") or "").strip().lower() == "anthropic":
+        return True
+    return str(getattr(channel, "provider", "") or "").strip().lower() in {"claude", "anthropic"}
+
+
 def _attach_retry_after_from_response(
     result: AttemptResult,
     response: httpx.Response | None,
@@ -1500,6 +1792,29 @@ def _attach_retry_after_from_response(
     if isinstance(channel, OpenAIOAuthChannel) or getattr(channel, "provider", "") == "openai":
         return capture_error_advice(result, headers=getattr(response, "headers", None),
                                     codex=isinstance(channel, OpenAIOAuthChannel))
+    if response is not None and _is_anthropic_protocol_channel(channel):
+        from .anthropic.rate_limit_headers import _get_ci, parse_unified_limit_signal
+        try:
+            resp_headers = dict(response.headers)
+        except Exception:
+            resp_headers = {}
+        rl_headers = {
+            str(k).lower(): v
+            for k, v in resp_headers.items()
+            if str(k).lower().startswith("anthropic-ratelimit-")
+        }
+        unified = parse_unified_limit_signal(resp_headers)
+        if rl_headers or unified is not None:
+            ctx = dict(result.translator_ctx or {})
+            if rl_headers:
+                ctx["anthropic_ratelimit_headers"] = rl_headers
+            if unified is not None:
+                ctx["anthropic_unified_limit"] = unified
+            result.translator_ctx = ctx
+    else:
+        resp_headers = None
+        unified = None
+
     if result.retry_after_seconds is None and response is not None:
         try:
             raw = response.headers.get("Retry-After")
@@ -1510,6 +1825,32 @@ def _attach_retry_after_from_response(
             result.retry_after_seconds = parsed
             if result.http_status == 429:
                 result.cooldown_until = retry_after_cooldown_until(raw)
+
+    if result.retry_after_seconds is None and response is not None and _is_anthropic_protocol_channel(channel):
+        from .anthropic.rate_limit_headers import _get_ci
+        import math as _math
+        hdrs = resp_headers if resp_headers is not None else {}
+        raw_ms = _get_ci(hdrs, "retry-after-ms")
+        if raw_ms is not None:
+            try:
+                ms_val = float(str(raw_ms).strip())
+            except (TypeError, ValueError, OverflowError):
+                ms_val = None
+            if ms_val is not None and _math.isfinite(ms_val) and ms_val >= 0:
+                sec_val = ms_val / 1000.0
+                result.retry_after_seconds = parse_retry_after_seconds(sec_val)
+                if result.http_status == 429 and 0 < sec_val <= 45 * 24 * 3600:
+                    result.cooldown_until = int((time.time() + sec_val) * 1000)
+        if result.retry_after_seconds is None and isinstance(unified, dict) and unified.get("reset_epoch_s") is not None:
+            now_ts = time.time()
+            reset_s = int(unified["reset_epoch_s"])
+            delta_s = float(reset_s) - now_ts
+            if -60.0 <= delta_s <= 45 * 24 * 3600:
+                clamped_s = max(0.0, delta_s)
+                result.retry_after_seconds = parse_retry_after_seconds(clamped_s)
+                if result.http_status == 429 and delta_s > 0:
+                    result.cooldown_until = reset_s * 1000
+
     if str(getattr(channel, "provider", "")) == "antigravity" and result.http_status == 429:
         google = parse_antigravity_429(result.full_response_text or result.error_detail)
         if google.get("quota_exhausted") and not result.error_code:
@@ -2133,7 +2474,13 @@ async def run_failover(
         try:
             search_tool_policy.validate(body)
         except GuardError as exc:
-            return _json_error_for_ingress(ingress_protocol, exc.status, errors.ErrType.INVALID_REQUEST, exc.message)
+            return _json_error_for_ingress(
+                ingress_protocol,
+                exc.status,
+                errors.ErrType.INVALID_REQUEST,
+                exc.message,
+                headers=errors.NO_RETRY_HEADERS if errors.is_non_retryable_http_status(exc.status) else None,
+            )
         if search_tool_policy.needs_loop(body):
             search_route = schedule_result
             async def invoke_search_round(round_body):
@@ -2246,6 +2593,7 @@ async def run_failover(
     retried_without_anthropic_thinking = False
     last_result: Optional[AttemptResult] = None
     structured_attempts: list[dict] = []
+    rate_limit_retry_afters: list[float] = []
     # 跟踪真实最后尝试的渠道（不同于"候选列表最后一条"，因为 OAuth 重刷会重试同 ch）
     last_ch_key: Optional[str] = None
     last_ch_type: Optional[str] = None
@@ -2420,6 +2768,13 @@ async def run_failover(
                 structured_attempts.append(
                     _structured_attempt_error(result, attempt_order, ch),
                 )
+                if (
+                    result.http_status == 429
+                    and quota_exhaustion is None
+                    and isinstance(result.retry_after_seconds, (int, float))
+                    and result.retry_after_seconds > 0
+                ):
+                    rate_limit_retry_afters.append(float(result.retry_after_seconds))
             if _attempt_proxy and not result.proxy_name:
                 result.proxy_name = _attempt_proxy
 
@@ -2597,7 +2952,13 @@ async def run_failover(
                 http_status=status, affinity_hit=affinity_hit,
                 upstream_protocol=getattr(ch, "protocol", "anthropic"),
             )
-            return _json_error_for_ingress(ingress_protocol, status, anth_err_type, msg)
+            return _json_error_for_ingress(
+                ingress_protocol,
+                status,
+                anth_err_type,
+                msg,
+                headers=errors.NO_RETRY_HEADERS if errors.is_non_retryable_http_status(status) else None,
+            )
 
         # 下游请求内容错误（例如坏 encrypted_content）：不要冷却渠道。
         # 对坏 EC 做一次同渠道降级重试：剥掉本次请求 input 里的 encrypted_content，
@@ -2663,6 +3024,7 @@ async def run_failover(
                         else None
                     )
                 ),
+                headers=errors.NO_RETRY_HEADERS if errors.is_non_retryable_http_status(status) else None,
             )
 
         if zhipu_body_started:
@@ -2841,6 +3203,13 @@ async def run_failover(
             idx += 1
             continue
 
+        if _apply_claude_oauth_429_policy(
+            ch, resolved_model, result, quota_exhaustion=quota_exhaustion,
+        ):
+            retry_count += 1
+            idx += 1
+            continue
+
         # 普通失败处理；HTML 403 只推进候选，不归咎账号或渠道健康。
         if not result.openai_oauth_html_403:
             plan = finalize_policy.error_plan(
@@ -2926,6 +3295,17 @@ async def run_failover(
             proxy_bytes_down=(last_result.proxy_bytes_down if last_result else None),
             **_request_stage_kwargs(last_result),
         )
+    terminal_headers: dict[str, str] = {}
+    if errors.is_non_retryable_http_status(status) or (
+        bool(structured_attempts)
+        and failure_details["root_cause"].get("retryable") is False
+    ):
+        terminal_headers["x-should-retry"] = "false"
+    elif status == 429 and rate_limit_retry_afters:
+        min_ra = min(rate_limit_retry_afters)
+        if min_ra > 0:
+            terminal_headers["Retry-After"] = str(min(86400 * 7, max(1, math.ceil(min_ra))))
+
     return _json_error_for_ingress(
         ingress_protocol,
         status,
@@ -2933,6 +3313,7 @@ async def run_failover(
         msg,
         code=failure_details["root_cause"].get("code"),
         details=failure_details,
+        headers=terminal_headers or None,
     )
 
 

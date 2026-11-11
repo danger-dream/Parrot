@@ -4955,6 +4955,8 @@ export interface components {
              * @enum {string}
              */
             program: "cedar_ember" | "juniper_tide";
+            /** Grantid */
+            grantId?: string | null;
         };
         /** ClaudeResetResultData */
         ClaudeResetResultData: {

@@ -120,6 +120,30 @@ CC_REQUEST_CONTEXT_KEYS = frozenset({
 ONE_M_CONTEXT_TOKENS = 1_000_000
 
 CLI_USER_AGENT = f"claude-cli/{CC_VERSION} ({USER_TYPE}, {CC_ENTRYPOINT})"
+# Interactive CLI endpoints (/api/oauth/usage, /reset_rate_limits) require
+# entrypoint "cli" -> surface "claude_code_cli"; "sdk-cli" is rejected with
+# ineligible_reason="surface". Keep CLI_USER_AGENT ("sdk-cli") for /v1/messages so
+# Messages UA matches cc_entrypoint=sdk-cli in the signed billing block.
+INTERACTIVE_CLI_USER_AGENT = f"claude-cli/{CC_VERSION} ({USER_TYPE}, cli)"
+# yi() in CC 2.1.321 (@282852593): used by /api/oauth/profile and /api/claude_cli/bootstrap.
+CLAUDE_CODE_USER_AGENT = f"claude-code/{CC_VERSION}"
+# Bundled Axios 1.15.2 default UA (@284994870 / @285013250) when Mt.post omits User-Agent
+# (e.g. Npe /v1/oauth/token refresh), avoiding python-httpx/* leakage.
+AXIOS_USER_AGENT = "axios/1.15.2"
+FIRST_PARTY_ACCEPT = "application/json, text/plain, */*"
+FIRST_PARTY_ACCEPT_ENCODING = "gzip, deflate, br"
+
+
+def first_party_oauth_headers(token: str) -> dict[str, str]:
+    """Exact header set and order emitted by CC 2.1.321 jt.* / uo() + qte() + Axios Mt."""
+    return {
+        "Accept": FIRST_PARTY_ACCEPT,
+        "User-Agent": INTERACTIVE_CLI_USER_AGENT,
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": OAUTH_BETA,
+        "Content-Type": "application/json",
+        "Accept-Encoding": FIRST_PARTY_ACCEPT_ENCODING,
+    }
 
 ANTHROPIC_API_BASE = "https://api.anthropic.com"
 

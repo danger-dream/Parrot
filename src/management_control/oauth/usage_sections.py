@@ -164,19 +164,56 @@ def _openai(row: dict, usage: dict) -> list[dict | None]:
     return [extra, _section("credits", "积分", credits_items)]
 
 
+def _claude_grant_short_label(grant: dict) -> str:
+    if grant.get("gives_back_weekly") is True:
+        return "Fable 卡"
+    gtype = grant.get("type")
+    if gtype == "session":
+        return "5h 卡"
+    if gtype == "weekly":
+        return "周卡"
+    if gtype == "full":
+        return "全量卡"
+    clears = [str(x) for x in (grant.get("clears") or [])]
+    if clears == ["five_hour"]:
+        return "5h 卡"
+    if clears and "five_hour" not in clears:
+        return "周卡"
+    return "全量卡"
+
+
 def _claude_reset(usage: dict) -> dict | None:
     items = []
     cedar = usage.get("cedar_ember") if isinstance(usage.get("cedar_ember"), dict) else None
     if cedar is not None:
         grants = [g for g in cedar.get("grants") or [] if isinstance(g, dict)]
-        note = None if cedar.get("eligible") else (cedar.get("ineligible_reason") or None)
-        items.append(item("周额度重置卡", remaining=len(grants), unit="count",
-                          resets_at=cedar.get("weekly_resets_at"), note=note))
+        active = [
+            g for g in grants
+            if not g.get("paused") and type(g.get("resets_left")) is int and g.get("resets_left") > 0
+        ]
+        remaining = sum(g["resets_left"] for g in active) if cedar.get("eligible") is True else 0
+        if not cedar.get("eligible"):
+            note = cedar.get("ineligible_reason") or "ineligible"
+        elif remaining > 0:
+            counts: dict[str, int] = {}
+            for g in active:
+                lbl = _claude_grant_short_label(g)
+                counts[lbl] = counts.get(lbl, 0) + g["resets_left"]
+            note = " · ".join(f"{k} ×{v}" for k, v in counts.items())
+        else:
+            note = "已用完" if grants else "暂无重置卡"
+        items.append(item("周额度重置卡", remaining=remaining, unit="count",
+                          resets_at=cedar.get("cooldown_until"), note=note))
     juniper = usage.get("juniper_tide") if isinstance(usage.get("juniper_tide"), dict) else None
     if juniper is not None:
-        available = juniper.get("available")
-        note = "可用" if available else (juniper.get("ineligible_reason") or "不可用")
-        items.append(item("5 小时重置", resets_at=juniper.get("next_available_at"), note=note))
+        available = juniper.get("available") is True
+        if available:
+            jnote = "当前可用（消耗周额度）"
+        else:
+            jnote = juniper.get("ineligible_reason") or (
+                "control" if juniper.get("in_experiment") is False or juniper.get("arm") != "reset" else "not_at_wall"
+            )
+        items.append(item("5 小时重置", resets_at=juniper.get("next_available_at"), note=jnote))
     return _section("claudeReset", "官方额度重置", items)
 
 

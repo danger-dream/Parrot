@@ -299,9 +299,13 @@ class OAuthBackend:
         from src.oauth import claude_reset
         return await claude_reset.status(account_id, program)
 
-    def claude_reset_eligibility(self, status: dict, program: str):
+    def claude_reset_eligibility(self, status: dict, program: str, grant_id: str | None = None):
         from src.oauth import claude_reset
-        return claude_reset.eligibility(status, program)
+        return claude_reset.eligibility(status, program, grant_id)
+
+    def claude_reset_select_grant(self, status: dict, grant_id: str | None = None):
+        from src.oauth import claude_reset
+        return claude_reset.select_cedar_grant(status, grant_id)
 
     async def claude_reset_redeem(self, account_id: str, program: str, **kwargs) -> dict:
         from src.oauth import claude_reset

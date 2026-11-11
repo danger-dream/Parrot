@@ -863,6 +863,9 @@ def resolve_binding(
         return None
     legacy_model = model_names.upstream_for_channel(scope, model)
     lookup_models = [model] if legacy_model == model else [model, legacy_model]
+    dot_canonical = model_pricing.canonical_anthropic_model_id(model)
+    if dot_canonical and dot_canonical not in lookup_models:
+        lookup_models.append(dot_canonical)
     if legacy_model != model and not outbound_model:
         outbound_model = legacy_model
     native = _oauth_account_record(model, scope_key=scope, outbound_model=outbound_model)

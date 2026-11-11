@@ -42,6 +42,7 @@ class OpenAiResetCreditsData(StrictSchema):
 
 class ClaudeResetPlanRequest(StrictSchema):
     program: Literal["cedar_ember", "juniper_tide"]
+    grantId: str | None = Field(default=None, pattern=r"^[a-z0-9_-]{1,40}$")
 
 
 class ClaudeResetPlanData(StrictSchema):
@@ -102,7 +103,7 @@ async def plan_claude_reset(
     accountId: AccountId, body: Annotated[ClaudeResetPlanRequest, Body()],
     request: Request, context: DestructiveContext, control: Control,
 ) -> DataEnvelope[ClaudeResetPlanData]:
-    value = await run_in_threadpool(control.plan_claude_reset_action, context, accountId, body.program)
+    value = await run_in_threadpool(control.plan_claude_reset_action, context, accountId, body.program, body.grantId)
     status = public_value(value.pop("status") or {}, camel_case_keys=True)
     return DataEnvelope(data=ClaudeResetPlanData(**public_value(value, camel_case_keys=True), status=status),
                         meta=meta(request))

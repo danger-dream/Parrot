@@ -72,21 +72,20 @@ class OAuthWebUiActionsMixin:
                 ErrorField("program", "UNSUPPORTED", "program must be cedar_ember or juniper_tide")])
         return program
 
-    def plan_claude_reset_action(self, context, account_id: str, program: str) -> dict:
+    def plan_claude_reset_action(self, context, account_id: str, program: str,
+                                 grant_id: str | None = None) -> dict:
         """Read-only status + eligibility; returns a one-shot plan when executable."""
         self._claude_program(program)
         with mapped_upstream():
-            plan = self.plan_claude_reset(context, account_id, program)
+            plan = self.plan_claude_reset(context, account_id, program, grant_id=grant_id)
         observation = plan.get("status") if isinstance(plan.get("status"), dict) else {}
-        grant_id = ((observation.get("cedar_ember") or {}).get("next_grant_id")
-                    if program == "cedar_ember" else None)
         return {
             "available": bool(plan.get("available")),
             "reason": plan.get("reason"),
             "program": program,
             "plan_token": plan.get("plan_token"),
             "expires_at": plan.get("expires_at"),
-            "grant_id": grant_id if plan.get("available") else None,
+            "grant_id": plan.get("grant_id") if plan.get("available") else grant_id,
             "status": observation,
         }
 

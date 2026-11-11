@@ -449,6 +449,16 @@ class OAuthAccountOrchestrationControlMixin:
                 failed += 1
                 results.append({"accountId": account_id, "status": "failed"})
                 continue
+            if (
+                self.backend.provider_of(account_id) == "claude"
+                and callable(getattr(self.backend, "claude_reset_status", None))
+            ):
+                try:
+                    self._run_coroutine_sync(
+                        lambda aid=account_id: self.backend.claude_reset_status(aid, "cedar_ember")
+                    )
+                except Exception:
+                    pass
             refreshed += 1
             results.append({"accountId": account_id, "status": "refreshed"})
         return {

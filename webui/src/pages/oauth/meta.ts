@@ -221,6 +221,25 @@ export const CLAUDE_PROGRAM_LABEL: Record<ClaudeProgram, string> = {
   juniper_tide: '5 小时重置',
 }
 
+export type CedarGrantKind = 'session' | 'weekly' | 'fable' | 'full'
+export const CLAUDE_GRANT_KIND_LABEL: Record<CedarGrantKind, string> = {
+  fable: 'Fable 重置卡 · 退回周额度',
+  session: '5 小时卡',
+  weekly: '周额度卡',
+  full: '全量重置卡',
+}
+export function claudeGrantKind(g: Record<string, unknown> | null | undefined): CedarGrantKind {
+  if (!g || typeof g !== 'object') return 'full'
+  if (pick(g, 'givesBackWeekly') === true) return 'fable'
+  const t = pick<string>(g, 'type')
+  if (t === 'session' || t === 'weekly' || t === 'full') return t
+  const rawClears = pick<unknown[]>(g, 'clears')
+  const clears = Array.isArray(rawClears) ? rawClears.map(String) : []
+  const has5h = clears.includes('five_hour')
+  const hasOther = clears.some((x) => x !== 'five_hour')
+  return has5h && !hasOther ? 'session' : hasOther && !has5h ? 'weekly' : 'full'
+}
+
 /** Server reasons for Claude reset eligibility / results (TG keeps the raw codes; we translate them). */
 export const CLAUDE_REASON: Record<string, string> = {
   status_unknown: '官方未返回这项功能的状态',
@@ -237,7 +256,28 @@ export const CLAUDE_REASON: Record<string, string> = {
   not_started: '重置卡尚未生效',
   not_limited: '额度还没撞限，这张卡要撞限后才能用',
   blocking: '有其他限制阻止使用',
+  fable_no_weekly_usage: '本周还没有可退回的 Fable 用量',
+  blocked_five_hour: '当前正受 5 小时限额阻止，需等其恢复后才能用',
+  blocked_seven_day: '当前正受 7 天周限额阻止',
+  blocked_opus: '当前正受 Opus 周限额阻止',
+  blocked_sonnet: '当前正受 Sonnet 周限额阻止',
+  blocked_other: '受此卡不负责清除的其它限额阻止',
+  cannot_clear: '这张卡无法清除当前触发的限额窗口',
+  needs_limit: '需要达到此卡对应的限额后才能使用',
+  query_cooldown: '查询处于限流冷却期，请稍后再试',
+  status_refresh_required: '状态需要重新刷新确认',
   unavailable: '官方暂不可用',
+  not_at_wall: '当前未触发 5 小时限额（撞限后可用）',
+  no_weekly_limit: '当前套餐无周限额窗口',
+  config_off: '官方暂未开启此功能',
+  tier: '当前套餐档位不支持',
+  seat: '当前席位类型不支持',
+  mobile: '移动端入口不支持',
+  cli_version: '客户端版本过低',
+  tenure: '订阅时长未满足活动条件',
+  other_experiment: '账号处于其它互斥试验组',
+  grant_id_required: '缺少重置卡标识',
+  unknown: '官方未说明具体原因',
   organization_missing: '缺少组织信息，请刷新用量后重试',
   organization_missing_or_changed: '组织信息缺失或已变化',
   operation_in_progress: '上一次重置还在处理中',
@@ -313,7 +353,7 @@ export function remainingAmount(it: UsageItem): string {
 
 export function usageValue(it: UsageItem): string {
   const fmt = (v: number) => (it.unit === 'usd' ? dollars(v) : v.toLocaleString('en-US', { maximumFractionDigits: 2 }))
-  const suffix = it.unit === 'credits' ? ' 积分' : ''
+  const suffix = it.unit === 'credits' ? ' 积分' : it.unit === 'count' ? ' 张' : ''
   const used = num(it.used)
   const limit = num(it.limit)
   const remaining = num(it.remaining)

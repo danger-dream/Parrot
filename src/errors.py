@@ -6,9 +6,17 @@
 """
 
 import json
+from collections.abc import Mapping
 from typing import Optional
 
 from fastapi.responses import JSONResponse
+
+NO_RETRY_HEADERS: dict[str, str] = {"x-should-retry": "false"}
+
+
+def is_non_retryable_http_status(status: int) -> bool:
+    """Return True when HTTP status is a deterministic client-side / auth / policy error."""
+    return 400 <= int(status) < 500 and int(status) not in (408, 429)
 
 
 class ErrType:
@@ -45,10 +53,12 @@ def json_error_response(
     *,
     code: Optional[str] = None,
     details: Optional[dict] = None,
+    headers: Optional[Mapping[str, str]] = None,
 ) -> JSONResponse:
     return JSONResponse(
         status_code=status,
         content=build_error_payload(err_type, message, code=code, details=details),
+        headers=dict(headers) if headers else None,
     )
 
 
@@ -89,13 +99,15 @@ def _openai_error_body(err_type: str, message: str, *, param: Optional[str] = No
 
 def json_error_openai(status: int, err_type: str, message: str,
                       *, param: Optional[str] = None, code: Optional[str] = None,
-                      details: Optional[dict] = None) -> JSONResponse:
+                      details: Optional[dict] = None,
+                      headers: Optional[Mapping[str, str]] = None) -> JSONResponse:
     """OpenAI 风格的 HTTP JSON 错误响应（未发首包时用）。"""
     return JSONResponse(
         status_code=status,
         content=_openai_error_body(
             err_type, message, param=param, code=code, details=details,
         ),
+        headers=dict(headers) if headers else None,
     )
 
 

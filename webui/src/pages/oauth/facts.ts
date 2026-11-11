@@ -96,10 +96,17 @@ export function planFacts(
       if (p.expiresAt) out.push({ label: '套餐到期', value: dateTime(p.expiresAt) })
       break
     }
-    case 'claude':
+    case 'claude': {
       if (p.status || p.billingType) out.push({ label: '订阅', value: [CLAUDE_SUB[p.status || ''] || p.status, BILLING[p.billingType || ''] || p.billingType].filter(Boolean).join(' · '), tone: p.status === 'active' ? 'green' : p.status ? 'orange' : undefined })
+      const cedarItem = sectionItem(sections, 'claudeReset', '周额度重置卡')
+      const count = p.resetCreditCount ?? num(cedarItem?.remaining)
+      if (count !== null && count !== undefined) {
+        const detailNote = count > 0 && cedarItem?.note ? `（${cedarItem.note}）` : ''
+        out.push({ label: '重置卡', value: count > 0 ? `${count} 张${detailNote}` : '无可用', tone: count > 0 ? 'green' : 'neutral' })
+      }
       if (d && p.startedAt) out.push({ label: '订阅开始', value: dateTime(p.startedAt) })
       break
+    }
     case 'xai':
       if (p.access?.state) out.push({ label: '访问', value: p.access.state === 'ok' ? '正常' : p.access.state === 'limited' ? '访问受限' : '账号受限', tone: p.access.state === 'ok' ? 'green' : 'red' })
       if (p.access?.grokCode !== undefined && p.access?.grokCode !== null) out.push({ label: 'Grok Code', value: p.access.grokCode ? '可用' : '不可用', tone: p.access.grokCode ? 'green' : 'orange' })

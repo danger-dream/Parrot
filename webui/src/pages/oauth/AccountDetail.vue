@@ -31,7 +31,7 @@ import { deltas, loadCompare, minuteNow, type Compare } from '@/utils/compare'
 import WorkBuddyPanel from './WorkBuddyPanel.vue'
 import ZhipuPanel from './ZhipuPanel.vue'
 import { accountPath, errorToast, notifyChanged, oauthBus, runOperation } from './oauthApi'
-import { accountState, countdown, noteLabel, pick, providerMeta, reasonLabel, usageValue, type AccountDetail, type Provider, type QuotaResetPlan, type RuntimeErr, type UsageItem } from './meta'
+import { accountState, countdown, noteLabel, num, pick, providerMeta, reasonLabel, usageValue, type AccountDetail, type Provider, type QuotaResetPlan, type RuntimeErr, type UsageItem } from './meta'
 import { accountAlerts, allSections, planFacts, planText, POOL_LABEL, quotaDisabledText, quotaPauseGroups } from './facts'
 import { cacheShare, loadAccountModelStats, MODEL_PERIODS, promptTokens, tps, type ModelRow, type StatsPeriod } from './channelStats'
 import { errorTitle } from '@/utils/errors'
@@ -107,6 +107,12 @@ const facts = computed(() =>
 )
 /** Claude's official reset is one block with its action; OpenAI's reset cards come from their own block. */
 const claudeReset = computed(() => sections.value.find((x) => x.id === 'claudeReset') || null)
+const claudeResetCount = computed(() => {
+  const fromPlan = data.value?.plan?.resetCreditCount ?? acc.value?.card?.plan?.resetCreditCount
+  if (typeof fromPlan === 'number') return fromPlan
+  const item = claudeReset.value?.items.find((i) => i.label === '周额度重置卡')
+  return num(item?.remaining)
+})
 const quotaSections = computed(() =>
   sections.value
     .filter((x) => x.id !== 'claudeReset')
@@ -525,15 +531,17 @@ function cooldownText(e: RuntimeErr): string {
         <UsageView v-if="quotaSections.length" :sections="quotaSections" :now="now" :quota-paused="acc.disabledReason === 'quota' || acc.quotaLimited" :disabled-until="acc.disabledUntil" />
         <SubBlock v-if="provider === 'claude'" title="官方额度重置" note="消耗 Anthropic 发放的重置次数">
           <template #actions>
-            <Btn variant="ghost" size="sm" @click="claudeResetOpen = true"><Sparkles /> 额度重置…</Btn>
+            <Btn variant="ghost" size="sm" @click="claudeResetOpen = true">
+              <Sparkles /> 额度重置<template v-if="claudeResetCount && claudeResetCount > 0">（{{ claudeResetCount }} 张）</template>…
+            </Btn>
           </template>
           <div v-if="claudeReset" class="kv-rows">
             <p v-for="it in claudeReset.items" :key="it.label" class="kv-row">
               <span>{{ it.label }}</span>
-              <span class="mono">{{ resetLine(it) }}</span>
+              <span :class="['mono', num(it.remaining) && num(it.remaining)! > 0 ? 'c-green' : '']">{{ resetLine(it) }}</span>
             </p>
           </div>
-          <p v-else class="faint small">还没有官方重置数据，打开「额度重置」可以实时查询。</p>
+          <p v-else class="faint small">点右上角「刷新额度」或打开「额度重置…」即可拉取并缓存重置卡状态。</p>
         </SubBlock>
         <div :id="`${scope}-quota`" class="slot stack" />
       </DetailSection>

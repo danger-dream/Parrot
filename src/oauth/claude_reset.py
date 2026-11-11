@@ -21,10 +21,14 @@ from urllib.parse import quote
 import httpx
 
 from .. import config, network, state_db
-from ..transform.cc_mimicry import CLI_USER_AGENT
+from ..transform.cc_mimicry import first_party_oauth_headers
 from . import claude_usage_queries as queries
 
 PROGRAMS = ("cedar_ember", "juniper_tide")
+CEDAR_GRANT_KINDS = ("session", "weekly", "fable", "full")
+GRANT_ID_RE = re.compile(r"^[a-z0-9_-]{1,40}$")
+REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+ORG_UUID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _locks: dict[str, threading.Lock] = {}
 _lock_guard = threading.Lock()
 
@@ -46,35 +50,50 @@ def _future(value):
     return stamp is not None and stamp > time.time()
 
 
-def eligibility(status: dict, program: str, grant_id: str | None = None) -> str | None:
-    """Conservative local gate; preserve server reasons, never infer entitlement."""
-    if program not in PROGRAMS:
-        return "unknown_program"
-    observation = (status.get("claude_reset_queries") or {}).get(program) or {}
-    if observation.get("state") in {"error", "cached"}:
-        return "query_cooldown" if observation.get("retry_at") else "status_refresh_required"
-    block = status.get(program)
+def grant_kind(grant: dict) -> str:
+    """Classify a cedar_ember grant (aligned with CC v2.1.321 Ye())."""
+    if not isinstance(grant, dict):
+        return "full"
+    if grant.get("gives_back_weekly") is True:
+        return "fable"
+    gtype = grant.get("type")
+    if gtype in {"session", "weekly", "full"}:
+        return gtype
+    clears = [c for c in (grant.get("clears") or []) if isinstance(c, str)]
+    has_five_hour = "five_hour" in clears
+    has_other = any(c != "five_hour" for c in clears)
+    if has_five_hour and not has_other:
+        return "session"
+    if has_other and not has_five_hour:
+        return "weekly"
+    return "full"
+
+
+def _blocking_reason(grant: dict, blocking) -> str:
+    gives_back = grant.get("gives_back_weekly") is True
+    items = [x for x in blocking if isinstance(x, str)] if isinstance(blocking, list) else []
+    if gives_back and "seven_day" in items:
+        return "fable_no_weekly_usage"
+    first = items[0] if items else None
+    if first == "five_hour":
+        return "blocked_five_hour"
+    if first == "seven_day":
+        return "blocked_seven_day"
+    if first == "seven_day_opus":
+        return "blocked_opus"
+    if first == "seven_day_sonnet":
+        return "blocked_sonnet"
+    return "blocked_other"
+
+
+def grant_eligibility(status: dict, grant: dict) -> str | None:
+    """Per-card conservative eligibility check preserving 321 granular reasons."""
+    if not isinstance(status, dict):
+        return "status_unknown"
+    block = status.get("cedar_ember")
     if not isinstance(block, dict):
         return "status_unknown"
-    if block.get("eligible") is not True:
-        return str(block.get("ineligible_reason") or "ineligible")
-    if program == "juniper_tide":
-        if block.get("arm") != "reset" or block.get("in_experiment") is not True:
-            return "control"
-        if block.get("available") is not True:
-            return str(block.get("ineligible_reason") or "already_used")
-        if _future(block.get("next_available_at")):
-            return "cooldown"
-        return None
-    if _future(block.get("cooldown_until")):
-        return "cooldown"
-    next_id = block.get("next_grant_id")
-    if not isinstance(next_id, str) or not re.fullmatch(r"[a-z0-9_-]{1,40}", next_id):
-        return "no_grant"
-    if grant_id is not None and grant_id != next_id:
-        return "not_next_grant"
-    grant = next((g for g in block.get("grants", []) if isinstance(g, dict) and g.get("id") == next_id), None)
-    if not grant:
+    if not isinstance(grant, dict):
         return "unknown_grant"
     if grant.get("paused"):
         return "paused"
@@ -86,12 +105,109 @@ def eligibility(status: dict, program: str, grant_id: str | None = None) -> str 
     remaining = grant.get("resets_left")
     if type(remaining) is not int or remaining <= 0:
         return "already_used"
+    unavailable_reason = grant.get("unavailable_reason")
+    blocking = grant.get("blocking")
+    blocking_list = blocking if isinstance(blocking, list) else []
+    if isinstance(unavailable_reason, str) and unavailable_reason.strip():
+        reason = unavailable_reason.strip()
+        if grant.get("gives_back_weekly") is True and (
+            reason == "blocked_seven_day" or "seven_day" in blocking_list
+        ):
+            return "fable_no_weekly_usage"
+        return reason
     if grant.get("use_requires_limit", True) and block.get("at_limit") is not True:
         return "not_limited"
-    if grant.get("blocking"):
-        return "blocking"
+    if blocking:
+        return _blocking_reason(grant, blocking)
     if grant.get("usable_now") is not True:
         return "unavailable"
+    return None
+
+
+def _cedar_priority_kinds(block: dict) -> list[str]:
+    exhausted = {x for x in (block.get("exhausted") or []) if isinstance(x, str)}
+    preferred: list[str] = []
+    if "five_hour" in exhausted:
+        preferred.append("session")
+    if "seven_day_overage_included" in exhausted:
+        preferred.append("fable")
+    if "seven_day" in exhausted:
+        preferred.append("weekly")
+    return preferred + [k for k in CEDAR_GRANT_KINDS if k not in preferred]
+
+
+def select_cedar_grant(status: dict, grant_id: str | None = None) -> tuple[dict | None, str | None]:
+    """Select a usable cedar_ember grant or return the conservative rejection reason."""
+    if not isinstance(status, dict):
+        return None, "status_unknown"
+    observation = (status.get("claude_reset_queries") or {}).get("cedar_ember") or {}
+    if observation.get("state") in {"error", "cached"}:
+        return None, "query_cooldown" if observation.get("retry_at") else "status_refresh_required"
+    block = status.get("cedar_ember")
+    if not isinstance(block, dict):
+        return None, "status_unknown"
+    if block.get("eligible") is not True:
+        return None, str(block.get("ineligible_reason") or "ineligible")
+    if _future(block.get("cooldown_until")):
+        return None, "cooldown"
+
+    grants = [g for g in (block.get("grants") or []) if isinstance(g, dict)]
+    if grant_id is not None:
+        if not isinstance(grant_id, str) or not GRANT_ID_RE.fullmatch(grant_id):
+            return None, "unknown_grant"
+        grant = next((g for g in grants if g.get("id") == grant_id), None)
+        if not grant:
+            return None, "unknown_grant"
+        reason = grant_eligibility(status, grant)
+        return (grant, None) if reason is None else (None, reason)
+
+    next_id = block.get("next_grant_id")
+    next_id_valid = isinstance(next_id, str) and bool(GRANT_ID_RE.fullmatch(next_id))
+    next_grant = next((g for g in grants if g.get("id") == next_id), None) if next_id_valid else None
+    if next_grant is not None and grant_eligibility(status, next_grant) is None:
+        return next_grant, None
+
+    for kind in _cedar_priority_kinds(block):
+        for candidate in grants:
+            cid = candidate.get("id")
+            if not isinstance(cid, str) or not GRANT_ID_RE.fullmatch(cid):
+                continue
+            if grant_kind(candidate) == kind and grant_eligibility(status, candidate) is None:
+                return candidate, None
+
+    if not grants:
+        return None, "no_grant"
+    if next_grant is not None:
+        return None, grant_eligibility(status, next_grant) or "unavailable"
+    active_grant = next((g for g in grants if type(g.get("resets_left")) is int and g["resets_left"] > 0), None)
+    if active_grant is not None:
+        return None, grant_eligibility(status, active_grant) or "unavailable"
+    if next_id_valid:
+        return None, "unknown_grant"
+    return None, grant_eligibility(status, grants[0]) or "unavailable"
+
+
+def eligibility(status: dict, program: str, grant_id: str | None = None) -> str | None:
+    """Conservative local gate; preserve server reasons, never infer entitlement."""
+    if program not in PROGRAMS:
+        return "unknown_program"
+    if program == "cedar_ember":
+        _, reason = select_cedar_grant(status, grant_id)
+        return reason
+    observation = (status.get("claude_reset_queries") or {}).get(program) or {}
+    if observation.get("state") in {"error", "cached"}:
+        return "query_cooldown" if observation.get("retry_at") else "status_refresh_required"
+    block = status.get(program)
+    if not isinstance(block, dict):
+        return "status_unknown"
+    if block.get("eligible") is not True:
+        return str(block.get("ineligible_reason") or "ineligible")
+    if block.get("arm") != "reset" or block.get("in_experiment") is not True:
+        return "control"
+    if block.get("available") is not True:
+        return str(block.get("ineligible_reason") or "already_used")
+    if _future(block.get("next_available_at")):
+        return "cooldown"
     return None
 
 
@@ -115,8 +231,7 @@ def _get_status_sync(token, account_key, program):
     query = "cedar_ember" if program == "cedar_ember" else "at_wall"
     response = network.get_sync(
         manager.OAUTH_USAGE_URL + f"?{query}=1&skip_spend=1",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json",
-                 "anthropic-beta": "oauth-2025-04-20", "User-Agent": CLI_USER_AGENT},
+        headers=first_party_oauth_headers(token),
         timeout=5, proxy_purpose="oauth_anthropic", proxy_channel=f"oauth:{account_key}",
     )
     response.raise_for_status()
@@ -245,10 +360,24 @@ async def status(account_key: str, program: str = "cedar_ember", *, expected=Non
 def _post_sync(token, key, org, body):
     if _manager().mock_mode_enabled():
         return {"result": "unavailable", "reason": "mock_mode"}
+    if not isinstance(org, str) or not ORG_UUID_RE.fullmatch(org):
+        raise ValueError("organization_invalid")
+    program = body.get("program") if isinstance(body, dict) else None
+    if program == "cedar_ember":
+        gid = body.get("grant_id")
+        rid = body.get("request_id")
+        if (tuple(body) != ("program", "grant_id", "request_id")
+                or not isinstance(gid, str) or not GRANT_ID_RE.fullmatch(gid)
+                or not isinstance(rid, str) or not REQUEST_ID_RE.fullmatch(rid)):
+            raise ValueError("malformed_cedar_claim")
+    elif program == "juniper_tide":
+        if tuple(body) != ("program",):
+            raise ValueError("malformed_juniper_claim")
+    else:
+        raise ValueError("unknown_program")
     response = network.post_sync(
         f"https://api.anthropic.com/api/organizations/{quote(org, safe='')}/reset_rate_limits",
-        json=body, headers={"Authorization": f"Bearer {token}",
-                            "Content-Type": "application/json", "User-Agent": CLI_USER_AGENT},
+        json=body, headers=first_party_oauth_headers(token),
         timeout=25, proxy_purpose="oauth_anthropic", proxy_channel=f"oauth:{key}",
     )
     response.raise_for_status()
@@ -286,15 +415,40 @@ async def _post_with_auth_recovery(token, key, org, body, expected):
         return await asyncio.to_thread(_post_sync, token, key, org, body)
 
 
-def _clear_recovered_quota_cooldowns(key, account, previous, flat):
-    """Clear only old rate-limit errors tied to a recovered account deadline.
+def _fable_window(flat: dict | None, usage: dict | None) -> tuple[float | None, str | None]:
+    if isinstance(flat, dict) and flat.get("fable_util") is not None and not isinstance(flat.get("fable_util"), bool):
+        try:
+            val = float(flat["fable_util"])
+        except (TypeError, ValueError):
+            val = None
+        if val is not None and math.isfinite(val):
+            return max(0.0, min(100.0, val)), flat.get("fable_reset")
+    if isinstance(usage, dict):
+        block = usage.get("seven_day_overage_included")
+        if (
+            isinstance(block, dict)
+            and block.get("is_active") is not False
+            and block.get("utilization") is not None
+            and not isinstance(block.get("utilization"), bool)
+        ):
+            try:
+                val = float(block["utilization"])
+            except (TypeError, ValueError):
+                val = None
+            if val is not None and math.isfinite(val):
+                return max(0.0, min(100.0, val)), block.get("resets_at")
+    return None, None
+
+
+def _clear_recovered_quota_cooldowns(key, account, previous, flat, usage=None):
+    """Clear only old rate-limit errors tied to a recovered account/Fable deadline.
 
     Caller holds the account generation lock and has compared pre-dispatch
     evidence, so an in-flight new restriction cannot be erased here.
     """
     from .. import cooldown
     manager = _manager()
-    if account.get("disabled_reason") != "quota":
+    if account.get("disabled_reason") not in {"quota", None}:
         return []
     try:
         threshold = float((config.get().get("quotaMonitor") or {}).get("disableThresholdPercent", 95))
@@ -303,19 +457,48 @@ def _clear_recovered_quota_cooldowns(key, account, previous, flat):
     windows = ("five_hour", "seven_day", "thirty_day", "sonnet", "opus")
     if any(flat.get(f"{w}_util") is not None and flat[f"{w}_util"] >= threshold for w in windows):
         return []
-    deadlines = {_date(account.get("disabled_until"))}
-    deadlines.update(_date(previous.get(f"{w}_reset")) for w in windows
-                     if previous.get(f"{w}_util") is not None and previous[f"{w}_util"] >= threshold
-                     and flat.get(f"{w}_util") is not None)
-    deadlines = {int(stamp * 1000) for stamp in deadlines if stamp is not None}
+    try:
+        previous_raw = json.loads(previous.get("raw_data") or "{}")
+    except (TypeError, ValueError):
+        previous_raw = {}
+    prev_fable_util, prev_fable_reset = _fable_window(previous, previous_raw if isinstance(previous_raw, dict) else None)
+    curr_fable_util, curr_fable_reset = _fable_window(flat, usage)
+
+    account_deadlines = set()
+    if account.get("disabled_reason") == "quota":
+        account_deadlines.add(_date(account.get("disabled_until")))
+        account_deadlines.update(
+            _date(previous.get(f"{w}_reset")) for w in windows
+            if previous.get(f"{w}_util") is not None and previous[f"{w}_util"] >= threshold
+            and flat.get(f"{w}_util") is not None
+        )
+    account_deadlines = {int(stamp * 1000) for stamp in account_deadlines if stamp is not None}
+
+    fable_deadlines = set()
+    if curr_fable_util is not None and curr_fable_util < threshold:
+        if prev_fable_util is not None and prev_fable_util >= threshold:
+            fable_deadlines.add(_date(prev_fable_reset))
+        fable_deadlines.add(_date(curr_fable_reset))
+    fable_deadlines = {int(stamp * 1000) for stamp in fable_deadlines if stamp is not None}
+
+    if not account_deadlines and not fable_deadlines:
+        return []
+
     fable_models = set(manager.claude_fable_models(account))
     cleared = []
     for row in state_db.error_load_all():
-        if row.get("channel_key") != f"oauth:{key}" or row.get("cooldown_until") not in deadlines:
+        if row.get("channel_key") != f"oauth:{key}":
             continue
         model = row.get("model")
-        if model in fable_models and (flat.get("fable_util") is None or flat["fable_util"] >= threshold):
-            continue
+        until = row.get("cooldown_until")
+        if model in fable_models:
+            if curr_fable_util is None or curr_fable_util >= threshold:
+                continue
+            if until not in (account_deadlines | fable_deadlines):
+                continue
+        else:
+            if until not in account_deadlines:
+                continue
         message = str(row.get("last_error_message") or "")
         if not message.startswith("HTTP 429:"):
             continue
@@ -377,8 +560,8 @@ async def _redeem_locked(key, program, expected, org, grant_id, operation_id, jo
     pending = old.get("status") in {"pending", "unknown"}
     # A newly confirmed, independently identified grant is not a replay of the
     # old uncertain claim. Keep same-grant ambiguity/600s idempotency unchanged.
-    if (pending and program == "cedar_ember" and grant_id
-            and grant_id != old.get("grant_id") and grant_id == block.get("next_grant_id")
+    if (pending and program == "cedar_ember" and isinstance(grant_id, str)
+            and GRANT_ID_RE.fullmatch(grant_id) and grant_id != old.get("grant_id")
             and eligibility(fresh, program, grant_id) is None):
         pending = False
     retry = False
@@ -413,11 +596,16 @@ async def _redeem_locked(key, program, expected, org, grant_id, operation_id, jo
         if pending and not retry:
             return {"result": "unconfirmed", "reason": "pending_requires_reconciliation",
                     "status": fresh, "previous_response": old.get("response")}
-    reason = eligibility(fresh, program, grant_id)
-    if reason:
-        return {"result": "ineligible", "reason": reason, "status": fresh}
-    if program == "cedar_ember" and grant_id != block.get("next_grant_id"):
-        return {"result": "ineligible", "reason": "not_next_grant"}
+    if program == "cedar_ember":
+        if not isinstance(grant_id, str) or not GRANT_ID_RE.fullmatch(grant_id):
+            return {"result": "ineligible", "reason": "no_grant", "status": fresh}
+        selected_grant, reason = select_cedar_grant(fresh, grant_id)
+        if reason or selected_grant is None:
+            return {"result": "ineligible", "reason": reason or "unknown_grant", "status": fresh}
+    else:
+        reason = eligibility(fresh, program)
+        if reason:
+            return {"result": "ineligible", "reason": reason, "status": fresh}
     record = old if retry else {
         "program": program, "operation_id": operation_id, "created_at": time.time(),
         "grant_id": grant_id, "request_id": str(uuid.uuid4()) if program == "cedar_ember" else None,
@@ -499,9 +687,17 @@ async def _redeem_locked(key, program, expected, org, grant_id, operation_id, jo
             return out
         flat = manager.flatten_usage(usage)
         previous = state_db.quota_load(key) or {}
+        try:
+            previous_raw = json.loads(previous.get("raw_data") or "{}")
+        except (TypeError, ValueError):
+            previous_raw = {}
+        prev_fable_util, _ = _fable_window(previous, previous_raw if isinstance(previous_raw, dict) else None)
+        curr_fable_util, _ = _fable_window(flat, usage)
         required = {"five_hour_util", "seven_day_util"}
-        required.update(k for k in ("sonnet_util", "opus_util", "fable_util") if previous.get(k) is not None)
+        required.update(k for k in ("sonnet_util", "opus_util") if previous.get(k) is not None)
         known = all(isinstance(flat.get(k), (int, float)) and math.isfinite(flat[k]) for k in required)
+        if prev_fable_util is not None and curr_fable_util is None:
+            known = False
         out["usage"] = usage
         if not known:
             # A partial read cannot erase the prior evidence required to
@@ -510,7 +706,7 @@ async def _redeem_locked(key, program, expected, org, grant_id, operation_id, jo
             out["quota_action"] = {"action": "quota_unknown_keep_disabled"}
         else:
             try:
-                cleared = _clear_recovered_quota_cooldowns(key, account, previous, flat)
+                cleared = _clear_recovered_quota_cooldowns(key, account, previous, flat, usage=usage)
             except Exception as exc:
                 out["quota_action"] = {"action": "resume_failed", "error_code": "runtime_state_clear_failed"}
                 out["state_error"] = type(exc).__name__

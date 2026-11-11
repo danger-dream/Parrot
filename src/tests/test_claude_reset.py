@@ -78,14 +78,14 @@ def env(monkeypatch):
     return e
 
 
-def final_plan(e, program="cedar_ember"):
-    plan = e.control.plan_claude_reset(e.ctx, e.key, program)
+def final_plan(e, program="cedar_ember", grant_id=None):
+    plan = e.control.plan_claude_reset(e.ctx, e.key, program, grant_id=grant_id)
     assert plan["available"], plan
     return e.control.confirm_claude_reset(e.ctx, e.key, plan["plan_token"])["plan_token"]
 
 
-def execute(e, program="cedar_ember"):
-    return e.control.execute_claude_reset(e.ctx, e.key, final_plan(e, program))
+def execute(e, program="cedar_ember", grant_id=None):
+    return e.control.execute_claude_reset(e.ctx, e.key, final_plan(e, program, grant_id=grant_id))
 
 
 @pytest.mark.parametrize("program", cr.PROGRAMS)
@@ -105,7 +105,28 @@ def test_wire_confirmed_only_and_duplicate_capability(env, program):
         assert body["grant_id"] == "g_one"
         assert 1 <= len(body["request_id"]) <= 64
     assert call["timeout"] == 25
-    assert call["headers"]["User-Agent"] == cr.CLI_USER_AGENT
+    expected_headers = [
+        ("Accept", "application/json, text/plain, */*"),
+        ("User-Agent", "claude-cli/2.1.321 (external, cli)"),
+        ("Authorization", "Bearer fake-at"),
+        ("anthropic-beta", "oauth-2025-04-20"),
+        ("Content-Type", "application/json"),
+        ("Accept-Encoding", "gzip, deflate, br"),
+    ]
+    assert list(call["headers"].items()) == expected_headers
+    assert list(env.gets[0][1]["headers"].items()) == expected_headers
+    wire_req = httpx.Request("POST", url, json=body, headers=call["headers"])
+    if program == "juniper_tide":
+        assert wire_req.content == b'{"program":"juniper_tide"}'
+    else:
+        assert wire_req.content == (
+            f'{{"program":"cedar_ember","grant_id":"g_one","request_id":"{body["request_id"]}"}}'.encode("ascii")
+        )
+    raw_names = [k.decode("ascii").lower() for k, _ in wire_req.headers.raw]
+    assert raw_names == [
+        "host", "accept", "user-agent", "authorization",
+        "anthropic-beta", "content-type", "accept-encoding", "content-length",
+    ]
     with pytest.raises(ManagementError):
         env.control.execute_claude_reset(env.ctx, env.key, token)
     assert len(env.posts) == 1
@@ -136,7 +157,7 @@ def test_status_preserves_spend_window_and_blocks(env):
 
 @pytest.mark.parametrize("change,reason", [
     ({"eligible": False, "ineligible_reason": "tier"}, "tier"),
-    ({"next_grant_id": "wrong"}, "unknown_grant"),
+    ({"next_grant_id": "wrong", "grants": []}, "no_grant"),
     ({"cooldown_until": "2030-01-01T00:00:00Z"}, "cooldown"),
     ({"at_limit": False}, "not_limited"),
 ])
@@ -150,7 +171,12 @@ def test_status_eligibility(env, change, reason):
 @pytest.mark.parametrize("change,reason", [
     ({"paused": True}, "paused"), ({"usable_now": False}, "unavailable"),
     ({"ends_at": "2020-01-01T00:00:00Z"}, "expired"),
-    ({"resets_left": 0}, "already_used"), ({"blocking": ["seven_day"]}, "blocking"),
+    ({"resets_left": 0}, "already_used"),
+    ({"blocking": ["seven_day"]}, "blocked_seven_day"),
+    ({"blocking": ["five_hour"]}, "blocked_five_hour"),
+    ({"gives_back_weekly": True, "blocking": ["seven_day"]}, "fable_no_weekly_usage"),
+    ({"gives_back_weekly": True, "unavailable_reason": "blocked_seven_day"}, "fable_no_weekly_usage"),
+    ({"unavailable_reason": "cannot_clear"}, "cannot_clear"),
 ])
 def test_grant_rechecked_after_confirmation(env, change, reason):
     token = final_plan(env)
@@ -160,12 +186,22 @@ def test_grant_rechecked_after_confirmation(env, change, reason):
 
 
 def test_next_grant_change_never_silently_spends_new_card(env):
+    # Case 1: confirmed g_one becomes used while new g_two becomes next_grant_id -> must reject, never spend g_two.
     token = final_plan(env)
     block = env.usage["cedar_ember"]
     block["grants"].append({**block["grants"][0], "id": "g_two"})
+    block["grants"][0]["resets_left"] = 0
     block["next_grant_id"] = "g_two"
     out = env.control.execute_claude_reset(env.ctx, env.key, token)
-    assert out["reason"] == "not_next_grant" and not env.posts
+    assert out["result"] == "ineligible" and out["reason"] == "already_used" and not env.posts
+
+    # Case 2: confirmed g_two (still usable) while next_grant_id points elsewhere -> spends g_two, never substitutes.
+    block["grants"][0]["resets_left"] = 1
+    block["next_grant_id"] = "g_one"
+    token_two = final_plan(env, grant_id="g_two")
+    out_two = env.control.execute_claude_reset(env.ctx, env.key, token_two)
+    assert out_two["result"] == "reset"
+    assert len(env.posts) == 1 and env.posts[0][1]["json"]["grant_id"] == "g_two"
 
 
 @pytest.mark.parametrize("program,field,value", [
@@ -462,3 +498,245 @@ def test_tg_claude_detail_keeps_local_reset_and_adds_official_entry(env, monkeyp
     assert any('清本地配额禁用' in label for label in labels)
     assert any('官方额度重置/状态' in label for label in labels)
     assert '测试卡' in text and '消耗周额度份额' in text
+
+
+@pytest.mark.parametrize("grant,expected_kind", [
+    ({"gives_back_weekly": True, "type": "weekly", "clears": ["seven_day_overage_included"]}, "fable"),
+    ({"gives_back_weekly": False, "type": "session", "clears": ["five_hour", "seven_day"]}, "session"),
+    ({"type": "weekly", "clears": ["five_hour"]}, "weekly"),
+    ({"type": "full", "clears": ["seven_day"]}, "full"),
+    ({"type": None, "clears": ["five_hour"]}, "session"),
+    ({"clears": ["seven_day_overage_included"]}, "weekly"),
+    ({"clears": ["five_hour", "seven_day"]}, "full"),
+    ({"clears": []}, "full"),
+])
+def test_grant_kind_matches_321_ye_rules(grant, expected_kind):
+    assert cr.grant_kind(grant) == expected_kind
+
+
+def test_multi_card_selection_fable_fallback_and_explicit_grant_id(env):
+    base_card = copy.deepcopy(env.usage["cedar_ember"]["grants"][0])
+    weekly_blocked = {
+        **base_card,
+        "id": "g_weekly",
+        "label": "普通周卡",
+        "type": "weekly",
+        "gives_back_weekly": False,
+        "usable_now": False,
+        "unavailable_reason": "cannot_clear",
+        "clears": ["seven_day"],
+    }
+    fable_usable = {
+        **base_card,
+        "id": "g_fable",
+        "label": "Fable 返还卡",
+        "type": "weekly",
+        "gives_back_weekly": True,
+        "usable_now": True,
+        "unavailable_reason": None,
+        "clears": ["seven_day_overage_included"],
+    }
+    session_usable = {
+        **base_card,
+        "id": "g_session",
+        "label": "5h 会话卡",
+        "type": "session",
+        "gives_back_weekly": False,
+        "usable_now": True,
+        "unavailable_reason": None,
+        "clears": ["five_hour"],
+    }
+    env.usage["cedar_ember"].update(
+        next_grant_id="g_weekly",
+        exhausted=["seven_day_overage_included"],
+        grants=[weekly_blocked, session_usable, fable_usable],
+    )
+    env.response["cleared"] = ["seven_day_overage_included"]
+
+    # Default selection skips unavailable next_grant_id and prioritizes fable because seven_day_overage_included is exhausted.
+    default_plan = env.control.plan_claude_reset(env.ctx, env.key, "cedar_ember")
+    assert default_plan["available"] is True
+    assert default_plan["grant_id"] == "g_fable"
+
+    # Explicit selection of unavailable card returns its exact reason without creating a planToken.
+    blocked_plan = env.control.plan_claude_reset(env.ctx, env.key, "cedar_ember", grant_id="g_weekly")
+    assert blocked_plan["available"] is False
+    assert blocked_plan["reason"] == "cannot_clear"
+    assert blocked_plan.get("plan_token") is None
+
+    # Unknown grant_id is rejected cleanly.
+    unknown_plan = env.control.plan_claude_reset(env.ctx, env.key, "cedar_ember", grant_id="g_missing")
+    assert unknown_plan["available"] is False
+    assert unknown_plan["reason"] == "unknown_grant"
+
+    # Explicit selection of session card hits 60s query cache (no extra GET) and binds one-shot plan strictly to g_session.
+    gets_before = len(env.gets)
+    session_plan = env.control.plan_claude_reset(env.ctx, env.key, "cedar_ember", grant_id="g_session")
+    assert len(env.gets) == gets_before
+    assert session_plan["available"] is True and session_plan["grant_id"] == "g_session"
+
+    # Execute Fable plan -> redeems g_fable, never g_session or g_weekly.
+    fable_final = env.control.confirm_claude_reset(env.ctx, env.key, default_plan["plan_token"])
+    assert fable_final["grant_id"] == "g_fable"
+    assert fable_final["grant_kind"] == "fable" and fable_final["gives_back_weekly"] is True
+    out = env.control.execute_claude_reset(env.ctx, env.key, fable_final["plan_token"])
+    assert out["result"] == "reset"
+    assert len(env.posts) == 1 and env.posts[0][1]["json"]["grant_id"] == "g_fable"
+
+
+def test_tg_multi_card_buttons_fable_reasons_and_confirm_copy(env, monkeypatch):
+    from src.telegram.menus import oauth_menu as menu, claude_reset_menu as cm
+    from src.telegram import ui
+    monkeypatch.setattr(menu, "oauth_control", env.control)
+    monkeypatch.setattr(cm, "control", env.control)
+    edits, receipts = [], []
+    monkeypatch.setattr(ui, "answer_cb", lambda *a, **k: None)
+    monkeypatch.setattr(ui, "edit", lambda *a, **k: edits.append((a, k)))
+    monkeypatch.setattr(menu, "_edit_cached_detail", lambda *a, **k: receipts.append((a, k)))
+
+    base = copy.deepcopy(env.usage["cedar_ember"]["grants"][0])
+    fable_blocked = {
+        **base,
+        "id": "g_fable_blocked",
+        "label": "Fable一卡",
+        "type": "weekly",
+        "gives_back_weekly": True,
+        "usable_now": False,
+        "unavailable_reason": "blocked_seven_day",
+        "clears": ["seven_day_overage_included"],
+        "blocking": ["seven_day"],
+    }
+    fable_ready = {
+        **base,
+        "id": "g_fable_ready",
+        "label": "Fable二卡",
+        "type": "weekly",
+        "gives_back_weekly": True,
+        "usable_now": True,
+        "unavailable_reason": None,
+        "clears": ["seven_day_overage_included"],
+        "blocking": [],
+    }
+    weekly_ready = {
+        **base,
+        "id": "g_weekly_ready",
+        "label": "周卡",
+        "type": "weekly",
+        "gives_back_weekly": False,
+        "usable_now": True,
+        "unavailable_reason": None,
+        "clears": ["seven_day", "seven_day_cowork", "seven_day_omelette"],
+        "blocking": [],
+    }
+    env.usage["cedar_ember"].update(
+        next_grant_id="g_fable_blocked",
+        exhausted=["seven_day_overage_included"],
+        grants=[fable_blocked, fable_ready, weekly_ready],
+    )
+    env.response["cleared"] = ["seven_day_overage_included"]
+
+    short = ui.register_code(env.key)
+    gets_before = len(env.gets)
+    assert menu.handle_callback(42, 123, "ask", f"oa:claude_reset_ask:{short}")
+    # Only 2 status GETs (cedar_ember + juniper_tide); extra per-card plan hits 60s cache!
+    assert len(env.gets) == gets_before + 2
+    ask_text = edits[-1][0][2]
+    assert "Fable 重置卡 · 退回周额度" in ask_text
+    assert "清 Fable 用量并退回 7 天周池" in ask_text
+    assert "本周还没有可退回的 Fable 用量" in ask_text
+    assert "Cowork 7 天" in ask_text and "Omelette 7 天" in ask_text
+
+    buttons = [b for row in edits[-1][1]["reply_markup"]["inline_keyboard"] for b in row]
+    fable_btn = next(b for b in buttons if "Fable 重置卡·退回周额度（Fable二卡）" in b["text"])
+    weekly_btn = next(b for b in buttons if "周额度重置卡（周卡）" in b["text"])
+    assert not any("Fable一卡" in b["text"] for b in buttons)
+    assert fable_btn["callback_data"] != weekly_btn["callback_data"]
+
+    menu.handle_callback(42, 123, "confirm", fable_btn["callback_data"])
+    confirm_text = edits[-1][0][2]
+    assert "Fable 重置卡 · 退回周额度" in confirm_text
+    assert "g_fable_ready" in confirm_text
+    assert "退回 7 天周池" in confirm_text
+
+    final_cb = next(
+        b["callback_data"]
+        for row in edits[-1][1]["reply_markup"]["inline_keyboard"]
+        for b in row
+        if "最终确认" in b["text"]
+    )
+    menu.handle_callback(42, 123, "execute", final_cb)
+    assert len(env.posts) == 1
+    assert env.posts[0][1]["json"]["grant_id"] == "g_fable_ready"
+    assert "Fable / 周子限额 7 天" in receipts[-1][1]["prefix"]
+
+
+def test_webui_plan_select_and_execute_wire_parity_with_real_321_grants(env):
+    """End-to-end mocked simulation against real Pro two-card cedar_ember shape."""
+    env.usage["cedar_ember"] = {
+        "eligible": True,
+        "ineligible_reason": None,
+        "at_limit": False,
+        "exhausted": [],
+        "next_grant_id": "launch-2610-fable-week",
+        "weekly_resets_at": "2030-11-17T12:00:00Z",
+        "cooldown_until": None,
+        "grants": [
+            {
+                "id": "launch-2610-fable-week",
+                "label": "New model launch: one Fable reset for Pro and Team Standard, launch week only",
+                "type": "full",
+                "gives_back_weekly": True,
+                "resets_total": 1,
+                "resets_left": 1,
+                "starts_at": "2020-11-09T18:00:00Z",
+                "ends_at": "2030-11-17T07:59:00Z",
+                "clears": ["five_hour", "seven_day_overage_included"],
+                "paused": False,
+                "usable_now": True,
+                "unavailable_reason": None,
+                "use_requires_limit": False,
+                "percent_used": {"five_hour": 0, "seven_day_overage_included": 0},
+                "blocking": [],
+            },
+            {
+                "id": "full-reset-2611",
+                "label": "One full limit reset (November 2026)",
+                "type": "full",
+                "gives_back_weekly": False,
+                "resets_total": 1,
+                "resets_left": 1,
+                "starts_at": "2020-11-10T21:30:00Z",
+                "ends_at": "2030-12-10T22:00:00Z",
+                "clears": ["five_hour", "seven_day", "seven_day_overage_included"],
+                "paused": False,
+                "usable_now": True,
+                "unavailable_reason": None,
+                "use_requires_limit": False,
+                "percent_used": {"five_hour": 0, "seven_day": 14, "seven_day_overage_included": 0},
+                "blocking": [],
+            },
+        ],
+    }
+    p_default = env.control.plan_claude_reset_action(env.ctx, env.key, "cedar_ember")
+    assert p_default["available"] is True
+    assert p_default["grant_id"] == "launch-2610-fable-week"
+    assert len(env.gets) == 1 and not env.posts
+
+    # User clicks the second card in WebUI modal -> hits 60s cache, zero extra GETs
+    p_second = env.control.plan_claude_reset_action(env.ctx, env.key, "cedar_ember", grant_id="full-reset-2611")
+    assert p_second["available"] is True
+    assert p_second["grant_id"] == "full-reset-2611"
+    assert len(env.gets) == 1 and not env.posts
+
+    # Mock execute: verifies fresh status GET + exact POST headers/body + post-reset plain usage GET
+    env.response["cleared"] = ["five_hour", "seven_day", "seven_day_overage_included"]
+    out = env.control.execute_claude_reset_action(env.ctx, env.key, p_second["plan_token"])
+    assert out["result"] == "reset"
+    assert out["grant_id"] == "full-reset-2611"
+    assert len(env.posts) == 1
+    url, post_call = env.posts[0]
+    assert url == "https://api.anthropic.com/api/organizations/org-actual/reset_rate_limits"
+    assert post_call["headers"]["anthropic-beta"] == "oauth-2025-04-20"
+    assert post_call["headers"]["User-Agent"] == "claude-cli/2.1.321 (external, cli)"
+    assert list(post_call["json"]) == ["program", "grant_id", "request_id"]
+    assert post_call["json"]["grant_id"] == "full-reset-2611"

@@ -427,12 +427,26 @@ def quota_save(account_key:str,data:dict[str,Any],*,email:str|None=None,expected
         if target.startswith(("openai:", "claude:")):
             # A partial active read is not evidence that an omitted window
             # recovered. Keep its last known value/deadline for recovery checks.
-            # raw_data stays the unmerged fresh response, so callers can still
-            # distinguish observed zero from a missing metric.
+            # raw_data stays the unmerged fresh response for quota windows, while
+            # Claude's opt-in reset blocks (never returned by plain /usage) are kept.
             for window in ("five_hour", "seven_day", "thirty_day", "sonnet", "opus", "fable"):
                 if updates.get(f"{window}_util") is None:
                     updates.pop(f"{window}_util", None)
                     updates.pop(f"{window}_reset", None)
+        if target.startswith("claude:") and isinstance(updates.get("raw_data"), str) and row.get("raw_data"):
+            try:
+                prev_raw = json.loads(row["raw_data"])
+                next_raw = json.loads(updates["raw_data"])
+                if isinstance(prev_raw, dict) and isinstance(next_raw, dict):
+                    changed = False
+                    for rkey in ("cedar_ember", "juniper_tide", "claude_reset_queries"):
+                        if rkey in prev_raw and rkey not in next_raw:
+                            next_raw[rkey] = prev_raw[rkey]
+                            changed = True
+                    if changed:
+                        updates["raw_data"] = json.dumps(next_raw, ensure_ascii=False)
+            except (TypeError, ValueError):
+                pass
         row.update({"account_key":target,"email":email or _quota_display_email(target),"fetched_at":int(data.get("fetched_at",now_ms()))})
         row.update(updates)
         if target.startswith("openai:") or row.get("codex_window_observations"):
@@ -504,7 +518,7 @@ def quota_delete(value:str)->None:
                     if r.get("email")==value:d.pop(k,None)
         _mut("oauth_quota_cache",op)
 def quota_patch_passive(account_key:str,patch:dict,*,email:str|None=None,expected_state_key:str|None=None)->None:
-    safe={k:v for k,v in patch.items() if k in {"five_hour_util","five_hour_reset","seven_day_util","seven_day_reset"}}
+    safe={k:v for k,v in patch.items() if k in {"five_hour_util","five_hour_reset","seven_day_util","seven_day_reset","fable_util","fable_reset"}}
     if not safe:return
     def op(d,target):
         row=_quota_defaults(dict(d.get(target) or {"account_key":target,"email":email or _quota_display_email(target),"fetched_at":0}));row.update(safe);row["last_passive_update_at"]=now_ms();d[target]=row
