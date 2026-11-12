@@ -177,6 +177,7 @@ def test_oauth_weekly_projection_formula():
     assert weekly_projection("claude", {"seven_day_util": 25}, stats) == {"tokens": 4000, "cost_ticks": 200}
     assert weekly_projection("cursor", {"seven_day_util": 25}, stats) is None
     assert weekly_projection("claude", {"seven_day_util": 0}, stats) is None
+    assert weekly_projection("antigravity", {"seven_day_util": 40}, stats) == {"tokens": 2500, "cost_ticks": 125}
 
 
 def test_oauth_detail_has_plan_period_stats_and_typed_errors():
@@ -471,13 +472,27 @@ def test_oauth_card_warmup_computes_every_account():
 
 
 def test_rolling_window_card_stats_keep_one_cache_key():
-    from src.management_control.oauth.account_card import card_stats_key, window_since
+    from src.management_control.oauth.account_card import (
+        _rolling_window_seconds,
+        card_stats_key,
+        window_since,
+    )
 
     now = 1_800_000_000.0
     # No reset time (unused Claude 5h window): the window rolls, the key must not.
     first = window_since(None, 5 * 3600, now)
     later = window_since(None, 5 * 3600, now + 600)
     assert card_stats_key("claude:a", first, 5 * 3600) == card_stats_key("claude:a", later, 5 * 3600)
+    # Unused Antigravity 5h window (used_percent == 0) whose resetTime moves with each poll:
+    # _rolling_window_seconds treats 0% used as rolling so the cache key never churns per minute.
+    ag_since_1 = window_since("2026-11-12T12:22:08Z", 5 * 3600, now)
+    ag_since_2 = window_since("2026-11-12T12:23:08Z", 5 * 3600, now + 60)
+    r1 = _rolling_window_seconds(0.0, ag_since_1, 5 * 3600, now)
+    r2 = _rolling_window_seconds(0.0, ag_since_2, 5 * 3600, now + 60)
+    assert r1 == 5 * 3600 and r2 == 5 * 3600
+    assert card_stats_key("antigravity:a", ag_since_1, r1, "antigravityGroup1:5 小时") == card_stats_key(
+        "antigravity:a", ag_since_2, r2, "antigravityGroup1:5 小时"
+    )
     # Anchored windows still change key with their start.
     assert card_stats_key("claude:a", 1000.0) != card_stats_key("claude:a", 1000.0 + 3600)
 
@@ -522,6 +537,10 @@ def test_antigravity_windows_are_ordered_and_use_seven_day_label():
     assert enriched[0]["items"][0]["local"]["total"] == 12
     assert enriched[1]["items"][0]["local"]["total"] == 12
     assert ("oauth:antigravity:u@x:p", ("gemini-3.8-flash-high",)) in seen
+    from src.management_control.oauth.account_card import weekly_projection
+    proj = weekly_projection("antigravity", {}, None, sections=sections, windows=windows)
+    # Primary active group is Gemini 4 Argon (99.4% used vs 50% used), 6200 tokens / 0.994 = 6237
+    assert proj == {"tokens": 6237, "cost_ticks": 101}
 
 
 def test_claude_fable_window_counts_only_fable_models():

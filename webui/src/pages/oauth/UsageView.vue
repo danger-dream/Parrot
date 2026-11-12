@@ -82,7 +82,7 @@ function tone(left: number): string {
   return left < 15 ? 'r' : left < 40 ? 'o' : ''
 }
 function localLine(it: UsageItem): string {
-  return localUsageLine(it.local)
+  return localUsageLine(it.local, it)
 }
 </script>
 

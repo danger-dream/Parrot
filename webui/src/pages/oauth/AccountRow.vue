@@ -37,6 +37,7 @@ const quotaFacts = computed(() =>
 const period = computed(() => card.value?.localPeriod || null)
 const stats = computed(() => period.value?.stats || null)
 const share = computed(() => cacheShare(stats.value))
+const projection = computed(() => card.value?.weeklyProjection || null)
 
 type Item = NonNullable<AccountSummary['card']>['usageSections'][number]['items'][number]
 function remaining(i: Item): number | null {
@@ -114,6 +115,10 @@ function tone(left: number | null): string {
         <dd title="平均输出速度">{{ tps(stats.averageTokensPerSecond) }}</dd>
         <dt>金额</dt>
         <dd>{{ stats.costTicks || !stats.unpricedSuccess ? usd(stats.costTicks) : '未计价' }}</dd>
+        <template v-if="projection">
+          <dt>7 天预测</dt>
+          <dd :title="`7 天额度预测：${compact(projection.tokens)} tokens${projection.costTicks ? ` · ${usd(projection.costTicks)}` : ''}`">{{ compact(projection.tokens) }}<template v-if="projection.costTicks"> · {{ usd(projection.costTicks) }}</template></dd>
+        </template>
       </dl>
       <p v-else class="sub">{{ period?.statsLoading ? '统计初始化中…' : '本期暂无请求' }}</p>
     </div>
@@ -131,7 +136,7 @@ function tone(left: number | null): string {
           <span class="qv">剩余 <b class="num" :class="tone(remaining(q))">{{ pctValue(remaining(q) ?? 0) }}</b><template v-if="remainingAmount(q)"> · {{ remainingAmount(q) }}</template><template v-if="itemReset(q)"> · {{ itemReset(q) }}</template></span>
         </div>
         <div class="bar"><span :class="tone(remaining(q))" :style="{ width: `${Math.max(0, Math.min(100, remaining(q) ?? 0))}%` }" /></div>
-        <p v-if="localUsageLine(q.local)" class="qf num">{{ localUsageLine(q.local) }}</p>
+        <p v-if="localUsageLine(q.local, q)" class="qf num">{{ localUsageLine(q.local, q) }}</p>
       </div>
       <p v-for="(v, i) in quotas.values" :key="`v${i}`" class="val">
         <span>{{ v.label }}</span>

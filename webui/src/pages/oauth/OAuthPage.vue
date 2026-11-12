@@ -60,6 +60,36 @@ watch(view, (v) => localStorage.setItem('parrot.oauth.view', v))
 // The table needs desktop width; phones always get the cards.
 const effView = computed(() => (ui.width < 900 ? 'cards' : view.value))
 
+function preserveLoadingStats(prev: AccountSummary[], next: AccountSummary[]): AccountSummary[] {
+  if (!prev.length) return next
+  const byId = new Map(prev.map((a) => [a.accountId, a]))
+  return next.map((item) => {
+    const oldCard = byId.get(item.accountId)?.card
+    const card = item.card
+    if (!oldCard || !card) return item
+    const anyWindowLoading = Object.values(card.windowStats || {}).some((w) => w.statsLoading)
+    if (!card.localPeriod.statsLoading && !anyWindowLoading) return item
+    const localPeriod =
+      card.localPeriod.statsLoading && !card.localPeriod.stats && oldCard.localPeriod.stats
+        ? { ...card.localPeriod, stats: oldCard.localPeriod.stats }
+        : card.localPeriod
+    const weeklyProjection = !card.weeklyProjection && anyWindowLoading ? oldCard.weeklyProjection : card.weeklyProjection
+    const oldSecMap = new Map((oldCard.usageSections || []).map((s) => [s.id, s]))
+    const usageSections = anyWindowLoading
+      ? (card.usageSections || []).map((s) => {
+          const oldSec = oldSecMap.get(s.id)
+          if (!oldSec) return s
+          const oldItems = new Map(oldSec.items.map((i) => [i.label, i]))
+          return {
+            ...s,
+            items: s.items.map((it) => (!it.local && oldItems.get(it.label)?.local ? { ...it, local: oldItems.get(it.label)?.local } : it)),
+          }
+        })
+      : card.usageSections
+    return { ...item, card: { ...card, localPeriod, weeklyProjection, usageSections } }
+  })
+}
+
 async function load(): Promise<void> {
   if (drag.id || savingOrder.value) {
     deferredLoad = true
@@ -79,7 +109,7 @@ async function load(): Promise<void> {
       return
     }
     if (recent) outcomes.value = recent
-    accounts.value = res.items
+    accounts.value = preserveLoadingStats(accounts.value, res.items)
     listRevision.value = res.revision
     error.value = ''
     // Cold start: stats are computed in the background (TG「统计初始化中」); ask again shortly.

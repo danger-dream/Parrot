@@ -1161,28 +1161,13 @@ def _fmt_credit_amount(v) -> str:
     return f"{x:,.2f}".rstrip("0").rstrip(".")
 
 
-def _weekly_quota_projection(account_key: str, row: dict | None = None) -> dict | None:
-    """Estimate one full weekly OAuth quota from this week's local usage.
-
-    The denominator is strictly the provider's shared seven-day/weekly quota
-    percentage.  The numerator is the matching ``WINDOW_STATS`` 7d snapshot;
-    monthly totals and 5h/30d percentages must never enter this calculation.
-    """
-    if oauth_control.provider_of_snapshot(account_key) not in {"claude", "openai", "xai", "zhipu"}:
-        return None
-    row = oauth_control.quota_snapshot(account_key) if row is None else row
-    if not isinstance(row, dict):
-        return None
+def _project_stats_with_used_percent(used_percent_raw, stats: dict | None, *, pricing_enabled: bool) -> dict | None:
     try:
-        used_percent = float(row.get("seven_day_util"))
+        used_percent = float(used_percent_raw)
     except (TypeError, ValueError, OverflowError):
         return None
     if not math.isfinite(used_percent) or used_percent <= 0 or used_percent > 100:
         return None
-
-    stats = menu_cache.WINDOW_STATS.peek(
-        _window_stats_cache_key(account_key, "7d")
-    ).value
     if not isinstance(stats, dict):
         return None
     prompt = ui.prompt_total(
@@ -1201,11 +1186,6 @@ def _weekly_quota_projection(account_key: str, row: dict | None = None) -> dict 
         )
     )
     result = {"tokens": projected_tokens, "cost_text": None}
-
-    pricing_cfg = oauth_control.config_snapshot().get("pricing", {})
-    pricing_enabled = not isinstance(pricing_cfg, dict) or bool(
-        pricing_cfg.get("enabled", True)
-    )
     try:
         cost_ticks = max(0, int(stats.get("cost_ticks") or 0))
         costed_success = max(0, int(stats.get("costed_success") or 0))
@@ -1219,6 +1199,64 @@ def _weekly_quota_projection(account_key: str, row: dict | None = None) -> dict 
         )
         result["cost_text"] = ui.fmt_cost({"cost_ticks": projected_ticks})
     return result
+
+
+def _weekly_quota_projection(account_key: str, row: dict | None = None) -> dict | None:
+    """Estimate one full weekly OAuth quota from this week's local usage.
+
+    The denominator is strictly the provider's shared seven-day/weekly quota
+    percentage (or for Antigravity, the primary active weekly quota group).
+    The numerator is the matching ``WINDOW_STATS`` 7d snapshot; monthly totals
+    and 5h/30d percentages must never enter this calculation.
+    """
+    provider = oauth_control.provider_of_snapshot(account_key)
+    if provider not in {"claude", "openai", "xai", "zhipu", "antigravity"}:
+        return None
+    row = oauth_control.quota_snapshot(account_key) if row is None else row
+    if not isinstance(row, dict):
+        return None
+    pricing_cfg = oauth_control.config_snapshot().get("pricing", {})
+    pricing_enabled = not isinstance(pricing_cfg, dict) or bool(
+        pricing_cfg.get("enabled", True)
+    )
+    if provider == "antigravity":
+        groups = _antigravity_raw_from_row(row).get("quota_groups") or []
+        best_rank: tuple[float, int] | None = None
+        best_result: dict | None = None
+        for idx, group in enumerate(groups):
+            if not isinstance(group, dict):
+                continue
+            for bucket in group.get("buckets") or []:
+                if not isinstance(bucket, dict) or str(bucket.get("window") or "").strip() != "weekly":
+                    continue
+                frac = bucket.get("remaining_fraction")
+                if frac is None or isinstance(frac, bool):
+                    continue
+                try:
+                    used_pct = round(100.0 - max(0.0, min(1.0, float(frac))) * 100.0, 4)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                gstats = menu_cache.WINDOW_STATS.peek(
+                    _window_stats_cache_key(account_key, f"ag-7d:{idx}")
+                ).value
+                projected = _project_stats_with_used_percent(
+                    used_pct, gstats, pricing_enabled=pricing_enabled,
+                )
+                if projected is None:
+                    continue
+                rank = (used_pct, int(projected["tokens"]))
+                if best_rank is None or rank > best_rank:
+                    best_rank = rank
+                    best_result = projected
+        if best_result is not None:
+            return best_result
+
+    stats = menu_cache.WINDOW_STATS.peek(
+        _window_stats_cache_key(account_key, "7d")
+    ).value
+    return _project_stats_with_used_percent(
+        row.get("seven_day_util"), stats, pricing_enabled=pricing_enabled,
+    )
 
 
 def _format_period_cost_with_week_projection(account_key: str, period_stats: dict | None,
@@ -2055,7 +2093,9 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
                     f"峰值 {ui.fmt_tps(ts.get('max_tps'))} · "
                     f"最低 {ui.fmt_tps(ts.get('min_tps'))}"
                 )
-            lines.append(f"💵 {local_period['money_label']} {ui.fmt_cost(ts)}")
+            lines.append(_format_period_cost_with_week_projection(
+                ak, ts, local_period["money_label"],
+            ))
         else:
             lines.append(f"💎 {local_period['usage_label']}: <i>暂无本地请求</i>")
     elif prov != "xai" and _has_local_usage_or_billing(ts):
@@ -2841,6 +2881,20 @@ def _oauth_window_specs(accounts: list[dict]) -> list[tuple[tuple, str, float]]:
                 specs.append((
                     _window_stats_cache_key(account_key, "fable-7d"), account_key, since,
                 ))
+        if provider == "antigravity":
+            groups = _antigravity_raw_from_row(row).get("quota_groups") or []
+            for idx, group in enumerate(groups):
+                if not isinstance(group, dict):
+                    continue
+                for bucket in group.get("buckets") or []:
+                    if not isinstance(bucket, dict) or str(bucket.get("window") or "").strip() != "weekly":
+                        continue
+                    if bucket.get("remaining_fraction") is None:
+                        continue
+                    since = _quota_window_since_ts(bucket.get("reset_time"), 7 * 86400, now_ts=now_ts)
+                    specs.append((
+                        _window_stats_cache_key(account_key, f"ag-7d:{idx}"), account_key, since,
+                    ))
     return specs
 
 
@@ -2850,6 +2904,21 @@ def _load_oauth_window_stats(account_key: str, since: float, window_name: str) -
         return oauth_control.tokens_for_channel_models_snapshot(
             f"oauth:{account_key}", oauth_control.claude_fable_models(account), since,
         )
+    if window_name.startswith("ag-7d:"):
+        from src.management_control.oauth.account_card import _antigravity_group_models
+        account = oauth_control.account_snapshot(account_key) or {}
+        groups = _antigravity_raw(account_key).get("quota_groups") or []
+        try:
+            idx = int(window_name.split(":", 1)[1])
+            group = groups[idx] if 0 <= idx < len(groups) and isinstance(groups[idx], dict) else {}
+        except (ValueError, IndexError):
+            group = {}
+        all_titles = [str(g.get("display_name") or "") for g in groups if isinstance(g, dict)]
+        models = _antigravity_group_models(account, str(group.get("display_name") or ""), all_titles)
+        if models:
+            return oauth_control.tokens_for_channel_models_snapshot(
+                f"oauth:{account_key}", list(models), since,
+            )
     return oauth_control.tokens_for_channel_snapshot(f"oauth:{account_key}", since_ts=since)
 
 
@@ -3321,6 +3390,13 @@ def _format_month_stats_block(account_key: str, *,
             if is_cursor else f"累计金额：{ui.fmt_cost(overall)}"
         ),
     ]
+    if not is_cursor:
+        projection = _weekly_quota_projection(account_key)
+        if projection is not None:
+            proj_line = f"周额度预测：{ui.fmt_tokens(projection['tokens'])}"
+            if projection.get("cost_text"):
+                proj_line += f" · {projection['cost_text']}"
+            lines.append(proj_line)
     if model_loading:
         lines.append("")
         lines.append("按模型: <i>统计初始化中</i>")

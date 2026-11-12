@@ -103,6 +103,20 @@ def window_since(reset_iso: Any, window_seconds: int, now_ts: float) -> float:
     return reset_ts - window_seconds
 
 
+def _rolling_window_seconds(used_percent: Any, since: float, seconds: int, now_ts: float) -> int | None:
+    """Unused windows (0% used, e.g. Antigravity buckets whose resetTime is poll_ts + window)
+    and windows without a reset time roll with the clock and must keep one stable cache key."""
+    if since == now_ts - seconds:
+        return seconds
+    if used_percent is not None and not isinstance(used_percent, bool):
+        try:
+            if float(used_percent) <= 0:
+                return seconds
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return None
+
+
 def card_stats_key(account_id: str, since: float, rolling_seconds: int | None = None,
                    scope: str | None = None) -> tuple:
     """Statistics-cache key of one card figure.
@@ -144,23 +158,64 @@ def stats_view(raw: dict | None) -> dict | None:
     }
 
 
-def weekly_projection(provider: str, row: dict | None, stats_7d: dict | None) -> dict | None:
-    """TG ``_weekly_quota_projection``: one full weekly quota from this week's usage."""
-    if provider not in {"claude", "openai", "xai", "zhipu"} or not isinstance(row, dict) or not stats_7d:
+def project_window_quota(used_percent: Any, stats_7d: dict | None) -> dict | None:
+    """Project one full 100% quota from a 7-day window's used percentage and matching local stats."""
+    if not isinstance(stats_7d, dict):
         return None
     try:
-        used = float(row.get("seven_day_util"))
+        used = float(used_percent)
     except (TypeError, ValueError, OverflowError):
         return None
     if not math.isfinite(used) or used <= 0 or used > 100:
         return None
-    tokens = stats_7d["prompt_tokens"] + stats_7d["output_tokens"]
+    tokens = int(stats_7d.get("prompt_tokens") or 0) + int(stats_7d.get("output_tokens") or 0)
     if tokens <= 0:
         return None
     denominator = Decimal(str(used))
     project = lambda value: int((Decimal(value) * 100 / denominator).to_integral_value(rounding=ROUND_HALF_UP))
-    costed = stats_7d["cost_ticks"] > 0 or stats_7d["costed_success"] > 0
-    return {"tokens": project(tokens), "cost_ticks": project(stats_7d["cost_ticks"]) if costed else None}
+    cost_ticks = int(stats_7d.get("cost_ticks") or 0)
+    costed = cost_ticks > 0 or int(stats_7d.get("costed_success") or 0) > 0
+    return {"tokens": project(tokens), "cost_ticks": project(cost_ticks) if costed else None}
+
+
+def weekly_projection(
+    provider: str,
+    row: dict | None,
+    stats_7d: dict | None,
+    *,
+    sections: tuple | list = (),
+    windows: dict | None = None,
+) -> dict | None:
+    """TG ``_weekly_quota_projection``: one full weekly quota from this week's usage."""
+    if provider == "antigravity":
+        best_rank: tuple[float, int] | None = None
+        best_projection: dict | None = None
+        if sections and isinstance(windows, dict):
+            for sec in sections:
+                if not isinstance(sec, dict):
+                    continue
+                sec_id = str(sec.get("id") or "")
+                if not sec_id.startswith("antigravityGroup"):
+                    continue
+                for entry in sec.get("items") or []:
+                    if not isinstance(entry, dict) or entry.get("label") != "7 天":
+                        continue
+                    wstats = (windows.get(f"{sec_id}:7 天") or {}).get("stats")
+                    projected = project_window_quota(entry.get("used_percent"), wstats)
+                    if projected is None:
+                        continue
+                    rank = (float(entry.get("used_percent") or 0.0), int(projected["tokens"]))
+                    if best_rank is None or rank > best_rank:
+                        best_rank = rank
+                        best_projection = projected
+        if best_projection is not None:
+            return best_projection
+        if isinstance(row, dict) and stats_7d:
+            return project_window_quota(row.get("seven_day_util"), stats_7d)
+        return None
+    if provider not in {"claude", "openai", "xai", "zhipu"} or not isinstance(row, dict) or not stats_7d:
+        return None
+    return project_window_quota(row.get("seven_day_util"), stats_7d)
 
 
 _WINDOW_LABELS = {"5 小时": "fiveHour", "7 天": "sevenDay", "Fable 7 天": "fable"}
@@ -191,8 +246,17 @@ def _antigravity_group_models(account: dict, group_title: str, all_titles: list[
             m for m in universe
             if "gemini" in m.lower() and (not has_separate_argon or "argon" not in m.lower())
         ]
-        if not has_separate_argon and "gemini-4-argon" not in matched:
-            matched.append("gemini-4-argon")
+        if not has_separate_argon:
+            if any("argon" in m.lower() for m in matched):
+                for bare in ("gemini-4-argon", "gemini-4-argon-low", "gemini-4-argon-medium", "gemini-4-argon-high"):
+                    if bare not in matched:
+                        matched.append(bare)
+            elif "gemini-4-argon" not in matched:
+                matched.append("gemini-4-argon")
+        if any("carbon" in m.lower() for m in matched):
+            for bare in ("gemini-4-carbon", "gemini-4-carbon-low", "gemini-4-carbon-medium", "gemini-4-carbon-high"):
+                if bare not in matched:
+                    matched.append(bare)
         return tuple(matched)
     return ()
 
@@ -325,7 +389,7 @@ class OAuthAccountCardMixin:
             return {}
         seconds = 7 * 86400
         since = window_since(reset, seconds, now_ts)
-        rolling = seconds if since == now_ts - seconds else None
+        rolling = _rolling_window_seconds(util, since, seconds, now_ts)
         stats, loading = self._local_stats(account_id, since, blocking, rolling_seconds=rolling,
                                            models=models, scope="fable")
         return {"fable": {"since": datetime.fromtimestamp(since, timezone.utc), "stats": stats,
@@ -352,7 +416,7 @@ class OAuthAccountCardMixin:
                     continue
                 reset = entry.get("resets_at")
                 since = window_since(reset, seconds, now_ts)
-                rolling = seconds if since == now_ts - seconds else None
+                rolling = _rolling_window_seconds(entry.get("used_percent"), since, seconds, now_ts)
                 wkey = f"{sec_id}:{label}"
                 try:
                     stats, loading = self._local_stats(
@@ -529,7 +593,7 @@ class OAuthAccountCardMixin:
                 if row.get(util_key) is None or (provider == "xai" and name == "fiveHour"):
                     continue
                 since = window_since(row.get(reset_key), seconds, now_ts)
-                rolling = seconds if since == now_ts - seconds else None
+                rolling = _rolling_window_seconds(row.get(util_key), since, seconds, now_ts)
                 stats, window_loading = self._local_stats(account_id, since, blocking, rolling_seconds=rolling)
                 windows[name] = {"since": datetime.fromtimestamp(since, timezone.utc), "stats": stats,
                                  "stats_loading": window_loading}
@@ -537,7 +601,10 @@ class OAuthAccountCardMixin:
             windows.update(self._fable_window(account_id, account, row, now_ts, blocking))
         if provider == "antigravity":
             windows.update(self._antigravity_windows(account_id, account, sections, now_ts, blocking))
-        projection = weekly_projection(provider, row, (windows.get("sevenDay") or {}).get("stats"))
+        projection = weekly_projection(
+            provider, row, (windows.get("sevenDay") or {}).get("stats"),
+            sections=sections, windows=windows,
+        )
         sections = _with_window_local(sections, windows)
         return {
             "status_tag": status,

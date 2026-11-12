@@ -833,6 +833,49 @@ def test_antigravity_credits_block_does_not_invent_percent(m):
     assert "⚡ TPS:" in used
     assert "💵" in used
     assert "暂无本地请求" not in used
+    from src.telegram import menu_cache
+    m["state_db"].quota_save(ak, {
+        "fetched_at": m["state_db"].now_ms(),
+        "seven_day_util": 25.0,
+        "raw_data": json.dumps({
+            "antigravity": {
+                "known": True,
+                "tier_name": "Google AI Pro",
+                "credit_amount": 12,
+                "minimum_credit_amount": 1,
+                "available": True,
+                "quota_groups": [
+                    {
+                        "display_name": "Gemini Models",
+                        "buckets": [{"window": "weekly", "remaining_fraction": 0.75, "reset_time": "2099-01-07T00:00:00Z"}],
+                    }
+                ],
+            }
+        }),
+    }, email="cred@gmail.com")
+    menu_cache.WINDOW_STATS.store(
+        m["oauth_menu"]._window_stats_cache_key(ak, "ag-7d:0"),
+        {"input": 600, "output": 200, "cache_creation": 0, "cache_read": 200, "cost_ticks": 15_000_000_000, "costed_success": 1},
+    )
+    month_snap = {
+        "by_channel": {
+            f"oauth:{ak}": {
+                "total": 3, "success_count": 3, "error_count": 0,
+                "input": 1000, "output": 200, "cache_creation": 0, "cache_read": 400,
+                "avg_tps": 12.5, "max_tps": 30.0, "min_tps": 2.0,
+                "cost_ticks": 30_000_000_000, "costed_success": 1, "unpriced_success": 0,
+            }
+        }
+    }
+    projected_list = m["oauth_menu"]._format_account_block(
+        m["oauth_manager"].get_account(ak), month_snapshot=month_snap,
+    )
+    assert "周额度预测：4.0K · $6.00" in projected_list
+    projected_detail = m["oauth_menu"]._format_month_stats_block(
+        ak, month_snapshot=month_snap, by_model=[],
+    )
+    assert "周额度预测：4.0K · $6.00" in projected_detail
+    menu_cache.WINDOW_STATS.clear()
     detail, _kb = m["oauth_menu"]._detail_text_and_kb(ak, refresh_quota=False)
     assert detail is not None
     assert "🏷️ 套餐: <code>Google AI Pro</code>" in detail
