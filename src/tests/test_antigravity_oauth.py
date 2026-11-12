@@ -341,8 +341,16 @@ def test_envelope_and_claude_tool_mode(m):
     assert env["requestId"].startswith("agent-")
     assert env["request"]["sessionId"].startswith("-")
     assert "maxOutputTokens" not in (env["request"].get("generationConfig") or {})
+    assert env["request"]["safetySettings"] == [
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
+        {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "OFF"},
+    ]
 
     image = codec.wrap_cloud_code(gemini, model="gemini-3.1-flash-image", project_id="proj-x")
+    assert "safetySettings" not in image["request"]
     assert image["requestType"] == "image_gen"
     assert image["requestId"].startswith("image_gen/")
 
@@ -351,7 +359,11 @@ def test_envelope_and_claude_tool_mode(m):
         model="claude-sonnet-4-6",
         project_id="proj-x",
     )
+    assert "safetySettings" not in claude["request"]
     assert claude["request"]["toolConfig"]["functionCallingConfig"]["mode"] == "VALIDATED"
+
+    gpt_oss = codec.wrap_cloud_code(gemini, model="gpt-oss-120b-medium", project_id="proj-x")
+    assert "safetySettings" not in gpt_oss["request"]
 
 
 def test_gemini_json_and_sse_restore(m):
@@ -1347,3 +1359,23 @@ def _finish_notification_ui_workers():
     for worker in threading.enumerate():
         if worker.name == "oauth-model-sync-ui":
             worker.join(25)
+
+
+def test_canned_gemini_filter_block_uses_content_filter_code_not_stream_incomplete(m):
+    codec = m["codec"]
+    blocked_text = (
+        "This request was blocked by Gemini's filters. "
+        "They can occasionally trigger by mistake on safe coding, security, or biology-related queries."
+    )
+    payload = {"response": {"candidates": [{"content": {"role": "model", "parts": [{"text": blocked_text}]}}]}}
+    json_out = codec.gemini_to_responses(payload, model="gemini-4-carbon-medium")
+    assert json_out["status"] == "failed"
+    assert json_out["error"]["code"] == "content_filter"
+    assert codec.request_failure_info(json_out) == ("content_filter", "Request blocked by Gemini's filters")
+    assert "content_filter" not in codec.RETRYABLE_REQUEST_FAILURE_CODES
+
+    converter = codec.GeminiStreamToResponses(model="gemini-4-carbon-medium")
+    sse_bytes = converter.feed(b"data: " + codec._json_dumps(payload).encode("utf-8") + b"\n\n") + converter.close()
+    assert b'"code":"content_filter"' in sse_bytes or b'"code": "content_filter"' in sse_bytes
+    assert converter.request_failure == ("content_filter", "Request blocked by Gemini's filters")
+

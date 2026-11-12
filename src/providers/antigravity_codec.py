@@ -33,7 +33,7 @@ SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator"
 # not the account, and another account replays the same prompt.
 REQUEST_FAILURE_CODES = frozenset({
     "gemini_malformed_function_call", "gemini_unexpected_tool_call",
-    "gemini_missing_thought_signature",
+    "gemini_missing_thought_signature", "content_filter",
 })
 # Sampled tool-call output, also retried by Gemini CLI. A missing signature
 # is fixed by the request and never by a replay.
@@ -566,7 +566,25 @@ def responses_to_gemini(payload: dict) -> dict[str, Any]:
 
         if typ == "function_call_output":
             call_id = str(item.get("call_id") or "")
-            name = call_names.get(call_id) or str(item.get("name") or "tool")
+            item_id = str(item.get("id") or "")
+            raw_name = str(item.get("name") or "")
+            is_standalone_fco = (
+                item_id.startswith("fco_")
+                or call_id.startswith("fco_")
+                or raw_name.startswith("codex_apps_")
+            )
+            if (not call_id or call_id not in call_names) and is_standalone_fco:
+                response, image_parts = _tool_output_parts(item.get("output"))
+                text_val = response if isinstance(response, str) else str(response)
+                label = f"[{raw_name}]\n{text_val}" if raw_name else text_val
+                parts_list: list[dict[str, Any]] = []
+                if label:
+                    parts_list.append({"text": label})
+                parts_list.extend(image_parts)
+                if parts_list:
+                    contents.append({"role": "user", "parts": parts_list})
+                continue
+            name = call_names.get(call_id) or raw_name or "tool"
             response, image_parts = _tool_output_parts(item.get("output"))
             function_response: dict[str, Any] = {
                 "name": name,
@@ -694,7 +712,17 @@ def wrap_cloud_code(
         request["sessionId"] = format_session_id(session_id) or _stable_session_id(request)
 
     image = is_image_model(model)
-    claude = "claude" in str(model or "").lower()
+    model_low = str(model or "").lower()
+    claude = "claude" in model_low
+    gemini_model = "gemini" in model_low
+    if gemini_model and not image:
+        request["safetySettings"] = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
+            {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "OFF"},
+        ]
     if claude:
         tool_config = request.setdefault("toolConfig", {})
         if isinstance(tool_config, dict):
@@ -791,9 +819,22 @@ def _finish_to_status(reason: str | None) -> tuple[str, dict | None]:
     return "failed", None
 
 
-def _terminal_details(reason: str | None, feedback: Any, error: Any = None, finish_message: str | None = None):
+def _is_canned_gemini_filter_block(text: str | None) -> bool:
+    return str(text or "").lstrip().startswith("This request was blocked by Gemini's filters.")
+
+
+def _terminal_details(
+    reason: str | None,
+    feedback: Any,
+    error: Any = None,
+    finish_message: str | None = None,
+    *,
+    output_text: str = "",
+):
     status, incomplete = _finish_to_status(reason)
     response_error = None
+    if not reason and error is None and _is_canned_gemini_filter_block(output_text):
+        error = {"code": "content_filter", "message": "Request blocked by Gemini's filters"}
     if isinstance(feedback, dict):
         block = feedback.get("blockReason") or feedback.get("block_reason")
         if block and block != "BLOCK_REASON_UNSPECIFIED":
@@ -948,19 +989,21 @@ def gemini_to_responses(payload: dict, *, model: str, namespace_tool_map: Any = 
     invalid_calls = [it for it in items if it["type"] == "function_call" and not _complete_call(it)]
     if invalid_calls and reason == "STOP" and error is None:
         error = {"code": "gemini_malformed_function_call", "message": "Invalid Gemini function call arguments"}
+    output_text = "".join(
+        (it.get("content") or [{}])[0].get("text", "")
+        for it in items
+        if it.get("type") == "message" and it.get("content")
+    )
     finish_message = candidate.get("finishMessage")
-    status, incomplete, response_error = _terminal_details(reason, feedback, error, finish_message)
+    status, incomplete, response_error = _terminal_details(
+        reason, feedback, error, finish_message, output_text=output_text,
+    )
     for item in items:
         if item["type"] == "function_call":
             if item in invalid_calls or reason in {"MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL"}:
                 item["status"] = "incomplete"
         elif status != "completed":
             item["status"] = "incomplete"
-    output_text = "".join(
-        (it.get("content") or [{}])[0].get("text", "")
-        for it in items
-        if it.get("type") == "message" and it.get("content")
-    )
     return {
         "id": _gen_id("resp_"),
         "object": "response",
@@ -1509,7 +1552,11 @@ class GeminiStreamToResponses:
                 "code": "gemini_malformed_function_call", "message": "Invalid Gemini function call arguments",
             }
         status, incomplete, response_error = _terminal_details(
-            self.finish_reason, self.prompt_feedback, self.upstream_error, self.finish_message,
+            self.finish_reason,
+            self.prompt_feedback,
+            self.upstream_error,
+            self.finish_message,
+            output_text=self.seen_text,
         )
         self.item_status = "completed" if status == "completed" else "incomplete"
         yield from self._ensure_created()
