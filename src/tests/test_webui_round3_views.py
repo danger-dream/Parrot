@@ -576,3 +576,81 @@ def test_qoder_credit_pools_are_labelled_jifen(name):
 
     section = _qoder({"usage": {"pools": [{"name": name, "total": 100, "remaining": 40, "used_percent": 60}]}})
     assert [i["label"] for i in section["items"]] == ["积分"]
+
+
+def test_openai_prolite_zero_minute_secondary_header_filtered_and_hidden():
+    from src.oauth import openai as openai_provider
+    from src.management_control.oauth.usage_sections import build_usage_sections
+
+    snap = openai_provider.parse_rate_limit_headers({
+        "x-codex-primary-used-percent": "92.0",
+        "x-codex-primary-window-minutes": "10080",
+        "x-codex-primary-reset-after-seconds": "343",
+        "x-codex-secondary-used-percent": "0.0",
+        "x-codex-secondary-window-minutes": "0",
+        "x-codex-secondary-reset-after-seconds": "0",
+    })
+    assert snap is not None
+    assert snap["secondary_used_pct"] is None
+    assert snap["secondary_window_min"] is None
+    normalized = openai_provider.normalize_codex_snapshot(snap)
+    assert "five_hour_util" not in normalized
+    assert normalized["seven_day_util"] == 92.0
+
+    # Persisted legacy row with codex_secondary_window_min == 0 is hidden from usageSections
+    row = {
+        "five_hour_util": 0.0,
+        "five_hour_reset": "2026-11-12T06:02:46Z",
+        "seven_day_util": 92.0,
+        "seven_day_reset": "2026-11-12T07:48:48Z",
+        "codex_secondary_window_min": 0,
+        "codex_secondary_used_pct": 0.0,
+        "raw_data": "{}",
+    }
+    sections = build_usage_sections("openai", row, None)
+    win_sec = next(s for s in sections if s["id"] == "windows")
+    assert [it["label"] for it in win_sec["items"]] == ["7 天"]
+
+
+def test_due_quota_window_reset_triggers_throttled_refresh(monkeypatch):
+    import asyncio
+    from src import oauth_manager as om
+
+    row_due = {
+        "fetched_at": 1_700_000_000_000,  # 1700000000s
+        "seven_day_util": 92.0,
+        "seven_day_reset": "2023-11-14T22:15:00Z",  # 1700000100s
+        "raw_data": "{}",
+    }
+    assert om.has_due_quota_window_reset("openai:u@x:ws", row_due, now_s=1_700_000_050.0) is False
+    assert om.has_due_quota_window_reset("openai:u@x:ws", row_due, now_s=1_700_000_120.0) is True
+
+    # Unused window (0%) does not trigger due-reset refresh
+    row_zero = {**row_due, "seven_day_util": 0.0}
+    assert om.has_due_quota_window_reset("openai:u@x:ws", row_zero, now_s=1_700_000_120.0) is False
+
+    acc = {"email": "u@x", "provider": "openai", "type": "openai", "workspace_id": "ws", "enabled": True}
+    calls = []
+
+    async def fake_snapshot(ak):
+        calls.append(ak)
+        return {"seven_day": {"utilization": 0.0, "resets_at": "2023-11-21T22:15:00Z"}}
+
+    monkeypatch.setattr(om.config, "get", lambda: {"oauthAccounts": [acc], "quotaMonitor": {"disableThresholdPercent": 95}})
+    monkeypatch.setattr(om, "list_accounts", lambda: [acc])
+    monkeypatch.setattr(om, "get_account", lambda ak: acc)
+    monkeypatch.setattr(om.state_db, "quota_load", lambda ak: row_due)
+    monkeypatch.setattr(om.state_db, "quota_save", lambda ak, data, **kw: None)
+    monkeypatch.setattr(om, "fetch_usage_snapshot", fake_snapshot)
+    monkeypatch.setattr(om, "evaluate_and_toggle_by_usage", lambda *a, **k: {"action": "kept_enabled", "utils": [0.0], "hit_windows": []})
+    om._DUE_QUOTA_REFRESH_AT.clear()
+
+    out1 = asyncio.run(om.refresh_due_quota_windows_once(min_retry_interval_s=60.0, now_s=1_700_000_120.0))
+    assert out1 == {"u@x": "kept_enabled"}
+    assert calls == ["openai:u@x:ws"]
+
+    # Second call within 60s is throttled
+    out2 = asyncio.run(om.refresh_due_quota_windows_once(min_retry_interval_s=60.0, now_s=1_700_000_150.0))
+    assert out2 == {"u@x": "throttled"}
+    assert len(calls) == 1
+

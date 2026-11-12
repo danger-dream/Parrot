@@ -1372,10 +1372,41 @@ def _normalize_limit_id(value: Any) -> str:
     return str(value or "").strip().lower().replace("-", "_")
 
 
+def _is_empty_zero_minute_window(minutes: int | None, used: float | None) -> bool:
+    """Codex single-window plans (e.g. prolite) emit a dummy secondary header with
+    ``window_minutes=0`` and ``used_percent=0``. Never treat a 0-minute placeholder as a real window."""
+    return minutes is not None and minutes <= 0 and (used is None or used <= 0)
+
+
+def is_bogus_zero_min_openai_5h(row: dict | None) -> bool:
+    """Return True when a persisted ``five_hour_util == 0`` row came from a 0-minute placeholder header."""
+    if not isinstance(row, dict):
+        return False
+    fh = _coerce_float(row.get("five_hour_util"))
+    if fh is None or fh > 0:
+        return False
+    for raw_name in ("secondary", "primary"):
+        wmin = _coerce_int(row.get(f"codex_{raw_name}_window_min"))
+        used = _coerce_float(row.get(f"codex_{raw_name}_used_pct"))
+        if _is_empty_zero_minute_window(wmin, used):
+            return True
+    try:
+        obs = json.loads(row.get("codex_window_observations") or "{}").get("five_hour")
+        if isinstance(obs, dict) and _is_empty_zero_minute_window(
+            _coerce_int(obs.get("window_min")), _coerce_float(obs.get("used_pct")),
+        ):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
 def _header_rate_limit_window(flat: dict, prefix: str, name: str,
                               now_seconds: int) -> dict | None:
     used = _clamp_percent(_parse_float(flat, f"{prefix}-{name}-used-percent"))
     minutes = _parse_int(flat, f"{prefix}-{name}-window-minutes")
+    if _is_empty_zero_minute_window(minutes, used):
+        return None
     reset_at = parse_codex_reset_at(
         flat.get(f"{prefix}-{name}-reset-at"), observed_at=now_seconds,
         window_minutes=minutes,
@@ -1505,6 +1536,8 @@ def parse_rate_limit_event(event: Any) -> dict | None:
             return None
         used = _clamp_percent(_coerce_float(value.get("used_percent")))
         minutes = _coerce_int(value.get("window_minutes"))
+        if _is_empty_zero_minute_window(minutes, used):
+            return None
         now = int(time.time())
         reset_at = parse_codex_reset_at(
             value.get("reset_at"), observed_at=now, window_minutes=minutes,
@@ -1742,6 +1775,8 @@ def sanitize_codex_window_observations(value: Any) -> dict[str, dict]:
                 continue
             if field_value >= 0:
                 item[field] = field_value
+        if _is_empty_zero_minute_window(item.get("window_min"), used_pct):  # type: ignore[arg-type]
+            continue
         sanitized[semantic] = item
     return sanitized
 
@@ -1805,6 +1840,8 @@ def codex_snapshot_window_observations(
                 continue
             if raw_value >= 0:
                 item[suffix] = raw_value
+        if _is_empty_zero_minute_window(item.get("window_min"), used_pct):  # type: ignore[arg-type]
+            continue
 
         semantic = window_map[raw_name]
         current = observations.get(semantic)
@@ -1830,6 +1867,9 @@ def normalize_codex_snapshot(snap: dict) -> dict:
         reset_key = f"{semantic}_reset_sec"
         util = snap.get(f"{raw_name}_used_pct")
         reset = snap.get(f"{raw_name}_reset_sec")
+        win_min = _coerce_int(snap.get(f"{raw_name}_window_min"))
+        if _is_empty_zero_minute_window(win_min, _coerce_float(util)):
+            continue
         if util is None and reset is None:
             # window_min identifies semantics but is not quota evidence by
             # itself. Do not erase a fresher active WHAM value when utilization

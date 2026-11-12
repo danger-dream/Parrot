@@ -7316,6 +7316,121 @@ async def proactive_refresh_loop() -> None:
         await asyncio.sleep(60)
 
 
+_DUE_QUOTA_REFRESH_AT: dict[str, float] = {}
+
+
+def has_due_quota_window_reset(account_key: str, row: dict | None = None, *,
+                               now_s: float | None = None) -> bool:
+    """Return True when a cached quota window with used_percent > 0 has reached its reset_time
+    since the snapshot was fetched (so UI shows '已到重置时间' with stale non-zero usage)."""
+    if row is None:
+        row = state_db.quota_load(account_key)
+    if not isinstance(row, dict):
+        return False
+    now_ts = float(now_s if now_s is not None else time.time())
+    fetched_ms = int(row.get("fetched_at") or 0)
+    fetched_s = fetched_ms / 1000.0 if fetched_ms > 0 else 0.0
+    prov = provider_of(account_key)
+    for util_key, reset_key in (
+        ("five_hour_util", "five_hour_reset"),
+        ("seven_day_util", "seven_day_reset"),
+        ("thirty_day_util", "thirty_day_reset"),
+        ("sonnet_util", "sonnet_reset"),
+        ("opus_util", "opus_reset"),
+        ("fable_util", "fable_reset"),
+    ):
+        if prov == "openai" and util_key == "five_hour_util" and openai_provider.is_bogus_zero_min_openai_5h(row):
+            continue
+        util_val = row.get(util_key)
+        if util_val is None or isinstance(util_val, bool):
+            continue
+        try:
+            if float(util_val) <= 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        reset_dt = _parse_iso(row.get(reset_key))
+        if reset_dt is None:
+            continue
+        reset_ts = reset_dt.timestamp()
+        if fetched_s < reset_ts <= now_ts:
+            return True
+    if prov == "antigravity":
+        raw = _raw_usage_from_flat(row)
+        ag = raw.get("antigravity") if isinstance(raw.get("antigravity"), dict) else {}
+        for group in ag.get("quota_groups") or []:
+            if not isinstance(group, dict):
+                continue
+            for bucket in group.get("buckets") or []:
+                if not isinstance(bucket, dict):
+                    continue
+                frac = bucket.get("remaining_fraction")
+                if frac is None or isinstance(frac, bool):
+                    continue
+                try:
+                    if float(frac) >= 1.0:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                reset_dt = _parse_iso(bucket.get("reset_time"))
+                if reset_dt is None:
+                    continue
+                reset_ts = reset_dt.timestamp()
+                if fetched_s < reset_ts <= now_ts:
+                    return True
+    return False
+
+
+async def refresh_due_quota_windows_once(*, min_retry_interval_s: float = 60.0,
+                                         now_s: float | None = None) -> dict[str, str]:
+    """Refresh only accounts whose consumed quota window has just passed its reset timestamp."""
+    cfg = config.get()
+    monitor_cfg = cfg.get("quotaMonitor") or {}
+    threshold = float(monitor_cfg.get("disableThresholdPercent", 95))
+    now_ts = float(now_s if now_s is not None else time.time())
+    out: dict[str, str] = {}
+    for acc in list_accounts()[:]:
+        email = acc.get("email") or (account_key_to_email(_account_key(acc)) if provider_of(acc) in {"workbuddy", "zhipu", "qoder"} else "")
+        if not email:
+            continue
+        ak = _account_key(acc)
+        if acc.get("disabled_reason") in ("user", "auth_error"):
+            continue
+        row = state_db.quota_load(ak)
+        if not has_due_quota_window_reset(ak, row, now_s=now_ts):
+            continue
+        if now_ts - _DUE_QUOTA_REFRESH_AT.get(ak, 0.0) < min_retry_interval_s:
+            out[email] = "throttled"
+            continue
+        _DUE_QUOTA_REFRESH_AT[ak] = now_ts
+        provider = provider_of(acc)
+        reason_before = acc.get("disabled_reason")
+        expected_state_key = account_state_key(acc)
+        notification_observation = reporting.observation(ak)
+        try:
+            usage = await fetch_usage_snapshot(ak)
+        except Exception as exc:
+            out[email] = f"fetch_failed:{exc}"
+            continue
+        with account_generation_guard(expected_state_key) as current:
+            if not current:
+                out[email] = "skipped:deleted_generation"
+                continue
+            usage = preserve_antigravity_cached_summary(ak, usage)
+            state_db.quota_save(ak, flatten_usage(usage), email=email)
+        fresh_for_resume = True
+        if provider == "openai" and reason_before == "quota":
+            fresh_for_resume = (_usage_has_any_quota_signal(usage)
+                                or openai_credits_usable(ak, usage))
+        result = evaluate_and_toggle_by_usage(ak, usage, threshold=threshold, fresh=fresh_for_resume,
+                                             expected_state_key=expected_state_key)
+        action = result["action"]
+        if action == "resumed":
+            reporting.quota(ak, recovered=True, usage=usage, observation=notification_observation)
+        out[email] = action
+    return out
+
+
 async def quota_monitor_loop() -> None:
     """后台任务：启动时预热 OpenAI 卡片明细，之后按配置监控额度。"""
     try:
@@ -7350,6 +7465,18 @@ async def quota_monitor_loop() -> None:
         except Exception as exc:
             quota_error = type(exc).__name__
             safe_diagnostics.report(exc, operation="quota_monitor_loop")
+        delay = max(1, int(monitor_cfg.get("intervalSeconds", 60)))
         job_telemetry.finished("quotaMonitor", ok=quota_error is None, error=quota_error,
-                               next_delay_seconds=int(monitor_cfg.get("intervalSeconds", 60)))
-        await asyncio.sleep(int(monitor_cfg.get("intervalSeconds", 60)))
+                               next_delay_seconds=delay)
+        remaining = float(delay)
+        while remaining > 0:
+            step = min(15.0, remaining)
+            await asyncio.sleep(step)
+            remaining -= step
+            if remaining > 0:
+                try:
+                    await refresh_due_quota_windows_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    safe_diagnostics.report(exc, operation="quota_monitor_loop")

@@ -44,6 +44,7 @@ from urllib.parse import parse_qs, urlparse
 
 from ... import model_names, quota_errors
 from ...cooldown import ACCOUNT_SCOPE
+from ...oauth import openai as openai_provider
 from ...oauth.plan_labels import openai_plan_label, xai_plan_label
 from ...management_control.oauth import CchMode, OAuthUsageDisplayMode
 from ...management_control.oauth.menu_bridge import (
@@ -2020,7 +2021,7 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
     elif prov == "antigravity":
         lines.extend(_format_antigravity_credits_block(ak, detail=False).splitlines())
     elif row:
-        fh_util = row.get("five_hour_util")
+        fh_util = None if (prov == "openai" and openai_provider.is_bogus_zero_min_openai_5h(row)) else row.get("five_hour_util")
         sd_util = row.get("seven_day_util")
         if fh_util is not None:
             reset = row.get("five_hour_reset")
@@ -2188,7 +2189,7 @@ def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
         "seven_day_util": 7 * 86400,
     }
     usage_rows = [
-        ("⏱ 5h", row.get("five_hour_util"), row.get("five_hour_reset"), "five_hour_util"),
+        ("⏱ 5h", None if (provider == "openai" and openai_provider.is_bogus_zero_min_openai_5h(row)) else row.get("five_hour_util"), row.get("five_hour_reset"), "five_hour_util"),
         ("📅 7d", row.get("seven_day_util"), row.get("seven_day_reset"), "seven_day_util"),
         ("📆 30d", row.get("thirty_day_util"), row.get("thirty_day_reset"), "thirty_day_util"),
         ("🤖 Sonnet 7d", row.get("sonnet_util"), row.get("sonnet_reset"), None),

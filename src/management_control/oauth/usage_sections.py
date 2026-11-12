@@ -85,6 +85,7 @@ def raw_usage(row: dict | None) -> dict:
 
 
 def _windows(provider: str, row: dict, backend) -> dict | None:
+    from src.oauth.openai import is_bogus_zero_min_openai_5h
     items = []
     for label, used_key, reset_key in (
         ("5 小时", "five_hour_util", "five_hour_reset"),
@@ -93,6 +94,8 @@ def _windows(provider: str, row: dict, backend) -> dict | None:
         ("Sonnet 7 天", "sonnet_util", "sonnet_reset"),
         ("Opus 7 天", "opus_util", "opus_reset"),
     ):
+        if provider == "openai" and used_key == "five_hour_util" and is_bogus_zero_min_openai_5h(row):
+            continue
         if _num(row.get(used_key)) is not None:
             items.append(item(label, used_percent=row.get(used_key), resets_at=row.get(reset_key)))
     if provider == "claude":

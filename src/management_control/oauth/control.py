@@ -338,13 +338,14 @@ class OAuthControl(
         account = self._account(account_id)
         summary = self._with_cards([self._summary(account)], context, blocking=True)[0]
         row = self.backend.quota_load(account_id) or {}
+        from src.oauth.openai import is_bogus_zero_min_openai_5h
         windows = []
         for name, used_key, reset_key in (
             ("fiveHour", "five_hour_util", "five_hour_reset"),
             ("sevenDay", "seven_day_util", "seven_day_reset"),
             ("thirtyDay", "thirty_day_util", "thirty_day_reset"),
         ):
-            used = row.get(used_key)
+            used = None if (summary.provider.value == "openai" and name == "fiveHour" and is_bogus_zero_min_openai_5h(row)) else row.get(used_key)
             used_float = float(used) if isinstance(used, (int, float)) else None
             windows.append(
                 OAuthUsageWindow(

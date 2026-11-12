@@ -588,9 +588,12 @@ class OAuthAccountCardMixin:
         now_ts = now.timestamp()
         windows = {}
         if provider in {"claude", "openai", "zhipu", "xai"}:
+            from src.oauth.openai import is_bogus_zero_min_openai_5h
             for name, util_key, reset_key, seconds in (("fiveHour", "five_hour_util", "five_hour_reset", 5 * 3600),
                                                        ("sevenDay", "seven_day_util", "seven_day_reset", 7 * 86400)):
                 if row.get(util_key) is None or (provider == "xai" and name == "fiveHour"):
+                    continue
+                if provider == "openai" and name == "fiveHour" and is_bogus_zero_min_openai_5h(row):
                     continue
                 since = window_since(row.get(reset_key), seconds, now_ts)
                 rolling = _rolling_window_seconds(row.get(util_key), since, seconds, now_ts)
