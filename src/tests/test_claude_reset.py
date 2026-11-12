@@ -740,3 +740,145 @@ def test_webui_plan_select_and_execute_wire_parity_with_real_321_grants(env):
     assert post_call["headers"]["User-Agent"] == "claude-cli/2.1.321 (external, cli)"
     assert list(post_call["json"]) == ["program", "grant_id", "request_id"]
     assert post_call["json"]["grant_id"] == "full-reset-2611"
+
+
+def test_background_token_refresh_quota_or_model_sync_does_not_invalidate_plan(env):
+    plan = env.control.plan_claude_reset(env.ctx, env.key, "cedar_ember")
+    assert plan["available"] is True
+
+    # Simulate background token refresh, model sync, and quota monitor updates before confirm/execute.
+    om._save_token_fields(env.key, {
+        "access_token": "rotated-background-at",
+        "refresh_token": "rotated-background-rt",
+        "expired": "2999-12-31T00:00:00Z",
+        "last_refresh": "2026-11-12T06:00:00Z",
+    })
+    om.set_disabled_by_quota(env.key, "2030-01-07T00:00:00Z")
+    config.update(lambda cfg: cfg["oauthAccounts"][0].update(
+        last_model_sync="2026-11-12T06:00:05Z",
+        models=["claude-fable-5-2", "claude-opus-5-5"],
+    ))
+
+    confirmed = env.control.confirm_claude_reset(env.ctx, env.key, plan["plan_token"])
+    out = env.control.execute_claude_reset(env.ctx, env.key, confirmed["plan_token"])
+    assert out["result"] == "reset"
+    assert len(env.posts) == 1
+    assert env.posts[0][1]["headers"]["Authorization"] == "Bearer rotated-background-at"
+
+
+def test_execute_precheck_transport_timeout_falls_back_to_fresh_cache(env, monkeypatch):
+    token = final_plan(env, "cedar_ember")
+    orig_get = env.get
+    status_calls = []
+
+    def flaky_get(url, **kwargs):
+        if "cedar_ember=1" in url:
+            status_calls.append(url)
+            raise httpx.ReadTimeout("transient proxy timeout on precheck GET")
+        return orig_get(url, **kwargs)
+
+    monkeypatch.setattr(cr.network, "get_sync", flaky_get)
+    out = env.control.execute_claude_reset(env.ctx, env.key, token)
+    assert len(status_calls) == 1
+    assert out["result"] == "reset"
+    assert len(env.posts) == 1
+
+
+def test_tg_execute_cooldown_reports_explicit_non_consumed_warning(env, monkeypatch):
+    from src.telegram.menus import oauth_menu as menu, claude_reset_menu as cm
+    from src.telegram import ui
+    monkeypatch.setattr(menu, "oauth_control", env.control)
+    monkeypatch.setattr(cm, "control", env.control)
+    edits, receipts, sent = [], [], []
+    monkeypatch.setattr(ui, "answer_cb", lambda *a, **k: None)
+    monkeypatch.setattr(ui, "edit", lambda *a, **k: edits.append((a, k)))
+    monkeypatch.setattr(ui, "send", lambda *a, **k: sent.append(a))
+    monkeypatch.setattr(menu, "_edit_cached_detail", lambda *a, **k: receipts.append((a, k)))
+
+    # Case 1: Fresh (<60s) panel cache exists when /api/oauth/usage hits 429 -> falls back to panel cache and succeeds!
+    short = ui.register_code(env.key)
+    assert menu.handle_callback(42, 123, "ask", f"oa:claude_reset_ask:{short}")
+    buttons = [b for row in edits[-1][1]["reply_markup"]["inline_keyboard"] for b in row]
+    confirm_cb = next(b["callback_data"] for b in buttons if "周额度重置卡" in b["text"])
+    menu.handle_callback(42, 123, "confirm", confirm_cb)
+    final_cb = next(
+        b["callback_data"]
+        for row in edits[-1][1]["reply_markup"]["inline_keyboard"]
+        for b in row
+        if "最终确认" in b["text"]
+    )
+    monkeypatch.setattr(
+        cr.network, "get_sync",
+        lambda url, **kw: httpx.Response(429, headers={"Retry-After": "60"}, request=httpx.Request("GET", url)),
+    )
+    menu.handle_callback(42, 123, "execute", final_cb)
+    assert len(env.posts) == 1
+    assert not sent
+
+    # Case 2: No fresh cache available and account is in CoolingDown -> sends explicit non-consumed cooldown message with formatted timestamp
+    monkeypatch.setattr(cr.network, "get_sync", env.get)
+    cr.queries._accounts.clear()
+    assert menu.handle_callback(42, 123, "ask", f"oa:claude_reset_ask:{short}")
+    buttons = [b for row in edits[-1][1]["reply_markup"]["inline_keyboard"] for b in row]
+    confirm_cb = next(b["callback_data"] for b in buttons if "周额度重置卡" in b["text"])
+    menu.handle_callback(42, 123, "confirm", confirm_cb)
+    final_cb = next(
+        b["callback_data"]
+        for row in edits[-1][1]["reply_markup"]["inline_keyboard"]
+        for b in row
+        if "最终确认" in b["text"]
+    )
+    state_key = om.account_state_key(om.get_account(env.key))
+    cr.queries.invalidate(state_key)
+    monkeypatch.setattr(
+        cr.network, "get_sync",
+        lambda url, **kw: httpx.Response(429, headers={"Retry-After": "60"}, request=httpx.Request("GET", url)),
+    )
+    # Trigger CoolingDown state and then execute without cache
+    env.control.refresh_claude_reset_status(env.ctx, env.key, "juniper_tide")
+    menu.handle_callback(42, 123, "execute", final_cb)
+    assert len(env.posts) == 1
+    assert sent and "限流冷却中（冷却至 20" in sent[-1][1] and "未向官方发送重置消耗请求" in sent[-1][1]
+
+
+def test_plain_usage_with_null_reset_keys_never_wipes_persisted_cards_and_redeem_decrements_db(env, monkeypatch):
+    # Step 1: Query reset status so cards are persisted in state_db
+    plan = env.control.plan_claude_reset_action(env.ctx, env.key, "cedar_ember")
+    assert plan["available"] is True
+    raw_after_plan = json.loads(state_db.quota_load(env.key)["raw_data"])
+    assert isinstance(raw_after_plan.get("cedar_ember"), dict)
+    assert raw_after_plan["cedar_ember"]["grants"][0]["resets_left"] == 1
+
+    # Step 2: Simulate real Anthropic plain /api/oauth/usage returning `"cedar_ember": None, "juniper_tide": None`
+    # after in-memory query cache is cleared (e.g. restart or token rotation).
+    cr.queries._accounts.clear()
+    orig_get = env.get
+
+    def real_plain_usage_get(url, **kwargs):
+        resp = orig_get(url, **kwargs)
+        if "?" not in url:
+            body = resp.json()
+            body["cedar_ember"] = None
+            body["juniper_tide"] = None
+            return httpx.Response(200, json=body, request=httpx.Request("GET", url))
+        return resp
+
+    monkeypatch.setattr(cr.network, "get_sync", real_plain_usage_get)
+    usage = asyncio.run(om.fetch_usage(env.key))
+    state_db.quota_save(env.key, om.flatten_usage(usage))
+
+    # Cards must remain intact in both returned usage and state_db!
+    assert isinstance(usage.get("cedar_ember"), dict)
+    raw_after_poll = json.loads(state_db.quota_load(env.key)["raw_data"])
+    assert isinstance(raw_after_poll.get("cedar_ember"), dict)
+    assert raw_after_poll["cedar_ember"]["grants"][0]["resets_left"] == 1
+
+    # Step 3: Redeem the card -> state_db must immediately reflect resets_left=0 and usable_now=False
+    out = env.control.execute_claude_reset_action(env.ctx, env.key, plan["plan_token"])
+    assert out["result"] == "reset"
+    raw_after_redeem = json.loads(state_db.quota_load(env.key)["raw_data"])
+    assert raw_after_redeem["cedar_ember"]["grants"][0]["resets_left"] == 0
+    assert raw_after_redeem["cedar_ember"]["grants"][0]["usable_now"] is False
+
+
+

@@ -51,6 +51,13 @@ def peek(generation, token, query):
     account = _account(generation)
     with account.lock:
         cached = account.cache.get(_key(token, query))
+        if cached is None:
+            candidates = [
+                val for (_, q_name), val in account.cache.items()
+                if q_name == query and isinstance(val, tuple) and len(val) == 2
+            ]
+            if candidates:
+                cached = max(candidates, key=lambda item: item[1])
         return (copy.deepcopy(cached[0]), cached[1], account.until) if cached else (None, None, account.until)
 
 def _read(generation, token, query, fetch, *, fresh=False):

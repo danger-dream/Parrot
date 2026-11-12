@@ -4,9 +4,12 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
+import httpx
+
 from .. import error_reporting, ui
+from ...management_control.errors import ManagementError, ManagementErrorCode
 from ...management_control.oauth.menu_bridge import control, telegram_context
-from ...oauth import claude_reset as cr
+from ...oauth import claude_reset as cr, claude_usage_queries as queries
 
 WINDOW_LABELS = {
     "five_hour": "5 小时",
@@ -96,6 +99,10 @@ NEW_321_REASONS = frozenset({
 
 def _esc(value):
     return ui.escape_html(str(value if value is not None else "未知"))
+
+
+def _when(value):
+    return datetime.fromtimestamp(value / 1000, timezone.utc).isoformat()
 
 
 def _fmt_reason(value) -> str:
@@ -213,14 +220,12 @@ def block(usage):
                      f"下次可用：{_esc(juniper.get('next_available_at'))} · 周重置日：{_esc(juniper.get('weekly_resets_at'))}")
     for program, observation in (usage.get("claude_reset_queries") or {}).items() if isinstance(usage, dict) else []:
         stamp, retry = observation.get("fetched_at"), observation.get("retry_at")
-        def when(value):
-            return datetime.fromtimestamp(value / 1000, timezone.utc).isoformat()
         if stamp:
-            lines.append(f"{_esc(program)} 数据时间：{_esc(when(stamp))}")
+            lines.append(f"{_esc(program)} 数据时间：{_esc(_when(stamp))}")
         if observation.get("state") == "error":
             lines.append("查询失败，保留上次成功数据；不代表零额度或无资格。")
         if retry:
-            lines.append(f"查询限流，冷却至 {_esc(when(retry))}；到期不保证上游已解除限流。")
+            lines.append(f"查询限流，冷却至 {_esc(_when(retry))}；到期不保证上游已解除限流。")
     return "\n".join(lines)
 
 
@@ -261,9 +266,9 @@ def ask(chat_id, message_id, cb_id, short, page=1, filter_key="all"):
         try:
             plan = control.plan_claude_reset(ctx, account_id, program)
             observation = dict(plan.get("status") or {})
-            queries = observation.pop("claude_reset_queries", {})
+            obs_queries = observation.pop("claude_reset_queries", {})
             status.update(observation)
-            status.setdefault("claude_reset_queries", {}).update(queries)
+            status.setdefault("claude_reset_queries", {}).update(obs_queries)
             cedar = status.get("cedar_ember") if program == "cedar_ember" else None
             if program == "cedar_ember" and _is_v321_cedar(cedar):
                 v321_mode = True
@@ -385,6 +390,41 @@ def execute(chat_id, message_id, cb_id, short, page=1, filter_key="all"):
         account_id, token = _decode(short)
         ui.answer_cb(cb_id, "正在执行官方重置...")
         result = control.execute_claude_reset(telegram_context(chat_id), account_id, token)
+    except queries.CoolingDown as exc:
+        until_text = _when(int(exc.until * 1000)) if getattr(exc, "until", None) else "稍后"
+        ui.send(
+            chat_id,
+            f"⚠️ 官方状态查询正处于限流冷却中（冷却至 {_esc(until_text)}），本次未向官方发送重置消耗请求。请待冷却结束后重新打开官方重置状态操作。",
+        )
+        return
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code if exc.response is not None else None
+        if code == 429:
+            ui.send(
+                chat_id,
+                "⚠️ 官方状态查询触发限流冷却（HTTP 429），本次未向官方发送重置消耗请求。请稍后重新打开官方重置状态操作。",
+            )
+            return
+        ui.send(
+            chat_id,
+            f"⚠️ 重置前核对官方状态失败（HTTP {_esc(code or '未知')}），本次未向官方发送重置消耗请求。请重新打开官方重置状态再试。",
+        )
+        return
+    except httpx.HTTPError:
+        ui.send(
+            chat_id,
+            "⚠️ 重置前核对官方状态网络超时或连接异常，本次未向官方发送重置消耗请求。请重新打开官方重置状态再试。",
+        )
+        return
+    except ManagementError as exc:
+        if exc.code == ManagementErrorCode.REVISION_CONFLICT:
+            ui.send(
+                chat_id,
+                "⚠️ 账号身份或组织已变更（本次未向官方发送重置消耗请求）。请重新打开官方重置状态操作。",
+            )
+            return
+        ui.send(chat_id, "⚠️ 确认已用/已失效，或请求未完成；不会自动重发。请重新打开官方重置状态核对。")
+        return
     except Exception:
         ui.send(chat_id, "⚠️ 确认已用/已失效，或请求未完成；不会自动重发。请重新打开官方重置状态核对。")
         return

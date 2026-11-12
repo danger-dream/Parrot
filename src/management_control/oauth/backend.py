@@ -297,7 +297,12 @@ class OAuthBackend:
 
     async def claude_reset_status(self, account_id: str, program: str) -> dict:
         from src.oauth import claude_reset
-        return await claude_reset.status(account_id, program)
+        try:
+            return await claude_reset.status(account_id, program)
+        except ValueError as exc:
+            if str(exc) != "stale_credentials":
+                raise
+            return await claude_reset.status(account_id, program)
 
     def claude_reset_eligibility(self, status: dict, program: str, grant_id: str | None = None):
         from src.oauth import claude_reset

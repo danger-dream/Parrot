@@ -74,15 +74,15 @@ def _blocking_reason(grant: dict, blocking) -> str:
     items = [x for x in blocking if isinstance(x, str)] if isinstance(blocking, list) else []
     if gives_back and "seven_day" in items:
         return "fable_no_weekly_usage"
-    first = items[0] if items else None
-    if first == "five_hour":
-        return "blocked_five_hour"
-    if first == "seven_day":
-        return "blocked_seven_day"
-    if first == "seven_day_opus":
-        return "blocked_opus"
-    if first == "seven_day_sonnet":
-        return "blocked_sonnet"
+    for item in items:
+        if item == "five_hour":
+            return "blocked_five_hour"
+        if item == "seven_day":
+            return "blocked_seven_day"
+        if item == "seven_day_opus":
+            return "blocked_opus"
+        if item == "seven_day_sonnet":
+            return "blocked_sonnet"
     return "blocked_other"
 
 
@@ -117,9 +117,16 @@ def grant_eligibility(status: dict, grant: dict) -> str | None:
         return reason
     if grant.get("use_requires_limit", True) and block.get("at_limit") is not True:
         return "not_limited"
-    if blocking:
-        return _blocking_reason(grant, blocking)
+    if blocking_list:
+        return _blocking_reason(grant, blocking_list)
     if grant.get("usable_now") is not True:
+        exhausted = [x for x in (block.get("exhausted") or []) if isinstance(x, str)]
+        clears = [x for x in (grant.get("clears") or []) if isinstance(x, str)]
+        gives_back = grant.get("gives_back_weekly") is True
+        if block.get("at_limit") is True and exhausted and not any(
+            w in clears or (w == "seven_day" and gives_back) for w in exhausted
+        ):
+            return "cannot_clear"
         return "unavailable"
     return None
 
@@ -133,7 +140,10 @@ def _cedar_priority_kinds(block: dict) -> list[str]:
         preferred.append("fable")
     if "seven_day" in exhausted:
         preferred.append("weekly")
-    return preferred + [k for k in CEDAR_GRANT_KINDS if k not in preferred]
+    rest = [k for k in CEDAR_GRANT_KINDS if k not in preferred]
+    if "seven_day" in exhausted and "seven_day_overage_included" not in exhausted and "fable" in rest:
+        rest = [k for k in rest if k != "fable"] + ["fable"]
+    return preferred + rest
 
 
 def select_cedar_grant(status: dict, grant_id: str | None = None) -> tuple[dict | None, str | None]:
@@ -232,7 +242,7 @@ def _get_status_sync(token, account_key, program):
     response = network.get_sync(
         manager.OAUTH_USAGE_URL + f"?{query}=1&skip_spend=1",
         headers=first_party_oauth_headers(token),
-        timeout=5, proxy_purpose="oauth_anthropic", proxy_channel=f"oauth:{account_key}",
+        timeout=12, proxy_purpose="oauth_anthropic", proxy_channel=f"oauth:{account_key}",
     )
     response.raise_for_status()
     value = response.json()
@@ -260,6 +270,7 @@ async def enrich_usage(token, account_key, usage, *, expected):
     if not isinstance(usage, dict):
         return usage
     result = copy.deepcopy(usage)
+    persisted_raw = None
     # Ordinary reads never fan out into opt-in GETs. Explicit status reads
     # populate this cache; only their status blocks (never spend/windows) attach.
     for program in PROGRAMS:
@@ -271,8 +282,27 @@ async def enrich_usage(token, account_key, usage, *, expected):
             blocks["claude_reset_queries"][program].update(
                 state="cached", fetched_at=int(stamp * 1000),
                 retry_at=int(until * 1000) if until > time.time() else None)
-            result.update({k: v for k, v in blocks.items() if k != "claude_reset_queries"})
+            if isinstance(blocks.get(program), dict):
+                result[program] = blocks[program]
             result.setdefault("claude_reset_queries", {}).update(blocks["claude_reset_queries"])
+            continue
+        # Plain /api/oauth/usage includes `"cedar_ember": null, "juniper_tide": null`.
+        # Preserve any previously persisted card block from state_db so ordinary
+        # quota polling never wipes out cards after token rotation or restart.
+        if persisted_raw is None:
+            try:
+                row = state_db.quota_load(account_key) or {}
+                parsed = json.loads(row.get("raw_data") or "{}")
+                persisted_raw = parsed if isinstance(parsed, dict) else {}
+            except (TypeError, ValueError):
+                persisted_raw = {}
+        if isinstance(persisted_raw.get(program), dict):
+            result[program] = copy.deepcopy(persisted_raw[program])
+        persisted_queries = persisted_raw.get("claude_reset_queries")
+        if isinstance(persisted_queries, dict) and isinstance(persisted_queries.get(program), dict):
+            result.setdefault("claude_reset_queries", {}).setdefault(
+                program, copy.deepcopy(persisted_queries[program])
+            )
     _current(account_key, expected)
     return result
 
@@ -527,6 +557,64 @@ def _journal_key(expected, program, organization_uuid):
     return hashlib.sha256(f"{expected}:{program}:{organization_uuid}".encode()).hexdigest()
 
 
+def _patch_redeemed_status_in_db(key: str, program: str, grant_id: str | None,
+                                  response: dict, expected: str) -> None:
+    """Mirror CC 2.1.321 Rr()/Br()/Xr() post-claim state updates into state_db."""
+    if not isinstance(response, dict):
+        return
+    res_kind = response.get("result")
+    if res_kind not in {"reset", "already_used", "cooldown", "ineligible"}:
+        return
+    try:
+        row = state_db.quota_load(key) or {}
+        raw = json.loads(row.get("raw_data") or "{}")
+    except (TypeError, ValueError):
+        return
+    if not isinstance(raw, dict):
+        return
+    block = raw.get(program)
+    if not isinstance(block, dict):
+        return
+    updated = copy.deepcopy(block)
+    if program == "cedar_ember":
+        if isinstance(response.get("weekly_resets_at"), str):
+            updated["weekly_resets_at"] = response["weekly_resets_at"]
+        if isinstance(response.get("cooldown_until"), str):
+            updated["cooldown_until"] = response["cooldown_until"]
+        if res_kind in {"reset", "already_used"} and isinstance(grant_id, str) and grant_id:
+            resp_left = response.get("resets_left")
+            grants = updated.get("grants")
+            if isinstance(grants, list):
+                for g in grants:
+                    if not isinstance(g, dict) or g.get("id") != grant_id:
+                        continue
+                    old_left = g.get("resets_left")
+                    if type(resp_left) is int:
+                        new_left = max(0, resp_left)
+                    elif res_kind == "already_used":
+                        new_left = 0
+                    elif type(old_left) is int:
+                        new_left = max(0, old_left - 1)
+                    else:
+                        new_left = 0
+                    g["resets_left"] = new_left
+                    if new_left <= 0:
+                        g["usable_now"] = False
+                        if updated.get("next_grant_id") == grant_id:
+                            updated["next_grant_id"] = None
+    elif program == "juniper_tide":
+        if isinstance(response.get("weekly_resets_at"), str):
+            updated["weekly_resets_at"] = response["weekly_resets_at"]
+        if isinstance(response.get("next_available_at"), str):
+            updated["next_available_at"] = response["next_available_at"]
+        if res_kind in {"reset", "already_used"}:
+            updated["available"] = False
+        elif res_kind == "ineligible":
+            updated["eligible"] = False
+            updated["available"] = False
+    state_db.quota_patch_claude_reset_status(key, {program: updated}, expected_state_key=expected)
+
+
 async def redeem(account_key: str, program: str, *, expected: str,
                  organization_uuid: str, grant_id: str | None, operation_id: str) -> dict:
     """Only called by the management execute-plan gate, never by refresh jobs."""
@@ -549,7 +637,35 @@ async def redeem(account_key: str, program: str, *, expected: str,
 
 async def _redeem_locked(key, program, expected, org, grant_id, operation_id, journal_key):
     manager = _manager()
-    fresh = await status(key, program, expected=expected, fresh=True)
+    used_cached_status = False
+    try:
+        try:
+            fresh = await status(key, program, expected=expected, fresh=True)
+        except ValueError as exc:
+            if str(exc) != "stale_credentials":
+                raise
+            fresh = await status(key, program, expected=expected, fresh=True)
+    except (httpx.TransportError, queries.CoolingDown, httpx.HTTPStatusError) as exc:
+        if isinstance(exc, httpx.HTTPStatusError):
+            code = exc.response.status_code if exc.response is not None else 0
+            if code != 429 and code < 500:
+                raise
+        _, current_account = _current(key, expected)
+        current_token = current_account.get("access_token") or ""
+        cached_val, cached_stamp, _ = queries.peek(expected, current_token, program)
+        now = time.time()
+        if cached_val is None or not cached_stamp or now - cached_stamp >= queries.TTL:
+            raise
+        blocks = _observed_blocks(cached_val, program)
+        blocks["claude_reset_queries"][program].update(
+            fetched_at=int(cached_stamp * 1000), cached=True,
+        )
+        fresh = {
+            **blocks,
+            "organization_uuid": current_account.get("claude_organization_uuid") or "",
+            "generation": expected,
+        }
+        used_cached_status = True
     key, account = _current(key, expected)
     if not org or account.get("claude_organization_uuid") != org:
         return {"result": "ineligible", "reason": "organization_missing_or_changed"}
@@ -624,9 +740,10 @@ async def _redeem_locked(key, program, expected, org, grant_id, operation_id, jo
     body = {"program": program}
     if program == "cedar_ember":
         body.update(grant_id=grant_id, request_id=record["request_id"])
-    # A competing management/background read may have learned a cooldown since
-    # the fresh eligibility check. Do not knowingly dispatch through it.
-    queries.check_cooldown(expected)
+    # If we did not already fall back to a fresh (<60s) panel cache due to
+    # /api/oauth/usage rate-limiting, check cooldown before dispatching.
+    if not used_cached_status:
+        queries.check_cooldown(expected)
     # Durable before dispatch: after a crash we cannot claim "not sent".
     state_db.claude_reset_operation_save(journal_key, record)
     try:
@@ -660,6 +777,9 @@ async def _redeem_locked(key, program, expected, org, grant_id, operation_id, jo
             out["status_error"] = "refresh_failed"
         out["quota_action"] = {"action": "unconfirmed_keep_disabled"}
         return out
+    with manager.account_generation_guard(expected) as current:
+        if current:
+            _patch_redeemed_status_in_db(key, program, grant_id, response, expected)
     if response.get("result") not in {"reset", "already_used"}:
         return out
     # Success is not proof of recovery. Read ordinary usage WITH spend, and
@@ -712,6 +832,7 @@ async def _redeem_locked(key, program, expected, org, grant_id, operation_id, jo
                 out["state_error"] = type(exc).__name__
                 return out
             state_db.quota_save(key, flat, expected_state_key=expected)
+            _patch_redeemed_status_in_db(key, program, grant_id, response, expected)
             out["quota_action"] = manager.evaluate_and_toggle_by_usage(key, usage, fresh=True, expected_state_key=expected)
             out["cleared_models"] = cleared
         # No blanket clear: Fable and unrelated/new restrictions retain their

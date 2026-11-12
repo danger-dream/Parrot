@@ -439,10 +439,21 @@ def quota_save(account_key:str,data:dict[str,Any],*,email:str|None=None,expected
                 next_raw = json.loads(updates["raw_data"])
                 if isinstance(prev_raw, dict) and isinstance(next_raw, dict):
                     changed = False
-                    for rkey in ("cedar_ember", "juniper_tide", "claude_reset_queries"):
-                        if rkey in prev_raw and rkey not in next_raw:
+                    for rkey in ("cedar_ember", "juniper_tide"):
+                        if isinstance(prev_raw.get(rkey), dict) and not isinstance(next_raw.get(rkey), dict):
                             next_raw[rkey] = prev_raw[rkey]
                             changed = True
+                    prev_queries = prev_raw.get("claude_reset_queries")
+                    next_queries = next_raw.get("claude_reset_queries")
+                    if isinstance(prev_queries, dict):
+                        if not isinstance(next_queries, dict):
+                            next_raw["claude_reset_queries"] = prev_queries
+                            changed = True
+                        else:
+                            merged_queries = {**prev_queries, **next_queries}
+                            if merged_queries != next_queries:
+                                next_raw["claude_reset_queries"] = merged_queries
+                                changed = True
                     if changed:
                         updates["raw_data"] = json.dumps(next_raw, ensure_ascii=False)
             except (TypeError, ValueError):
@@ -916,7 +927,7 @@ def quota_patch_claude_reset_status(account_key: str, blocks: dict, *, expected_
         if not isinstance(raw, dict):
             raw = {}
         for name in ("cedar_ember", "juniper_tide"):
-            if name in blocks:
+            if name in blocks and (isinstance(blocks[name], dict) or not isinstance(raw.get(name), dict)):
                 raw[name] = blocks[name]
         if isinstance(blocks.get("claude_reset_queries"), dict):
             previous = raw.get("claude_reset_queries")

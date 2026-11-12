@@ -95,10 +95,13 @@ def test_preconsume_requires_new_status_and_cooldown_blocks_existing_plan(env, m
     result = env.control.execute_claude_reset(env.ctx, env.key, token)
     assert result['result'] == 'ineligible' and not env.posts
     env.usage['cedar_ember']['eligible'] = True
-    q.invalidate(om.account_state_key(om.get_account(env.key)))
+    state_key = om.account_state_key(om.get_account(env.key))
+    q.invalidate(state_key)
     token = final_plan(env)
     monkeypatch.setattr(cr.network, 'get_sync', lambda *a, **kw: response(429))
     env.control.refresh_claude_reset_status(env.ctx, env.key, 'juniper_tide')
+    # When cache is invalidated (no fresh <60s observation available), cooldown blocks blind dispatch:
+    q.invalidate(state_key)
     with pytest.raises(q.CoolingDown):
         env.control.execute_claude_reset(env.ctx, env.key, token)
     assert not env.posts

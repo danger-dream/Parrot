@@ -17,6 +17,17 @@ class ClaudeResetControlMixin:
             raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
         return account
 
+    def _claude_reset_revision(self, account) -> str:
+        org = account.get("claude_organization_uuid") or account.get("organization_id") or ""
+        return revision({
+            "id": account.get("_id"),
+            "provider": self.backend.provider_of(account),
+            "email": account.get("email"),
+            "subject": account.get("subject") or account.get("sub"),
+            "organization_uuid": str(org),
+            "generation_id": account.get("generationId"),
+        })
+
     def refresh_claude_reset_status(self, context, account_id, program="cedar_ember"):
         self._require(context, Capability.WRITE)
         self._claude_reset_account(account_id)
@@ -78,7 +89,7 @@ class ClaudeResetControlMixin:
         )
         token, plan = self._claude_reset_plans.create(
             actor_subject_id=context.actor.subject_id, kind="claude-reset-explain",
-            revision=revision(self._account(account_id)), payload={
+            revision=self._claude_reset_revision(self._account(account_id)), payload={
                 "account_id": account_id, "program": program,
                 "expected": observation["generation"],
                 "organization_uuid": observation["organization_uuid"],
@@ -98,7 +109,7 @@ class ClaudeResetControlMixin:
         account = self._claude_reset_account(account_id)
         plan = self._claude_reset_plans.inspect(plan_token, actor_subject_id=context.actor.subject_id,
                                                kind="claude-reset-explain")
-        if plan.payload["account_id"] != account_id or revision(account) != plan.revision:
+        if plan.payload["account_id"] != account_id or self._claude_reset_revision(account) != plan.revision:
             raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
         self._claude_reset_plans.consume(plan_token, actor_subject_id=context.actor.subject_id,
                                          kind="claude-reset-explain")
@@ -117,7 +128,7 @@ class ClaudeResetControlMixin:
         account = self._claude_reset_account(account_id)
         plan = self._claude_reset_plans.inspect(plan_token, actor_subject_id=context.actor.subject_id,
                                                kind="claude-reset-execute")
-        if plan.payload["account_id"] != account_id or revision(account) != plan.revision:
+        if plan.payload["account_id"] != account_id or self._claude_reset_revision(account) != plan.revision:
             raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
         # Consumed BEFORE asynchronous work. Double callbacks, including after
         # transport timeouts, cannot replay this capability.
