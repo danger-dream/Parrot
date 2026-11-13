@@ -1741,6 +1741,7 @@ def test_cursor_batch_disable_survives_process_restart(monkeypatch):
 
 
 def test_cursor_disabled_model_disappears_from_registry_and_load_balancing():
+    config.update(lambda cfg: cfg.update(modelRegistry={"enabled": False}))
     oauth_manager.add_account(_account())
     account_key = "cursor:cursor-user-1"
     oauth_manager.set_cursor_disabled_models(account_key, {"gpt-5.5"})
@@ -1753,11 +1754,12 @@ def test_cursor_disabled_model_disappears_from_registry_and_load_balancing():
         assert "gpt-5.5" not in load_balancing_menu._client_models()
         assert channel in load_balancing_menu._channels_for_model("claude-fable-5")
     finally:
-        config.update(lambda cfg: cfg.__setitem__("oauthAccounts", []))
+        config.update(lambda cfg: (cfg.__setitem__("oauthAccounts", []), cfg.update(modelRegistry={"enabled": True})))
         registry.rebuild_from_config()
 
 
 def test_cursor_model_disable_is_scoped_to_one_account():
+    config.update(lambda cfg: cfg.update(modelRegistry={"enabled": False}))
     first = _account()
     second = _account()
     second.update({
@@ -1779,7 +1781,7 @@ def test_cursor_model_disable_is_scoped_to_one_account():
         assert "oauth:cursor:cursor-user-2" in keys
         assert "gpt-5.5" in load_balancing_menu._client_models()
     finally:
-        config.update(lambda cfg: cfg.__setitem__("oauthAccounts", []))
+        config.update(lambda cfg: (cfg.__setitem__("oauthAccounts", []), cfg.update(modelRegistry={"enabled": True})))
         registry.rebuild_from_config()
 
 

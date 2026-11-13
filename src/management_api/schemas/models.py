@@ -272,6 +272,10 @@ class ModelRegistryEnvelope(StrictSchema):
     meta: ResponseMeta
 
 
+class ModelRegistryEnabledRequest(StrictSchema):
+    enabled: bool
+
+
 class ModelRegistryRulesRequest(StrictSchema):
     rules: list[RegistryRuleData] = Field(max_length=500)
     dismissed: list[str] = Field(default_factory=list, max_length=500)

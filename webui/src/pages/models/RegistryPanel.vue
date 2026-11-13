@@ -12,6 +12,7 @@ import Btn from '@/components/ui/Btn.vue'
 import Badge from '@/components/ui/Badge.vue'
 import Skeleton from '@/components/ui/Skeleton.vue'
 import Empty from '@/components/ui/Empty.vue'
+import Switch from '@/components/ui/Switch.vue'
 import RuleModal from './RuleModal.vue'
 import { channelLabel, loadModels } from './shared'
 
@@ -134,6 +135,28 @@ async function removeRule(rule: Rule, idx: number): Promise<void> {
   }, '规则已删除', `rm:${idx}`)
 }
 
+async function toggleEnabled(next: boolean): Promise<void> {
+  if (!data.value || busy.value) return
+  busy.value = 'enabled'
+  try {
+    await api.put('/models/registry/enabled', { enabled: next }, { ifMatch: data.value.revision })
+    toast(next ? '已开启统一模型命名' : '已关闭统一模型命名', 'success')
+    await Promise.all([load(), loadModels(true)])
+  } catch (err) {
+    if (err instanceof ApiError && err.code === 'REVISION_CONFLICT') {
+      toast('配置已在别处被修改', 'warning', '已载入最新状态，请重试。', 7000)
+      await Promise.all([load(), loadModels(true)])
+    } else {
+      toast(errorTitle(err), 'error', errorDetail(err), 7000)
+      if (err instanceof ApiError && err.fields?.some((field) => field.code === 'SAVED_RELOAD_UNCONFIRMED')) {
+        await Promise.all([load(), loadModels(true)])
+      }
+    }
+  } finally {
+    busy.value = ''
+  }
+}
+
 async function addRule(rule: Rule): Promise<void> {
   const ok = await write((rules) => rules.push(rule), '规则已添加', 'add')
   if (ok) ruleOpen.value = false
@@ -149,7 +172,19 @@ async function addRule(rule: Rule): Promise<void> {
     <p v-if="error" class="err"><TriangleAlert /> {{ error }}</p>
     <div v-else-if="loading && !data" class="grid"><Skeleton v-for="i in 3" :key="i" h="160px" r="14px" /></div>
     <template v-else-if="data">
-      <p v-if="!data.enabled" class="err"><TriangleAlert /> 统一模型名未开启，规则暂不生效。</p>
+      <Card>
+        <div class="toggle-row">
+          <div class="toggle-info">
+            <span class="toggle-title">启用统一模型命名</span>
+            <span class="sub faint">
+              {{ data.enabled
+                ? '已开启 · 自动合并跨渠道同名模型及思考等级变体（如 -low / -medium / -high）。'
+                : '已关闭 · 各渠道按自身原始模型名暴露与路由，下方规则暂不生效。' }}
+            </span>
+          </div>
+          <Switch :model-value="data.enabled" :loading="busy === 'enabled'" label="启用统一模型命名" @update:model-value="toggleEnabled" />
+        </div>
+      </Card>
 
       <div class="grid">
         <Card title="待确认" :subtitle="`${pendingGroups.length} 项 · 系统拿不准归到哪个名字`">
@@ -343,6 +378,22 @@ async function addRule(rule: Rule): Promise<void> {
   padding-left: 18px;
   font-size: 12.5px;
   line-height: 1.7;
+}
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.toggle-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.toggle-title {
+  font-size: 13.5px;
+  font-weight: 500;
 }
 .small {
   font-size: 12px;

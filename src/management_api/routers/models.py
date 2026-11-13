@@ -50,6 +50,7 @@ from ..schemas.models import (
     ModelStateRequest,
     ModelDefaultEffortRequest,
     ModelRegistryData,
+    ModelRegistryEnabledRequest,
     ModelRegistryEnvelope,
     ModelRegistryRevisionData,
     ModelRegistryRevisionEnvelope,
@@ -335,6 +336,24 @@ def get_model_registry(
         ),
         meta=_meta(request),
     )
+
+
+@router.put(
+    "/models/registry/enabled",
+    operation_id="putModelRegistryEnabled",
+    response_model=ModelRegistryRevisionEnvelope,
+    responses={**_success(200, {"revision": "rev_example"}), **management_error_responses(*_MUTATION_ERRORS)},
+)
+def put_model_registry_enabled(
+    body: ModelRegistryEnabledRequest,
+    request: Request,
+    context: WriteContext,
+    control: Annotated[ModelCenterControl, Depends(get_model_control)],
+    if_match: IfMatch = None,
+) -> ModelRegistryRevisionEnvelope:
+    reject_unknown_query_parameters(request)
+    revision = control.set_registry_enabled(context, enabled=body.enabled, expected_revision=if_match)
+    return ModelRegistryRevisionEnvelope(data=ModelRegistryRevisionData(revision=revision), meta=_meta(request))
 
 
 @router.put(

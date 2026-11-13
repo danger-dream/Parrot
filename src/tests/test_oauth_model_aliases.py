@@ -64,6 +64,7 @@ def env(monkeypatch):
     monkeypatch.setattr(om, "ensure_channel_token", token)
     config.update(lambda c: c.update(oauthAccounts=[], channels=[], modelBindings={"defaults": {}, "scoped": {}},
         network={"routing": {"default": "direct"}}, protocolBridge={"enabled": True},
+        modelRegistry={"enabled": False},
         modelMapping={}, timeouts={"connect": 2, "firstByte": 2, "idle": 2, "total": 5}))
     fake._install_keys(m, fake._default_key())
     yield m

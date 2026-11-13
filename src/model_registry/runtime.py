@@ -225,6 +225,7 @@ class Switches:
     hidden: frozenset[str]
     exceptions: Mapping[str, frozenset[str]]
     api_disabled: Mapping[str, frozenset[str]]
+    cfg: Mapping[str, Any] | None = None
 
     @classmethod
     def read(cls, cfg: Mapping[str, Any] | None = None) -> "Switches":
@@ -233,7 +234,8 @@ class Switches:
         keys = lambda values: frozenset(compare_key(value) for value in values)
         return cls(keys(state["disabledModels"]), keys(state["hiddenModels"]),
                    {source: keys(values) for source, values in state["sourceEnabledModels"].items()},
-                   {source: keys(values) for source, values in state["apiSourceDisabledModels"].items()})
+                   {source: keys(values) for source, values in state["apiSourceDisabledModels"].items()},
+                   cfg)
 
     def model_disabled(self, model_id: str) -> bool:
         return compare_key(model_id) in self.disabled
@@ -251,6 +253,9 @@ class Switches:
         if channel is None or not channel.enabled or channel.disabled_reason:
             return "disabled"
         if not offer.available:
+            return "source_model_disabled"
+        from .. import model_state
+        if offer.source.startswith("oauth:") and not model_state.is_source_enabled(offer.source, offer.wire, self.cfg):
             return "source_model_disabled"
         key = compare_key(model_id)
         api_off = self.api_disabled.get(offer.source)
@@ -611,6 +616,100 @@ def _carry_switches(cfg: dict, old: str, new: str) -> None:
             models.setdefault(new, models.pop(model_id))
 
 
+def write_enabled(cfg: dict, value: bool) -> None:
+    from .report import legacy_names
+    root = cfg.setdefault("modelRegistry", {})
+    before = enabled(cfg)
+    done = root.get("migrated") or 0
+    if before == value and (not value or done >= MIGRATION_VERSION):
+        return
+    registry = compute(cfg, legacy=legacy_names())
+    if value:
+        if not before or done < 1:
+            _switches_to_unified(cfg, registry)
+        _remember_names(cfg, registry)
+        if done < MIGRATION_VERSION:
+            migrate_config(cfg, registry, [], switches=False)
+    else:
+        _switches_to_legacy(cfg, registry)
+    root["enabled"] = bool(value)
+
+
+def _offer_names(offer: Offer) -> set[str]:
+    from .. import model_names
+    public = offer.name if offer.source.startswith("api:") else model_names.for_channel(offer.source, offer.wire)
+    return {name for name in (public, offer.legacy) if name}
+
+
+def _switches_to_legacy(cfg: dict, registry: Registry) -> None:
+    center = cfg.setdefault("modelCenter", {})
+    models = {compare_key(model.id): model for model in registry.models.values()}
+
+    def expand(values, source=None):
+        result = set()
+        for name in values or ():
+            model = models.get(compare_key(name))
+            offers = [offer for offer in model.offers if source is None or offer.source == source] if model else []
+            result.update({name for offer in offers for name in _offer_names(offer)} if offers else {name})
+        return sorted(result)
+
+    for field in SWITCH_LISTS:
+        center[field] = expand(center.get(field))
+    for field in ("sourceEnabledModels", "apiSourceDisabledModels"):
+        center[field] = {source: expand(values, source) for source, values in (center.get(field) or {}).items()}
+
+
+def _switches_to_unified(cfg: dict, registry: Registry) -> None:
+    from .. import model_names, model_state
+    state = model_state.state_snapshot(cfg)
+    center = cfg.setdefault("modelCenter", {})
+    consumed_disabled, consumed_hidden = set(), set()
+    consumed_exceptions: dict[str, set[str]] = {}
+    disabled, hidden = set(), set()
+    exceptions: dict[str, set[str]] = {}
+    blocked: list[Offer] = []
+
+    def matched(offer, values):
+        provider = model_names.channel_provider(offer.source)
+        names = _offer_names(offer) | {offer.wire}
+        return {value for name in names for value in model_names.matching_keys(provider, name, values)}
+
+    for model in registry.models.values():
+        rows = []
+        for offer in model.offers:
+            off = matched(offer, state["disabledModels"])
+            concealed = matched(offer, state["hiddenModels"])
+            overrides = state["sourceEnabledModels"].get(offer.source, ())
+            exempt = matched(offer, overrides)
+            consumed_disabled.update(off)
+            consumed_hidden.update(concealed)
+            consumed_exceptions.setdefault(offer.source, set()).update(exempt)
+            if concealed:
+                hidden.add(model.id)
+            if exempt:
+                exceptions.setdefault(offer.source, set()).add(model.id)
+            effective_off = bool(off) and not all(
+                model_names.matching_keys(model_names.channel_provider(offer.source), name, overrides) for name in off)
+            rows.append((offer, bool(off), effective_off))
+        all_off = bool(rows) and all(off for _, off, _ in rows)
+        if all_off:
+            disabled.add(model.id)
+        for offer, _, effective_off in rows:
+            # A merged model can have only one global switch and one exception per source.
+            # Keep a partially disabled variant/source disabled at its own upstream id.
+            if effective_off and (not all_off or model.id in exceptions.get(offer.source, ())):
+                blocked.append(offer)
+
+    center["disabledModels"] = sorted(disabled | (set(state["disabledModels"]) - consumed_disabled))
+    center["hiddenModels"] = sorted(hidden | (set(state["hiddenModels"]) - consumed_hidden))
+    center["sourceEnabledModels"] = {
+        source: sorted(exceptions.get(source, set()) | (set(values) - consumed_exceptions.get(source, set())))
+        for source, values in state["sourceEnabledModels"].items()
+    }
+    for offer in blocked:
+        _disable_offer(cfg, offer)
+
+
 def write_default_effort(cfg: dict, model_id: str, effort: str | None) -> None:
     models = cfg.setdefault("modelRegistry", {}).setdefault("models", {})
     entry = dict(models.get(model_id) or {})
@@ -622,10 +721,10 @@ def write_default_effort(cfg: dict, model_id: str, effort: str | None) -> None:
 
 
 def admin_revision(cfg: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
-    """What the registry's admin revision covers: rules, dismissals and per-model defaults."""
+    """What the registry's admin revision covers: enabled, rules, dismissals and per-model defaults."""
     root = settings(cfg)
-    return {"rules": root.get("rules") or [], "dismissed": root.get("dismissed") or [],
-            "defaults": overview(cfg).defaults}
+    return {"enabled": enabled(cfg), "rules": root.get("rules") or [],
+            "dismissed": root.get("dismissed") or [], "defaults": overview(cfg).defaults}
 
 
 # ─── one-time switch migration ───────────────────────────────────────
@@ -648,11 +747,14 @@ def migrate_if_needed() -> list[str] | None:
     return notes
 
 
-def migrate_config(cfg: dict, registry: Registry, notes: list[str]) -> None:
+def migrate_config(cfg: dict, registry: Registry, notes: list[str], *, switches: bool = True) -> None:
     root = cfg.setdefault("modelRegistry", {})
     done = root.get("migrated") or 0
     if done < 1:
-        _migrate_switches(cfg, registry, notes)
+        if switches:
+            _migrate_switches(cfg, registry, notes)
+        else:
+            _remember_names(cfg, registry)
     if done < 2:
         _key_metadata_by_model(cfg, registry, notes)
     root["migrated"] = MIGRATION_VERSION
@@ -682,7 +784,7 @@ def _key_metadata_by_model(cfg: dict, registry: Registry, notes: list[str]) -> N
                     notes.append(f"{where}{label}里 {'、'.join(keys)} 都属于 {model_id}，按模型查询时采用 {keys[0]} 的设置")
 
 
-def _migrate_switches(cfg: dict, registry: Registry, notes: list[str]) -> None:
+def _remember_names(cfg: dict, registry: Registry) -> None:
     root = cfg.setdefault("modelRegistry", {})
     models = root.setdefault("models", {})
     for model_id in registry.models:
@@ -698,6 +800,9 @@ def _migrate_switches(cfg: dict, registry: Registry, notes: list[str]) -> None:
                 aliases.setdefault(offer.legacy, {"model": model.id, "traits": dict(offer.traits)}
                                    if offer.traits else model.id)
 
+
+def _migrate_switches(cfg: dict, registry: Registry, notes: list[str]) -> None:
+    _remember_names(cfg, registry)
     center = cfg.setdefault("modelCenter", {})
     disabled: set[str] = set()
     for entry in center.get("disabledModels") or ():

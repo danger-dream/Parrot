@@ -135,12 +135,20 @@ async def test_v1_models_combines_hidden_enabled_key_allowlist_and_alias_target(
         server.auth, "validate",
         lambda _headers: ("client", ["public-model"], None),
     )
+    monkeypatch.setattr(
+        server.auth, "api_key_entry",
+        lambda name: {"allowedModels": ["public-model"]} if name == "client" else None,
+    )
     payload = await server.list_models(request)
     ids = {item["id"] for item in payload["data"]}
     assert ids == {"public-model"}
     monkeypatch.setattr(
         server.auth, "validate",
         lambda _headers: ("client", ["public-model", "friendly"], None),
+    )
+    monkeypatch.setattr(
+        server.auth, "api_key_entry",
+        lambda name: {"allowedModels": ["public-model", "friendly"]} if name == "client" else None,
     )
     payload = await server.list_models(request)
     assert {item["id"] for item in payload["data"]} == {"public-model", "friendly"}

@@ -2062,6 +2062,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/management/v1/models/registry/enabled": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Put Model Registry Enabled */
+        put: operations["putModelRegistryEnabled"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/management/v1/models/registry/rules": {
         parameters: {
             query?: never;
@@ -7357,6 +7374,11 @@ export interface components {
             };
             /** Globaldefaulteffort */
             globalDefaultEffort?: string | null;
+        };
+        /** ModelRegistryEnabledRequest */
+        ModelRegistryEnabledRequest: {
+            /** Enabled */
+            enabled: boolean;
         };
         /** ModelRegistryEnvelope */
         ModelRegistryEnvelope: {
@@ -25274,6 +25296,105 @@ export interface operations {
                 };
             };
             /** @description Management API error: SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    putModelRegistryEnabled: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ModelRegistryEnabledRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "revision": "rev_example"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["ModelRegistryRevisionEnvelope"];
+                };
+            };
+            /** @description Management API error: CONFIRMATION_REQUIRED */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: CAPABILITY_DENIED, ORIGIN_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: REVISION_CONFLICT, RESOURCE_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED, UNSUPPORTED_VALUE */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SERVICE_NOT_READY, DEPENDENCY_UNAVAILABLE */
             503: {
                 headers: {
                     [name: string]: unknown;

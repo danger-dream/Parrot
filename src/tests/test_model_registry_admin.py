@@ -83,11 +83,22 @@ def test_default_effort_api_validates_model_and_level(enabled):
 
 
 def test_registry_writes_are_refused_while_the_registry_is_off(domain_client):  # noqa: F811
-    client, _runtime, admin, _read_only, _denied = domain_client
+    client, _runtime, admin, read_only, _denied = domain_client
+    before = client.get(BASE, headers=admin).json()["data"]
+    assert before["enabled"] is True
+    assert client.put(BASE + "/enabled", headers=read_only, json={"enabled": False}).status_code == 403
+    assert client.put(BASE + "/enabled", headers=admin, json={"enabled": False}).json()["error"]["code"] == "CONFIRMATION_REQUIRED"
+    assert client.put(BASE + "/enabled", headers={**admin, "If-Match": "rev_stale"}, json={"enabled": False}).json()["error"]["code"] == "REVISION_CONFLICT"
+    toggled = client.put(BASE + "/enabled", headers={**admin, "If-Match": before["revision"]}, json={"enabled": False})
+    assert toggled.status_code == 200, toggled.text
     data = client.get(BASE, headers=admin).json()["data"]
     assert data["enabled"] is False
+    assert data["revision"] == toggled.json()["data"]["revision"]
     refused = client.put(BASE + "/rules", headers={**admin, "If-Match": data["revision"]}, json={"rules": []})
     assert refused.json()["error"]["code"] == "UNSUPPORTED_VALUE"
+    re_enabled = client.put(BASE + "/enabled", headers={**admin, "If-Match": data["revision"]}, json={"enabled": True})
+    assert re_enabled.status_code == 200
+    assert client.get(BASE, headers=admin).json()["data"]["enabled"] is True
 
 
 def _buttons(keyboard):
@@ -313,3 +324,22 @@ def test_detail_puts_shared_values_on_top_and_unscheduled_sources_last(enabled, 
     scheduled, unscheduled = text.index("<b>参与调度</b>"), text.index("<b>未参与调度</b>")
     assert scheduled < text.index("<b>1. ") < text.index("Reseller") < unscheduled < text.index("Official")
     assert "原因：<code>本来源已停用</code>" in text[unscheduled:] and "🚫 " in text[unscheduled:]
+
+
+def test_telegram_registry_page_toggles_enabled(enabled, monkeypatch):
+    from src.telegram.menus import model_center_registry as tg_registry
+    _client, runtime, _admin, _read_only, _denied = enabled
+    monkeypatch.setattr(menu, "_CONTROL", runtime.control_owner().models)
+    monkeypatch.setattr(ui, "is_admin", lambda chat_id: int(chat_id) == 42)
+    monkeypatch.setattr(ui, "api", lambda method, data=None: calls.append((method, dict(data or {}))) or {
+        "ok": True, "result": {"message_id": 100}})
+    menu.reset_for_tests()
+    assert "关闭" not in tg_registry.entry_button(42)["text"]
+    _text, kb = tg_registry._registry_render(42)
+    text, kb = _press("关闭统一命名", kb)
+    assert "状态：已关闭" in text
+    assert config.get()["modelRegistry"]["enabled"] is False
+    assert "已关闭" in tg_registry.entry_button(42)["text"]
+    text, _kb = _press("开启统一命名", kb)
+    assert "已开启" in text
+    assert config.get()["modelRegistry"]["enabled"] is True

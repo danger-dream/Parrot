@@ -27,9 +27,11 @@ def _label(source: str) -> str:
 
 
 def entry_button(chat_id: int) -> dict | None:
-    if model_registry.current() is None or not hasattr(menu._CONTROL, "registry_overview"):
+    if not hasattr(menu._CONTROL, "registry_overview"):
         return None
     overview, _revision = _overview(chat_id)
+    if not overview.enabled:
+        return ui.btn("🧩 统一命名（已关闭）", menu._freeze(chat_id, "registry"))
     count = len(_pending_groups(overview)) + len(overview.suggestions)
     return ui.btn("🧩 统一命名" + (f"（待处理 {count}）" if count else ""), menu._freeze(chat_id, "registry"))
 
@@ -46,10 +48,16 @@ def _number_rows(buttons: list[dict], width: int = 4) -> list[list[dict]]:
 
 
 def _registry_render(chat_id: int) -> tuple[str, dict]:
-    overview, _revision = _overview(chat_id)
+    overview, revision = _overview(chat_id)
     if not overview.enabled:
-        return "🧩 <b>统一命名</b>\n\n统一模型名未开启。", inline_kb([[ui.btn("返回模型列表", "mc:list")]])
-    lines = ["🧩 <b>统一命名</b>", ""]
+        return (
+            "🧩 <b>统一命名</b>\n\n状态：已关闭（各渠道按自身模型名暴露与路由，不合并思考等级等变体）。",
+            inline_kb([
+                [ui.btn("🟢 开启统一命名", menu._freeze(chat_id, "registry_toggle", enabled=True, revision=revision))],
+                [ui.btn("返回模型列表", "mc:list")],
+            ]),
+        )
+    lines = ["🧩 <b>统一命名</b>（已开启）", ""]
     rows: list[list[dict]] = []
     groups = _pending_groups(overview)
     lines.append(f"<b>待确认 {len(groups)}</b>")
@@ -85,6 +93,7 @@ def _registry_render(chat_id: int) -> tuple[str, dict]:
     if overview.dismissed:
         lines += ["", f"已忽略的建议 {len(overview.dismissed)} 条。"]
         rows.append([ui.btn("恢复已忽略的建议", menu._freeze(chat_id, "registry_undismiss"))])
+    rows.append([ui.btn("🔴 关闭统一命名", menu._freeze(chat_id, "registry_toggle", enabled=False, revision=revision))])
     rows.append([ui.btn("返回模型列表", "mc:list")])
     return menu._paged(chat_id, "\n".join(lines), inline_kb(rows))
 
@@ -277,6 +286,16 @@ def handle_action(chat_id: int, message_id: int, cb_id: str, action) -> bool:
         _write(chat_id, message_id, cb_id,
                lambda rules, _dismissed: rules.__setitem__(slice(None), [rule for rule in rules if rule != target]),
                "规则已删除")
+    elif name == "registry_toggle":
+        target = bool(data["enabled"])
+        try:
+            menu._CONTROL.set_registry_enabled(
+                menu._ctx(chat_id), enabled=target, expected_revision=data.get("revision"))
+        except ManagementError as exc:
+            menu._answer_error(cb_id, exc)
+        else:
+            ui.answer_cb(cb_id, "已开启统一命名" if target else "已关闭统一命名")
+        menu._show_rendered(chat_id, message_id, None, lambda: _registry_render(chat_id))
     elif name == "registry_effort":
         show(lambda: _effort_render(chat_id, data["model_id"], data["detail_key"], data["detail_back"]))
     elif name == "registry_effort_set":

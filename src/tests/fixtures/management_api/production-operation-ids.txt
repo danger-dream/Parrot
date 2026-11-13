@@ -168,6 +168,7 @@ putIngressDefaultModel
 putModelDefaultEffort
 putModelMapping
 putModelMetadataBinding
+putModelRegistryEnabled
 refreshAllOAuthUsage
 refreshChannelProviderUsage
 refreshOAuthQoderStatus

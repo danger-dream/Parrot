@@ -228,7 +228,8 @@ def test_release_routes_aliases_and_retirements_are_explicit(upgraded, released_
     from src.openai.channel.registration import register_factories
     register_factories()
     registry.rebuild_from_config()
-    assert set(registry.available_models()) == set(released_config['available']) - {'custom-claude-fallback'}
+    expected_available = (set(released_config['available']) - {'custom-claude-fallback', 'composer-2.5'}) | {'cursor-composer-2.5'}
+    assert set(registry.available_models()) == expected_available
     channel = registry.get_channel('api:release-api')
     assert channel.supports_model('client-alias') == 'claude-sonnet-4-5'
     assert model_mapping.get_ingress_map('anthropic')['old-alias'] == 'client-alias'

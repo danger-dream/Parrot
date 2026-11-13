@@ -227,9 +227,11 @@ def _make_openai_oauth_channel(email: str = "fake-ws@example.com"):
 
 
 def _install_channels(m, channels):
+    from src.model_registry import runtime as model_registry
     reg = m["registry"]
     with reg._lock:
         reg._channels = {ch.key: ch for ch in channels}
+    model_registry.rebuild({"modelRegistry": {"enabled": False}})
 
 
 def _install_keys(m, keys: dict):

@@ -760,6 +760,31 @@ class ModelCenterControl(DomainControl):
         self._read(context)
         return model_registry.global_default_effort(config.get())
 
+    def set_registry_enabled(
+        self,
+        context: ManagementContext | None,
+        *,
+        enabled: bool,
+        expected_revision: str | None,
+    ) -> str:
+        actual = self._write(context)
+        with config.serialized_updates():
+            cfg = config.get()
+            self._check_revision(expected_revision, stable_revision(model_registry.admin_revision(cfg)), required=True)
+            with config.observe_reload_failures() as reload_failures:
+                saved = config.update(lambda current: model_registry.write_enabled(current, enabled), skip_if_unchanged=True)
+            revision = stable_revision(model_registry.admin_revision(saved))
+        if reload_failures:
+            self._audit(actual, "model_center.registry.enabled", "registry", "saved_reload_unconfirmed")
+            message = "配置已保存，运行时重载未确认；请刷新状态，勿重放旧操作"
+            raise ManagementError(
+                ManagementErrorCode.DEPENDENCY_UNAVAILABLE, message,
+                fields=(ErrorField(path="runtime", code="SAVED_RELOAD_UNCONFIRMED", message=message),),
+                retryable=False,
+            )
+        self._audit(actual, "model_center.registry.enabled", "registry", "succeeded")
+        return revision
+
     def replace_registry_rules(
         self,
         context: ManagementContext | None,

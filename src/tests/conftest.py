@@ -406,6 +406,21 @@ def pytest_unconfigure(config):
 
 
 @pytest.fixture(autouse=True)
+def _model_registry_process_isolation():
+    """Keep process-wide model_registry._registry from leaking between tests."""
+    import sys
+
+    def reset():
+        mod = sys.modules.get("src.model_registry.runtime")
+        if mod is not None:
+            mod.rebuild({"modelRegistry": {"enabled": False}})
+
+    reset()
+    yield
+    reset()
+
+
+@pytest.fixture(autouse=True)
 def _zhipu_process_cache_isolation(request):
     if "zhipu" not in request.node.nodeid:
         yield

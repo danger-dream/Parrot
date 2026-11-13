@@ -189,6 +189,18 @@ def set_api_source_enabled_in_config(
     mapping = root["apiSourceDisabledModels"]
     values = _strings(mapping.get(source))
     models = _strings(model_ids)
+    if enabled:
+        from .model_registry import runtime as model_registry
+        from .model_registry.names import compare_key
+        registry = model_registry.current() if model_registry.enabled(cfg) else None
+        for model in models:
+            found = registry.lookup(model) if registry else None
+            if found is not None:
+                names = {compare_key(found[0])} | {
+                    compare_key(name) for offer in registry.models[found[0]].offers if offer.source == source
+                    for name in (offer.name, offer.wire)
+                }
+                values = {value for value in values if compare_key(value) not in names}
     for model in models:
         if enabled:
             values.discard(model)
