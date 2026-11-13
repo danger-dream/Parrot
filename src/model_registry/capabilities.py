@@ -17,7 +17,14 @@ from .offers import Offer
 
 def serving_offers(model_id: str, api_key: str | None) -> list[Offer]:
     registry = runtime.current()
-    model = registry.models.get(model_id) if registry else None
+    if registry is None:
+        from .. import model_names
+        from ..channel import registry as channel_registry
+        return [
+            Offer(source, model_names.channel_provider(source), wire, model_id)
+            for source, wire in channel_registry.serving_channels(model_id, api_key_name=api_key)
+        ]
+    model = registry.models.get(model_id)
     if model is None:
         return []
     from .. import auth
@@ -29,7 +36,10 @@ def serving_offers(model_id: str, api_key: str | None) -> list[Offer]:
 def _metadata(model_id: str, offer: Offer) -> Mapping[str, Any]:
     from .. import model_metadata
     try:
-        binding = model_metadata.resolve_binding(model_id, scope_key=offer.source, outbound_model=offer.wire)
+        binding = model_metadata.resolve_binding(
+            model_id, scope_key=offer.source, outbound_model=offer.wire,
+            fallback_to_outbound=True,
+        )
     except Exception:
         return {}
     return dict(binding.metadata) if binding is not None else {}
@@ -44,19 +54,55 @@ def _least(values: Iterable[int | None]) -> int | None:
     return min(known) if known else None
 
 
-# Config changes rebuild the registry, which drops this cache; the age limit covers
-# channels failing at runtime without a config change.
+def _clean_modalities(raw: Any) -> list[str]:
+    if not isinstance(raw, (list, tuple)):
+        return []
+    seen: list[str] = []
+    for item in raw:
+        val = str(item).strip().lower() if isinstance(item, str) else ""
+        if val and val not in seen:
+            seen.append(val)
+    return seen
+
+
+def _source_modalities(md: Mapping[str, Any]) -> tuple[list[str] | None, list[str] | None]:
+    nested = md.get("modalities") if isinstance(md.get("modalities"), Mapping) else {}
+    in_mods = _clean_modalities(md.get("inputModalities") or nested.get("input"))
+    out_mods = _clean_modalities(md.get("outputModalities") or nested.get("output"))
+    vision = md.get("vision") if isinstance(md.get("vision"), bool) else None
+    if in_mods:
+        if vision is True and "image" not in in_mods:
+            in_mods = [*in_mods, "image"]
+        elif vision is False:
+            in_mods = [m for m in in_mods if m != "image"] or ["text"]
+    elif vision is not None:
+        in_mods = ["text", "image"] if vision else ["text"]
+    if in_mods and not out_mods:
+        out_mods = ["text"]
+    return (in_mods or None, out_mods or None)
+
+
+def _intersect_modalities(groups: list[list[str]]) -> list[str]:
+    if not groups:
+        return []
+    common = set(groups[0]).intersection(*groups[1:])
+    return [item for item in groups[0] if item in common]
+
+
+# Config changes rebuild the registry or replace the active config snapshot,
+# dropping this cache; the age limit covers channels failing at runtime.
 _CACHE_SECONDS = 60
 _cache: tuple[Any, dict[tuple[str, str | None], tuple[float, dict[str, Any]]]] = (None, {})
 
 
 def describe(model_id: str, api_key: str | None) -> dict[str, Any]:
     global _cache
-    registry = runtime.current()
+    from .. import config
+    cache_owner = (runtime.current(), id(config.get()))
     owner, entries = _cache
-    if owner is not registry:
+    if owner != cache_owner:
         entries = {}
-        _cache = (registry, entries)
+        _cache = (cache_owner, entries)
     now = time.monotonic()
     cached = entries.get((model_id, api_key))
     if cached is not None and now - cached[0] < _CACHE_SECONDS:
@@ -87,6 +133,22 @@ def _describe(model_id: str, api_key: str | None) -> dict[str, Any]:
                                    for md, _ in sources),
         "max_output_tokens": _least(_tokens(md.get("maxOutputTokens")) for md, _ in sources),
     }
+    in_groups, out_groups = [], []
+    for md, _ in sources:
+        in_mods, out_mods = _source_modalities(md)
+        if in_mods:
+            in_groups.append(in_mods)
+        if out_mods:
+            out_groups.append(out_mods)
+    in_shared = _intersect_modalities(in_groups)
+    out_shared = _intersect_modalities(out_groups)
+    if in_shared or out_shared:
+        arch: dict[str, Any] = {}
+        if in_shared:
+            arch["input_modalities"] = in_shared
+        if out_shared:
+            arch["output_modalities"] = out_shared
+        result["architecture"] = arch
     capabilities: dict[str, Any] = {}
     for name, key in (("vision", "vision"), ("tool_call", "toolCall"), ("structured_output", "structuredOutput")):
         values = [md[key] for md, _ in sources if isinstance(md.get(key), bool)]

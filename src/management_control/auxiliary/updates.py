@@ -20,6 +20,7 @@ from ..context import AuditSink, ManagementContext
 from ..errors import ManagementError, ManagementErrorCode
 from ..operations import ManagementOperation, OperationRegistry, OperationStore
 from .update_state import UpdateStateMixin
+from .update_backups import UpdateBackupMixin
 from .common import (
     ConfigGateway,
     ModuleConfigGateway,
@@ -52,7 +53,9 @@ class UpdateSettings:
     enabled: bool
     include_prerelease: bool
     auto_update: bool
+    silent_update: bool
     interval_seconds: int
+    keep_backups: int
     ignored_versions: tuple[str, ...]
     revision: str
 
@@ -89,7 +92,17 @@ class UpdateBackup:
     target_version: str
     mode: str
     created_at: str | None
+    protected: bool
+    orphan: bool
+    unowned: bool
     revision: str
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateBackupClearResult:
+    deleted: int
+    kept_protected: bool
+    kept_unowned: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +151,8 @@ class UpdateGateway(Protocol):
     def state(self) -> dict[str, Any]: ...
     def busy(self) -> bool: ...
     def backups(self) -> list[dict[str, Any]]: ...
+    def delete_backup(self, ref: str) -> str: ...
+    def clear_backups(self) -> dict[str, Any]: ...
     def failure_log(self) -> str: ...
     def set_progress(self, callback: Callable[[str, str], None] | None) -> None: ...
     def stage(self, version: str, *, chat_id: int | None = None, notify_msg_id: int | None = None) -> tuple[bool, str]: ...
@@ -185,6 +200,12 @@ class ModuleUpdateGateway:
     def backups(self) -> list[dict[str, Any]]:
         return updater.list_backups()
 
+    def delete_backup(self, ref: str) -> str:
+        return updater.delete_backup(ref)
+
+    def clear_backups(self) -> dict[str, Any]:
+        return updater.clear_backups()
+
     def failure_log(self) -> str:
         return updater.get_update_log()
 
@@ -217,7 +238,7 @@ def _actor_key(context: ManagementContext) -> str:
     return context.actor.session_id or context.actor.subject_id
 
 
-class UpdateControl(UpdateStateMixin):
+class UpdateControl(UpdateStateMixin, UpdateBackupMixin):
     STAGE_KIND = "updates.stage"
     ACTIVATE_KIND = "updates.activate"
 
@@ -261,11 +282,18 @@ class UpdateControl(UpdateStateMixin):
     @staticmethod
     def _effective(root: dict[str, Any]) -> dict[str, Any]:
         raw = root.get("updateChecker") or {}
+        raw_keep = raw.get("keepBackups", 1)
+        try:
+            keep_backups = 1 if raw_keep is None or isinstance(raw_keep, bool) else int(raw_keep)
+        except (TypeError, ValueError):
+            keep_backups = 1
         return {
             "enabled": bool(raw.get("enabled", True)),
             "includePrerelease": bool(raw.get("includePrerelease", True)),
             "autoUpdate": bool(raw.get("autoUpdate", False)),
+            "silentUpdate": bool(raw.get("silentUpdate", False)),
             "intervalSeconds": int(raw.get("intervalSeconds", 3600) or 3600),
+            "keepBackups": max(0, min(20, keep_backups)),
             "ignoredVersions": string_list(raw.get("ignoredVersions")),
         }
 
@@ -275,14 +303,18 @@ class UpdateControl(UpdateStateMixin):
             "enabled": bool(value["enabled"]),
             "includePrerelease": bool(value["includePrerelease"]),
             "autoUpdate": bool(value["autoUpdate"]),
+            "silentUpdate": bool(value.get("silentUpdate", False)),
             "intervalSeconds": int(value["intervalSeconds"]),
+            "keepBackups": int(value.get("keepBackups", 1)),
             "ignoredVersions": string_list(value["ignoredVersions"]),
         }
         return UpdateSettings(
             enabled=stable["enabled"],
             include_prerelease=stable["includePrerelease"],
             auto_update=stable["autoUpdate"],
+            silent_update=stable["silentUpdate"],
             interval_seconds=stable["intervalSeconds"],
+            keep_backups=stable["keepBackups"],
             ignored_versions=tuple(stable["ignoredVersions"]),
             revision=revision_for(stable),
         )
@@ -311,6 +343,10 @@ class UpdateControl(UpdateStateMixin):
             interval = value["intervalSeconds"]
             if not isinstance(interval, int) or isinstance(interval, bool) or not 300 <= interval <= 604800:
                 raise invalid_field("intervalSeconds", "OUT_OF_RANGE", "must be between 300 and 604800")
+        if "keepBackups" in value:
+            keep = value["keepBackups"]
+            if not isinstance(keep, int) or isinstance(keep, bool) or not 0 <= keep <= 20:
+                raise invalid_field("keepBackups", "OUT_OF_RANGE", "must be between 0 and 20")
         if "ignoredVersions" in value:
             versions = string_list(value["ignoredVersions"])
             value["ignoredVersions"] = [self._validate_version(item, "ignoredVersions") for item in versions]
@@ -436,6 +472,9 @@ class UpdateControl(UpdateStateMixin):
             "targetVersion": str(row.get("target_tag") or ""),
             "mode": str(row.get("mode") or ""),
             "createdAt": rfc3339_utc(row.get("ts"), compact=True),
+            "protected": bool(row.get("protected")),
+            "orphan": bool(row.get("orphan")),
+            "unowned": bool(row.get("unowned")),
         }
         return UpdateBackup(
             ref=stable["ref"],
@@ -443,6 +482,9 @@ class UpdateControl(UpdateStateMixin):
             target_version=stable["targetVersion"],
             mode=stable["mode"],
             created_at=stable["createdAt"],
+            protected=stable["protected"],
+            orphan=stable["orphan"],
+            unowned=stable["unowned"],
             revision=revision_for(stable),
         )
 

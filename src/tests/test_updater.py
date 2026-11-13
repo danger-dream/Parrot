@@ -103,10 +103,13 @@ class TestCfg:
         assert cfg["repo"] == "danger-dream/Parrot"
         assert cfg["composeService"] == "parrot"
         assert cfg["containerName"] == "parrot"
-        assert cfg["keepBackups"] == 5
+        assert cfg["keepBackups"] == 1
         assert cfg["healthTimeoutSeconds"] == 90
         assert cfg["updaterImage"] == "docker:cli"
         assert cfg["autoUpdate"] is False
+
+        config.update(lambda c: c.__setitem__("updateChecker", {"keepBackups": 0}))
+        assert updater._cfg()["keepBackups"] == 0
 
     def test_health_url_uses_listen_port(self):
         config.update(lambda c: c.__setitem__("listen", {"host": "0.0.0.0", "port": 22122}))
@@ -531,7 +534,7 @@ class TestStageUpdate:
                             lambda tag: (True, "ref-1", "backup ok"))
         monkeypatch.setattr(updater, "_docker_pull",
                             lambda tag: (True, "pulled"))
-        monkeypatch.setattr(updater, "_prune_backups", lambda: None)
+        monkeypatch.setattr(updater, "_prune_backups_locked", lambda: None)
         ok, detail = updater.stage_update("v0.23.0", chat_id=999, notify_msg_id=1)
         assert ok is True
         st = updater.load_state()
@@ -644,3 +647,192 @@ class TestRestartDatabaseGuard:
         assert "snapshot verification failed" in detail
         assert restart_calls == []
         assert updater.load_state()["stage"] == updater.STAGE_STAGED
+
+
+class TestBackupCleanupAndOrphanDockerTags:
+    def test_docker_backups_and_orphan_tags_are_listed_pruned_and_deleted(self, monkeypatch, tmp_path):
+        bdir = tmp_path / "backups"
+        bdir.mkdir()
+        monkeypatch.setattr(updater, "_backup_root", lambda: str(bdir))
+        monkeypatch.setattr(updater, "_detect_mode", lambda: updater.MODE_DOCKER)
+
+        updater.save_state(backup_owner="review-owner")
+        live_tags = {
+            "parrot-backup:review-owner-0.35.0-20261001-100000": "sha256:old_orphan",
+            "parrot-backup:0.36.3-20261110-120000": "sha256:b1",
+            "parrot-backup:0.36.4-20261112-120000": "sha256:b2",
+        }
+        removed: list[str] = []
+
+        monkeypatch.setattr(
+            updater, "_docker_list_backup_tags",
+            lambda: [(tag, digest, None) for tag, digest in sorted(live_tags.items())],
+        )
+
+        def fake_rm(tag: str) -> bool:
+            removed.append(tag)
+            live_tags.pop(tag, None)
+            return True
+
+        monkeypatch.setattr(updater, "_docker_remove_backup_tag", fake_rm)
+
+        for ref, ver, tgt, ts, tag in (
+            ("docker-0.36.3-20261110-120000", "0.36.3", "v0.36.4", "20261110-120000", "parrot-backup:0.36.3-20261110-120000"),
+            ("docker-0.36.4-20261112-120000", "0.36.4", "v0.36.5", "20261112-120000", "parrot-backup:0.36.4-20261112-120000"),
+        ):
+            (bdir / f"{ref}.json").write_text(json.dumps({
+                "ref": ref, "version": ver, "target_tag": tgt, "mode": "docker",
+                "backup_tag": tag, "ts": ts, "created_at": updater._parse_stamp_ts(ts),
+            }))
+
+        # Orphan docker tag without JSON is surfaced in list_backups()
+        listed = updater.list_backups()
+        assert [item["ref"] for item in listed] == [
+            "docker-0.36.4-20261112-120000",
+            "docker-0.36.3-20261110-120000",
+            "docker-review-owner-0.35.0-20261001-100000",
+        ]
+        assert listed[2]["orphan"] is True
+
+        # Active staged rollback anchor is protected from deletion
+        updater.save_state(stage=updater.STAGE_STAGED, mode=updater.MODE_DOCKER, backup_ref="docker-0.36.4-20261112-120000")
+        assert updater.delete_backup("docker-0.36.4-20261112-120000") == "protected"
+
+        # Prune with default keepBackups=1 while staged keeps active + 1 newest non-active, removing the orphan
+        config.update(lambda c: c.__setitem__("updateChecker", {"keepBackups": 1}))
+        updater._prune_backups()
+        assert "parrot-backup:review-owner-0.35.0-20261001-100000" in removed
+
+        # Once STAGE_SUCCESS is reached, active anchor is released; prune keeps only the 1 newest backup
+        updater.save_state(stage=updater.STAGE_SUCCESS, mode=updater.MODE_DOCKER, backup_ref="docker-0.36.4-20261112-120000")
+        updater._prune_backups()
+        assert [item["ref"] for item in updater.list_backups()] == ["docker-0.36.4-20261112-120000"]
+        assert not (bdir / "docker-0.36.3-20261110-120000.json").exists()
+        assert "parrot-backup:0.36.3-20261110-120000" in removed
+
+        # clear_backups() removes the remaining backup and its docker tag
+        cleared = updater.clear_backups()
+        assert cleared == {"deleted": 1, "keptProtected": False, "keptUnowned": 0, "failed": 0}
+        assert updater.list_backups() == []
+        assert live_tags == {}
+
+
+class TestSilentIdleAutoUpdate:
+    @pytest.fixture(autouse=True)
+    def clean_drain_state(self):
+        from src import drain
+        drain.reset_for_tests()
+        yield
+        drain.reset_for_tests()
+
+    def test_drain_work_tracking_ignores_admin_and_enforces_quiet_window(self, monkeypatch):
+        import asyncio
+        from src import drain
+
+        drain.reset_for_tests()
+        clock = [1000.0]
+        monkeypatch.setattr(drain.time, "monotonic", lambda: clock[0])
+
+        async def scenario():
+            # Admin UI & /v1/models probes do not mark model work busy
+            async with drain.active("http GET /api/management/v1/updates/state"):
+                assert drain.active_work_count() == 0
+                assert drain.is_idle_for_update(180.0) is True
+            async with drain.active("http GET /v1/models"):
+                assert drain.active_work_count() == 0
+                assert drain.is_idle_for_update(180.0) is True
+
+            # Active inference blocks idle, and finishing starts the 180s quiet window
+            async with drain.active("http POST /v1/messages"):
+                assert drain.active_work_count() == 1
+                assert drain.is_idle_for_update(180.0) is False
+                clock[0] += 10.0
+
+            assert drain.active_work_count() == 0
+            assert drain.is_idle_for_update(180.0) is False
+            clock[0] += 179.0
+            assert drain.is_idle_for_update(180.0) is False
+            clock[0] += 2.0
+            assert drain.is_idle_for_update(180.0) is True
+
+        asyncio.run(scenario())
+        drain.reset_for_tests()
+
+    def test_breaking_release_detection_handles_major_markers_and_negations(self):
+        from src import update_checker
+
+        # Normal minor/patch bump without breaking marker is allowed for silent update
+        assert update_checker.is_breaking_release("0.36.5", "v0.37.0", {"name": "v0.37.0", "body": "本次更新无破坏性变更，新增静默升级"}) == (False, "")
+        assert update_checker.is_breaking_release("0.36.5", "v0.36.6", {"name": "v0.36.6", "body": "No breaking changes in this release."}) == (False, "")
+
+        # Major bump or explicit breaking change marker blocks silent update
+        is_brk, _ = update_checker.is_breaking_release("0.36.5", "v1.0.0", {"name": "v1.0.0", "body": "正式 1.0"})
+        assert is_brk is True
+        is_brk2, _ = update_checker.is_breaking_release("0.36.5", "v0.37.0", {"name": "v0.37.0", "body": "### BREAKING CHANGE\n调整配置结构"})
+        assert is_brk2 is True
+        is_brk3, _ = update_checker.is_breaking_release("0.36.5", "v0.37.0", {"name": "feat(api)!: 重构鉴权", "body": "包含破坏性变更"})
+        assert is_brk3 is True
+
+    def test_silent_update_suppresses_prompt_waits_for_idle_and_notifies_on_success(self, monkeypatch):
+        from src import drain, notifier, update_checker
+
+        drain.reset_for_tests()
+        updater.reset_state()
+        notifications: list[str] = []
+        restarts: list[str] = []
+        busy_flag = [True]
+
+        monkeypatch.setattr(update_checker, "__version__", "0.36.5")
+        monkeypatch.setattr(updater, "__version__", "0.36.5")
+        monkeypatch.setattr(notifier, "notify_event", lambda event, text, **kw: notifications.append(text))
+        monkeypatch.setattr(updater, "_detect_mode", lambda: updater.MODE_BARE)
+        monkeypatch.setattr(updater, "_src_is_git_repo", lambda: False)
+        monkeypatch.setattr(updater, "_src_backup", lambda tag: (True, "src-0.36.5", "ok"))
+        monkeypatch.setattr(updater, "_src_stage", lambda tag: (True, "downloaded"))
+        monkeypatch.setattr(updater, "_prune_backups_locked", lambda: None)
+        monkeypatch.setattr(drain, "is_idle_for_update", lambda quiet=180.0: not busy_flag[0])
+        monkeypatch.setattr(updater, "_src_restart", lambda: restarts.append("restart") or (True, "restarted"))
+
+        config.update(lambda c: c.__setitem__("updateChecker", {
+            "enabled": True, "silentUpdate": True, "includePrerelease": True,
+            "repo": "danger-dream/Parrot", "ignoredVersions": [], "keepBackups": 1,
+        }))
+
+        # 1) Non-breaking release: stages silently without pre-update TG prompt, waits while busy
+        monkeypatch.setattr(update_checker, "_http_get_json", lambda url, timeout=15: [{
+            "tag_name": "v0.36.6", "name": "Parrot v0.36.6", "body": "常规优化", "prerelease": False, "draft": False,
+        }])
+        update_checker._check_once(push=True)
+        assert notifications == []
+        assert update_checker.get_update_banner() is None
+        assert updater.load_state()["stage"] == updater.STAGE_STAGED
+        assert updater.load_state()["silent"] is True
+        assert restarts == []
+
+        # 2) Once idle, try_silent_activate triggers restart
+        busy_flag[0] = False
+        ok, _ = updater.try_silent_activate()
+        assert ok is True
+        assert restarts == ["restart"]
+        assert updater.load_state()["stage"] == updater.STAGE_RESTARTING
+
+        # 3) New process comes up on v0.36.6 and sends completion notification
+        drain.reset_for_tests()
+        monkeypatch.setattr(updater, "__version__", "0.36.6")
+        monkeypatch.setattr(updater, "wait_healthy", lambda timeout: (True, "healthy"))
+        updater.resume_after_restart()
+        if updater._resume_thread is not None:
+            updater._resume_thread.join(5)
+        assert updater.load_state()["stage"] == updater.STAGE_SUCCESS
+        assert len(notifications) == 1 and "静默自动更新完成" in notifications[0]
+
+        # 4) Breaking release: skips silent stage and pushes manual confirmation alert
+        notifications.clear()
+        updater.reset_state()
+        monkeypatch.setattr(update_checker, "__version__", "0.36.6")
+        monkeypatch.setattr(update_checker, "_http_get_json", lambda url, timeout=15: [{
+            "tag_name": "v1.0.0", "name": "Parrot v1.0.0", "body": "BREAKING CHANGE: major upgrade", "prerelease": False, "draft": False,
+        }])
+        update_checker._check_once(push=True)
+        assert len(notifications) == 1 and "升级安全检查未通过" in notifications[0]
+        assert updater.load_state()["stage"] == updater.STAGE_IDLE

@@ -23,6 +23,7 @@ from src.notifications import reporting
 from src.notifications.events import Effect
 
 import asyncio
+from src import drain
 import copy
 import json
 import re
@@ -504,21 +505,36 @@ class _WsIngressQueue(asyncio.Queue):
         if (lane.queued_bytes + size > _WS_LANE_QUEUE_BYTES
                 or lane.connection.queued_bytes + size > _WS_CONNECTION_QUEUE_BYTES):
             raise asyncio.QueueFull
-        super()._put((size, item))
+        # Admission belongs to the queue, not the dispatcher: every accepted
+        # create owns its lease even when enqueued by another internal caller.
+        is_create = getattr(lane, "creates", None) is self
+        work = drain.enter_work() if is_create else None
+        try:
+            super()._put((size, item, work))
+        except BaseException:
+            if work is not None:
+                work.close()
+            raise
         lane.queued_bytes += size
         lane.connection.queued_bytes += size
-        if getattr(lane, "creates", None) is self:
+        if is_create:
             lane.ready.set()
 
     def _get(self):
-        size, item = super()._get()
+        size, item, work = super()._get()
         self.lane.queued_bytes -= size
         self.lane.connection.queued_bytes -= size
-        return item
+        # Create consumers take ownership of the lease together with the frame.
+        return (item, work) if work is not None else item
 
     def clear(self):
         while not self.empty():
-            self.get_nowait()
+            entry = self.get_nowait()
+            if getattr(self.lane, "creates", None) is self:
+                _frame, work = entry
+                work.close()
+        if getattr(self.lane, "creates", None) is self:
+            self.lane.ready.clear()
 
 
 class _ResponsesWsLane:
@@ -538,6 +554,7 @@ class _ResponsesWsLane:
         self.scope = getattr(connection.websocket, "scope", {})
         self.application_state = WebSocketState.CONNECTED
         self.queued_bytes = 0
+        self.current_work = None
         self.creates = _WsIngressQueue(self, 32)
         self.controls = _WsIngressQueue(self, 64)
         self.acks = _WsIngressQueue(self, 64)
@@ -561,6 +578,9 @@ class _ResponsesWsLane:
         self.application_state = WebSocketState.CONNECTED
 
     def release_slot(self):
+        if self.current_work is not None:
+            self.current_work.close()
+            self.current_work = None
         if self.owns_slot:
             self.owns_slot = False
             self.connection.slots.release()
@@ -573,7 +593,7 @@ class _ResponsesWsLane:
         # lanes must not reserve slots, and slot waiters must not unbudget bodies.
         await self.connection.slots.acquire()
         self.owns_slot = True
-        frame = self.creates.get_nowait()
+        frame, self.current_work = self.creates.get_nowait()
         if self.creates.empty():
             self.ready.clear()
         self.terminal_sent = False
@@ -772,6 +792,11 @@ class _ResponsesWsConnection:
             lane = self.lanes[sid]
             try:
                 lane.creates.put_nowait(frame)
+            except drain.AdmissionClosed:
+                await _send_request_invalid_error_frame(
+                    _ResponsesWsLane(self, sid), "Parrot is restarting; please retry shortly.",
+                    code="server_restarting", status=503)
+                return
             except asyncio.QueueFull:
                 await _send_request_invalid_error_frame(_ResponsesWsLane(self, sid), "WebSocket pending request budget exceeded.",
                     code="websocket_queue_full", status=429)
@@ -870,6 +895,9 @@ class _ResponsesWsConnection:
 
             async def finish_connection():
                 await asyncio.gather(*tasks, return_exceptions=True)
+                for lane in self.lanes.values():
+                    lane.release_slot()
+                    lane.creates.clear()
                 self.history.clear()
 
             # Reader exceptions and repeated ASGI cancellation must not let the

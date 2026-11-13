@@ -15,7 +15,9 @@ class UpdateSettingsData(StrictSchema):
     enabled: bool
     includePrerelease: bool
     autoUpdate: bool
+    silentUpdate: bool = False
     intervalSeconds: int
+    keepBackups: int = 1
     ignoredVersions: list[str]
     revision: str
 
@@ -24,7 +26,9 @@ class UpdateSettingsPatch(StrictSchema):
     enabled: bool = True
     includePrerelease: bool = True
     autoUpdate: bool = False
+    silentUpdate: bool = False
     intervalSeconds: int = Field(default=3600, ge=300, le=604800)
+    keepBackups: int = Field(default=1, ge=0, le=20)
     ignoredVersions: list[str] = Field(default_factory=list, max_length=500)
 
 
@@ -54,7 +58,16 @@ class UpdateBackupData(StrictSchema):
     targetVersion: str
     mode: str
     createdAt: datetime | None
+    protected: bool = False
+    orphan: bool = False
+    unowned: bool = False
     revision: str
+
+
+class UpdateBackupClearData(StrictSchema):
+    deleted: int
+    keptProtected: bool
+    keptUnowned: int = 0
 
 
 class UpdateBackupListData(StrictSchema):

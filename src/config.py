@@ -318,8 +318,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "intervalSeconds": 3600,
         "includePrerelease": True,
+        "silentUpdate": False,
         "repo": "danger-dream/Parrot",
         "ignoredVersions": [],
+        "keepBackups": 1,
     },
     "translation": {
         "enabled": False,

@@ -855,8 +855,16 @@ def resolve_binding(
     scope_key: str | None = None,
     outbound_model: str | None = None,
     _override_fields: tuple[Mapping[str, Any], Mapping[str, Any]] | None = None,
+    fallback_to_outbound: bool = False,
+    _catalog_fallback: bool = False,
 ) -> MetadataBinding | None:
-    """Resolve matching, sparse inheritance and provider-native hard limits."""
+    """Resolve matching, sparse inheritance and provider-native hard limits.
+
+    Capability export may fall back to the outbound identity when the visible
+    name has no base binding. Merge sparse operator fields before deriving any
+    limits: public wire < public alias < source wire < source alias. An explicit
+    visible-name binding remains authoritative and does not inherit wire fields.
+    """
     model = normalize_model_name(client_visible_model)
     scope = normalize_model_name(scope_key) or None
     if not model:
@@ -912,6 +920,28 @@ def resolve_binding(
         )
         if binding is not None and legacy_model != model:
             binding = MetadataBinding(**{**binding.__dict__, "client_visible_model": model})
+    if binding is None and fallback_to_outbound and outbound_model and outbound_model != model:
+        common, source = get_override_fields(
+            model, scope_key=scope, outbound_model=outbound_model,
+        ) if _override_fields is None else _override_fields
+        wire_common, wire_source = get_override_fields(
+            outbound_model, scope_key=scope, outbound_model=outbound_model,
+        )
+        fallback = resolve_binding(
+            outbound_model, scope_key=scope, outbound_model=outbound_model,
+            _override_fields=({**wire_common, **common}, {**wire_source, **source}),
+            _catalog_fallback=True,
+        )
+        if fallback is not None:
+            return MetadataBinding(**{**fallback.__dict__, "client_visible_model": model})
+    if binding is None and _catalog_fallback:
+        target = model_pricing.canonical_official_model(model)
+        snapshot = model_pricing.binding_snapshot(target) if target else None
+        if isinstance(snapshot, Mapping) and isinstance(snapshot.get("metadata"), Mapping):
+            binding = _record_for(
+                model, {"target": target, "source": "auto", "autoSnapshot": snapshot},
+                scope_key=scope, known_outbound_model=outbound_model,
+            )
     return _effective_binding(
         binding, model=model, scope_key=scope,
         outbound_model=outbound_model, native=native,

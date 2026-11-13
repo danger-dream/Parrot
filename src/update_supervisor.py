@@ -212,6 +212,28 @@ def wait_health(plan: dict, version: str) -> bool:
     return False
 
 
+def apply_source_update(plan: dict) -> None:
+    update = plan.get("source_update")
+    if not update:
+        return
+    for args in update["commands"]:
+        subprocess.run(args, timeout=120, check=True)
+    if not update.get("install"):
+        return
+    snapshot = snapshot_dependencies(update["dependency_root"], update["dependency_paths"])
+    plan["dependencies"] = str(Path(snapshot["root"]) / "snapshot.json")
+    meta_path = Path(update["meta_path"])
+    meta = json.loads(meta_path.read_text())
+    meta["dependencies"] = plan["dependencies"]
+    write_json(meta_path, meta)
+    try:
+        subprocess.run([update["python"], "-m", "pip", "install", "-r",
+                        str(Path(plan["app"]) / "requirements.txt")], timeout=600, check=True)
+        subprocess.run([update["python"], "-m", "pip", "check"], timeout=60, check=True)
+    finally:
+        seal_dependencies(snapshot)
+
+
 def run(plan: dict) -> str:
     """Stop/start, check exact version, restore code+changed dependencies on failure."""
     child = None
@@ -246,7 +268,13 @@ def run(plan: dict) -> str:
         if not stop():
             # Never restore files underneath a live old/new interpreter.
             raise RuntimeError("process did not stop safely")
-        if start() and wait_health(plan, plan["target_version"]) and (child is None or child.poll() is None):
+        applied = False
+        try:
+            apply_source_update(plan)
+            applied = True
+        except Exception as exc:
+            print(f"[source-updater] source apply failed: {type(exc).__name__}", flush=True)
+        if applied and start() and wait_health(plan, plan["target_version"]) and (child is None or child.poll() is None):
             result = "OK"
         else:
             if not stop(): raise RuntimeError("failed version did not stop safely")

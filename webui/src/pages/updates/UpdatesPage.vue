@@ -129,7 +129,10 @@ const backups = ref<Backup[]>([])
 const bTotal = ref(0)
 const bPage = ref(1)
 const bLoading = ref(true)
+const bDeleting = ref('')
 const bError = ref('')
+const hasDeletableBackups = computed(() => backups.value.some((b) => !b.protected) || bTotal.value > backups.value.filter((b) => b.protected).length)
+
 async function loadBackups(p = bPage.value): Promise<void> {
   bLoading.value = true
   try {
@@ -142,6 +145,53 @@ async function loadBackups(p = bPage.value): Promise<void> {
     bError.value = errorTitle(err)
   } finally {
     bLoading.value = false
+  }
+}
+
+async function removeBackup(b: Backup): Promise<void> {
+  if (b.protected || bDeleting.value) return
+  const detail =
+    b.mode === 'docker'
+      ? `将删除备份 ${b.ref} 及其关联的 parrot-backup 镜像标签。删除后无法再使用该备份回滚；仍被其他标签或容器引用的镜像不会释放空间。`
+      : `将删除备份归档 ${b.ref}。删除后无法再使用该备份回滚。`
+  const ok = await confirmAction({ title: '删除这条备份？', detail, confirmText: '删除', danger: true })
+  if (!ok) return
+  bDeleting.value = b.ref
+  try {
+    await api.del(`/updates/backups/${enc(b.ref)}`)
+    toast('已删除备份', 'success')
+    const nextPage = backups.value.length <= 1 && bPage.value > 1 ? bPage.value - 1 : bPage.value
+    await loadBackups(nextPage)
+  } catch (err) {
+    toast(errorTitle(err), 'error', errorDetail(err), 7000)
+    await loadBackups()
+  } finally {
+    bDeleting.value = ''
+  }
+}
+
+async function clearAllBackups(): Promise<void> {
+  if (bDeleting.value) return
+  const ok = await confirmAction({
+    title: '清空历史备份？',
+    detail: '将删除本实例可删备份及对应标签，保留活跃回滚备份和归属未知的标签。其他标签或容器引用的镜像不会释放空间。',
+    confirmText: '清空备份',
+    danger: true,
+  })
+  if (!ok) return
+  bDeleting.value = 'all'
+  try {
+    const r = await api.del<Schemas['UpdateBackupClearData']>('/updates/backups')
+    const msg = r.data.keptProtected
+      ? `已清理 ${r.data.deleted} 份备份（保留了当前更新回滚锚点）`
+      : `已清理 ${r.data.deleted} 份备份`
+    toast(r.data.keptUnowned ? `${msg}，另保留 ${r.data.keptUnowned} 个归属未知的标签` : msg, 'success')
+    await loadBackups(1)
+  } catch (err) {
+    toast(errorTitle(err), 'error', errorDetail(err), 7000)
+    await loadBackups()
+  } finally {
+    bDeleting.value = ''
   }
 }
 
@@ -246,11 +296,17 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer))
         <Field label="包含预发布版本" hint="开启后也会提示 beta / rc 等预发布版本；关闭只提示正式版。" inline>
           <Switch v-model="draft.includePrerelease" label="包含预发布版本" />
         </Field>
-        <Field label="自动下载新版本" hint="发现新版本时自动备份并下载（暂存）。重启仍需人工确认（网页或 Telegram），不会自动重启。" inline>
+        <Field label="自动下载新版本" hint="发现新版本时自动备份并下载（暂存）。未开启静默自动更新时，重启仍需人工确认（网页或 Telegram）。" inline>
           <Switch v-model="draft.autoUpdate" label="自动下载新版本" />
+        </Field>
+        <Field label="静默自动更新" hint="开启后发现非破坏性更新（无主版本号跨代及 Breaking Change 标记）时不再推送待更新提醒，自动备份下载并在无模型/MCP 请求连续空闲 3 分钟后自动重启生效，完成后推送通知。" inline>
+          <Switch v-model="draft.silentUpdate" label="静默自动更新" />
         </Field>
         <Field label="检查间隔" :hint="`多久检查一次（300–604800 秒，即 5 分钟到 7 天）。当前约 ${humanSeconds(draft.intervalSeconds)}，推荐 3600 秒。`" inline>
           <NumberInput :model-value="draft.intervalSeconds" :min="300" :max="604800" integer unit="秒" @update:model-value="$event !== null && (draft!.intervalSeconds = $event)" />
+        </Field>
+        <Field label="保留备份份数" hint="更新成功并通过健康检查后自动保留最近几份备份（0–20，默认 1 份）。设为 0 表示升级成功后自动删空备份；更新进行中的回滚备份始终受保护。" inline>
+          <NumberInput :model-value="draft.keepBackups" :min="0" :max="20" integer unit="份" @update:model-value="$event !== null && (draft!.keepBackups = $event)" />
         </Field>
         <Field label="已忽略的版本" hint="这些版本不会再提醒或出现在一键更新中。点 × 取消忽略。">
           <div class="ign">
@@ -265,22 +321,39 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer))
       </template>
     </SettingsSection>
 
-    <Card title="备份" subtitle="每次更新前自动创建的备份，回滚时使用。">
+    <Card title="备份" subtitle="清理本实例的备份归档和镜像标签。归属未知的标签只展示不删除；镜像仍被其他标签或容器引用时不会释放磁盘空间。">
       <template #icon><Archive /></template>
       <template #actions>
-        <Btn size="sm" variant="ghost" :loading="bLoading" @click="loadBackups()"><RefreshCw /> 刷新</Btn>
+        <Btn v-if="hasDeletableBackups" size="sm" variant="ghost" :loading="bDeleting === 'all'" :disabled="Boolean(bDeleting)" @click="clearAllBackups"><Trash2 /> 清空备份</Btn>
+        <Btn size="sm" variant="ghost" :loading="bLoading" :disabled="Boolean(bDeleting)" @click="loadBackups()"><RefreshCw /> 刷新</Btn>
       </template>
       <p v-if="bError" class="err"><TriangleAlert /> {{ bError }}</p>
       <div v-else-if="bLoading && !backups.length" class="sk"><Skeleton v-for="i in 2" :key="i" h="30px" /></div>
       <Empty v-else-if="!backups.length" title="还没有备份" detail="第一次通过这里或 Telegram 更新时会自动创建。" />
       <template v-else>
         <div v-for="b in backups" :key="b.ref" class="brow">
-          <span class="bv mono">{{ showVersion(b.version) }} → {{ showVersion(b.targetVersion) }}</span>
-          <Badge>{{ MODE_LABEL[b.mode] || '其他方式' }}</Badge>
+          <span class="bv mono">{{ b.targetVersion ? `${showVersion(b.version)} → ${showVersion(b.targetVersion)}` : showVersion(b.version) }}</span>
+          <div class="btags">
+            <Badge>{{ MODE_LABEL[b.mode] || '其他方式' }}</Badge>
+            <Badge v-if="b.orphan" tone="neutral">历史镜像标签</Badge>
+            <Badge v-if="b.unowned" tone="orange">归属未知 · 不清理</Badge>
+            <Badge v-else-if="b.protected" tone="orange">当前回滚保护</Badge>
+          </div>
           <span class="bref"><CopyText :text="b.ref" /></span>
           <span class="bt muted" :title="dateTime(b.createdAt)">{{ b.createdAt ? relative(b.createdAt) : '—' }}</span>
+          <Btn
+            size="sm"
+            variant="ghost"
+            :loading="bDeleting === b.ref"
+            :disabled="Boolean(bDeleting) || b.protected"
+            :title="b.unowned ? '无法确认实例归属，不允许删除' : b.protected ? '更新进行中，当前回滚备份不可删除' : `删除备份 ${b.ref}`"
+            :aria-label="`删除备份 ${b.ref}`"
+            @click="removeBackup(b)"
+          >
+            <Trash2 />
+          </Btn>
         </div>
-        <Pager :page="bPage" :page-size="10" :total="bTotal" :disabled="bLoading" @update:page="loadBackups" />
+        <Pager :page="bPage" :page-size="10" :total="bTotal" :disabled="bLoading || Boolean(bDeleting)" @update:page="loadBackups" />
       </template>
     </Card>
 
@@ -436,12 +509,18 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer))
 }
 .brow {
   display: grid;
-  grid-template-columns: minmax(140px, auto) auto minmax(0, 1fr) 90px;
+  grid-template-columns: minmax(140px, auto) auto minmax(0, 1fr) 90px auto;
   align-items: center;
   gap: 12px;
   min-height: 36px;
   font-size: 12.5px;
   border-bottom: 0.5px solid var(--hairline);
+}
+.btags {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
 }
 .bref {
   min-width: 0;
@@ -475,7 +554,7 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer))
     width: 100%;
   }
   .brow {
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) auto auto;
     padding: 6px 0;
   }
   .bref {

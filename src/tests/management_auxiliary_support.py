@@ -183,6 +183,10 @@ class FakeUpdates:
         self.stage_ok = True
         self.activate_calls = 0
         self.cancel_calls = 0
+        self._backups = [
+            {"ref": "b2", "version": "0.31.13", "target_tag": "0.32.0", "mode": "docker", "ts": "20260202-030405"},
+            {"ref": "b1", "version": "0.31.12", "target_tag": "0.31.13", "mode": "src", "ts": "20260101-010203"},
+        ]
 
     def cached_release(self):
         return copy.deepcopy(self.release)
@@ -220,10 +224,22 @@ class FakeUpdates:
         return self.update_state["stage"] not in {STAGE_IDLE, "failed", "success", "rolled_back"}
 
     def backups(self):
-        return [
-            {"ref": "b2", "version": "0.31.13", "target_tag": "0.32.0", "mode": "docker", "ts": "20260202-030405"},
-            {"ref": "b1", "version": "0.31.12", "target_tag": "0.31.13", "mode": "src", "ts": "20260101-010203"},
-        ]
+        return copy.deepcopy(self._backups)
+
+    def delete_backup(self, ref):
+        active = self.update_state.get("backup_ref") if self.busy() else None
+        if active and ref == active:
+            return "protected"
+        before = len(self._backups)
+        self._backups = [item for item in self._backups if item["ref"] != ref]
+        return "deleted" if len(self._backups) < before else "not_found"
+
+    def clear_backups(self):
+        active = self.update_state.get("backup_ref") if self.busy() else None
+        kept = [item for item in self._backups if active and item["ref"] == active]
+        deleted = len(self._backups) - len(kept)
+        self._backups = kept
+        return {"deleted": deleted, "keptProtected": bool(kept), "failed": 0}
 
     def failure_log(self):
         return "api_token=top-secret\nhealth failed"

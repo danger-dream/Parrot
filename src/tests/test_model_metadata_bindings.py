@@ -684,3 +684,68 @@ def test_oauth_default_fallback_binding_never_uses_stale_account_catalog(monkeyp
     assert model_metadata.resolve_binding(
         "fallback-model", scope_key=scope, outbound_model="fallback-model",
     ) is None
+
+
+def test_capability_fallback_merges_raw_layers_before_deriving_limits(monkeypatch):
+    from src.model_registry import runtime
+    monkeypatch.setattr(runtime, "current", lambda: None)
+    monkeypatch.setattr(runtime, "_registry", None)
+    cfg = {
+        "modelBindings": {}, "modelMetadata": {},
+        "modelMetadataOverrides": {
+            "defaults": {"wire": {"fields": {"contextWindow": 500, "toolCall": True}},
+                         "alias": {"fields": {"contextWindow": 1000}}},
+            "scoped": {"api:Test": {
+                "wire": {"outboundModel": "wire", "fields": {"contextWindow": 2000}},
+                "alias": {"outboundModel": "wire", "fields": {"vision": False}},
+            }},
+        },
+    }
+    monkeypatch.setattr(config, "get", lambda: cfg)
+    base = {"contextWindow": 100000, "maxInputTokens": 90000,
+            "compactTriggerTokens": 80000, "vision": True,
+            "inputModalities": ["text", "image", "pdf"], "unknownField": "unchanged"}
+    monkeypatch.setattr(model_pricing, "canonical_official_model", lambda m: "test/wire")
+    monkeypatch.setattr(model_pricing, "binding_snapshot", lambda target: {"metadata": base})
+
+    def resolve():
+        return model_metadata.resolve_binding(
+            "alias", scope_key="api:Test", outbound_model="wire", fallback_to_outbound=True)
+
+    bound = resolve()
+    assert bound.metadata["contextWindow"] == 2000  # source wire beats public alias
+    assert bound.metadata["maxInputTokens"] == 2000  # not the intermediate wire/public 500
+    assert bound.metadata["compactTriggerTokens"] == 2000
+    assert bound.metadata["inputModalities"] == ["text", "pdf"]
+    assert bound.metadata["supportsImages"] is False
+    assert bound.metadata["unknownField"] == "unchanged"
+    assert bound.metadata["toolCall"] is True
+    assert bound.constrained_by["maxInputTokens"] == ("contextWindow",)
+    cfg["modelMetadataOverrides"]["scoped"]["api:Test"]["alias"]["fields"]["contextWindow"] = 1000
+    assert resolve().metadata["maxInputTokens"] == 1000
+    # Stale alias overrides cannot follow a repointed outbound model.
+    cfg["modelMetadataOverrides"]["scoped"]["api:Test"]["alias"]["outboundModel"] = "old-wire"
+    assert resolve().metadata["contextWindow"] == 2000
+    assert resolve().metadata["vision"] is True
+    assert base["maxInputTokens"] == 90000
+
+
+def test_capability_fallback_keeps_override_only_wire_and_explicit_alias_binding(monkeypatch):
+    from src.model_registry import runtime
+    monkeypatch.setattr(runtime, "_registry", None)
+    cfg = {"modelBindings": {}, "modelMetadata": {}, "modelMetadataOverrides": {
+        "defaults": {"wire": {"fields": {"contextWindow": 32768}}},
+        "scoped": {"api:Test": {"wire": {"outboundModel": "wire", "fields": {"vision": True}}}},
+    }}
+    monkeypatch.setattr(config, "get", lambda: cfg)
+    monkeypatch.setattr(model_pricing, "canonical_official_model", lambda m: None)
+    def resolve():
+        return model_metadata.resolve_binding(
+            "alias", scope_key="api:Test", outbound_model="wire", fallback_to_outbound=True)
+    assert resolve().metadata == {"contextWindow": 32768, "vision": True, "supportsImages": True}
+    cfg["modelBindings"] = {"defaults": {"alias": {"target": "test/alias", "source": "manual"}}}
+    monkeypatch.setattr(model_pricing, "catalog_metadata", lambda target: {"contextWindow": 4000})
+    assert resolve().metadata == {"contextWindow": 4000}
+    cfg["modelBindings"] = {}
+    cfg["modelMetadataOverrides"] = {}
+    assert resolve() is None  # unknown stays unknown

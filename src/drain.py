@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from contextvars import ContextVar
@@ -24,15 +25,43 @@ from . import config
 
 _DRainingReason = str | None
 
+_lock = threading.RLock()
+_update_reservation: object | None = None
+
+
+class AdmissionClosed(Exception):
+    """New business work is fenced for update or shutdown."""
+
+
 _draining: bool = False
 _shutdown_requested: bool = False
 _reason: _DRainingReason = None
 _started_at: float | None = None
 _active_requests: int = 0
+_active_work: int = 0
+_last_work_at: float | None = None
 _condition: asyncio.Condition | None = None
 _condition_loop: asyncio.AbstractEventLoop | None = None
 _deadline: float | None = None
 _current_lease: ContextVar[DrainLease | None] = ContextVar("parrot_request_lease", default=None)
+
+
+def is_work_label(label: str) -> bool:
+    """Connection-level work: responses rounds and MCP tools are counted separately."""
+    text = str(label or "").strip()
+    if text.startswith("ws /v1/"):
+        return text != "ws /v1/responses"
+    if text.startswith("http "):
+        rest = text[5:].strip()
+        method, _, path = rest.partition(" ")
+        method_up = method.upper()
+        if path in {"/images/generations", "/images/edits", "/backend-api/codex/realtime/calls"}:
+            return True
+        if path.startswith("/v1/"):
+            if path == "/v1/models" and method_up in {"GET", "HEAD", "OPTIONS"}:
+                return False
+            return True
+    return False
 
 
 @dataclass
@@ -74,6 +103,62 @@ def reason() -> str | None:
 
 def active_count() -> int:
     return _active_requests
+
+
+def active_work_count() -> int:
+    with _lock:
+        return _active_work
+
+
+def _idle_locked(quiet_seconds: float) -> bool:
+    return not (_draining or _shutdown_requested or _update_reservation is not None or _active_work) and (
+        _last_work_at is None or time.monotonic() - _last_work_at >= max(0.0, float(quiet_seconds)))
+
+
+def is_idle_for_update(quiet_seconds: float = 180.0) -> bool:
+    with _lock:
+        return _idle_locked(quiet_seconds)
+
+
+def try_reserve_update(quiet_seconds: float = 180.0) -> object | None:
+    """Atomically check quietness and fence new work; does not request shutdown."""
+    global _update_reservation
+    with _lock:
+        if not _idle_locked(quiet_seconds):
+            return None
+        _update_reservation = object()
+        return _update_reservation
+
+
+def release_update(token: object) -> None:
+    global _update_reservation
+    with _lock:
+        if token is _update_reservation:
+            _update_reservation = None
+
+
+@dataclass
+class WorkLease:
+    closed: bool = False
+
+    def close(self) -> None:
+        global _active_work, _last_work_at
+        with _lock:
+            if not self.closed:
+                self.closed = True
+                _active_work -= 1
+                _last_work_at = time.monotonic()
+
+
+def enter_work() -> WorkLease:
+    """Reserve a round/tool before enqueueing, release after owned finalizers."""
+    global _active_work, _last_work_at
+    with _lock:
+        if _draining or _shutdown_requested or _update_reservation is not None:
+            raise AdmissionClosed()
+        _active_work += 1
+        _last_work_at = time.monotonic()
+        return WorkLease()
 
 
 def started_at() -> float | None:
@@ -134,44 +219,55 @@ def expedite() -> None:
 def begin(reason_text: str = "shutdown") -> None:
     """Enter draining mode.
 
-    This is sync on purpose so signal handlers can call it directly.  Active
-    counter mutations happen on the asyncio loop; the assignment here is atomic
-    enough for Parrot's single-process/single-event-loop runtime.
+    This is sync so signal handlers can call it directly. The admission lock
+    also serializes updates from the background updater thread.
     """
 
     global _draining, _shutdown_requested, _reason, _started_at, _deadline
-    first = not _draining
-    _draining = True
-    _shutdown_requested = True
-    _reason = reason_text
-    if _started_at is None:
-        _started_at = time.time()
-    if first:
-        _deadline = time.monotonic() + shutdown_timeout_seconds()
-        print(f"[drain] entering draining mode reason={reason_text} active={_active_requests}")
+    with _lock:
+        first = not _draining
+        _draining = True
+        _shutdown_requested = True
+        _reason = reason_text
+        if _started_at is None:
+            _started_at = time.time()
+        if first:
+            _deadline = time.monotonic() + shutdown_timeout_seconds()
+            print(f"[drain] entering draining mode reason={reason_text} active={_active_requests}")
 
 
 def reset_for_tests() -> None:
     """Reset global state for unit tests only."""
 
-    global _draining, _shutdown_requested, _reason, _started_at, _active_requests, _deadline
+    global _draining, _shutdown_requested, _reason, _started_at, _active_requests, _active_work, _last_work_at, _deadline
+    global _update_reservation
+    _update_reservation = None
     _draining = False
     _shutdown_requested = False
     _reason = None
     _started_at = None
     _active_requests = 0
+    _active_work = 0
+    _last_work_at = None
     _deadline = None
     _current_lease.set(None)
 
 
 async def enter(label: str = "request") -> DrainLease:
-    global _active_requests
+    global _active_requests, _active_work, _last_work_at
     cond = await _condition_for_current_loop()
     async with cond:
-        _active_requests += 1
-        lease = DrainLease(label=label)
-        _current_lease.set(lease)
-        return lease
+        with _lock:
+            work = is_work_label(label)
+            if _draining or _shutdown_requested or (work and _update_reservation is not None):
+                raise AdmissionClosed()
+            _active_requests += 1
+            if work:
+                _active_work += 1
+                _last_work_at = time.monotonic()
+            lease = DrainLease(label=label)
+            _current_lease.set(lease)
+            return lease
 
 
 @asynccontextmanager
@@ -184,12 +280,16 @@ async def active(label: str = "request") -> AsyncIterator[DrainLease]:
 
 
 async def _decrement_active(label: str = "request") -> None:
-    global _active_requests
+    global _active_requests, _active_work, _last_work_at
     cond = await _condition_for_current_loop()
     async with cond:
-        _active_requests = max(0, _active_requests - 1)
-        if _draining:
-            print(f"[drain] active request finished label={label} remaining={_active_requests}")
+        with _lock:
+            _active_requests = max(0, _active_requests - 1)
+            if is_work_label(label):
+                _active_work = max(0, _active_work - 1)
+                _last_work_at = time.monotonic()
+            if _draining:
+                print(f"[drain] active request finished label={label} remaining={_active_requests}")
         cond.notify_all()
 
 

@@ -30,11 +30,12 @@ def test_update_all_operations_prepare_commit_polling_and_replay(tmp_path):
 
         updated = client.patch(
             BASE + "/updates/settings",
-            json={"enabled": False, "intervalSeconds": 7200},
+            json={"enabled": False, "intervalSeconds": 7200, "keepBackups": 0},
             headers={**headers, "If-Match": revision},
         )
         assert updated.status_code == 200
         assert updated.json()["data"]["intervalSeconds"] == 7200
+        assert updated.json()["data"]["keepBackups"] == 0
 
         checked = client.post(BASE + "/updates/actions/check", headers=headers)
         assert checked.status_code == 200
@@ -58,6 +59,15 @@ def test_update_all_operations_prepare_commit_polling_and_replay(tmp_path):
         assert backups.json()["data"]["items"][0]["ref"] == "b2"
         assert backups.json()["data"]["items"][0]["createdAt"] == "2026-02-02T03:04:05Z"
         assert backups.json()["data"]["items"][0]["revision"].startswith("rev_")
+
+        deleted_one = client.delete(BASE + "/updates/backups/b1", headers=headers)
+        assert deleted_one.status_code == 204
+        missing_backup = client.delete(BASE + "/updates/backups/b1", headers=headers)
+        assert missing_backup.status_code == 404
+        cleared_backups = client.delete(BASE + "/updates/backups", headers=headers)
+        assert cleared_backups.status_code == 200
+        assert cleared_backups.json()["data"] == {"deleted": 1, "keptProtected": False, "keptUnowned": 0}
+        assert client.get(BASE + "/updates/backups", headers=headers).json()["meta"]["total"] == 0
 
         failure_log = client.get(BASE + "/updates/failure-log", headers=headers)
         assert failure_log.status_code == 200

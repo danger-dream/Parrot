@@ -275,3 +275,5 @@ getMediaStatistics
 listRecentOutcomes
 listNotifications
 markNotificationsRead
+deleteUpdateBackup
+clearUpdateBackups

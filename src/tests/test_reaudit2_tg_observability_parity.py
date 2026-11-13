@@ -524,6 +524,8 @@ def test_p11_status_alert_and_update_callbacks_answer_before_redraw_failure(monk
                 enabled=True,
                 include_prerelease=True,
                 auto_update=False,
+                silent_update=False,
+                keep_backups=1,
                 interval_seconds=3600,
                 ignored_versions=(),
             )

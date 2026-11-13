@@ -17,6 +17,7 @@ from ..schemas.operations import ManagementOperationData
 from ..schemas.auxiliary_updates import (
     ActivateStagedUpdateRequest,
     StageUpdateOperationData,
+    UpdateBackupClearData,
     UpdateBackupData,
     UpdateBackupListData,
     UpdateBackupListEnvelope,
@@ -46,7 +47,9 @@ _SETTINGS_EXAMPLE = {
         "enabled": True,
         "includePrerelease": False,
         "autoUpdate": False,
+        "silentUpdate": False,
         "intervalSeconds": 3600,
+        "keepBackups": 1,
         "ignoredVersions": [],
         "revision": "rev_example",
     },
@@ -75,10 +78,16 @@ _BACKUPS_EXAMPLE = {
             "targetVersion": "0.32.0",
             "mode": "docker",
             "createdAt": "2026-01-02T03:04:05Z",
+            "protected": False,
+            "orphan": False,
             "revision": "rev_example",
         }]
     },
     "meta": {"requestId": "request-example", "page": 1, "pageSize": 50, "total": 1, "hasNext": False},
+}
+_BACKUPS_CLEAR_EXAMPLE = {
+    "data": {"deleted": 2, "keptProtected": False},
+    "meta": {"requestId": "request-example"},
 }
 _FAILURE_LOG_EXAMPLE = {
     "data": {"content": "health verification failed", "revision": "rev_example"},
@@ -129,7 +138,9 @@ def _settings(value) -> UpdateSettingsData:
         enabled=value.enabled,
         includePrerelease=value.include_prerelease,
         autoUpdate=value.auto_update,
+        silentUpdate=value.silent_update,
         intervalSeconds=value.interval_seconds,
+        keepBackups=value.keep_backups,
         ignoredVersions=list(value.ignored_versions),
         revision=value.revision,
     )
@@ -270,6 +281,9 @@ def list_update_backups(
             targetVersion=item.target_version,
             mode=item.mode,
             createdAt=item.created_at,
+            protected=item.protected,
+            orphan=item.orphan,
+            unowned=item.unowned,
             revision=item.revision,
         )
         for item in value.items
@@ -283,6 +297,44 @@ def list_update_backups(
             total=value.total,
             hasNext=value.has_next,
         ),
+    )
+
+
+@router.delete(
+    "/updates/backups/{backupRef}",
+    operation_id="deleteUpdateBackup",
+    dependencies=[Depends(reject_unknown_query())],
+    tags=["updates"],
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={**no_content_response("Update backup deleted"), **management_error_responses(*_ERRORS)},
+)
+def delete_update_backup(
+    backupRef: Annotated[str, Path(min_length=1, max_length=192)],
+    controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.UPDATE))],
+) -> Response:
+    controls.updates.delete_backup(context, backupRef)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.delete(
+    "/updates/backups",
+    operation_id="clearUpdateBackups",
+    dependencies=[Depends(reject_unknown_query())],
+    tags=["updates"],
+    response_model=DataEnvelope[UpdateBackupClearData],
+    responses={**success_response(200, _BACKUPS_CLEAR_EXAMPLE), **management_error_responses(*_ERRORS)},
+)
+def clear_update_backups(
+    request: Request,
+    controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.UPDATE))],
+) -> DataEnvelope[UpdateBackupClearData]:
+    value = controls.updates.clear_backups(context)
+    return DataEnvelope(
+        data=UpdateBackupClearData(deleted=value.deleted, keptProtected=value.kept_protected,
+                                   keptUnowned=value.kept_unowned),
+        meta=response_meta(request),
     )
 
 

@@ -15,6 +15,7 @@ from typing import Optional
 
 from ...management_control.auxiliary import get_auxiliary_controls
 from ...management_control.auxiliary.common import telegram_context
+from ...management_control.errors import ManagementError, ManagementErrorCode
 from ...management_control.auxiliary.updates import (
     STAGE_BACKING_UP,
     STAGE_FAILED,
@@ -42,7 +43,9 @@ def _cfg() -> dict:
         "enabled": value.enabled,
         "includePrerelease": value.include_prerelease,
         "autoUpdate": value.auto_update,
+        "silentUpdate": value.silent_update,
         "intervalSeconds": value.interval_seconds,
+        "keepBackups": value.keep_backups,
         "ignoredVersions": list(value.ignored_versions),
         "repo": _CONTROL.repository(_ctx()),
     }
@@ -60,6 +63,7 @@ def _format_main_text() -> str:
     interval = int(cfg.get("intervalSeconds", 3600) or 3600)
     include_pre = bool(cfg.get("includePrerelease", True))
     auto_update = bool(cfg.get("autoUpdate", False))
+    silent_update = bool(cfg.get("silentUpdate", False))
     repo = cfg.get("repo") or "danger-dream/Parrot"
     ignored = list(cfg.get("ignoredVersions") or [])
 
@@ -84,7 +88,7 @@ def _format_main_text() -> str:
         f"仓库: <code>{ui.escape_html(repo)}</code>",
         f"自动检查: <code>{'开' if enabled else '关'}</code> · 间隔 <code>{interval}s</code> · "
         f"含预发布: <code>{'是' if include_pre else '否'}</code>",
-        f"自动更新: <code>{'开' if auto_update else '关'}</code>",
+        f"自动更新: <code>{'静默（空闲自动升级）' if silent_update else ('开' if auto_update else '关')}</code>",
         f"已忽略: <code>{', '.join(ignored) if ignored else '无'}</code>",
         "",
     ]
@@ -136,6 +140,7 @@ def _format_kb() -> dict:
     enabled = bool(cfg.get("enabled", True))
     include_pre = bool(cfg.get("includePrerelease", True))
     auto_update = bool(cfg.get("autoUpdate", False))
+    silent_update = bool(cfg.get("silentUpdate", False))
     interval = int(cfg.get("intervalSeconds", 3600) or 3600)
     ignored = set(cfg.get("ignoredVersions") or [])
     st = _CONTROL.cached_release(_ctx()) or {}
@@ -171,7 +176,10 @@ def _format_kb() -> dict:
         ui.btn("🔄 立即检查", "upd:refresh"),
         ui.btn("🗂 备份列表", "upd:backups"),
     ])
-    rows.append([ui.btn("📋 更新日志", "upd:faillog")])
+    rows.append([
+        ui.btn(f"{'🤫 静默更新: 开' if silent_update else '🔔 静默更新: 关'}", "upd:toggle_silent"),
+        ui.btn("📋 更新日志", "upd:faillog"),
+    ])
     if latest and _CONTROL.is_newer(_ctx(), latest):
         if latest in ignored:
             rows.append([ui.btn(f"✅ 取消忽略 {latest}", f"upd:unignore:{latest}")])
@@ -213,6 +221,13 @@ def _toggle_auto(chat_id: int, message_id: int, cb_id: str) -> None:
     cur = bool(_cfg().get("autoUpdate", False))
     _update_cfg({"autoUpdate": not cur}, chat_id)
     ui.answer_cb(cb_id, "自动更新已开启" if not cur else "自动更新已关闭")
+    show(chat_id, message_id)
+
+
+def _toggle_silent(chat_id: int, message_id: int, cb_id: str) -> None:
+    cur = bool(_cfg().get("silentUpdate", False))
+    _update_cfg({"silentUpdate": not cur}, chat_id)
+    ui.answer_cb(cb_id, "静默空闲自动更新已开启" if not cur else "静默自动更新已关闭")
     show(chat_id, message_id)
 
 
@@ -274,23 +289,106 @@ def _clear_ignored(chat_id: int, message_id: int, cb_id: str) -> None:
     show(chat_id, message_id)
 
 
-def _backups(chat_id: int, message_id: int, cb_id: str) -> None:
-    ui.answer_cb(cb_id)
+def _backups(chat_id: int, message_id: int, cb_id: Optional[str] = None) -> None:
+    if cb_id is not None:
+        ui.answer_cb(cb_id)
+    keep = int(_cfg().get("keepBackups", 1))
     backups = _CONTROL.backups_raw(_ctx(chat_id))
+    rows: list[list[dict]] = []
     if not backups:
-        text = "🗂 <b>备份列表</b>\n\n暂无备份。"
+        text = f"🗂 <b>备份列表</b>（自动保留最近 <code>{keep}</code> 份）\n\n暂无备份。"
     else:
-        lines = ["🗂 <b>备份列表</b>（最近在前）", ""]
-        for b in backups[:10]:
-            ref = b.get("ref", "?")
-            ver = b.get("version", "?")
-            tgt = b.get("target_tag", "?")
-            mode = b.get("mode", "?")
-            lines.append(f"• <code>{ui.escape_html(ref)}</code>")
-            lines.append(f"  v{ui.escape_html(ver)} → {ui.escape_html(tgt)} ({mode})")
+        shown = backups[:10]
+        lines = [f"🗂 <b>备份列表</b>（最近在前 · 自动保留最近 <code>{keep}</code> 份）", ""]
+        del_btns: list[dict] = []
+        for idx, b in enumerate(shown, 1):
+            ref = str(b.get("ref", "?"))
+            ver = str(b.get("version", "?"))
+            tgt = str(b.get("target_tag") or "")
+            mode = str(b.get("mode", "?"))
+            protected = bool(b.get("protected"))
+            orphan = bool(b.get("orphan"))
+            span = f"v{ui.escape_html(ver)} → {ui.escape_html(tgt)}" if tgt else f"v{ui.escape_html(ver)}"
+            flags = []
+            if orphan:
+                flags.append("历史镜像标签")
+            if b.get("unowned"):
+                flags.append("🔒归属未知，不清理")
+            elif protected:
+                flags.append("🔒回滚保护中")
+            flag_str = f" · {' / '.join(flags)}" if flags else ""
+            lines.append(f"<b>#{idx}</b> <code>{ui.escape_html(ref)}</code>")
+            lines.append(f"  {span} ({ui.escape_html(mode)}){flag_str}")
+            if not protected and ref != "?":
+                code = ui.register_code(ref)
+                del_btns.append(ui.btn(f"🗑 删除 #{idx}", f"upd:del_bk:{code}"))
+        for i in range(0, len(del_btns), 3):
+            rows.append(del_btns[i : i + 3])
+        if any(not b.get("protected") for b in backups):
+            rows.append([ui.btn("🧹 清空可删备份", "upd:clear_bk")])
         text = "\n".join(lines)
-    ui.edit(chat_id, message_id, ui.truncate(text),
-            reply_markup=ui.inline_kb([[ui.btn("◀ 返回", "menu:update")]]))
+    rows.append([ui.btn(f"📦 保留份数: {keep}", "upd:edit_keep"), ui.btn("◀ 返回", "menu:update")])
+    ui.edit(chat_id, message_id, ui.truncate(text), reply_markup=ui.inline_kb(rows))
+
+
+def _delete_backup(chat_id: int, message_id: int, cb_id: str, code: str) -> None:
+    ref = ui.resolve_code(code) or code
+    try:
+        _CONTROL.delete_backup(_ctx(chat_id), ref)
+    except ManagementError as exc:
+        msg = "更新操作进行中、备份受保护或归属未知" if exc.code == ManagementErrorCode.STATE_CONFLICT else "备份不存在或删除失败"
+        ui.answer_cb(cb_id, msg, show_alert=True)
+    else:
+        ui.answer_cb(cb_id, "已删除备份")
+    _backups(chat_id, message_id)
+
+
+def _confirm_clear_backups(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    text = (
+        "🧹 <b>确认清空可删备份？</b>\n\n"
+        "将移除本实例可删备份归档及对应镜像标签，保留活跃回滚备份和归属未知的标签。"
+        "仍被其他标签或容器引用的镜像不会释放磁盘空间。"
+    )
+    ui.edit(chat_id, message_id, text, reply_markup=ui.inline_kb([
+        [ui.btn("✅ 确认清空", "upd:clear_bk_ok"), ui.btn("❌ 取消", "upd:backups")],
+    ]))
+
+
+def _clear_backups(chat_id: int, message_id: int, cb_id: str) -> None:
+    try:
+        res = _CONTROL.clear_backups(_ctx(chat_id))
+    except ManagementError as exc:
+        msg = "更新操作进行中，请稍后重试" if exc.code == ManagementErrorCode.STATE_CONFLICT else "部分备份清理失败，请稍后重试"
+        ui.answer_cb(cb_id, msg, show_alert=True)
+    else:
+        tail = f"，保留 {res.kept_unowned} 个归属未知的标签" if res.kept_unowned else ""
+        ui.answer_cb(cb_id, f"已清理 {res.deleted} 份备份{tail}")
+    _backups(chat_id, message_id)
+
+
+def _edit_keep(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    states.set_state(chat_id, "upd_keep")
+    ui.edit(
+        chat_id, message_id,
+        "请输入升级成功后自动保留的备份份数（0–20 的整数，默认 1；设为 0 表示升级成功验活后立即自动删空备份）：\n\n例：<code>1</code>",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "upd:backups")]]),
+    )
+
+
+def _on_keep_input(chat_id: int, text: str) -> None:
+    try:
+        v = int((text or "").strip())
+        if not 0 <= v <= 20:
+            raise ValueError
+    except ValueError:
+        ui.send(chat_id, "❌ 需要 0–20 的整数，请重新输入：")
+        return
+    _update_cfg({"keepBackups": v}, chat_id)
+    states.pop_state(chat_id)
+    ui.send(chat_id, f"✅ 备份保留份数已更新为 <code>{v}</code> 份")
+    send_new(chat_id)
 
 
 def _faillog(chat_id: int, message_id: int, cb_id: str) -> None:
@@ -412,12 +510,22 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         _toggle_pre(chat_id, message_id, cb_id); return True
     if data == "upd:toggle_auto":
         _toggle_auto(chat_id, message_id, cb_id); return True
+    if data == "upd:toggle_silent":
+        _toggle_silent(chat_id, message_id, cb_id); return True
     if data == "upd:edit_interval":
         _edit_interval(chat_id, message_id, cb_id); return True
     if data == "upd:refresh":
         _refresh(chat_id, message_id, cb_id); return True
     if data == "upd:backups":
         _backups(chat_id, message_id, cb_id); return True
+    if data == "upd:edit_keep":
+        _edit_keep(chat_id, message_id, cb_id); return True
+    if data == "upd:clear_bk":
+        _confirm_clear_backups(chat_id, message_id, cb_id); return True
+    if data == "upd:clear_bk_ok":
+        _clear_backups(chat_id, message_id, cb_id); return True
+    if data.startswith("upd:del_bk:"):
+        _delete_backup(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data == "upd:faillog":
         _faillog(chat_id, message_id, cb_id); return True
     if data.startswith("upd:do_update:"):
@@ -440,4 +548,6 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
 def handle_text_state(chat_id: int, action: str, text: str) -> bool:
     if action == "upd_interval":
         _on_interval_input(chat_id, text); return True
+    if action == "upd_keep":
+        _on_keep_input(chat_id, text); return True
     return False

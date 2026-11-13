@@ -25,7 +25,7 @@ from mcp.server.lowlevel.server import ServerRequestContext
 from mcp.server.mcpserver.exceptions import ToolError
 from starlette.responses import Response
 
-from .. import apikey_limiter, auth, config, image_artifacts, log_db, search_service
+from .. import drain, apikey_limiter, auth, config, image_artifacts, log_db, search_service
 from ..async_owned import await_owned
 from . import catalog, policy, request_adapter
 
@@ -679,6 +679,20 @@ async def on_list_tools(ctx: ServerRequestContext, params: Any) -> types.ListToo
 
 
 async def on_call_tool(ctx: ServerRequestContext, params: types.CallToolRequestParams):
+    try:
+        work = drain.enter_work()
+    except drain.AdmissionClosed:
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text="Parrot is restarting; please retry shortly.")],
+            is_error=True,
+        )
+    try:
+        return await _on_call_tool(ctx, params)
+    finally:
+        work.close()
+
+
+async def _on_call_tool(ctx: ServerRequestContext, params: types.CallToolRequestParams):
     """执行一次工具调用；限流、取消和日志均由本次调用拥有。"""
     tool_name = str(params.name or "")
     arguments = params.arguments if isinstance(params.arguments, dict) else {}

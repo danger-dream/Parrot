@@ -936,7 +936,11 @@ class _DrainHttpMiddleware:
             return
 
         method = str(scope.get("method") or "")
-        drain_lease = await drain.enter(f"http {method} {path}")
+        try:
+            drain_lease = await drain.enter(f"http {method} {path}")
+        except drain.AdmissionClosed:
+            await drain.reject_response()(scope, receive, send)
+            return
         key_lease: apikey_limiter.ApiKeyLease | None = None
         policy_body_guard = None
         response_started = False
@@ -1230,10 +1234,13 @@ async def list_models(request: Request):
     unified = model_registry.current()
 
     def declared(name: str) -> dict:
-        if unified is None or name in image_models:
+        if name in image_models:
             return {}
-        found = unified.lookup(global_map.get(name, name))
-        return capabilities.describe(found[0], key_name) if found else {}
+        target = global_map.get(name, name)
+        if unified is not None:
+            found = unified.lookup(target)
+            return capabilities.describe(found[0], key_name) if found else {}
+        return capabilities.describe(target, key_name)
 
     data = [
         {"type": "model", "id": m, "display_name": model_registry.display_name(m), "created_at": placeholder_ts,
@@ -1269,8 +1276,11 @@ async def proxy_responses_websocket(websocket: WebSocket):
         await websocket.close(code=1013, reason="Parrot is draining for graceful restart")
         return
     from src.openai.responses_ws import handle_responses_ws
-    async with drain.active("ws /v1/responses"):
-        await handle_responses_ws(websocket)
+    try:
+        async with drain.active("ws /v1/responses"):
+            await handle_responses_ws(websocket)
+    except drain.AdmissionClosed:
+        await websocket.close(code=1013, reason="Parrot is restarting; please retry shortly")
 
 
 @app.websocket("/v1/realtime")
@@ -1280,8 +1290,11 @@ async def proxy_realtime_websocket(websocket: WebSocket):
         await websocket.close(code=1013, reason="Parrot is draining for graceful restart")
         return
     from src.openai.realtime import handle_realtime_ws
-    async with drain.active("ws /v1/realtime"):
-        await handle_realtime_ws(websocket, path="/v1/realtime")
+    try:
+        async with drain.active("ws /v1/realtime"):
+            await handle_realtime_ws(websocket, path="/v1/realtime")
+    except drain.AdmissionClosed:
+        await websocket.close(code=1013, reason="Parrot is restarting; please retry shortly")
 
 
 @app.websocket("/v1/live")
@@ -1291,8 +1304,11 @@ async def proxy_realtime_live_websocket(websocket: WebSocket):
         await websocket.close(code=1013, reason="Parrot is draining for graceful restart")
         return
     from src.openai.realtime import handle_realtime_ws
-    async with drain.active("ws /v1/live"):
-        await handle_realtime_ws(websocket, path="/v1/live")
+    try:
+        async with drain.active("ws /v1/live"):
+            await handle_realtime_ws(websocket, path="/v1/live")
+    except drain.AdmissionClosed:
+        await websocket.close(code=1013, reason="Parrot is restarting; please retry shortly")
 
 
 @app.websocket("/v1/live/{call_id}")
@@ -1302,8 +1318,11 @@ async def proxy_realtime_live_sideband_websocket(websocket: WebSocket, call_id: 
         await websocket.close(code=1013, reason="Parrot is draining for graceful restart")
         return
     from src.openai.realtime import handle_realtime_ws
-    async with drain.active("ws /v1/live/{call_id}"):
-        await handle_realtime_ws(websocket, path=f"/v1/live/{call_id}", live_call_id=call_id)
+    try:
+        async with drain.active("ws /v1/live/{call_id}"):
+            await handle_realtime_ws(websocket, path=f"/v1/live/{call_id}", live_call_id=call_id)
+    except drain.AdmissionClosed:
+        await websocket.close(code=1013, reason="Parrot is restarting; please retry shortly")
 
 
 @app.post("/backend-api/codex/realtime/calls")

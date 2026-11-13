@@ -2586,7 +2586,25 @@ export interface paths {
         get: operations["listUpdateBackups"];
         put?: never;
         post?: never;
-        delete?: never;
+        /** Clear Update Backups */
+        delete: operations["clearUpdateBackups"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/management/v1/updates/backups/{backupRef}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Delete Update Backup */
+        delete: operations["deleteUpdateBackup"];
         options?: never;
         head?: never;
         patch?: never;
@@ -5664,6 +5682,11 @@ export interface components {
         /** DataEnvelope[UpdateActivationPlanData] */
         DataEnvelope_UpdateActivationPlanData_: {
             data: components["schemas"]["UpdateActivationPlanData"];
+            meta: components["schemas"]["ResponseMeta"];
+        };
+        /** DataEnvelope[UpdateBackupClearData] */
+        DataEnvelope_UpdateBackupClearData_: {
+            data: components["schemas"]["UpdateBackupClearData"];
             meta: components["schemas"]["ResponseMeta"];
         };
         /** DataEnvelope[UpdateCheckData] */
@@ -11826,6 +11849,18 @@ export interface components {
             /** Expiresat */
             expiresAt?: string | null;
         };
+        /** UpdateBackupClearData */
+        UpdateBackupClearData: {
+            /** Deleted */
+            deleted: number;
+            /** Keptprotected */
+            keptProtected: boolean;
+            /**
+             * Keptunowned
+             * @default 0
+             */
+            keptUnowned: number;
+        };
         /** UpdateBackupData */
         UpdateBackupData: {
             /** Ref */
@@ -11838,6 +11873,21 @@ export interface components {
             mode: string;
             /** Createdat */
             createdAt: string | null;
+            /**
+             * Protected
+             * @default false
+             */
+            protected: boolean;
+            /**
+             * Orphan
+             * @default false
+             */
+            orphan: boolean;
+            /**
+             * Unowned
+             * @default false
+             */
+            unowned: boolean;
             /** Revision */
             revision: string;
         };
@@ -11998,8 +12048,18 @@ export interface components {
             includePrerelease: boolean;
             /** Autoupdate */
             autoUpdate: boolean;
+            /**
+             * Silentupdate
+             * @default false
+             */
+            silentUpdate: boolean;
             /** Intervalseconds */
             intervalSeconds: number;
+            /**
+             * Keepbackups
+             * @default 1
+             */
+            keepBackups: number;
             /** Ignoredversions */
             ignoredVersions: string[];
             /** Revision */
@@ -12023,10 +12083,20 @@ export interface components {
              */
             autoUpdate: boolean;
             /**
+             * Silentupdate
+             * @default false
+             */
+            silentUpdate: boolean;
+            /**
              * Intervalseconds
              * @default 3600
              */
             intervalSeconds: number;
+            /**
+             * Keepbackups
+             * @default 1
+             */
+            keepBackups: number;
             /** Ignoredversions */
             ignoredVersions?: string[];
         };
@@ -29254,7 +29324,9 @@ export interface operations {
                      *         "enabled": true,
                      *         "includePrerelease": false,
                      *         "autoUpdate": false,
+                     *         "silentUpdate": false,
                      *         "intervalSeconds": 3600,
+                     *         "keepBackups": 1,
                      *         "ignoredVersions": [],
                      *         "revision": "rev_example"
                      *       },
@@ -29376,7 +29448,9 @@ export interface operations {
                      *         "enabled": true,
                      *         "includePrerelease": false,
                      *         "autoUpdate": false,
+                     *         "silentUpdate": false,
                      *         "intervalSeconds": 3600,
+                     *         "keepBackups": 1,
                      *         "ignoredVersions": [],
                      *         "revision": "rev_example"
                      *       },
@@ -29616,7 +29690,9 @@ export interface operations {
                      *         "enabled": true,
                      *         "includePrerelease": false,
                      *         "autoUpdate": false,
+                     *         "silentUpdate": false,
                      *         "intervalSeconds": 3600,
+                     *         "keepBackups": 1,
                      *         "ignoredVersions": [],
                      *         "revision": "rev_example"
                      *       },
@@ -29849,6 +29925,8 @@ export interface operations {
                      *             "targetVersion": "0.32.0",
                      *             "mode": "docker",
                      *             "createdAt": "2026-01-02T03:04:05Z",
+                     *             "protected": false,
+                     *             "orphan": false,
                      *             "revision": "rev_example"
                      *           }
                      *         ]
@@ -29864,6 +29942,224 @@ export interface operations {
                      */
                     "application/json": components["schemas"]["UpdateBackupListEnvelope"];
                 };
+            };
+            /** @description Management API error: INVALID_REQUEST, INVALID_OPERATION_STATE */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: REVISION_CONFLICT, STATE_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: OPERATION_ALREADY_RUNNING */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: UPSTREAM_ERROR */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SERVICE_NOT_READY, DEPENDENCY_UNAVAILABLE */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    clearUpdateBackups: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "deleted": 2,
+                     *         "keptProtected": false
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_UpdateBackupClearData_"];
+                };
+            };
+            /** @description Management API error: INVALID_REQUEST, INVALID_OPERATION_STATE */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: REVISION_CONFLICT, STATE_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: OPERATION_ALREADY_RUNNING */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: UPSTREAM_ERROR */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: SERVICE_NOT_READY, DEPENDENCY_UNAVAILABLE */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    deleteUpdateBackup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                backupRef: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Update backup deleted */
+            204: {
+                headers: {
+                    /**
+                     * @description Stable request correlation identifier
+                     * @example request-example
+                     */
+                    "X-Request-Id"?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Management API error: INVALID_REQUEST, INVALID_OPERATION_STATE */
             400: {

@@ -270,19 +270,23 @@ def test_declared_capabilities_hold_for_every_schedulable_source(env, monkeypatc
     from src.model_registry import capabilities
     metadata = {
         "api:Official": {"contextWindow": 1_000_000, "maxOutputTokens": 128_000, "vision": True,
+                         "inputModalities": ["text", "image", "pdf"], "outputModalities": ["text"],
                          "toolCall": True, "reasoningEfforts": ["low", "medium", "high", "max"]},
         "api:Reseller": {"contextWindow": 200_000, "maxOutputTokens": 64_000, "vision": True,
+                         "inputModalities": ["text", "image"], "outputModalities": ["text"],
                          "toolCall": False, "reasoningEfforts": ["low", "high"]},
     }
     monkeypatch.setattr(capabilities, "_metadata", lambda model_id, offer: metadata[offer.source])
     assert capabilities.describe("minimax-m3.1-flash", None) == {
         "context_window": 200_000, "context_length": 200_000, "max_input_tokens": 200_000, "max_output_tokens": 64_000,
+        "architecture": {"input_modalities": ["text", "image"], "output_modalities": ["text"]},
         "capabilities": {"vision": True, "tool_call": False, "reasoning_efforts": ["low", "high"]}}
     # A source out of scheduling no longer narrows what is declared; one declaring nothing does not count.
     _switches(env, apiSourceDisabledModels={"api:Reseller": ["minimax-m3.1-flash"]})
     metadata["api:Official"].pop("vision")
     declared = capabilities.describe("minimax-m3.1-flash", None)
     assert declared["context_window"] == 1_000_000 and "vision" not in declared["capabilities"]
+    assert declared["architecture"] == {"input_modalities": ["text", "image", "pdf"], "output_modalities": ["text"]}
 
 
 def test_ids_fixed_to_one_effort_declare_only_their_levels(monkeypatch):
@@ -308,7 +312,9 @@ def test_models_endpoint_declares_context_and_capabilities(env, monkeypatch):
     assert body["data"] == [{
         "type": "model", "id": "minimax-m3.1-flash", "display_name": "MiniMax-M3.1-Flash",
         "created_at": "2025-01-01T00:00:00Z", "context_window": 300_000, "context_length": 300_000,
-        "max_input_tokens": 300_000, "capabilities": {"vision": False}}]
+        "max_input_tokens": 300_000,
+        "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+        "capabilities": {"vision": False}}]
 
 
 def test_models_endpoint_applies_an_unscoped_keys_allowlist(env, monkeypatch):
@@ -418,3 +424,128 @@ def test_drift_is_reported_off_the_reload_path_and_only_for_the_latest_build(mon
     runtime._queue_drift("c", {})
     gate.set()
     assert done.wait(5) and seen == ["a", "c"]
+
+
+def test_models_endpoint_declares_prefixed_api_alias_capabilities_when_registry_off(env, monkeypatch):
+    import asyncio
+    import server
+    from starlette.requests import Request
+    from src import model_metadata
+
+    def setup_legacy_prefixed(cfg):
+        cfg["modelRegistry"] = {"enabled": False}
+        cfg["channels"] = [{
+            "name": "EHH",
+            "baseUrl": "https://upstream.example.com/v1",
+            "apiKey": "sk-testkey12345",
+            "protocol": "openai-chat",
+            "models": [
+                {"real": "claude-sonnet-4-6", "alias": "EHH-claude-sonnet-4-6"},
+                {"real": "gpt-6.1-sol", "alias": "EHH-gpt-6.1-sol"},
+            ],
+            "enabled": True,
+        }]
+        cfg["modelMetadataOverrides"] = {
+            "scoped": {
+                "api:EHH": {
+                    "EHH-claude-sonnet-4-6": {
+                        "outboundModel": "claude-sonnet-4-6",
+                        "fields": {"vision": False},
+                    },
+                    "EHH-gpt-6.1-sol": {
+                        "outboundModel": "gpt-6.1-sol",
+                        "fields": {"contextWindow": 1_050_000, "maxOutputTokens": 128_000, "vision": True},
+                    },
+                }
+            }
+        }
+
+    env["config"].update(setup_legacy_prefixed)
+    env["registry"].rebuild_from_config()
+    assert env["runtime"].current() is None
+
+    monkeypatch.setattr(server.auth, "validate", lambda headers: ("", None, None))
+
+    req = Request({"type": "http", "method": "GET", "path": "/v1/models", "headers": [], "query_string": b""})
+    body = asyncio.run(server.list_models(req))
+    by_id = {item["id"]: item for item in body["data"]}
+
+    sonnet = by_id["EHH-claude-sonnet-4-6"]
+    assert sonnet["context_length"] == 1_000_000 and sonnet["context_window"] == 1_000_000
+    assert sonnet["max_output_tokens"] > 0
+    # Operator vision=False removes image while keeping remaining catalog modalities (text, pdf)
+    assert sonnet["architecture"] == {
+        "input_modalities": ["text", "pdf"],
+        "output_modalities": ["text"],
+    }
+    assert sonnet["capabilities"]["vision"] is False
+
+    # Unlisted custom/future model with operator overrides still declares limits and architecture
+    custom = by_id["EHH-gpt-6.1-sol"]
+    assert custom["context_length"] == 1_050_000 and custom["max_output_tokens"] == 128_000
+    assert custom["architecture"] == {
+        "input_modalities": ["text", "image"],
+        "output_modalities": ["text"],
+    }
+    assert custom["capabilities"]["vision"] is True
+
+    # Removing the vision=False override immediately restores image modality without waiting for cache expiry
+    model_metadata.delete_override_layer("EHH-claude-sonnet-4-6", scope_key="api:EHH")
+    body2 = asyncio.run(server.list_models(req))
+    sonnet2 = {item["id"]: item for item in body2["data"]}["EHH-claude-sonnet-4-6"]
+    assert sonnet2["architecture"] == {
+        "input_modalities": ["text", "image", "pdf"],
+        "output_modalities": ["text"],
+    }
+    assert sonnet2["capabilities"]["vision"] is True
+
+
+
+@pytest.mark.parametrize("unified", [False, True])
+@pytest.mark.parametrize("catalog", [False, True])
+def test_alias_capability_wire_overrides_and_constraints_in_both_naming_modes(env, monkeypatch, unified, catalog):
+    from src import model_pricing
+    from src.model_registry import capabilities
+    channel = _api("Test", [])
+    channel["models"] = [{"real": "custom-wire", "alias": "shared"}]
+    env["config"].update(lambda cfg: cfg.update(
+        channels=[channel], modelRegistry={"enabled": unified},
+        modelBindings={"defaults": {}, "scoped": {}}, modelMetadata={},
+        modelMetadataOverrides={"defaults": {"custom-wire": {"fields": {"toolCall": True}}},
+            "scoped": {"api:Test": {
+                "custom-wire": {"outboundModel": "custom-wire", "fields": {"contextWindow": 32768}},
+                "shared": {"outboundModel": "custom-wire", "fields": {"contextWindow": 1000}},
+            }}}))
+    env["registry"].rebuild_from_config()
+    monkeypatch.setattr(model_pricing, "canonical_official_model", lambda m: "test/custom" if catalog else None)
+    monkeypatch.setattr(model_pricing, "binding_snapshot", lambda t: {
+        "metadata": {"contextWindow": 100000, "maxInputTokens": 90000}})
+    model = env["runtime"].current().lookup("shared")[0] if unified else "shared"
+    result = capabilities._describe(model, None)
+    assert result["context_window"] == result["max_input_tokens"] == 1000
+    assert result["capabilities"]["tool_call"] is True
+    assert "architecture" not in result
+
+
+@pytest.mark.parametrize("unified", [False, True])
+def test_hidden_serving_source_stays_in_capability_intersection(env, unified):
+    from src.model_registry import capabilities
+    channels = [_api("Visible", []), _api("Hidden", [])]
+    for channel, wire in zip(channels, ["visible-wire", "hidden-wire"]):
+        channel["models"] = [{"real": wire, "alias": "shared"}]
+    env["config"].update(lambda cfg: cfg.update(
+        channels=channels, modelRegistry={"enabled": unified}, modelBindings={}, modelMetadata={},
+        modelMetadataOverrides={"scoped": {
+            "api:Visible": {"shared": {"fields": {"contextWindow": 10000, "vision": True}}},
+            "api:Hidden": {"shared": {"fields": {"contextWindow": 1000, "vision": False}}},
+        }}, modelCenter={"schemaVersion": 1, "hiddenModels": ["hidden-wire"]}))
+    env["registry"].rebuild_from_config()
+    model = env["runtime"].current().lookup("shared")[0] if unified else "shared"
+    assert set(_routes(env, model)[0]) == {("api:Visible", "visible-wire"), ("api:Hidden", "hidden-wire")}
+    result = capabilities._describe(model, None)
+    assert result["context_window"] == 1000
+    assert result["capabilities"]["vision"] is False
+    assert result["architecture"]["input_modalities"] == ["text"]
+    _switches(env, apiSourceDisabledModels={"api:Hidden": ["hidden-wire"]})
+    assert _routes(env, model)[0] == [("api:Visible", "visible-wire")]
+    assert capabilities._describe(model, None)["context_window"] == 10000

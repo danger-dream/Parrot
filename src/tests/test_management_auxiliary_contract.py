@@ -54,6 +54,7 @@ _PATH_VALUES = {
     "{kind}": "image",
     "{modelId:path}": "model-a",
     "{sourceId:path}": "oauth:xai:test",
+    "{backupRef}": "b1",
 }
 
 
@@ -124,6 +125,8 @@ EXPECTED_OPERATION_IDS = {
     "ignoreUpdateVersion",
     "unignoreUpdateVersion",
     "listUpdateBackups",
+    "deleteUpdateBackup",
+    "clearUpdateBackups",
     "getUpdateFailureLog",
     "stageUpdate",
     "activateStagedUpdate",
@@ -188,7 +191,7 @@ def _guard_allowed_names(decorator: ast.Call) -> set[str]:
 
 def test_auxiliary_manifest_has_exactly_one_pre_control_query_guard_per_operation(tmp_path):
     operation_ids = [item["operation_id"] for item in AUXILIARY_OPERATION_MANIFEST]
-    assert len(operation_ids) == 39  # Five AG image ops retired; WebUI round 2: 3 update-state reads + media statistics.
+    assert len(operation_ids) == 41  # Includes deleteUpdateBackup and clearUpdateBackups.
     assert len(set(operation_ids)) == len(operation_ids)
     assert set(operation_ids) == EXPECTED_OPERATION_IDS
 

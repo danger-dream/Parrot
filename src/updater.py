@@ -116,15 +116,23 @@ def _cfg() -> dict:
     root = config.get()
     uc = root.get("updateChecker") or {}
     shutdown = root.get("shutdown") or {}
+    raw_keep = uc.get("keepBackups", 1)
+    try:
+        keep_backups = 1 if raw_keep is None or isinstance(raw_keep, bool) else int(raw_keep)
+    except (TypeError, ValueError):
+        keep_backups = 1
     return {
+        "enabled": bool(uc.get("enabled", True)),
         "autoUpdate": bool(uc.get("autoUpdate", False)),
+        "ignoredVersions": list(uc.get("ignoredVersions") or []),
+        "silentUpdate": bool(uc.get("silentUpdate", False)),
         "repo": str(uc.get("repo") or "danger-dream/Parrot").strip(),
         "serviceName": str(uc.get("serviceName") or "parrot.service").strip(),
         "composeDir": str(uc.get("composeDir") or "").strip(),
         "composeService": str(uc.get("composeService") or "parrot").strip(),
         "containerName": str(uc.get("containerName") or "parrot").strip(),
         "image": str(uc.get("image") or "ghcr.io/danger-dream/parrot:latest").strip(),
-        "keepBackups": int(uc.get("keepBackups", 5) or 5),
+        "keepBackups": max(0, min(20, keep_backups)),
         "healthTimeoutSeconds": int(uc.get("healthTimeoutSeconds", 90) or 90),
         "gracefulStopSeconds": max(
             10, min(600, int(shutdown.get("drainTimeoutSeconds", 80) or 80) + 20)
@@ -175,7 +183,8 @@ def reset_state() -> None:
     save_state(
         stage=STAGE_IDLE, mode=None, from_version=None, to_version=None,
         target_tag=None, backup_ref=None, message=None,
-        chat_id=None, notify_msg_id=None,
+        chat_id=None, notify_msg_id=None, silent=False,
+        source_target_commit=None, source_guard_digest=None,
     )
 
 
@@ -382,6 +391,18 @@ def _prepare_source_dependencies() -> dict:
     return snapshot
 
 
+def _src_stage(target_tag: str) -> tuple[bool, str]:
+    rc, out = _git(["fetch", "--all", "--tags", "--prune"], timeout=180)
+    if rc != 0:
+        return False, f"git fetch failed: {out[:300]}"
+    rc, commit = _git(["rev-parse", "--verify", f"{target_tag}^{{commit}}"], timeout=30)
+    if rc != 0:
+        return False, "target release commit could not be verified"
+    save_state(source_target_commit=commit.strip(),
+               source_guard_digest=update_supervisor.code_digest(_app_dir(), _source_data_excludes()))
+    return True, f"downloaded {target_tag}; source switch deferred until process stop"
+
+
 def _src_pull(target_tag: str, prev_commit: str = "") -> tuple[bool, str]:
     """git fetch + checkout 到目标 tag。不重启。返回 (ok, detail)。
 
@@ -480,6 +501,24 @@ def _src_restart() -> tuple[bool, str]:
                                    ["git", "-C", _app_dir(), "reset", "--soft", meta["commit"]]]
                                   if meta.get("commit") else []),
         }
+        if st.get("source_target_commit"):
+            if _src_has_local_changes() or _src_current_commit() != meta.get("commit"):
+                return False, "source changed after staging; refusing to overwrite local work"
+            target_commit = st["source_target_commit"]
+            rc, diff = _git(["diff", "--name-only", meta["commit"], target_commit], timeout=30)
+            if rc != 0:
+                return False, "cannot verify staged dependency changes"
+            paths = sysconfig.get_paths()
+            plan["target_code_digest"] = st.get("source_guard_digest")
+            plan["source_update"] = {
+                "commands": [["git", "-C", _app_dir(), *_source_restore_args(target_commit, meta.get("excludes", []))],
+                             ["git", "-C", _app_dir(), "reset", "--soft", target_commit]],
+                "install": "requirements.txt" in diff.splitlines(),
+                "python": sys.executable,
+                "dependency_root": str(root / (ref + ".deps")),
+                "dependency_paths": list(dict.fromkeys(paths[key] for key in ("purelib", "platlib", "scripts"))),
+                "meta_path": str(root / (ref + ".json")),
+            }
         plan_path = str(root / (ref + ".plan.json"))
         update_supervisor.write_json(plan_path, plan)
         save_state(supervisor_id=update_id, supervisor_result=result_path)
@@ -588,6 +627,49 @@ def _engine_tag_image(image_ref: str, repo: str, tag: str) -> bool:
             return r.status_code in (200, 201)
     except Exception as exc:
         print(f"[updater] engine tag failed: {exc}")
+        return False
+
+
+def _engine_list_backup_tags() -> list[tuple[str, str, int | None]]:
+    """GET /images/json 列出所有 parrot-backup:* 镜像标签 (tag, image_id, created_ts)。"""
+    import urllib.parse
+    if not os.path.exists(DOCKER_SOCK):
+        return []
+    flt = urllib.parse.quote(json.dumps({"reference": ["parrot-backup:*"]}))
+    out: list[tuple[str, str, int | None]] = []
+    try:
+        with _engine_client(15) as c:
+            r = c.get(f"/images/json?filters={flt}")
+            if r.status_code != 200:
+                return []
+            for item in r.json() or []:
+                if not isinstance(item, dict):
+                    continue
+                img_id = str(item.get("Id") or "")
+                created = item.get("Created")
+                created_ts = int(created) if isinstance(created, (int, float)) else None
+                for tag in item.get("RepoTags") or []:
+                    if isinstance(tag, str) and tag.startswith("parrot-backup:") and tag != "parrot-backup:<none>":
+                        out.append((tag, img_id, created_ts))
+    except Exception as exc:
+        print(f"[updater] engine list backup tags failed: {exc}")
+    return out
+
+
+def _engine_remove_backup_tag(backup_tag: str) -> bool:
+    """DELETE /images/{backup_tag} 移除单个 parrot-backup:* 标签（404 视为已不存在）。"""
+    import urllib.parse
+    if not backup_tag.startswith("parrot-backup:"):
+        return False
+    if not os.path.exists(DOCKER_SOCK):
+        return False
+    encoded = urllib.parse.quote(backup_tag, safe="")
+    try:
+        with _engine_client(30) as c:
+            r = c.delete(f"/images/{encoded}")
+            return r.status_code in (200, 404)
+    except Exception as exc:
+        print(f"[updater] engine remove backup tag failed ({backup_tag}): {exc}")
         return False
 
 
@@ -972,9 +1054,10 @@ def _docker_backup(target_tag: str) -> tuple[bool, str, str]:
     if not digest:
         return False, "", "cannot inspect current container image"
     ts = time.strftime("%Y%m%d-%H%M%S")
-    ref = f"docker-{__version__}-{ts}"
+    owner = _backup_owner(create=True)
     backup_repo = "parrot-backup"
-    backup_label = f"{__version__}-{ts}"
+    backup_label = f"{owner}-{__version__}-{ts}"
+    ref = f"docker-{backup_label}"
     backup_tag = f"{backup_repo}:{backup_label}"
     if _has_local_docker():
         rc, _ = _run(["docker", "tag", digest, backup_tag], timeout=30)
@@ -984,7 +1067,7 @@ def _docker_backup(target_tag: str) -> tuple[bool, str, str]:
     if not tagged:
         return False, "", f"backup tag failed: {backup_tag}"
     meta = {"ref": ref, "image": image, "digest": digest,
-            "backup_tag": backup_tag, "version": __version__,
+            "backup_tag": backup_tag, "owner": owner, "version": __version__,
             "target_tag": target_tag, "mode": "docker", "ts": ts, "created_at": time.time()}
     with open(os.path.join(_backup_root(), ref + ".json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -1067,7 +1150,23 @@ def _docker_rollback(backup_ref: str) -> tuple[bool, str]:
     ok, detail = _docker_sidecar_recreate()
     return ok, f"rollback retag ok; {detail}"
 
-# ─── 高层编排（TG 按钮调用入口）─────────────────────────────────
+SILENT_IDLE_QUIET_SECONDS = 180.0
+
+
+def try_silent_activate(*, quiet_seconds: float = SILENT_IDLE_QUIET_SECONDS) -> tuple[bool, str]:
+    """若当前有待激活的 staged 更新且满足空闲窗口，则自动触发重启。"""
+    cfg = _cfg()
+    if _stopping.is_set() or not cfg["enabled"] or not cfg["silentUpdate"]:
+        return False, "silent update disabled"
+    st = load_state()
+    if st.get("target_tag") in cfg["ignoredVersions"] or st.get("target_repo") != cfg["repo"]:
+        return False, "target ignored or repository changed"
+    if st.get("stage") != STAGE_STAGED:
+        return False, "not staged"
+    from . import drain
+    if not drain.is_idle_for_update(quiet_seconds):
+        return False, "busy"
+    return confirm_restart(silent=True, require_idle_seconds=quiet_seconds)
 #
 # 两阶段双重确认：
 #   stage_update()   ：备份 + 拉取 → 进入 staged 态（不重启）
@@ -1083,17 +1182,18 @@ def set_progress_callback(cb) -> None:
     _progress_cb = cb
 
 
-def _emit(stage: str, text: str) -> None:
-    if _progress_cb:
+def _emit(stage: str, text: str, *, silent: bool = False) -> None:
+    if _progress_cb and not silent:
         try:
             _progress_cb(stage, text)
         except Exception as exc:
-            print(f"[updater] progress cb failed: {exc}")
+            print(f"[updater:{stage}] progress cb failed: {exc}")
     print(f"[updater:{stage}] {text}")
 
 
 def stage_update(target_tag: str, *, chat_id: Optional[int] = None,
-                 notify_msg_id: Optional[int] = None) -> tuple[bool, str]:
+                 notify_msg_id: Optional[int] = None,
+                 silent: bool = False) -> tuple[bool, str]:
     """第一阶段：备份 → 拉取 → staged。线程安全，幂等拒绝并发。"""
     if _stopping.is_set():
         return False, "服务正在关闭，未执行更新操作"
@@ -1106,18 +1206,26 @@ def stage_update(target_tag: str, *, chat_id: Optional[int] = None,
             return False, "已有更新在进行中（staged/restarting）"
         mode = _detect_mode()
         reset_update_log()
-        append_update_log(f"开始更新：{__version__} → {target_tag}（形态 {mode}）")
+        append_update_log(f"开始更新：{__version__} → {target_tag}（形态 {mode}{' · 静默' if silent else ''}）")
         save_state(stage=STAGE_BACKING_UP, mode=mode, from_version=__version__,
-                   target_tag=target_tag, to_version=target_tag,
-                   chat_id=chat_id, notify_msg_id=notify_msg_id, message="开始备份",
-                   supervisor_id=None, supervisor_result=None, target_code_digest=None)
-        _emit(STAGE_BACKING_UP, f"📦 正在备份当前版本 v{__version__} …")
+                   target_tag=target_tag, to_version=target_tag, target_repo=_cfg()["repo"],
+                   chat_id=None if silent else chat_id,
+                   notify_msg_id=None if silent else notify_msg_id,
+                   silent=bool(silent),
+                   message="开始备份",
+                   supervisor_id=None, supervisor_result=None, target_code_digest=None,
+                   source_target_commit=None, source_guard_digest=None,
+                   silent_error_notified=None, silent_error_attempt_at=None, cancelled_target=None)
+        _emit(STAGE_BACKING_UP, f"📦 正在备份当前版本 v{__version__} …", silent=silent)
 
         # 源码形态：先挡掉未提交改动
         if mode in (MODE_SYSTEMD, MODE_BARE) and _src_is_git_repo():
             if _src_has_local_changes():
                 save_state(stage=STAGE_FAILED, message="工作树有未提交改动，已拒绝更新")
-                _emit(STAGE_FAILED, "❌ 源码目录有未提交改动，已拒绝自动更新（避免覆盖本地改动）")
+                fail_msg = "❌ 源码目录有未提交改动，已拒绝自动更新（避免覆盖本地改动）"
+                _emit(STAGE_FAILED, fail_msg, silent=silent)
+                if silent:
+                    notify_silent_failure("工作树有未提交改动，已拒绝更新")
                 return False, "工作树有未提交改动"
 
         # ① 备份
@@ -1128,15 +1236,19 @@ def stage_update(target_tag: str, *, chat_id: Optional[int] = None,
         if not ok:
             append_update_log(f"❌ 备份失败：{detail}")
             save_state(stage=STAGE_FAILED, message=f"备份失败: {detail}")
-            _emit(STAGE_FAILED, f"❌ 备份失败：{detail}")
+            _emit(STAGE_FAILED, f"❌ 备份失败：{detail}", silent=silent)
+            if silent:
+                notify_silent_failure(f"备份失败: {detail}")
             return False, detail
         append_update_log(f"✅ 备份完成：{detail}")
         save_state(stage=STAGE_PULLING, backup_ref=ref, message=f"备份完成: {detail}")
-        _emit(STAGE_PULLING, f"✅ 备份完成 → ⬇️ 正在拉取 {target_tag} …")
+        _emit(STAGE_PULLING, f"✅ 备份完成 → ⬇️ 正在拉取 {target_tag} …", silent=silent)
 
         # ② 拉取
         if mode == MODE_DOCKER:
             ok, detail = _docker_pull(target_tag)
+        elif silent:
+            ok, detail = _src_stage(target_tag)
         else:
             # 从备份 meta 取更新前 commit，供 _src_pull 稳健判断依赖变化
             prev_commit = ""
@@ -1149,26 +1261,30 @@ def stage_update(target_tag: str, *, chat_id: Optional[int] = None,
                 pass
             ok, detail = _src_pull(target_tag, prev_commit=prev_commit)
         if not ok:
-            if mode != MODE_DOCKER:
+            if mode != MODE_DOCKER and not silent:
                 restored, restore_detail = _src_rollback(ref)
                 detail += f"; rollback={restored}: {restore_detail}"
             append_update_log(f"❌ 拉取失败：{detail}")
             save_state(stage=STAGE_FAILED, message=f"拉取失败: {detail}")
-            _emit(STAGE_FAILED, f"❌ 拉取失败：{detail}")
+            _emit(STAGE_FAILED, f"❌ 拉取失败：{detail}", silent=silent)
+            if silent:
+                notify_silent_failure(f"拉取失败: {detail}")
             return False, detail
         if _stopping.is_set():
-            if mode != MODE_DOCKER:
+            if mode != MODE_DOCKER and not silent:
                 _src_rollback(ref)
             save_state(stage=STAGE_FAILED, message="更新因关停中断；未进入 staged")
             return False, "update interrupted by shutdown"
         append_update_log(f"✅ 拉取完成：{detail}")
 
-        # ③ 进入 staged（停下，等用户二次确认）
-        _prune_backups()
-        save_state(stage=STAGE_STAGED, message=f"已拉取 {target_tag}，等待确认重启")
+        # ③ 进入 staged（手动模式停下等二次确认；静默模式等待空闲窗口自动重启）
+        _prune_backups_locked()
+        staged_msg = f"已静默拉取 {target_tag}，等待空闲自动重启" if silent else f"已拉取 {target_tag}，等待确认重启"
+        save_state(stage=STAGE_STAGED, message=staged_msg)
         _emit(STAGE_STAGED,
               f"✅ 已备份并拉取 <b>{target_tag}</b>，<b>尚未重启</b>。\n"
-              f"请二次确认是否立即重启生效。")
+              f"{'等待当前业务空闲后自动重启生效。' if silent else '请二次确认是否立即重启生效。'}",
+              silent=silent)
         return True, "staged"
     finally:
         _op_lock.release()
@@ -1192,11 +1308,13 @@ def _restart_guard_failed(detail: str) -> tuple[bool, str]:
         STAGE_STAGED,
         "❌ 状态快照写入或完整性验证失败，已阻止重启。\n"
         f"详情：{detail}",
+        silent=bool(load_state().get("silent")),
     )
+    notify_silent_failure(public_detail)
     return False, public_detail
 
 
-def confirm_restart() -> tuple[bool, str]:
+def confirm_restart(*, silent: bool = False, require_idle_seconds: float | None = None) -> tuple[bool, str]:
     """第二阶段：数据库保护成功后才允许重启并由新进程 resume。
 
     用 _op_lock 防止「连点两次确认」触发两次备份或重启（TOCTOU）。
@@ -1205,12 +1323,24 @@ def confirm_restart() -> tuple[bool, str]:
         return False, "服务正在关闭，未执行更新操作"
     if not _op_lock.acquire(blocking=False):
         return False, "另一个更新操作正在进行中"
+    reservation = None
+    dispatched = False
+    from . import drain
     try:
         if _stopping.is_set():
             return False, "服务正在关闭，未执行更新操作"
         st = load_state()
         if st.get("stage") != STAGE_STAGED:
             return False, f"当前不在 staged 态（{st.get('stage')}），无法确认重启"
+        if require_idle_seconds is not None:
+            cfg = _cfg()
+            if (not cfg["enabled"] or not cfg["silentUpdate"] or st.get("target_tag") in cfg["ignoredVersions"]
+                    or st.get("target_repo") != cfg["repo"]):
+                return False, "silent update disabled or target changed"
+            reservation = drain.try_reserve_update(require_idle_seconds)
+            if reservation is None:
+                return False, "当前仍有请求在运行或尚未达到空闲静默窗口"
+        is_silent = bool(silent or st.get("silent"))
         mode = st.get("mode") or _detect_mode()
 
         # Fail closed: both snapshots must be installed and read-back verified.
@@ -1222,12 +1352,14 @@ def confirm_restart() -> tuple[bool, str]:
 
         # Durable StateStore guarantees the restarting state is verified before return.
         try:
-            save_state(stage=STAGE_RESTARTING, message="用户已确认，正在重启生效",
+            save_state(stage=STAGE_RESTARTING,
+                       silent=is_silent,
+                       message="检测到业务空闲，正在静默重启生效" if is_silent else "用户已确认，正在重启生效",
                        result_id=uuid.uuid4().hex if mode == MODE_DOCKER else None)
         except Exception as exc:
             return _restart_guard_failed(f"persist restarting state: {exc}")
 
-        _emit(STAGE_RESTARTING, "🔄 状态快照保护完成，正在重启生效 …")
+        _emit(STAGE_RESTARTING, "🔄 状态快照保护完成，正在重启生效 …", silent=is_silent)
         if mode == MODE_DOCKER:
             # 取备份 digest 传给 sidecar，供健康检查失败时自动回滚
             backup_digest = ""
@@ -1250,10 +1382,20 @@ def confirm_restart() -> tuple[bool, str]:
             ok, detail = _src_restart()
         if not ok:
             save_state(stage=STAGE_FAILED, message=f"重启触发失败: {detail}")
-            _emit(STAGE_FAILED, f"❌ 重启触发失败：{detail}")
+            _emit(STAGE_FAILED, f"❌ 重启触发失败：{detail}", silent=is_silent)
+            notify_silent_failure(f"重启触发失败: {detail}")
             return False, detail
+        dispatched = True
+        if reservation is not None:
+            threading.Thread(target=_watch_silent_dispatch, args=(reservation, load_state()),
+                             daemon=True, name="silent-update-dispatch").start()
         return True, detail
+    except Exception as exc:
+        notify_silent_failure(f"更新激活失败: {type(exc).__name__}")
+        raise
     finally:
+        if reservation is not None and not dispatched:
+            drain.release_update(reservation)
         _op_lock.release()
 
 
@@ -1275,7 +1417,10 @@ def cancel_staged() -> tuple[bool, str]:
         mode = st.get("mode") or _detect_mode()
         backup_ref = st.get("backup_ref") or ""
         if mode in (MODE_SYSTEMD, MODE_BARE):
-            ok, detail = _src_rollback(backup_ref)
+            if st.get("source_target_commit"):
+                ok, detail = True, "source was downloaded but not applied"
+            else:
+                ok, detail = _src_rollback(backup_ref)
         else:
             # _docker_pull already moved the compose tag. Restore it without
             # recreating the still-running old container, or a later ordinary
@@ -1291,12 +1436,75 @@ def cancel_staged() -> tuple[bool, str]:
                 ok, detail = False, f"cannot restore compose image tag: {exc}"
         if ok:
             reset_state()
+            if st.get("target_tag"):
+                save_state(cancelled_target=st["target_tag"], cancelled_repo=_cfg()["repo"])
             _emit(STAGE_IDLE, f"↩️ 已取消更新：{detail}")
         else:
             save_state(stage=STAGE_STAGED, message=f"取消回滚失败: {detail}")
         return ok, detail
     finally:
         _op_lock.release()
+
+
+def notify_silent_failure(detail: str) -> None:
+    st = load_state()
+    if not st.get("silent"):
+        return
+    key = f"{st.get('target_tag')}:{detail}"
+    if st.get("silent_error_notified") == key:
+        return
+    now = time.time()
+    if now - float(st.get("silent_error_attempt_at") or 0) < 60:
+        return
+    try:
+        sent = notifier.notify_event(
+            "app_update",
+            f"⚠️ <b>静默更新未完成（{notifier.escape_html(str(st.get('target_tag') or '?'))}）</b>\n"
+            f"<code>{notifier.escape_html(detail[:500])}</code>",
+            reply_markup=_faillog_buttons(),
+        )
+        save_state(silent_error_notified=key if sent is not False else None,
+                   silent_error_attempt_at=now)
+    except Exception as exc:
+        print(f"[updater] silent failure notification failed: {type(exc).__name__}")
+        try:
+            save_state(silent_error_attempt_at=now)
+        except Exception:
+            pass
+
+
+def _watch_silent_dispatch(reservation, st: dict) -> None:
+    from . import drain
+    mode = st.get("mode")
+    identity_key = "result_id" if mode == MODE_DOCKER else "supervisor_id"
+    identity = st.get(identity_key)
+    if not identity:
+        return
+    path = (Path(config.DATA_DIR) / (".update_result." + identity) if mode == MODE_DOCKER
+            else Path(st["supervisor_result"]))
+    while not _stopping.wait(0.2):
+        current = load_state()
+        if current.get(identity_key) != identity or current.get("stage") != STAGE_RESTARTING:
+            return
+        try:
+            if mode == MODE_DOCKER:
+                result = path.read_text().strip()
+            else:
+                value = json.loads(path.read_text())
+                result = value.get("result") if value.get("update_id") == identity else None
+        except (OSError, ValueError):
+            continue
+        if result and result != "OK" and _op_lock.acquire(blocking=False):
+            try:
+                current = load_state()
+                if _stopping.is_set() or current.get(identity_key) != identity:
+                    return
+                save_state(stage=STAGE_FAILED, message="独立更新监护未能安全启动更新，请查看日志")
+                drain.release_update(reservation)
+                notify_silent_failure("独立更新监护未能安全启动更新，请查看日志")
+            finally:
+                _op_lock.release()
+            return
 
 
 def _faillog_buttons() -> dict:
@@ -1431,14 +1639,29 @@ def resume_after_restart() -> None:
                 _stopping.wait(0.2)
             if _stopping.is_set(): return  # preserve verifying for the next process
             if result == "OK" and now_ver.lstrip("vV") == target.lstrip("vV"):
-                stage, message = STAGE_SUCCESS, f"更新成功 → v{now_ver}（独立监护已验证）"
+                stage = STAGE_SUCCESS
+                if st.get("silent"):
+                    from_disp = (st.get("from_version") or "?").lstrip("vV")
+                    message = (
+                        f"✅ <b>静默自动更新完成</b>\n"
+                        f"已趁空闲时段自动完成 <code>v{notifier.escape_html(from_disp)}</code> → "
+                        f"<code>v{notifier.escape_html(now_ver)}</code> 更新并通过健康检查。"
+                    )
+                else:
+                    message = f"更新成功 → v{now_ver}（独立监护已验证）"
             elif result == "ROLLBACK" and now_ver.lstrip("vV") == str(st.get("from_version", "")).lstrip("vV"):
                 stage, message = STAGE_ROLLED_BACK, "独立监护已回滚源码/依赖并验证旧版本健康"
             else:
                 stage, message = STAGE_FAILED, "独立监护未确认目标版本或回滚健康，请查看更新日志"
-            save_state(stage=stage, to_version=now_ver, message=message)
+            save_state(stage=stage, to_version=now_ver,
+                       message=f"更新成功 → v{now_ver}" if stage == STAGE_SUCCESS else message)
+            if stage == STAGE_SUCCESS:
+                _prune_backups_locked()
             _emit(stage, message)
-            _notify_cross_process(message, st.get("chat_id"), st.get("notify_msg_id"))
+            _notify_cross_process(
+                message, st.get("chat_id"), st.get("notify_msg_id"),
+                reply_markup=None if stage == STAGE_SUCCESS else _faillog_buttons(),
+            )
             return
 
         # docker 形态：sidecar 已经做过健康门控 + 回滚，这里优先读它写的结果标记。
@@ -1486,8 +1709,22 @@ def resume_after_restart() -> None:
         if ok and not rolled_back_by_version:
             save_state(stage=STAGE_SUCCESS, to_version=now_ver,
                        message=f"更新成功 → v{now_ver}")
-            msg = (f"✅ <b>更新成功</b>，当前已运行 <code>v{now_ver}</code>（目标 {target}）\n"
-                   f"<i>已备份旧版本，如需回退可在「🗂 备份列表」查看。</i>")
+            _prune_backups_locked()
+            keep_n = _cfg()["keepBackups"]
+            tail_hint = (
+                "<i>已按保留策略清理旧备份，如需管理可在「🗂 备份列表」查看。</i>"
+                if keep_n > 0
+                else "<i>已按设置自动清理本次升级备份。</i>"
+            )
+            if st.get("silent"):
+                from_disp = from_ver or "?"
+                msg = (
+                    f"✅ <b>静默自动更新完成</b>\n"
+                    f"已趁空闲时段自动完成 <code>v{notifier.escape_html(from_disp)}</code> → "
+                    f"<code>v{notifier.escape_html(now_ver)}</code> 更新并通过健康检查。\n{tail_hint}"
+                )
+            else:
+                msg = f"✅ <b>更新成功</b>，当前已运行 <code>v{now_ver}</code>（目标 {target}）\n{tail_hint}"
             _emit(STAGE_SUCCESS, msg)
             _notify_cross_process(msg, st.get("chat_id"), st.get("notify_msg_id"))
         elif rolled_back_by_version:
@@ -1539,46 +1776,229 @@ def resume_after_restart() -> None:
         raise
 
 
-# ─── 备份清理 ────────────────────────────────────────────────────
+# ─── 备份清理与管理 ──────────────────────────────────────────────
+
+_PROTECTED_BACKUP_STAGES = frozenset({
+    STAGE_BACKING_UP, STAGE_PULLING, STAGE_STAGED, STAGE_RESTARTING, STAGE_VERIFYING,
+})
+
+
+def _protected_backup_ref() -> str | None:
+    st = load_state()
+    if st.get("stage") in _PROTECTED_BACKUP_STAGES:
+        ref = str(st.get("backup_ref") or "").strip()
+        return ref or None
+    return None
+
+
+def _parse_stamp_ts(stamp: str) -> float | None:
+    try:
+        return float(time.mktime(time.strptime(stamp, "%Y%m%d-%H%M%S")))
+    except (TypeError, ValueError):
+        return None
+
+
+def _docker_list_backup_tags() -> list[tuple[str, str, int | None]]:
+    """列出宿主机/Engine 中现有的 parrot-backup:* 标签（仅在 Docker 形态下探测）。"""
+    if _detect_mode() != MODE_DOCKER:
+        return []
+    if _has_local_docker():
+        rc, out = _run(
+            ["docker", "image", "ls", "parrot-backup", "--format", "{{.Repository}}:{{.Tag}}\t{{.ID}}"],
+            timeout=15,
+        )
+        if rc != 0:
+            return []
+        rows: list[tuple[str, str, int | None]] = []
+        for line in out.splitlines():
+            parts = line.strip().split("\t")
+            tag = parts[0] if parts else ""
+            img_id = parts[1] if len(parts) > 1 else ""
+            if tag.startswith("parrot-backup:") and not tag.endswith(":<none>"):
+                rows.append((tag, img_id, None))
+        return rows
+    return _engine_list_backup_tags()
+
+
+def _docker_remove_backup_tag(backup_tag: str) -> bool:
+    """安全移除 parrot-backup:<label> 标签（不强制删正在运行的容器或其它标签）。"""
+    if not isinstance(backup_tag, str) or not backup_tag.startswith("parrot-backup:"):
+        return False
+    if _has_local_docker():
+        rc, out = _run(["docker", "image", "rm", backup_tag], timeout=30)
+        if rc == 0 or "No such image" in (out or ""):
+            return True
+        print(f"[updater] docker image rm failed ({backup_tag}): {out[-200:]}")
+        return False
+    if os.path.exists(DOCKER_SOCK):
+        return _engine_remove_backup_tag(backup_tag)
+    return False
+
+
+def _backup_owner(*, create: bool = False) -> str:
+    owner = str(load_state().get("backup_owner") or "")
+    if not owner and create:
+        owner = uuid.uuid4().hex
+        save_state(backup_owner=owner)
+    return owner
+
+
+def _orphan_entry_from_tag(backup_tag: str, img_id: str, created_ts: int | None) -> dict:
+    label = backup_tag.split(":", 1)[1]
+    owner = _backup_owner()
+    owned = bool(owner and label.startswith(owner + "-"))
+    version_label = label[len(owner) + 1:] if owned else label
+    parts = version_label.rsplit("-", 2)
+    if len(parts) == 3 and len(parts[1]) == 8 and len(parts[2]) == 6 and parts[1].isdigit() and parts[2].isdigit():
+        version, ts = parts[0], f"{parts[1]}-{parts[2]}"
+    else:
+        version, ts = version_label, time.strftime("%Y%m%d-%H%M%S", time.gmtime(created_ts)) if created_ts else ""
+    parsed_ts = _parse_stamp_ts(ts)
+    created = parsed_ts if parsed_ts is not None else float(created_ts or 0)
+    return {
+        "ref": f"docker-{label}",
+        "image": _cfg()["image"],
+        "digest": img_id,
+        "backup_tag": backup_tag,
+        "version": version,
+        "target_tag": "",
+        "mode": "docker",
+        "ts": ts,
+        "created_at": created,
+        "orphan": True,
+        "unowned": not owned,
+    }
+
 
 def _backup_entries() -> list[dict]:
     root = Path(_backup_root())
-    entries = []
+    entries: list[tuple[float, dict]] = []
+    known_tags: set[str] = set()
+    known_refs: set[str] = set()
     for path in root.glob("*.json"):
         try:
             meta = json.loads(path.read_text())
-            if meta.get("ref") != path.stem:
+            if not isinstance(meta, dict) or meta.get("ref") != path.stem:
                 continue  # monitor plans/results are not backup metadata
             try:
                 created = float(meta["created_at"])
             except (KeyError, ValueError, TypeError):
-                # Historical names end in timestamp, regardless of version width.
                 stamp = meta.get("ts") or "-".join(path.stem.rsplit("-", 2)[-2:])
-                try: created = time.mktime(time.strptime(stamp, "%Y%m%d-%H%M%S"))
-                except ValueError: created = path.stat().st_mtime
+                parsed = _parse_stamp_ts(stamp)
+                created = parsed if parsed is not None else path.stat().st_mtime
             entries.append((created, meta))
+            known_refs.add(meta["ref"])
+            if isinstance(meta.get("backup_tag"), str) and meta["backup_tag"]:
+                known_tags.add(meta["backup_tag"])
         except (OSError, ValueError, TypeError):
             continue
-    return [meta for _, meta in sorted(entries, key=lambda item: item[0], reverse=True)]
+    for tag, img_id, created_ts in _docker_list_backup_tags():
+        if tag in known_tags:
+            continue
+        orphan = _orphan_entry_from_tag(tag, img_id, created_ts)
+        if orphan["ref"] not in known_refs:
+            entries.append((float(orphan.get("created_at") or 0), orphan))
+            known_refs.add(orphan["ref"])
+    return [meta for _, meta in sorted(entries, key=lambda item: (item[0], str(item[1].get("ref") or "")), reverse=True)]
+
+
+def _remove_backup_entry(meta: dict) -> bool:
+    ref = str(meta.get("ref") or "").strip()
+    if not ref or "/" in ref or "\\" in ref or ".." in ref or meta.get("unowned"):
+        return False
+    backup_tag = meta.get("backup_tag")
+    if not backup_tag and meta.get("mode") == "docker" and ref.startswith("docker-"):
+        backup_tag = f"parrot-backup:{ref.removeprefix('docker-')}"
+    if isinstance(backup_tag, str) and backup_tag.startswith("parrot-backup:"):
+        if not _docker_remove_backup_tag(backup_tag):
+            return False
+    root = Path(_backup_root())
+    try:
+        for suffix in (".tar.gz", ".state.db", ".monitor.py", ".plan.json", ".result.json"):
+            (root / (ref + suffix)).unlink(missing_ok=True)
+        deps = root / (ref + ".deps")
+        if deps.is_dir():
+            shutil.rmtree(deps)
+        (root / (ref + ".json")).unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"[updater] remove backup files failed ({ref}): {exc}")
+        return False
+    return True
 
 
 def _prune_backups() -> None:
-    """Keep newest by creation time; never remove the current rollback anchor."""
+    if not _op_lock.acquire(blocking=False):
+        return
+    try:
+        _prune_backups_locked()
+    finally:
+        _op_lock.release()
+
+
+def _prune_backups_locked() -> None:
+    """Caller owns the update lock through listing, protection checks and removal."""
     keep = max(0, _cfg()["keepBackups"])
-    root = Path(_backup_root())
-    active_ref = load_state().get("backup_ref")
-    for meta in _backup_entries()[keep:]:
-        ref = meta["ref"]
-        if ref == active_ref:
+    protected = _protected_backup_ref()
+    kept = 0
+    for meta in _backup_entries():
+        ref = meta.get("ref")
+        if meta.get("unowned") or (protected and ref == protected):
             continue
-        try:
-            for suffix in (".json", ".tar.gz", ".state.db", ".monitor.py", ".plan.json", ".result.json"):
-                (root / (ref + suffix)).unlink(missing_ok=True)
-            deps = root / (ref + ".deps")
-            if deps.is_dir(): shutil.rmtree(deps)
-        except OSError as exc:
-            print(f"[updater] prune backups failed: {exc}")
+        if kept < keep:
+            kept += 1
+            continue
+        _remove_backup_entry(meta)
+
+
+def delete_backup(ref: str) -> str:
+    """删除指定备份。返回 'deleted' | 'protected' | 'not_found' | 'failed'。"""
+    target = str(ref or "").strip()
+    if not target or "/" in target or "\\" in target or ".." in target:
+        return "not_found"
+    if not _op_lock.acquire(blocking=False):
+        return "busy"
+    try:
+        protected = _protected_backup_ref()
+        if protected and target == protected:
+            return "protected"
+        entry = next((item for item in _backup_entries() if item.get("ref") == target), None)
+        if entry is None:
+            return "not_found"
+        if entry.get("unowned"):
+            return "protected"
+        return "deleted" if _remove_backup_entry(entry) else "failed"
+    finally:
+        _op_lock.release()
+
+
+def clear_backups() -> dict:
+    """清空除当前活跃更新保护锚点外的全部备份。"""
+    result = {"deleted": 0, "keptProtected": False, "keptUnowned": 0, "failed": 0}
+    if not _op_lock.acquire(blocking=False):
+        return {**result, "busy": True}
+    try:
+        protected = _protected_backup_ref()
+        for entry in _backup_entries():
+            if entry.get("unowned"):
+                result["keptUnowned"] += 1
+                continue
+            if protected and entry.get("ref") == protected:
+                result["keptProtected"] = True
+                continue
+            if _remove_backup_entry(entry):
+                result["deleted"] += 1
+            else:
+                result["failed"] += 1
+        return result
+    finally:
+        _op_lock.release()
 
 
 def list_backups() -> list[dict]:
-    return _backup_entries()
+    protected = _protected_backup_ref()
+    result = []
+    for item in _backup_entries():
+        row = dict(item)
+        row["protected"] = bool(row.get("unowned") or (protected and row.get("ref") == protected))
+        result.append(row)
+    return result

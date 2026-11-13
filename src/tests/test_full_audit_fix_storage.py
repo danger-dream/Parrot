@@ -454,7 +454,7 @@ def test_unknown_search_tier_is_unpriced_unless_actual(logs, monkeypatch, tier, 
 def test_pruning_protects_current_anchor_even_if_older(tmp_path, monkeypatch):
     monkeypatch.setattr(updater, '_backup_root', lambda: str(tmp_path))
     monkeypatch.setattr(updater, '_cfg', lambda: {'keepBackups':1})
-    monkeypatch.setattr(updater, 'load_state', lambda: {'backup_ref':'old'})
+    monkeypatch.setattr(updater, 'load_state', lambda: {'backup_ref':'old', 'stage':updater.STAGE_STAGED})
     for ref, created in [('old',1),('new',2)]:
         (tmp_path / (ref+'.json')).write_text(json.dumps({'ref':ref,'created_at':created}))
     updater._prune_backups()

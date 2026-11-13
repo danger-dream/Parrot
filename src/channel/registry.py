@@ -279,6 +279,24 @@ def available_model_aliases(mapping: dict[str, str], *, api_key_name: Optional[s
             for alias, model in mapping.items() if _model_discovery_visible(ch, model, alias)}
 
 
+def serving_channels(model: str, *, api_key_name: Optional[str] = None) -> list[tuple[str, str]]:
+    """Enabled, key-permitted channels serving ``model`` when unified naming is off."""
+    result: list[tuple[str, str]] = []
+    for ch in all_channels():
+        if not ch.enabled or ch.disabled_reason or not auth.channel_allowed(api_key_name, ch.key):
+            continue
+        resolved = ch.supports_model(model)
+        # Hidden names remain routable; capability intersection must include
+        # them just as the scheduler does, while still honoring enable gates.
+        if resolved and all(
+            model_state.is_global_enabled(name, source_key=ch.key)
+            and model_state.is_source_enabled(ch.key, name)
+            for name in {model, resolved}
+        ):
+            result.append((ch.key, resolved))
+    return result
+
+
 def available_model_spellings(spellings, *, api_key_name: Optional[str] = None) -> set[str]:
     """Resolve explicit legacy names without advertising duplicate identities."""
     from ..model_registry import runtime as model_registry

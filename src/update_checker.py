@@ -15,9 +15,10 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 import time
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 from packaging.version import InvalidVersion, Version
 
@@ -33,6 +34,8 @@ def _cfg() -> dict:
         "enabled": bool(uc.get("enabled", True)),
         "intervalSeconds": int(uc.get("intervalSeconds", 3600) or 3600),
         "includePrerelease": bool(uc.get("includePrerelease", True)),
+        "autoUpdate": bool(uc.get("autoUpdate", False)),
+        "silentUpdate": bool(uc.get("silentUpdate", False)),
         "repo": str(uc.get("repo") or "danger-dream/Parrot").strip(),
         "ignoredVersions": list(uc.get("ignoredVersions") or []),
         "apiBase": str(uc.get("apiBase") or "https://api.github.com").strip().rstrip("/"),
@@ -80,13 +83,15 @@ def _load_state(repo: str) -> Optional[dict]:
 def _save_state(repo: str, *, latest_version: Optional[str], latest_name: Optional[str],
                 latest_url: Optional[str], latest_body: Optional[str],
                 latest_published_at: Optional[str], latest_prerelease: bool,
-                notified_for: Optional[str]) -> None:
+                notified_for: Optional[str], silent_checks: dict | None = None) -> None:
     state_db.update_state_save(repo, {
         "latest_version": latest_version, "latest_name": latest_name,
         "latest_url": latest_url, "latest_body": latest_body,
         "latest_published_at": latest_published_at,
         "latest_prerelease": 1 if latest_prerelease else 0,
         "notified_for": notified_for,
+        "silent_checks": silent_checks or {},
+        "silent_checked_from": __version__,
     })
 
 
@@ -132,20 +137,81 @@ def _has_newer(latest_tag: Optional[str]) -> bool:
     return lat > cur
 
 
+_NEGATED_BREAKING_RE = re.compile(
+    r"(?i)(?:无|没有|不含|未引入|不涉及|non[\s-]*|no\s+|without\s+)"
+    r"(?:breaking[\s_-]*changes?|破坏性(?:变更|更新|改动)|不兼容(?:更新|变更|改动))"
+)
+_BREAKING_MARKER_RE = re.compile(
+    r"(?i)(?:\bbreaking[\s_-]*changes?\b|\[breaking\]|破坏性(?:变更|更新|改动)|不兼容(?:更新|变更|改动))"
+)
+_CONVENTIONAL_BREAKING_RE = re.compile(r"(?im)^\s*(?:[-*+]\s+|\d+[.)]\s+|>\s*|#{1,6}\s+)*[`*_]*[a-z]+(?:\([^)\n]+\))?!:")
+
+
+def is_breaking_release(
+    current_version: str,
+    target_tag: str,
+    release: Mapping[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """Identify major version jumps or explicit breaking-change markers in release notes."""
+    cur = _parse(current_version)
+    lat = _parse(target_tag)
+    if cur is not None and lat is not None and lat.major > cur.major:
+        return True, f"主版本号升级（v{cur.major} → v{lat.major}）"
+    if isinstance(release, Mapping):
+        combined = f"{release.get('name') or ''}\n{release.get('body') or ''}"
+        cleaned = _NEGATED_BREAKING_RE.sub("", combined)
+        if _BREAKING_MARKER_RE.search(cleaned) or _CONVENTIONAL_BREAKING_RE.search(cleaned):
+            return True, "发布说明包含破坏性变更（Breaking Change）标记"
+    return False, ""
+
+
+def _release_path_check(target: str, releases: list, *, complete: bool) -> dict:
+    current, end = _parse(__version__), _parse(target)
+    reason = ""
+    target_release = None
+    if current is None or end is None:
+        reason = "版本号无法解析，无法确认升级路径"
+    elif not complete:
+        reason = "发布列表不完整，无法确认全部中间版本"
+    else:
+        for release in releases:
+            if not isinstance(release, Mapping) or release.get("draft"):
+                continue
+            version = _parse(str(release.get("tag_name") or ""))
+            if version == end:
+                target_release = release
+            if version is not None and current < version <= end:
+                breaking, detail = is_breaking_release(__version__, str(release["tag_name"]), release)
+                if breaking:
+                    reason = f"{release['tag_name']}: {detail}"
+                    break
+        if not reason and target_release is None:
+            reason = "目标版本的发布说明不可用"
+    return {"blocked": bool(reason), "reason": reason,
+            "prerelease": bool((end and end.is_prerelease) or (target_release and target_release.get("prerelease")))}
+
+
 # ─── banner 生成 ─────────────────────────────────────────────────
 
 
 def get_update_banner() -> Optional[str]:
-    """主菜单底部 banner：仅在 latest>local 且未被忽略时返回字符串，否则 None。"""
+    """主菜单底部 banner：仅在 latest>local 且未被忽略时返回字符串，否则 None。
+    开启静默自动更新且非破坏性版本时不再弹出催更横幅。
+    """
     st = get_cached()
     if not st:
         return None
     latest = st.get("latest_version")
     if not latest or not _has_newer(latest):
         return None
-    ignored = set(_cfg().get("ignoredVersions") or [])
+    cfg = _cfg()
+    ignored = set(cfg.get("ignoredVersions") or [])
     if latest in ignored:
         return None
+    if cfg.get("silentUpdate"):
+        verdict = (st.get("silent_checks") or {}).get(latest)
+        if st.get("silent_checked_from") == __version__ and verdict and not verdict.get("blocked"):
+            return None
     return (
         f"🆕 <b>Parrot 新版本可用</b>: <code>v{__version__}</code> → "
         f"<code>{notifier.escape_html(latest)}</code> — "
@@ -242,14 +308,29 @@ def _check_once_impl(*, push: bool = True, raise_on_error: bool = False, manual:
         return
     if not cfg["enabled"]:
         push = False
-    url = f"{cfg['apiBase']}/repos/{cfg['repo']}/releases?per_page=20"
+    page_size = 100 if cfg.get("silentUpdate", False) else 20
+    url = f"{cfg['apiBase']}/repos/{cfg['repo']}/releases?per_page={page_size}"
     releases = _http_get_json(url)
     if _stopping:
         return
     if not isinstance(releases, list):
+        cached = get_cached()
+        if cached and "silent_checks" in cached:
+            _set_cache({**cached, "silent_checks": {}})
         if raise_on_error:
             raise RuntimeError("Release check failed")
         return
+    complete = len(releases) < page_size
+    if cfg.get("silentUpdate", False):
+        for page in range(2, 11):
+            if complete or _stopping:
+                break
+            more = _http_get_json(f"{url}&page={page}")
+            if not isinstance(more, list):
+                break
+            releases.extend(more)
+            complete = len(more) < page_size
+    releases = [r for r in releases if isinstance(r, Mapping)]
     latest = _pick_latest(releases, include_prerelease=cfg["includePrerelease"])
     if not latest:
         # 没有任何符合条件的 release：清掉缓存即可
@@ -268,25 +349,42 @@ def _check_once_impl(*, push: bool = True, raise_on_error: bool = False, manual:
 
     is_newer = _has_newer(tag)
     ignored = set(cfg["ignoredVersions"])
+    silent_mode = bool(cfg.get("silentUpdate")) and not manual
+    checks = {}
+    if cfg.get("silentUpdate", False):
+        from . import updater
+        targets = {tag}
+        staged = updater.load_state()
+        if staged.get("stage") == updater.STAGE_STAGED and staged.get("target_tag"):
+            targets.add(staged["target_tag"])
+        checks = {target: _release_path_check(target, releases, complete=complete) for target in targets}
+    verdict = checks.get(tag) or {}
+    breaking = bool(silent_mode and verdict.get("blocked"))
+    breaking_reason = verdict.get("reason") or ""
     should_push = (
         push
         and is_newer
         and tag not in ignored
         and tag != notified_for      # 同一版本不重复推
+        and (not silent_mode or breaking)
     )
 
     if should_push:
         try:
             reply_markup = _build_update_buttons(tag)
-            notifier.notify_event("app_update", _format_release(tag, latest),
-                                  reply_markup=reply_markup)
+            text = _format_release(tag, latest)
+            if silent_mode and breaking:
+                text = (
+                    f"⚠️ <b>升级安全检查未通过（{notifier.escape_html(breaking_reason)}），已跳过静默更新，请人工确认</b>\n\n"
+                    + text
+                )
+            notifier.notify_event("app_update", text, reply_markup=reply_markup)
             notified_for = tag
         except Exception as exc:
             print(f"[update_checker] notify failed: {exc}")
-        # 自动更新模式：检测到新版直接走自更新（仍是双重确认——staged 后等用户点确认）
-        # 注意：只做"备份+拉取"进 staged，重启仍需用户在 TG 点确认（不绕过双重确认）。
+        # 自动下载模式（非静默）：检测到新版直接走备份+拉取进 staged，重启仍需人工二次确认
         try:
-            if not _stopping and _cfg_auto_update() and tag not in ignored:
+            if not _stopping and not silent_mode and _cfg_auto_update() and tag not in ignored:
                 from . import updater
                 if not updater.is_busy():
                     admin_chat = None
@@ -309,12 +407,59 @@ def _check_once_impl(*, push: bool = True, raise_on_error: bool = False, manual:
         latest_published_at=latest.get("published_at"),
         latest_prerelease=bool(latest.get("prerelease")),
         notified_for=notified_for,
+        silent_checks=checks,
     )
     _set_cache(_load_state(cfg["repo"]))
+
+    if silent_mode and not _stopping:
+        _drive_silent_update(tag)
+
+
+def _drive_silent_update(tag: str) -> None:
+    """在静默更新模式下推进：未暂存则静默备份拉取，已暂存且业务空闲则触发重启。"""
+    try:
+        from . import updater
+        cfg = _cfg()
+        if _stopping or not cfg["enabled"] or not cfg["silentUpdate"]:
+            return
+        st = updater.load_state()
+        stage = st.get("stage")
+        if stage == updater.STAGE_STAGED:
+            if not st.get("silent") or st.get("target_repo") != cfg["repo"]:
+                return
+            tag = st.get("target_tag") or ""
+        if stage in (updater.STAGE_FAILED, updater.STAGE_ROLLED_BACK) and st.get("target_tag") == tag:
+            updater.notify_silent_failure(str(st.get("message") or "自动更新失败，请查看日志"))
+            return
+        if st.get("cancelled_target") == tag and st.get("cancelled_repo") == cfg["repo"]:
+            return
+        cached = get_cached() or {}
+        verdict = (cached.get("silent_checks") or {}).get(tag)
+        if (not tag or not _has_newer(tag) or tag in cfg["ignoredVersions"]
+                or cached.get("repo") != cfg["repo"] or cached.get("silent_checked_from") != __version__
+                or not verdict or verdict.get("blocked")
+                or (verdict.get("prerelease") and not cfg["includePrerelease"])
+                or time.time() - float(cached.get("checked_at") or 0) > max(300, cfg["intervalSeconds"]) * 2):
+            return
+        if stage == updater.STAGE_STAGED:
+            updater.try_silent_activate()
+            return
+        if not updater.is_busy():
+            ok, _ = updater.stage_update(tag, silent=True)
+            if ok and not _stopping:
+                updater.try_silent_activate()
+    except Exception as exc:
+        print(f"[update_checker] silent update step failed: {exc}")
+        from . import updater
+        updater.notify_silent_failure(f"后台更新异常: {type(exc).__name__}")
 
 
 def _cfg_auto_update() -> bool:
     return bool((config.get().get("updateChecker") or {}).get("autoUpdate", False))
+
+
+def _cfg_silent_update() -> bool:
+    return bool((config.get().get("updateChecker") or {}).get("silentUpdate", False))
 
 
 def _build_update_buttons(tag: str) -> dict:
@@ -382,14 +527,23 @@ async def update_loop() -> None:
 
     # 首次延迟 30s，避免和其他 startup 抢
     await asyncio.sleep(30)
+    next_check_at = 0.0
     while True:
         try:
             cfg = _cfg()
-            if not cfg["enabled"]:
-                await asyncio.sleep(max(300, cfg["intervalSeconds"]))
-                continue
-            await asyncio.to_thread(_check_once, push=True)
-            await asyncio.sleep(max(300, cfg["intervalSeconds"]))
+            now = time.monotonic()
+            if cfg["enabled"] and now >= next_check_at:
+                await asyncio.to_thread(_check_once, push=True)
+                cfg = _cfg()
+                next_check_at = time.monotonic() + max(300, cfg["intervalSeconds"])
+            elif not cfg["enabled"]:
+                next_check_at = now + max(300, cfg["intervalSeconds"])
+            elif cfg.get("silentUpdate"):
+                cached = get_cached() or {}
+                tag = cached.get("latest_version") or ""
+                await asyncio.to_thread(_drive_silent_update, tag)
+            sleep_sec = 20.0 if (cfg["enabled"] and cfg.get("silentUpdate")) else max(1.0, min(60.0, next_check_at - time.monotonic()))
+            await asyncio.sleep(sleep_sec)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
