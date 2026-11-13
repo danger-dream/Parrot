@@ -566,6 +566,10 @@ class OAuthBackend:
     def fable_display_from_quota_row(self, *args, **kwargs):
         return oauth_manager.fable_display_from_quota_row(*args, **kwargs)
 
+    def is_bogus_zero_min_openai_5h(self, *args, **kwargs):
+        from ...oauth.openai import is_bogus_zero_min_openai_5h
+        return is_bogus_zero_min_openai_5h(*args, **kwargs)
+
     def claude_plan_label(self, *args, **kwargs):
         return oauth_manager.claude_plan_label(*args, **kwargs)
 
