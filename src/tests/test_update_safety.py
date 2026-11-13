@@ -15,6 +15,8 @@ from src import config, drain, state_db, update_checker, update_supervisor, upda
 
 @pytest.fixture(autouse=True)
 def isolated_update(monkeypatch, tmp_path):
+    monkeypatch.setattr(update_checker, "__version__", "0.36.5")
+    monkeypatch.setattr(updater, "__version__", "0.36.5")
     state_db.init()
     updater.start()
     update_checker.start()
