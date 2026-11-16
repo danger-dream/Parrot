@@ -1,0 +1,37 @@
+{
+  "evidence": "Official LS 2.32.1 request construction against a local mock with catalog metadata; not a live Google acceptance test. Only generation fields retained.",
+  "samples": [
+    {
+      "source": "102430_016_daily-cloudcode-pa.googleapis.com_POST__v1internal:streamGenerateContent%alt=sse.json",
+      "model": "gemini-4-carbon-medium",
+      "catalog": {
+        "thinkingLevel": 2,
+        "minThinkingBudget": 128,
+        "maxOutputTokens": 262144
+      },
+      "generationConfig": {
+        "maxOutputTokens": 262144,
+        "thinkingConfig": {
+          "includeThoughts": true,
+          "thinkingLevel": "MEDIUM"
+        }
+      }
+    },
+    {
+      "source": "102621_026_daily-cloudcode-pa.googleapis.com_POST__v1internal:streamGenerateContent%alt=sse.json",
+      "model": "gemini-4-hydrogen-xhigh",
+      "catalog": {
+        "thinkingLevel": 100,
+        "minThinkingBudget": 32,
+        "maxOutputTokens": 262144
+      },
+      "generationConfig": {
+        "maxOutputTokens": 262144,
+        "thinkingConfig": {
+          "includeThoughts": true,
+          "thinkingLevel": 100
+        }
+      }
+    }
+  ]
+}

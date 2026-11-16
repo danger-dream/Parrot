@@ -18,6 +18,8 @@ from ..xai import imagine
 from . import images_simple as legacy
 from .codex_constants import apply_codex_workspace_routing, codex_responses_url
 
+from ..providers.antigravity_errors import ImageResponseError, parse_antigravity_error, present_error, safe_error_message
+
 SAFE_REJECTIONS = {401, 403, 404, 429}
 MAX_GENERATIONS = 10
 
@@ -300,6 +302,7 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
     if parsed.native_options.get('input_fidelity') and any(s.key.startswith('oauth:') for s in sources):
         warnings.append('input_fidelity adapted as reference-preservation prompt guidance; not a native fidelity control')
     response_headers = {}
+    response = None
     cache_paths = []; media_bytes = 0; actual_qualities = []
     source = sources[0]
     log_source = source  # Last actually attempted source, not a skipped candidate.
@@ -339,9 +342,10 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
                     elif response.status_code in imagine._EXPLICIT_SAFE_FAILOVER_STATUSES or response.status_code >= 500:
                         cooldown.record_error(effect_key, source.upstream, f'xAI Imagine HTTP {response.status_code}')
                 elif antigravity_images.is_source(source):
+                    ag_signal = parse_antigravity_error(response.text, http_status=response.status_code)
                     if 200 <= response.status_code < 300:
                         cooldown.clear_on_success(effect_key, source.upstream)
-                    elif response.status_code == 429:
+                    elif response.status_code == 429 or ag_signal['classification'] == 'validation_required':
                         from ..antigravity.quota import apply_request_429
                         used_credits = bool(getattr(attempt_parsed, '_parrot_antigravity_use_credits', False))
                         should_retry_credits = apply_request_429(
@@ -349,7 +353,7 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
                             account_key=source.key.removeprefix('oauth:'),
                             expected_state_key=getattr(source, 'state_key', None),
                             retry_after=response.headers.get('retry-after'),
-                            used_credits=used_credits,
+                            used_credits=used_credits, http_status=response.status_code,
                         )
                         if should_retry_credits and not used_credits and calls < max_calls:
                             if await concurrency.try_acquire(effect_key):
@@ -364,14 +368,20 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
                                     concurrency.release(effect_key)
                                 if 200 <= response.status_code < 300:
                                     cooldown.clear_on_success(effect_key, source.upstream)
-                                elif response.status_code == 429:
+                                elif response.status_code == 429 or parse_antigravity_error(
+                                    response.text, http_status=response.status_code,
+                                )['classification'] == 'validation_required':
                                     apply_request_429(
                                         effect_key, source.upstream, response.text,
                                         account_key=source.key.removeprefix('oauth:'),
                                         expected_state_key=getattr(source, 'state_key', None),
                                         retry_after=response.headers.get('retry-after'),
-                                        used_credits=True,
+                                        used_credits=True, http_status=response.status_code,
                                     )
+                if antigravity_images.is_source(source):
+                    ag_signal = parse_antigravity_error(response.text, http_status=response.status_code)
+                    if ag_signal['stop_failover']:
+                        break
                 if response.status_code in SAFE_REJECTIONS:
                     sources.remove(source)
                     continue
@@ -386,7 +396,7 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
                 try:
                     error = response.json().get('error')
                     detail = error.get('message') if isinstance(error, dict) else None
-                    if isinstance(detail, str):
+                    if isinstance(detail, str) and not antigravity_images.is_source(source):
                         secrets = []
                         channel = registry.get_channel(source.key)
                         if channel is not None: secrets.append(getattr(channel, 'api_key', ''))
@@ -401,11 +411,19 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
                         message += ': ' + detail[:500]
                 except (ValueError, TypeError, AttributeError): pass
                 failure = {'type': 'upstream_error', 'message': message}
+                if antigravity_images.is_source(source):
+                    ag_signal = present_error(ag_signal)
+                    failure.update(message=safe_error_message(ag_signal), code=ag_signal['public_code'], diagnostic=ag_signal['diagnostic'])
                 break
             obj = response.json()
+            if antigravity_images.is_source(source) and isinstance(obj.get('error'), dict):
+                raise ImageResponseError(parse_antigravity_error(obj, http_status=response.status_code))
             if isinstance(obj.get('usage'), dict): usages[-1] = obj['usage']
             batch = obj.get('data')
-            if not isinstance(batch, list) or not batch: raise ValueError('upstream completed without images; not retried')
+            if not isinstance(batch, list) or not batch:
+                if antigravity_images.is_source(source):
+                    raise ImageResponseError(present_error(parse_antigravity_error({}, http_status=response.status_code), local_code='no_images'))
+                raise ValueError('upstream completed without images; not retried')
             if len(batch) != n:
                 status = 502
                 failure = {'type': 'image_count_mismatch', 'message': f'upstream returned {len(batch)} images for n={n}; not automatically regenerated'}
@@ -453,10 +471,19 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
             cached_media_count=len(cache_paths), cache_paths=cache_paths, media_bytes=media_bytes,
             error_type='cancelled', error_message='image request cancelled; no regeneration attempted'))
         raise
+    except ImageResponseError as exc:
+        status = 502
+        failure = {'type': 'image_result_error', 'code': exc.signal['public_code'],
+                   'message': safe_error_message(exc.signal), 'diagnostic': exc.signal['diagnostic']}
     except httpx.TimeoutException:
         status = 504; failure = {'type':'outcome_unknown', 'message':'image POST timed out; it may have been billed and was not retried'}
     except Exception as exc:
+        ag_exception_code = 'transport_error' if isinstance(exc, httpx.TransportError) else 'image_result_error'
         status = 502; failure = {'type':'image_result_error', 'message': str(exc) if isinstance(exc, ValueError) else 'image upstream failed; outcome may be unknown; not retried'}
+    if failure and antigravity_images.is_source(source) and 'diagnostic' not in failure and failure['type'] in {'outcome_unknown', 'image_result_error'}:
+        code = ('timeout' if status == 504 else ag_exception_code)
+        signal = present_error(parse_antigravity_error({}, http_status=response.status_code if response is not None else None), local_code=code)
+        failure.update(message=safe_error_message(signal), code=signal['public_code'], diagnostic=signal['diagnostic'])
     if parsed.response_format == 'url':
         downloadable = [item for item in data if image_artifacts.url_available(item['url'])]
         if len(downloadable) != len(data):

@@ -107,7 +107,8 @@ async def test_malformed_call_retries_same_account_then_returns_400_without_heal
     state["responses"] = [lambda req: reply(req, MALFORMED)]
     response = await call(api, ingress, stream)
     assert response.status_code == 400, response.text
-    assert FINISH_MESSAGE in response.text
+    assert FINISH_MESSAGE not in response.text
+    assert "gemini_malformed_function_call" in response.text
     assert "response.completed" not in response.text and "[DONE]" not in response.text
     # One account, the initial attempt plus the shared budget of two replays.
     assert len(state["projects"]) == 3 and len(set(state["projects"])) == 1
@@ -160,7 +161,8 @@ async def test_replay_switch_off_returns_first_failure(m, rig):
     m["config"].update(lambda cfg: cfg["retry"]["transient"].update(errors={"antigravityToolCallFailure": False}))
     state["responses"] = [lambda req: reply(req, MALFORMED)]
     response = await call(api, "chat", False)
-    assert response.status_code == 400 and FINISH_MESSAGE in response.text
+    assert response.status_code == 400 and FINISH_MESSAGE not in response.text
+    assert "gemini_malformed_function_call" in response.text
     assert len(state["projects"]) == 1 and health == []
 
 
@@ -171,7 +173,7 @@ async def test_missing_thought_signature_is_not_replayed(rig, stream):
     state["responses"] = [lambda req: reply(req, candidate("MISSING_THOUGHT_SIGNATURE"))]
     response = await call(api, "chat", stream)
     assert response.status_code == 400, response.text
-    assert "MISSING_THOUGHT_SIGNATURE" in response.text
+    assert "gemini_missing_thought_signature" in response.text
     assert len(state["projects"]) == 1 and health == []
 
 
@@ -185,7 +187,8 @@ async def test_failure_after_visible_output_keeps_health(rig, ingress):
                                                      stream=fake.ChunkedByteStream(chunks))]
     response = await call(api, ingress, True)
     assert response.status_code == 200, response.text
-    assert "partial-content" in response.text and FINISH_MESSAGE in response.text
+    assert "partial-content" in response.text and FINISH_MESSAGE not in response.text
+    assert "gemini_malformed_function_call" in response.text
     assert len(state["projects"]) == 1 and health == []
     row, _chain = latest_log()
     assert row["status"] == "error" and row["http_status"] == 400

@@ -5766,6 +5766,9 @@ def account_model_selection(account_or_key: dict | str) -> dict:
             for item in records if str(item.get("id") or "").strip()
         }
         models = [model for model in configured_models if model in native_ids]
+    elif provider == "antigravity":
+        models = [model for model in configured_models
+                  if antigravity_provider.model_at_generation_endpoint(account, model)]
     else:
         models = configured_models
     hidden_models: list[str] = []
@@ -5778,7 +5781,9 @@ def account_model_selection(account_or_key: dict | str) -> dict:
         hidden_records = [item for item in records if item.get("visibility") == "hide"]
         models = [model for model in models if model not in hidden]
         records = [item for item in records if item.get("visibility") != "hide"]
-    if models or (provider == "openai" and configured_models):
+    if models or (provider == "openai" and configured_models) or (
+        provider == "antigravity" and _model_catalog_complete(account, configured_models)
+    ):
         source = str(account.get("last_model_sync_source") or "lkg:legacy-config")
     else:
         source = f"{provider}:awaiting-account-catalog"
@@ -5798,7 +5803,7 @@ def account_model_selection(account_or_key: dict | str) -> dict:
         # Empty catalogs never acquire metadata or routes from static lists.
         "records": (
             [item for item in records if str(item.get("id") or "").strip() in models]
-            if provider == "cursor" else records if models else []
+            if provider == "cursor" else records if models or provider == "antigravity" else []
         ),
     }
 
@@ -6072,7 +6077,13 @@ async def _discover_account_models_once(account_key: str, *, timeout_s: float) -
         }
 
     models = list(dict.fromkeys(str(model).strip() for model in result.models if str(model).strip()))
-    if not models:
+    authoritative_empty = (
+        provider == "antigravity"
+        and isinstance(result.catalog, dict)
+        and result.catalog.get("antigravityCatalogComplete") is True
+        and result.catalog.get("antigravityGenerationBaseUrl") == antigravity_provider.effective_request_base_url(account)
+    )
+    if not models and not authoritative_empty:
         _persist_model_discovery_failure(canonical, generation, "empty catalog")
         return {"action": "empty", "account_key": canonical}
     now = _format_utc(datetime.now(timezone.utc))
@@ -6083,7 +6094,8 @@ async def _discover_account_models_once(account_key: str, *, timeout_s: float) -
             if _canonical_key(item) != canonical or _discovery_generation(item) != generation:
                 continue
             # Atomic LKG replacement: IDs, allow-listed metadata and sync facts
-            # are committed by one config mutation. Errors/empty never reach here.
+            # are committed by one mutation. AG's complete empty catalog revokes
+            # stale availability; discovery failures never reach here.
             item["models"] = models
             item["account_model_catalog"] = copy.deepcopy(getattr(result, "catalog", {}) or {})
             item["last_model_sync"] = now
@@ -6522,6 +6534,7 @@ def _model_catalog_complete(account: dict, model_ids: Iterable[str]) -> bool:
     catalog = account.get(catalog_key)
     if provider_of(account) == "antigravity" and (
         not isinstance(catalog, dict)
+        or catalog.get("antigravityCatalogComplete") is not True
         or catalog.get("antigravityGenerationBaseUrl") != antigravity_provider.effective_request_base_url(account)
     ):
         return False
@@ -6572,7 +6585,8 @@ def _model_sync_due(account: dict, *, now: datetime | None = None) -> bool:
         ):
             return True
     model_ids = _model_ids(account)
-    if not model_ids or last_success is None or not _model_catalog_complete(account, model_ids):
+    complete = _model_catalog_complete(account, model_ids)
+    if (not model_ids and not (provider_of(account) == "antigravity" and complete)) or last_success is None or not complete:
         return True
     ttl = (
         OPENAI_MODEL_SYNC_SUCCESS_TTL_SECONDS

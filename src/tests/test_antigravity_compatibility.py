@@ -215,7 +215,7 @@ async def test_active_catalog_only_selects_active_models_and_keeps_side_metadata
             assert type(source["observedAt"]) is int and source["observedAt"] > 0
 
 
-@pytest.mark.parametrize("bad", [RuntimeError("offline"), {"models": {}}, {"models": {MODEL: None}}, {}])
+@pytest.mark.parametrize("bad", [RuntimeError("offline"), {"models": {MODEL: None}}, {}])
 @pytest.mark.parametrize("active", ["prod", "daily"])
 @pytest.mark.asyncio
 async def test_active_failure_does_not_replace_lkg_or_release_quota(m, monkeypatch, bad, active):

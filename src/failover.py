@@ -58,7 +58,9 @@ from .openai.responses_ws_runtime import (
 from .proxy.connector import SOCKS5Connector, SS2022Connector
 from .oauth import openai as openai_provider
 from .providers import registry as provider_registry
-from .providers.antigravity_errors import parse_antigravity_429
+from .providers.antigravity_errors import (
+    GoogleErrorObservation, parse_antigravity_429, parse_antigravity_error, safe_error_message, present_error,
+)
 from .protocols import finalize as finalize_policy
 from .protocols import errors as protocol_errors
 from .protocols.usage import openai_envelope_containers
@@ -1321,6 +1323,29 @@ def _sanitize_upstream_message(value: Any) -> str:
     return (code_message or "Unknown upstream error")[:500]
 
 
+def _antigravity_error_evidence(result: AttemptResult):
+    """Read server-owned decoder state, never a client-supplied diagnostic dict."""
+    from .providers.antigravity_codec import GeminiStreamToResponses, REQUEST_FAILURE_CODES
+    decoder = (result.translator_ctx or {}).get("antigravity_stream")
+    observation = decoder.google_error if isinstance(decoder, GeminiStreamToResponses) else None
+    if isinstance(observation, GoogleErrorObservation):
+        return {"error": observation.error}, present_error(observation.signal())
+    raw = result.full_response_text or result.error_detail
+    # The decoder exists before connection setup; its presence is not evidence
+    # that any HTTP response was received. Committed streams pass upstream_status.
+    signal = parse_antigravity_error(raw, http_status=result.http_status)
+    failure = decoder.request_failure if isinstance(decoder, GeminiStreamToResponses) else None
+    if failure and failure[0] in REQUEST_FAILURE_CODES:
+        signal["diagnostic"]["generation_code"] = failure[0]
+    local_code = decoder.local_error_code if isinstance(decoder, GeminiStreamToResponses) else None
+    if not local_code and signal["classification"] == "unknown":
+        local_code = ("timeout" if "timeout" in result.outcome else
+                      "transport_error" if result.outcome in {"connect_error", "proxy_connect_error", "connection_lifecycle"} else result.outcome)
+    if local_code == "transform_error" and not isinstance(decoder, GeminiStreamToResponses):
+        local_code = "request_transform_error"
+    return raw, present_error(signal, local_code=local_code)
+
+
 def _structured_attempt_error(
     result: AttemptResult,
     ordinal: int,
@@ -1376,6 +1401,14 @@ def _structured_attempt_error(
     else:
         classification = str(result.outcome or "upstream_error")
 
+    ag_signal = None
+    if getattr(channel, "provider", "") == "antigravity":
+        _, ag_signal = _antigravity_error_evidence(result)
+        # Do not expose an arbitrary upstream code/message through the generic
+        # final-error builder. Raw response/error_detail remain in internal logs.
+        code = ag_signal["public_code"]
+        if ag_signal["account_quota_exhausted"]:
+            classification = "quota_exhausted"
     transient_kind = retryable_transient_error_kind(channel, result) if channel is not None else None
     if quota is not None:
         retryable, retry_scope = ((False, "none") if workbuddy_quota
@@ -1392,6 +1425,7 @@ def _structured_attempt_error(
         "classification": classification,
         "code": code,
         "message": (
+            safe_error_message(ag_signal) if ag_signal is not None else
             "Upstream returned an HTTP 403 response"
             if result.openai_oauth_html_403
             else _sanitize_upstream_message(
@@ -2507,6 +2541,9 @@ async def run_failover(
         start_monotonic = time.monotonic()
     candidates = list(schedule_result.candidates)
     all_initial_candidates = candidates + list(schedule_result.saturated)
+    if any(getattr(channel, "provider", "") == "antigravity" for channel, _model in all_initial_candidates):
+        from .antigravity.request_context import ensure_context
+        body = ensure_context(body)
     if any(bool(getattr(channel, "cc_mimicry", False)) for channel, _model in all_initial_candidates):
         # One logical request owns one stable CC session/prompt context.  Same-
         # candidate 529 and OAuth refresh retries rebuild the request but reuse
@@ -2761,9 +2798,34 @@ async def run_failover(
                     terminal_release=_release_once,
                 )
             result = _request_invalid_result_if_needed(result, ch)
+            ag_signal = None
+            if getattr(ch, "provider", "") == "antigravity" and not result.success:
+                ag_raw, ag_signal = _antigravity_error_evidence(result)
+                # Application errors inside a 200 JSON/SSE envelope carry their
+                # original identities in the decoder, not in translated text.
+                if not result.stream_started and ag_signal["diagnostic"].get("http_status") == 200:
+                    semantic_status = {
+                        "request_rejected": 400, "validation_required": 403,
+                        "quota_exhausted": 429, "account_quota_exhausted": 429,
+                        "rate_limit": 429,
+                    }.get(ag_signal["classification"])
+                    if semantic_status is None and isinstance(ag_raw, dict) and isinstance(ag_raw.get("error"), dict) and ag_raw["error"].get("code") == 429:
+                        semantic_status = 429  # Unknown rate rejection: bounded pause, never credits.
+                    if semantic_status is not None:
+                        result.http_status = semantic_status
+                    if result.retry_after_seconds is None:
+                        result.retry_after_seconds = ag_signal["retry_after"]
+                result.translator_ctx = {
+                    **(result.translator_ctx or {}),
+                    "antigravity_error": ag_signal["diagnostic"],
+                }
+                if ag_signal["stop_failover"]:
+                    result.outcome = "guard_error"
             pending_stream_result = result
             last_result = result
             quota_exhaustion = bounded_account_quota_error(result, ch)
+            if ag_signal is not None and not ag_signal["account_quota_exhausted"]:
+                quota_exhaustion = None
             if not result.success and not result.stream_started:
                 structured_attempts.append(
                     _structured_attempt_error(result, attempt_order, ch),
@@ -2940,12 +3002,13 @@ async def run_failover(
         # 请求级 guard 错误：所有 openai 候选语义一致，切也无用，直接短路 4xx
         if result.outcome == "guard_error":
             status = int(result.http_status or 400)
-            msg = result.error_detail or "request rejected by guard"
+            msg = safe_error_message(ag_signal) if ag_signal is not None else (result.error_detail or "request rejected by guard")
             # err_type 直接从 status 反推（保持与 classify_http_status 一致）
             anth_err_type = protocol_errors.legacy_anthropic_error_type_for_http_status(status)
             request_elapsed_ms = _elapsed_ms(start_monotonic)
             await asyncio.to_thread(
-                log_db.finish_error, request_id, msg[:4000], retry_count,
+                log_db.finish_error, request_id,
+                ((result.error_detail or msg) if ag_signal is not None else msg)[:4000], retry_count,
                 final_channel_key=ch.key, final_channel_type=ch.type, final_model=resolved_model,
                 connect_ms=None, first_token_ms=None, total_ms=None,
                 request_elapsed_ms=request_elapsed_ms,
@@ -2957,6 +3020,7 @@ async def run_failover(
                 status,
                 anth_err_type,
                 msg,
+                code=ag_signal["public_code"] if ag_signal is not None else None,
                 headers=errors.NO_RETRY_HEADERS if errors.is_non_retryable_http_status(status) else None,
             )
 
@@ -2997,7 +3061,8 @@ async def run_failover(
             status = int(result.http_status or 400)
             request_elapsed_ms = _elapsed_ms(start_monotonic)
             await asyncio.to_thread(
-                log_db.finish_error, request_id, msg[:4000], retry_count,
+                log_db.finish_error, request_id,
+                ((result.error_detail or msg) if ag_signal is not None else msg)[:4000], retry_count,
                 final_channel_key=ch.key, final_channel_type=ch.type, final_model=resolved_model,
                 connect_ms=result.connect_ms, first_token_ms=result.first_byte_ms,
                 idle_ms=result.idle_ms, total_ms=result.total_ms,
@@ -3015,9 +3080,9 @@ async def run_failover(
                 ingress_protocol,
                 status,
                 protocol_errors.legacy_anthropic_error_type_for_http_status(status),
-                msg,
+                safe_error_message(ag_signal) if ag_signal is not None else msg,
                 code=(
-                    getattr(result, "error_code", None)
+                    ag_signal["public_code"] if ag_signal is not None else getattr(result, "error_code", None)
                     or (
                         protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
                         if _is_context_length_exceeded_error(msg)
@@ -3029,6 +3094,20 @@ async def run_failover(
 
         if zhipu_body_started:
             break  # No transient retry, PAT recovery or alternate candidate.
+
+        if ag_signal is not None and ag_signal["classification"] == "validation_required":
+            # This account needs human verification, not a token refresh or
+            # credits. Keep alternate accounts usable; never infer a pool ban.
+            from .antigravity.quota import apply_request_429
+            apply_request_429(
+                channel_state.effect_key(ch), resolved_model,
+                ag_raw,
+                account_key=ch.account_key, expected_state_key=getattr(ch, "state_key", None),
+                http_status=ag_signal["diagnostic"].get("http_status"),
+            )
+            retry_count += 1
+            idx += 1
+            continue
 
         # Only a raw request-setup model 401 may reject a PAT. A mapped 2xx
         # business error/SSE error is already response-body and cannot replay.
@@ -3132,6 +3211,12 @@ async def run_failover(
         # released, so backoff does not occupy channel concurrency.  Intermediate
         # retries do not score/cool down; the terminal failure below does so once.
         transient_kind = retryable_transient_error_kind(ch, result)
+        if ag_signal is not None and result.http_status == 429:
+            delay = ag_signal["retry_after"]
+            transient_kind = (
+                "antigravityRateLimit" if ag_signal["classification"] == "rate_limit"
+                and isinstance(delay, (int, float)) and delay < 3 else None
+            )  # No generic overload retries for unknown Google 429s.
         if (
             quota_exhaustion is None
             and transient_retries_used < transient_retry_limit
@@ -3163,11 +3248,12 @@ async def run_failover(
             )
             should_retry_credits = apply_request_429(
                 channel_state.effect_key(ch), resolved_model,
-                result.full_response_text or result.error_detail,
+                ag_raw,
                 account_key=ch.account_key,
                 expected_state_key=getattr(ch, "state_key", None),
                 retry_after=result.retry_after_seconds,
                 used_credits=used_credits,
+                http_status=ag_signal["diagnostic"].get("http_status"),
             )
             if should_retry_credits and ag_credits_key not in retried_with_antigravity_credits:
                 retried_with_antigravity_credits.add(ag_credits_key)
@@ -6107,15 +6193,54 @@ async def _consume_stream(
             return None
         return getattr((translator_ctx or {}).get("qoder_stream"), "error_mapping", None)
 
+    def _public_sse_error(protocol, err_type, message, *, code=None, outcome=None):
+        if getattr(ch, "provider", "") == "antigravity":
+            _, signal = _antigravity_error_evidence(AttemptResult(
+                outcome=outcome or ("timeout" if err_type == "timeout_error" else "request_invalid" if err_type == "invalid_request_error" else "transport_error"), http_status=upstream_status, translator_ctx=translator_ctx,
+            ))
+            message = safe_error_message(signal)
+            code = signal["public_code"]
+        return _sse_error_for_ingress(protocol, err_type, message, code=code)
+
     def _workbuddy_responses_error(chunks):
+        if getattr(ch, "provider", "") == "antigravity":
+            # Only the outgoing terminal is sanitized. Tracker/DB retain the
+            # original response, and no stream that has committed is replayed.
+            _, signal = _antigravity_error_evidence(AttemptResult(outcome="stream_upstream_error", http_status=upstream_status, translator_ctx=translator_ctx))
+            public_error = {"type": "api_error", "code": signal["public_code"],
+                            "message": safe_error_message(signal)}
+            tail, blocks = upstream.split_sse_events(b"".join(chunks))
+            output = []
+            for block in blocks:
+                event, data = upstream.parse_sse_event_bytes(block)
+                if not isinstance(data, dict):
+                    output.append(block + b"\n\n")
+                    continue
+                response = data.get("response")
+                if isinstance(response, dict) and isinstance(response.get("error"), dict):
+                    response = {**response, "error": public_error}
+                    metadata = response.get("provider_metadata")
+                    if isinstance(metadata, dict) and isinstance(metadata.get("gemini"), dict):
+                        response["provider_metadata"] = {**metadata, "gemini": {
+                            "error": signal["diagnostic"],
+                        }}
+                    data = {**data, "response": response}
+                elif isinstance(data.get("error"), dict) or event == "error":
+                    data = {"type": "error", "error": public_error}
+                else:
+                    output.append(block + b"\n\n")
+                    continue
+                output.append((f"event: {event}\n" if event else "").encode() + b"data: " +
+                              json.dumps(data, ensure_ascii=False).encode() + b"\n\n")
+            return [*output, *([tail] if tail else [])]
         mapped = _qoder_stream_mapping()
         if mapped is not None:
             error = mapped["error"]
-            return [_sse_error_for_ingress(ingress_protocol, error["type"], error["message"], code=error.get("code"))]
+            return [_public_sse_error(ingress_protocol, error["type"], error["message"], code=error.get("code"))]
         if ingress_protocol != "responses" or not workbuddy_stream_error:
             return chunks
         error = workbuddy_stream_error["error"]
-        canonical = _sse_error_for_ingress(
+        canonical = _public_sse_error(
             ingress_protocol, error["type"], error["message"], code=error["code"],
         )
         # Preserve visible output/item closures, but replace the FIRST mapped
@@ -6322,7 +6447,7 @@ async def _consume_stream(
                     msg,
                     outcome="request_invalid",
                 )
-                yield _sse_error_for_ingress(
+                yield _public_sse_error(
                     ingress_protocol,
                     errors.ErrType.INVALID_REQUEST,
                     msg,
@@ -6392,10 +6517,11 @@ async def _consume_stream(
                             msg,
                             outcome=step.outcome or "transport_error",
                         ))
-                    yield _sse_error_for_ingress(
+                    yield _public_sse_error(
                         ingress_protocol,
                         err_type,
                         msg,
+                        outcome=step.outcome,
                         code=step.error_code or (
                             protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
                             if step.outcome == "request_invalid" and _is_context_length_exceeded_error(msg)
@@ -6410,7 +6536,7 @@ async def _consume_stream(
                         msg,
                         outcome="blacklist_hit",
                     ))
-                    yield _sse_error_for_ingress(ingress_protocol, errors.ErrType.API, msg)
+                    yield _public_sse_error(ingress_protocol, errors.ErrType.API, msg)
                     return
 
                 # Error frames also let the client stop immediately. Preserve
@@ -6446,7 +6572,7 @@ async def _consume_stream(
                     msg,
                     outcome="stream_truncated",
                 ))
-                yield _sse_error_for_ingress(ingress_protocol, errors.ErrType.API, msg)
+                yield _public_sse_error(ingress_protocol, errors.ErrType.API, msg, outcome="stream_truncated")
                 return
 
             # 上游已正常收尾 → 先让 translator 生成终态帧/完成内部副作用，

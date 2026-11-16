@@ -32,6 +32,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from .. import network
+from ..antigravity import client_profile, catalog as ag_catalog
 
 
 CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
@@ -54,15 +55,10 @@ API_ENDPOINT = "https://cloudcode-pa.googleapis.com"
 DAILY_API_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com"
 API_VERSION = "v1internal"
 
-# Cloud Code rejects newer models below 2.9.0; hub UA floor is 2.9.1.
-# Impersonate the official hub family UA and platform.
-DEFAULT_HUB_VERSION = "2.22.0"
-DEFAULT_HUB_PLATFORM = "linux/amd64"
-DEFAULT_BUILD_CL = "995734886"
-DEFAULT_USER_AGENT = (
-    f"antigravity/hub/{DEFAULT_HUB_VERSION} "
-    f"(aidev_client; os_type=linux; arch=amd64; cl={DEFAULT_BUILD_CL})"
-)
+DEFAULT_HUB_VERSION = client_profile.HUB_VERSION
+DEFAULT_HUB_PLATFORM = client_profile.HUB_PLATFORM
+DEFAULT_BUILD_CL = client_profile.BUILD_CL
+DEFAULT_USER_AGENT = client_profile.USER_AGENT
 DEFAULT_TLS_PROFILE = "antigravity-ls-2.22.0"
 OAUTH_USER_AGENT = "Go-http-client/1.1"
 NODE_API_CLIENT_UA = "google-api-nodejs-client/10.3.0"
@@ -223,6 +219,8 @@ def model_at_generation_endpoint(account: dict, model: str) -> bool:
     catalog = account.get("account_model_catalog") or {}
     records = catalog.get("models") if isinstance(catalog, dict) else None
     record = next((r for r in records if isinstance(r, dict) and r.get("id") == model), None) if isinstance(records, list) else None
+    if ag_catalog.disabled(model, record or {}):
+        return False
     if not record or "antigravitySources" not in record:
         return True
     base = effective_request_base_url(account)
@@ -230,8 +228,42 @@ def model_at_generation_endpoint(account: dict, model: str) -> bool:
         return False
     sources = record.get("antigravitySources")
     return isinstance(sources, list) and any(
-        isinstance(source, dict) and source.get("baseUrl") == base for source in sources
+        isinstance(source, dict) and source.get("baseUrl") == base
+        and source.get("disabled") is not True for source in sources
     )
+
+
+def generation_model_metadata(account: dict, model: str) -> dict:
+    if not model_at_generation_endpoint(account, model):
+        return {}
+    catalog = account.get("account_model_catalog") or {}
+    if not isinstance(catalog, dict) or catalog.get("antigravityGenerationBaseUrl") != effective_request_base_url(account):
+        return {}
+    records = catalog.get("models")
+    for record in records if isinstance(records, list) else []:
+        if not isinstance(record, dict) or record.get("id") != model:
+            continue
+        sources = record.get("antigravitySources")
+        for source in sources if isinstance(sources, list) else []:
+            if not isinstance(source, dict) or source.get("baseUrl") != catalog["antigravityGenerationBaseUrl"]:
+                continue
+            result = {}
+            enum = ag_catalog.model_enum(source.get("modelEnum"))
+            if enum:
+                result["modelEnum"] = enum
+            level = ag_catalog.thinking_level(source.get("thinkingLevel"))
+            if level is not None:
+                result["thinkingLevel"] = level
+            for field in ("maxOutputTokens", "minThinkingBudget"):
+                value = source.get(field)
+                if type(value) is int and value > 0:
+                    result[field] = value
+            return result
+    return {}
+
+
+def model_enum_at_generation_endpoint(account: dict, model: str) -> str:
+    return generation_model_metadata(account, model).get("modelEnum", "")
 
 
 def generate_content_url() -> str:

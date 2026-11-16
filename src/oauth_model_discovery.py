@@ -11,6 +11,7 @@ from typing import Any, Callable
 from urllib.parse import urlencode
 
 from . import config, network
+from .antigravity import catalog as ag_catalog
 from .channel.url_utils import resolve_api_endpoint
 from .oauth import antigravity as antigravity_provider
 from .oauth import cursor as cursor_provider
@@ -409,7 +410,7 @@ _ANTIGRAVITY_EXCLUDED_CATALOG_IDS = frozenset({
 })
 
 
-def _antigravity_is_text(record: dict, image_model_ids: set[str]) -> bool:
+def _antigravity_is_text(record: dict, image_model_ids: set[str], *, include_disabled: bool = False) -> bool:
     """Accept upstream account models unless metadata positively says non-text.
 
     Antigravity's real catalog usually has no generic ``capabilities`` or
@@ -422,6 +423,7 @@ def _antigravity_is_text(record: dict, image_model_ids: set[str]) -> bool:
         or model_id in image_model_ids
         or model_id in _ANTIGRAVITY_EXCLUDED_CATALOG_IDS
         or record.get("isInternal") is True
+        or (not include_disabled and ag_catalog.disabled(model_id, record))
     ):
         return False
 
@@ -489,17 +491,12 @@ def discover_antigravity(account: dict, *, timeout: float = _TIMEOUT, proxy_chan
                 record = dict(value)
                 record["id"] = model_id.strip()
                 records.append(record)
-            models = _unique([
-                item["id"] for item in records
-                if _antigravity_is_text(item, image_model_ids)
-            ])
-            if not models:
-                raise ValueError("Antigravity catalog has no verified text models")
-            wanted = set(models)
+            records = [item for item in records
+                       if _antigravity_is_text(item, image_model_ids, include_disabled=True)]
+            wanted = {item["id"] for item in records
+                      if not ag_catalog.disabled(item["id"], item)}
             for item in records:
                 model_id = item["id"]
-                if model_id not in wanted:
-                    continue
                 # Keep every source observation, but only the active endpoint
                 # supplies effective metadata for shared models. Replacing the
                 # whole record avoids borrowing fields absent from that endpoint;
@@ -507,6 +504,18 @@ def discover_antigravity(account: dict, *, timeout: float = _TIMEOUT, proxy_chan
                 sources = list(merged.get(model_id, {}).get("antigravitySources", []))
                 source = {"endpoint": endpoint, "baseUrl": base.rstrip("/"),
                           "observedAt": int(time.time() * 1000)}
+                if ag_catalog.disabled(model_id, item):
+                    source["disabled"] = True
+                enum = ag_catalog.model_enum(item.get("model"))
+                if enum:
+                    source["modelEnum"] = enum
+                level = ag_catalog.thinking_level(item.get("thinkingLevel"))
+                if level is not None:
+                    source["thinkingLevel"] = level
+                for field in ("maxOutputTokens", "minThinkingBudget"):
+                    value = item.get(field)
+                    if type(value) is int and value > 0:
+                        source[field] = value
                 quota = normalize_quota_info(item.get("quotaInfo"))
                 if quota:
                     source["quotaInfo"] = quota
@@ -518,6 +527,12 @@ def discover_antigravity(account: dict, *, timeout: float = _TIMEOUT, proxy_chan
                         "reasoning": ("supportsThinking",), "supportsThinking": ("supportsThinking",), "supportsImages": ("supportsImages",),
                         "inputModalities": ("inputModalities",), "outputModalities": ("outputModalities",),
                     })
+                    if source.get("disabled"):
+                        merged[model_id]["disabled"] = True
+                    if enum:
+                        merged[model_id]["modelEnum"] = enum
+                    if level is not None:
+                        merged[model_id]["antigravityThinkingLevel"] = level
                 merged[model_id]["antigravitySources"] = sources
             if base == active_base:
                 active_models = wanted
@@ -525,11 +540,15 @@ def discover_antigravity(account: dict, *, timeout: float = _TIMEOUT, proxy_chan
             last_error = exc
             if base == active_base:
                 active_error = exc
-    if merged and active_models is not None:
+    if active_models is not None:
         for model_id, record in merged.items():
-            record["antigravityAvailability"] = "generation" if model_id in active_models else "discovery_only"
+            record["antigravityAvailability"] = (
+                "generation" if model_id in active_models else
+                "disabled" if record.get("disabled") is True else "discovery_only"
+            )
         catalog = _catalog(list(merged.values()))
         catalog["antigravityGenerationBaseUrl"] = active_base
+        catalog["antigravityCatalogComplete"] = True
         return DiscoveryResult([model for model in merged if model in active_models], catalog, "upstream:antigravity")
     if active_error is not None:
         raise active_error

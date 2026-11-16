@@ -541,18 +541,21 @@ def test_function_call_roundtrip_and_channel_envelope(m):
     same_key_a = asyncio.run(ch.build_upstream_request({
         "model": "gemini-3.7-flash-high",
         "prompt_cache_key": "conv-1",
+        "_api_key_name": "session-test-tenant",
         "input": [{"type": "message", "role": "user", "content": "first opening"}],
         "stream": False,
     }, "gemini-3.7-flash-high", ingress_protocol="responses"))
     same_key_b = asyncio.run(ch.build_upstream_request({
         "model": "gemini-3.7-flash-high",
         "prompt_cache_key": "conv-1",
+        "_api_key_name": "session-test-tenant",
         "input": [{"type": "message", "role": "user", "content": "different opening"}],
         "stream": False,
     }, "gemini-3.7-flash-high", ingress_protocol="responses"))
     other_key = asyncio.run(ch.build_upstream_request({
         "model": "gemini-3.7-flash-high",
         "prompt_cache_key": "conv-2",
+        "_api_key_name": "session-test-tenant",
         "input": [{"type": "message", "role": "user", "content": "first opening"}],
         "stream": False,
     }, "gemini-3.7-flash-high", ingress_protocol="responses"))

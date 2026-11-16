@@ -12,7 +12,9 @@ Neither model metadata, generic quota wording nor a long delay proves scope.
 
 from __future__ import annotations
 
+import copy
 import json
+from dataclasses import dataclass
 import math
 import re
 from typing import Any
@@ -39,51 +41,156 @@ _UNIT_SECONDS = {
 }
 
 
-def parse_antigravity_429(raw: Any) -> dict[str, Any]:
-    """Separate exhaustion from proven account scope; do not retain metadata."""
+def _identifier(value: Any, *, domain: bool = False) -> str:
+    # Diagnostics never copy messages, URLs or opaque metadata.
+    pattern = r"[a-zA-Z0-9.-]{1,128}" if domain else r"[A-Z][A-Z0-9_]{0,127}"
+    return value if isinstance(value, str) and re.fullmatch(pattern, value) else ""
+
+
+def parse_antigravity_error(raw: Any, *, http_status: int | None = None) -> dict[str, Any]:
+    """Classify only structured evidence; permission denial alone has no pool scope.
+
+    VALIDATION_REQUIRED is an account challenge, not a request-wide policy ban.
+    INVALID_ARGUMENT/OUT_OF_RANGE are protocol request errors. No policy-ban
+    reason is inferred from prose, model names, identity text or RetryInfo.
+    """
     payload = _as_object(raw)
     error = payload.get("error") if isinstance(payload.get("error"), dict) else payload
-    if not isinstance(error, dict):
-        error = {}
-    details = error.get("details")
-    reason = ""
-    retry_after: float | None = None
-    account_quota = False
-    if isinstance(details, list):
-        for item in details:
-            if not isinstance(item, dict):
-                continue
-            typ = str(item.get("@type") or "")
-            if typ == RETRY_INFO_TYPE and retry_after is None:
-                retry_after = parse_google_duration(item.get("retryDelay", item.get("retry_delay")))
-            elif typ == ERROR_INFO_TYPE:
-                candidate = str(item.get("reason") or "").strip()
-                if candidate:
-                    reason = candidate
-                    account_quota |= candidate.upper() == "INSUFFICIENT_G1_CREDITS_BALANCE"
-                if retry_after is None:
-                    meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-                    retry_after = parse_google_duration(
-                        meta.get("quotaResetDelay") or meta.get("quota_reset_delay")
-                    )
-    if not reason:
-        reason = str(error.get("status") or error.get("reason") or "").strip()
-    text = json.dumps(payload, ensure_ascii=False).lower() if payload else str(raw or "").lower()
-    quota = reason.upper() in QUOTA_REASONS or any(
-        marker in text for marker in (
-            "quota_exhausted",
-            "quota exhausted",
-            "insufficient_g1_credits_balance",
-            "insufficient g1 credits",
-        )
-    )
-    account_quota |= reason.upper() == "INSUFFICIENT_G1_CREDITS_BALANCE"
-    return {
-        "reason": reason,
-        "retry_after": retry_after,
-        "quota_exhausted": quota,
-        "account_quota_exhausted": account_quota,
+    status = _identifier(error.get("status"))
+    # Numeric Google error codes describe HTTP categories, not request scope.
+    code = error.get("code") if type(error.get("code")) is int else None
+    infos = []
+    retry_info = None
+    quota_delay = None
+    for item in error.get("details", []) if isinstance(error.get("details"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("@type") == RETRY_INFO_TYPE and retry_info is None:
+            retry_info = parse_google_duration(item.get("retryDelay", item.get("retry_delay")))
+        elif item.get("@type") == ERROR_INFO_TYPE:
+            infos.append((_identifier(item.get("reason")), _identifier(item.get("domain"), domain=True)))
+            meta = item.get("metadata")
+            if quota_delay is None and isinstance(meta, dict):
+                quota_delay = parse_google_duration(meta.get("quotaResetDelay") or meta.get("quota_reset_delay"))
+    reasons = {reason for reason, _ in infos}
+    if status == "VALIDATION_REQUIRED" or "VALIDATION_REQUIRED" in reasons:
+        kind = "validation_required"
+        selected = "VALIDATION_REQUIRED"
+    elif status in {"INVALID_ARGUMENT", "OUT_OF_RANGE"}:
+        kind, selected = "request_rejected", status
+    elif status in {"PERMISSION_DENIED", "UNAUTHENTICATED"} or http_status in {401, 403} or code in {401, 403}:
+        kind, selected = "account_rejected", status
+    elif "INSUFFICIENT_G1_CREDITS_BALANCE" in reasons:
+        kind = "account_quota_exhausted"
+        selected = "INSUFFICIENT_G1_CREDITS_BALANCE"
+    elif "QUOTA_EXHAUSTED" in reasons:
+        kind, selected = "quota_exhausted", "QUOTA_EXHAUSTED"
+    elif "RATE_LIMIT_EXCEEDED" in reasons:
+        kind, selected = "rate_limit", "RATE_LIMIT_EXCEEDED"
+    else:
+        kind, selected = "unknown", next((r for r, _ in infos if r), "")
+    reason, domain = next(((r, d) for r, d in infos if r == selected), (selected, ""))
+    # In contradictory envelopes the protocol rejection wins even over a
+    # structured quota reason. Keep the original identities in diagnostics only.
+    diagnostic = {
+        "http_status": http_status, "status": status,
+        "error_info": [{"reason": r, "domain": d} for r, d in infos if r or d],
+        "retry_info_seconds": retry_info,
     }
+    return {
+        "reason": reason, "domain": domain, "status": status,
+        "classification": kind, "diagnostic": diagnostic,
+        "retry_after": retry_info if retry_info is not None else quota_delay,
+        "quota_exhausted": kind in {"quota_exhausted", "account_quota_exhausted"},
+        "account_quota_exhausted": kind == "account_quota_exhausted",
+        "stop_failover": kind == "request_rejected",
+    }
+
+
+@dataclass(frozen=True)
+class GoogleErrorObservation:
+    """In-process decoder observation; never reconstructed from client JSON."""
+
+    error: Any
+
+    @classmethod
+    def capture(cls, error: Any) -> GoogleErrorObservation:
+        return cls(copy.deepcopy(error))
+
+    def signal(self) -> dict[str, Any]:
+        return parse_antigravity_error({"error": self.error}, http_status=200)
+
+
+# Presentation only: these identities must never drive account/quota actions.
+LOCAL_ERROR_MESSAGES = {
+    "upstream_stream_incomplete": "Antigravity stream ended without a completion reason",
+    "stream_truncated": "Antigravity stream ended before a terminal event",
+    "timeout": "Antigravity upstream timed out; completion is unknown",
+    "transport_error": "Antigravity upstream connection failed; completion is unknown",
+    "invalid_upstream_json": "Antigravity returned invalid JSON",
+    "invalid_upstream_utf8": "Antigravity returned invalid UTF-8",
+    "invalid_upstream_stream": "Antigravity returned an invalid stream",
+    "transform_error": "Antigravity response could not be decoded",
+    "request_transform_error": "Parrot could not prepare the Antigravity request; check model availability and request compatibility",
+    "guard_error": "Parrot could not dispatch this Antigravity request; check model availability and thinking-tier compatibility",
+    "candidate_guard": "Parrot could not dispatch this Antigravity model; check model availability and thinking-tier compatibility",
+    "request_invalid": "Parrot could not process this Antigravity request",
+    "no_images": "Antigravity returned no images; generation was not repeated",
+    "image_result_error": "Antigravity image result could not be processed; generation was not repeated",
+}
+
+
+def present_error(signal: dict[str, Any], *, local_code: str | None = None) -> dict[str, Any]:
+    """Enrich safe diagnostics without changing retry/health classification."""
+    result = dict(signal)
+    diagnostic = {k: v for k, v in signal['diagnostic'].items() if v is not None and v != '' and v != []}
+    if local_code in LOCAL_ERROR_MESSAGES:
+        diagnostic['local_code'] = local_code
+    if 'error_info' in diagnostic:
+        diagnostic['error_info'] = [{k: v for k, v in item.items() if v} for item in diagnostic['error_info']]
+    code = diagnostic.get('generation_code') or diagnostic.get('local_code') or signal['reason'] or signal['status']
+    if not code:
+        status = diagnostic.get('http_status')
+        code = f'upstream_http_{status}' if status and status >= 400 else 'antigravity_upstream_error'
+    diagnostic['category'] = (
+        'generation_error' if diagnostic.get('generation_code') else
+        diagnostic.get('local_code') or
+        (signal['classification'] if signal['classification'] != 'unknown' else 'upstream_error')
+    )
+    result['public_code'] = code
+    result['diagnostic'] = diagnostic
+    return result
+
+
+def safe_error_message(signal: dict[str, Any]) -> str:
+    signal = present_error(signal)
+    code = signal['public_code']
+    messages = {
+        'request_rejected': 'Antigravity rejected the request parameters',
+        'validation_required': 'Antigravity account requires verification',
+        'account_rejected': 'Antigravity account authentication or permission failed',
+        'quota_exhausted': 'Antigravity model quota is exhausted',
+        'account_quota_exhausted': 'Antigravity account credits are exhausted',
+        'rate_limit': 'Antigravity rate limit was reached',
+    }
+    message = LOCAL_ERROR_MESSAGES.get(code) or messages.get(signal['classification'])
+    if not message:
+        message = ('Antigravity generation failed' if signal['diagnostic'].get('generation_code')
+                   else 'Antigravity upstream returned an error')
+    return message + ': ' + json.dumps({'code': code, **signal['diagnostic']}, ensure_ascii=False)
+
+
+class ImageResponseError(ValueError):
+    """Trusted adapter observation, not exception prose or client metadata."""
+
+    def __init__(self, signal):
+        self.signal = present_error(signal)
+        super().__init__(safe_error_message(self.signal))
+
+
+def parse_antigravity_429(raw: Any) -> dict[str, Any]:
+    """Compatibility entry point shared by text/image quota and retry policy."""
+    return parse_antigravity_error(raw, http_status=429)
 
 
 def parse_google_duration(value: Any) -> float | None:

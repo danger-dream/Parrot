@@ -14,7 +14,7 @@ from dataclasses import replace
 from typing import Optional
 
 from .. import cache_hints, config, json_bytes, media_config, oauth_manager
-from ..antigravity import DispatchGuardError
+from ..antigravity import DispatchGuardError, generation_policy, request_context
 from ..oauth import antigravity as ag_provider
 from ..oauth_ids import account_key as _account_key
 from ..openai.transform import anthropic_to_responses, chat_to_responses, guard, responses_to_chat
@@ -80,28 +80,6 @@ async def _guarded_stream_context(request, factory, validate):
 
 def _wants_stream(body: dict) -> bool:
     return bool(body.get("stream"))
-
-
-def _session_anchor(requested_body: dict, payload: dict) -> str:
-    """Same idea as OpenAI session_id / xAI x-grok-conv-id: pin the conversation.
-
-    Prefer the client/prompt cache key over hashing the first user text. The
-    first-user fallback changes whenever the opening turn changes, which breaks
-    Antigravity session affinity for Claude Code / Responses clients.
-    """
-    for source in (payload, requested_body):
-        if not isinstance(source, dict):
-            continue
-        key = str(source.get("prompt_cache_key") or "").strip()
-        if key:
-            return key
-        metadata = source.get("metadata")
-        if isinstance(metadata, dict):
-            for field in ("session_id", "sessionId"):
-                value = str(metadata.get(field) or "").strip()
-                if value:
-                    return value
-    return str(cache_hints.anthropic_session_id(requested_body) or "").strip()
 
 
 class AntigravityOAuthChannel(Channel):
@@ -186,8 +164,9 @@ class AntigravityOAuthChannel(Channel):
                 raise DispatchGuardError(400, "invalid_request_error", "Model is disabled for this source", param="model", scope="candidate")
 
     def resolve_request_model(self, requested_model: str, body: dict, ingress: str) -> Optional[str]:
-        from ..antigravity import argon
-        return argon.resolve(requested_model, self._selected_request_models(), body, ingress)
+        from ..antigravity import argon, fixed_thinking
+        policy = fixed_thinking if fixed_thinking.family(requested_model) else argon
+        return policy.resolve(requested_model, self._selected_request_models(), body, ingress)
 
     def list_client_models(self) -> list[str]:
         return list(self.models)
@@ -226,22 +205,41 @@ class AntigravityOAuthChannel(Channel):
                 f"openai-responses ingress; got {ingress_protocol!r}."
             )
 
-        from ..antigravity import argon
+        from ..antigravity import argon, fixed_thinking
         # body.model remains the trusted post-ingress-mapping request identity;
         # only the response/pricing identity is rewritten for a bare Argon tier.
         requested_models = tuple(str(requested_body.get(key) or "").strip()
                                  for key in ("model", "_client_visible_model"))
+        generation_metadata = None
         def validate():
             self.validate_dispatch(resolved_model, requested_models)
+            if generation_metadata is not None:
+                live = oauth_manager.get_account(self.account_key) or {}
+                if ag_provider.generation_model_metadata(live, resolved_model) != generation_metadata:
+                    raise DispatchGuardError(400, "invalid_request_error", "Antigravity model metadata changed before dispatch", param="model", scope="candidate")
         validate()
-        argon_config = None
-        if argon.is_argon(resolved_model):
+        generation_metadata = ag_provider.generation_model_metadata(
+            oauth_manager.get_account(self.account_key) or {}, resolved_model,
+        )
+        forced_max_output = (
+            None if antigravity_codec.is_image_model(resolved_model)
+            else generation_policy.max_output_tokens(generation_metadata)
+        )
+        thinking_config = None
+        policy = fixed_thinking if fixed_thinking.family(resolved_model) else argon if argon.is_argon(resolved_model) else None
+        if policy is not None:
             selected = self._selected_request_models()
-            expected = argon.resolve(str(requested_body.get("model") or resolved_model), selected, requested_body, ingress_protocol)
+            expected = policy.resolve(str(requested_body.get("model") or resolved_model), selected, requested_body, ingress_protocol)
             if expected != resolved_model:
-                raise guard.GuardError(400, "invalid_request_error", "Argon must resolve to an enabled exact model before dispatch", param="model", scope="candidate")
-            argon_config = argon.thinking_config(resolved_model, requested_body, ingress_protocol)
+                raise guard.GuardError(400, "invalid_request_error", "Antigravity thinking tiers must resolve to an enabled exact model before dispatch", param="model", scope="candidate")
+            thinking_config = policy.thinking_config(
+                resolved_model, requested_body, ingress_protocol,
+                **({"metadata": generation_metadata} if policy is fixed_thinking else {}),
+            )
         stream = _wants_stream(requested_body)
+        identity_context = request_context.context_of(requested_body)
+        principal = _request_api_key_name(requested_body)
+        previous_response_id = str(requested_body.get("previous_response_id") or "") if ingress_protocol == "responses" else ""
         # Gemini inlineData cannot consume ordinary remote URLs.  Resolve them at
         # this provider boundary so other bridges retain their existing policy.
         if ingress_protocol in ("chat", "responses"):
@@ -308,11 +306,13 @@ class AntigravityOAuthChannel(Channel):
             }
 
         payload["model"] = resolved_model
-        if argon_config is not None:
+        if forced_max_output is not None:
+            payload["max_output_tokens"] = forced_max_output
+        if thinking_config is not None:
             # Override bridge-derived defaults, never the selected wire model.
-            payload["reasoning"] = {"summary": "auto" if argon_config["includeThoughts"] else "none"}
-            if argon_config.get("thinkingLevel"):
-                payload["reasoning"]["effort"] = argon_config["thinkingLevel"]
+            payload["reasoning"] = {"summary": "auto" if thinking_config["includeThoughts"] else "none"}
+            if policy is argon and thinking_config.get("thinkingLevel"):
+                payload["reasoning"]["effort"] = thinking_config["thinkingLevel"]
         from ..antigravity import quota as ag_quota
         force_credits = bool(requested_body.get("_parrot_antigravity_use_credits"))
         use_credits = ag_quota.should_inject_credits(
@@ -323,26 +323,45 @@ class AntigravityOAuthChannel(Channel):
             self, payload, protocol="openai-responses",
         )
         gemini = antigravity_codec.responses_to_gemini(payload)
+        if policy is fixed_thinking:
+            generation = gemini.setdefault("generationConfig", {})
+            generation["thinkingConfig"] = thinking_config
+        validate()
+        access_token = await oauth_manager.ensure_channel_token(self)
+        validate()
+        identity = None
+        if not antigravity_codec.is_image_model(resolved_model):
+            identity = request_context.next_attempt(
+                identity_context, principal=principal, account=self.state_key,
+                base_url=self.base_url, model=resolved_model,
+                anchor=identity_context.anchor,
+                previous_response_id=previous_response_id,
+                model_enum=generation_metadata.get("modelEnum", ""),
+            )
+        if local_store_context is not None:
+            local_store_context["antigravity_identity"] = identity
         envelope = antigravity_codec.wrap_cloud_code(
             gemini,
             model=resolved_model,
             project_id=self.project_id,
             stream=stream,
-            session_id=_session_anchor(requested_body, payload),
+            session_id=identity_context.anchor,
             enabled_credit_types=(ag_provider.CREDIT_TYPE,) if use_credits else None,
+            request_identity=identity,
         )
+        if forced_max_output is not None:
+            envelope["request"].setdefault("generationConfig", {})["maxOutputTokens"] = forced_max_output
+            generation_policy.prepend_identity(envelope["request"])
         translator_ctx["antigravity_used_credits"] = use_credits
         translator_ctx["antigravity_stream"] = antigravity_codec.GeminiStreamToResponses(
             model=resolved_model,
             request_body=requested_body if ingress_protocol == "responses" else payload,
             namespace_tool_map=namespace_tool_map,
             local_store_context=local_store_context,
+            request_identity=identity,
         )
         translator_ctx["antigravity_stream_requested"] = stream
 
-        validate()
-        access_token = await oauth_manager.ensure_channel_token(self)
-        validate()
         headers = self._build_headers(access_token, stream=stream)
         url = (
             f"{self.base_url}/{ag_provider.API_VERSION}:streamGenerateContent?alt=sse"

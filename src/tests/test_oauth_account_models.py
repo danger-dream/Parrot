@@ -367,8 +367,14 @@ def test_antigravity_only_active_endpoint_success_can_update_models(
 
     account = {"access_token": "tok", "project_id": "p", "request_base_url": "https://daily.example"}
     if failed_index == 1:
-        with pytest.raises((RuntimeError, ValueError)):
-            oauth_model_discovery.discover_antigravity(account)
+        if failure_kind == "http_error":
+            with pytest.raises((RuntimeError, ValueError)):
+                oauth_model_discovery.discover_antigravity(account)
+        else:
+            result = oauth_model_discovery.discover_antigravity(account)
+            assert result.models == []
+            assert result.catalog["antigravityCatalogComplete"] is True
+            assert all(record["antigravityAvailability"] == "discovery_only" for record in result.catalog["models"])
         assert len(calls) == 2
         return
     result = oauth_model_discovery.discover_antigravity(account)
@@ -387,7 +393,7 @@ def test_antigravity_only_active_endpoint_success_can_update_models(
 
 
 @pytest.mark.parametrize("failure_kind", ["http_error", "no_text_models"])
-def test_antigravity_rejects_when_both_endpoints_are_unavailable(monkeypatch, failure_kind):
+def test_antigravity_distinguishes_empty_success_from_endpoint_failure(monkeypatch, failure_kind):
     calls = []
 
     def post(url, **kwargs):
@@ -405,9 +411,14 @@ def test_antigravity_rejects_when_both_endpoints_are_unavailable(monkeypatch, fa
     monkeypatch.setattr(oauth_model_discovery.antigravity_provider, "daily_api_base_url", lambda: "https://daily.example")
     monkeypatch.setattr(oauth_model_discovery.antigravity_provider, "image_models", lambda: ["gemini-image"])
 
-    expected = "HTTP 503" if failure_kind == "http_error" else "no verified text models"
-    with pytest.raises((RuntimeError, ValueError), match=expected):
-        oauth_model_discovery.discover_antigravity({"access_token": "tok", "project_id": "p", "request_base_url": "https://daily.example"})
+    account = {"access_token": "tok", "project_id": "p", "request_base_url": "https://daily.example"}
+    if failure_kind == "http_error":
+        with pytest.raises((RuntimeError, ValueError), match="HTTP 503"):
+            oauth_model_discovery.discover_antigravity(account)
+    else:
+        result = oauth_model_discovery.discover_antigravity(account)
+        assert result.models == []
+        assert result.catalog["antigravityCatalogComplete"] is True
     assert len(calls) == 2
 
 
@@ -419,7 +430,7 @@ def test_cursor_adapter_delegates_existing_catalog(monkeypatch):
 
 @pytest.mark.parametrize("provider", ["openai", "claude", "xai", "antigravity", "cursor"])
 @pytest.mark.parametrize("failure", ["empty", "http_error", "timeout"])
-def test_all_discovery_adapters_reject_empty_error_and_timeout(monkeypatch, provider, failure):
+def test_discovery_adapters_empty_error_and_timeout_policy(monkeypatch, provider, failure):
     if failure == "timeout":
         def response(*args, **kwargs): raise TimeoutError("mock timeout")
     elif failure == "http_error":
@@ -443,8 +454,13 @@ def test_all_discovery_adapters_reject_empty_error_and_timeout(monkeypatch, prov
         else:
             monkeypatch.setattr(oauth_model_discovery.cursor_provider, "fetch_model_catalog_sync", lambda token: {"models": []})
     account = {"provider": provider, "access_token": "tok", "project_id": "p", "base_url": "https://example.invalid"}
-    with pytest.raises(Exception):
-        oauth_model_discovery.ADAPTERS[provider](account)
+    if provider == "antigravity" and failure == "empty":
+        result = oauth_model_discovery.ADAPTERS[provider](account)
+        assert result.models == []
+        assert result.catalog["antigravityCatalogComplete"] is True
+    else:
+        with pytest.raises(Exception):
+            oauth_model_discovery.ADAPTERS[provider](account)
 
 
 @pytest.fixture

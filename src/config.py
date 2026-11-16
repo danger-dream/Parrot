@@ -5,6 +5,7 @@
 """
 
 from .notifications.catalog import default_events as _notification_default_events
+from .antigravity import client_profile as _antigravity_client_profile
 
 import copy
 import json
@@ -658,7 +659,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "userinfoEndpoint": "https://www.googleapis.com/oauth2/v2/userinfo?alt=json",
         "apiBaseUrl": "https://cloudcode-pa.googleapis.com",
         "dailyApiBaseUrl": "https://daily-cloudcode-pa.googleapis.com",
-        "userAgent": "antigravity/hub/2.22.0 (aidev_client; os_type=linux; arch=amd64; cl=995734886)",
+        "userAgent": _antigravity_client_profile.USER_AGENT,
         # Existing files with no saved profile retain chrome131 via the
         # raw-aware load migration; explicitly disabled settings are preserved.
         "tlsFingerprint": {
@@ -831,7 +832,7 @@ def _migrate_antigravity_client_defaults(cfg: dict, raw: dict | None = None) -> 
     ):
         fingerprint["profile"] = "chrome131"
         changed = True
-    if section.get("userAgent") == "antigravity/hub/2.9.1 darwin/arm64":
+    if section.get("userAgent") in _antigravity_client_profile.LEGACY_USER_AGENTS:
         section["userAgent"] = defaults["userAgent"]
         changed = True
     old_scope = defaults["scope"].removesuffix(" https://www.googleapis.com/auth/aicode")

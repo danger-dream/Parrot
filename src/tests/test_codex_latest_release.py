@@ -380,6 +380,7 @@ def test_each_provider_model_sync_ttl_only_openai_five_minutes(provider, ttl):
     acc[key] = {"schema": 2 if provider == "openai" else 1, "models": [{"id": "model"}]}
     if provider == "antigravity":
         acc[key]["antigravityGenerationBaseUrl"] = antigravity.effective_request_base_url(acc)
+        acc[key]["antigravityCatalogComplete"] = True
     assert not oauth_manager._model_sync_due(acc, now=now + timedelta(seconds=ttl - 1))
     assert oauth_manager._model_sync_due(acc, now=now + timedelta(seconds=ttl))
     acc["last_model_sync_error"] = "TimeoutError"

@@ -40,7 +40,10 @@ def test_pkce_challenge_and_version_identity(monkeypatch):
     assert "https://www.googleapis.com/auth/aicode" in query["scope"][0].split()
     assert query["redirect_uri"] == [ag.REDIRECT_URI]
     assert ag.DEFAULT_HUB_VERSION in ag.request_user_agent()
-    assert "cl=995734886" in ag.request_user_agent()
+    assert ag.DEFAULT_HUB_VERSION == "2.32.1"
+    assert "cl=1021296516" in ag.request_user_agent()
+    from src import config
+    assert config.DEFAULT_CONFIG["antigravityOAuth"]["userAgent"] == ag.DEFAULT_USER_AGENT
 
 
 def test_pkce_verifier_exchange_and_oauth_ua(monkeypatch):
@@ -276,13 +279,17 @@ def test_new_file_defaults_to_ls_but_existing_implicit_profile_stays_chrome(tmp_
     }
 
 
-def test_stock_identity_migration_preserves_accounts_and_operator_overrides():
+@pytest.mark.parametrize("old_ua", [
+    "antigravity/hub/2.9.1 darwin/arm64",
+    "antigravity/hub/2.22.0 (aidev_client; os_type=linux; arch=amd64; cl=995734886)",
+])
+def test_stock_identity_migration_preserves_accounts_and_operator_overrides(old_ua):
     import copy
     from src import config
     old_scope = ag.SCOPES.removesuffix(" https://www.googleapis.com/auth/aicode")
     account = {"access_token": "stored", "refresh_token": "stored-refresh", "scopes": old_scope}
     cfg = {"antigravityOAuth": {
-        "userAgent": "antigravity/hub/2.9.1 darwin/arm64", "scope": old_scope,
+        "userAgent": old_ua, "scope": old_scope,
         "redirectUri": ag.REDIRECT_URI,
         "tlsFingerprint": {"enabled": False, "profile": "chrome131"},
     }, "oauthAccounts": [copy.deepcopy(account)]}
@@ -292,8 +299,10 @@ def test_stock_identity_migration_preserves_accounts_and_operator_overrides():
     assert cfg["oauthAccounts"] == [account]
     assert cfg["antigravityOAuth"]["tlsFingerprint"] == {"enabled": False, "profile": "chrome131"}
     assert not config._migrate_antigravity_client_defaults(cfg)
-    cfg["antigravityOAuth"].update(userAgent="custom-client", scope="custom-scope")
-    assert not config._migrate_antigravity_client_defaults(cfg)
+    for custom in ("custom-client", "antigravity/hub/2.23.1 (aidev_client; os_type=linux; arch=amd64; cl=998881661)"):
+        cfg["antigravityOAuth"].update(userAgent=custom, scope="custom-scope")
+        assert not config._migrate_antigravity_client_defaults(cfg)
+        assert cfg["antigravityOAuth"]["userAgent"] == custom
 
 
 def test_generation_preserves_existing_credit_and_id_policy():

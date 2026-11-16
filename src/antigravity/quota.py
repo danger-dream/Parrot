@@ -12,7 +12,7 @@ import time
 from datetime import datetime
 from typing import Any
 
-from ..providers.antigravity_errors import parse_antigravity_429, parse_google_duration
+from ..providers.antigravity_errors import parse_antigravity_429, parse_antigravity_error, parse_google_duration
 
 CATALOG_PAUSE = "antigravity_catalog_quota"
 REQUEST_PAUSE = "antigravity_model_429"
@@ -175,9 +175,13 @@ def can_retry_429_with_credits(
 def apply_request_429(
     channel_key: str, model: str, raw: Any, *, account_key: str,
     expected_state_key: str | None = None, retry_after: Any = None,
-    used_credits: bool = False,
+    used_credits: bool = False, http_status: int = 429,
 ) -> bool:
-    """Shared text/image rejection policy; caller owns pre-commit retry limits.
+    """Shared text/image 429 and validation-challenge policy.
+
+    ``http_status`` defaults to 429 for existing callers; challenges can supply
+    their actual 403. Unknown/challenge pauses are not quota markers and cannot
+    be cleared by enabling credits. Caller owns pre-commit retry limits.
 
     Returns True when the caller should immediately retry on the same account
     with ``enabledCreditTypes=["GOOGLE_ONE_AI"]`` instead of advancing to the
@@ -185,7 +189,9 @@ def apply_request_429(
     """
     from .. import channel_state, config, cooldown, oauth_manager
 
-    signal = parse_antigravity_429(raw)
+    signal = parse_antigravity_error(raw, http_status=http_status)
+    if signal["stop_failover"]:
+        return False  # Request errors must not penalize accounts or spend credits.
     with oauth_manager.account_generation_guard(expected_state_key) as current:
         if not current:
             return False
@@ -226,7 +232,13 @@ def apply_request_429(
             return False
         if isinstance(previous_until, int):
             until = max(until, previous_until)
-        message = json.dumps({"error": {"code": REQUEST_PAUSE}}, separators=(",", ":"))
+        code = REQUEST_PAUSE if signal["classification"] in {
+            "quota_exhausted", "rate_limit",
+        } else "antigravity_request_rejection"
+        message = json.dumps({"error": {
+            "code": code, "classification": signal["classification"],
+            "diagnostic": signal["diagnostic"],
+        }}, separators=(",", ":"))
         cooldown.record_error(channel_key, model, message, cooldown_until=until)
         return False
 

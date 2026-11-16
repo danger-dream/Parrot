@@ -19,6 +19,7 @@ from .. import image_artifacts, image_catalog, media_cache, media_config, networ
 from ..async_owned import await_owned
 from ..oauth import antigravity as ag_provider
 from ..providers.antigravity_codec import unwrap_cloud_code, wrap_cloud_code
+from ..providers.antigravity_errors import ImageResponseError, parse_antigravity_error, present_error
 
 _MAX_RESPONSE_BYTES = 110 * 1024 * 1024
 _SUPPORTED_ASPECTS = {
@@ -193,6 +194,8 @@ def _usage(meta: Any) -> dict[str, Any] | None:
 
 def normalize_response(payload: Any, *, model: str) -> dict[str, Any]:
     data = unwrap_cloud_code(payload)
+    if isinstance(data, dict) and isinstance(data.get("error"), dict):
+        raise ImageResponseError(parse_antigravity_error(data, http_status=200))
     candidates = data.get("candidates") if isinstance(data, dict) else None
     images: list[dict[str, str]] = []
     for candidate in candidates or []:
@@ -218,7 +221,7 @@ def normalize_response(payload: Any, *, model: str) -> dict[str, Any]:
                 raise ValueError("Antigravity returned invalid base64 image data") from exc
             images.append({"b64_json": encoded})
     if not images:
-        raise ValueError("Antigravity completed without a decodable image")
+        raise ImageResponseError(present_error(parse_antigravity_error({}, http_status=200), local_code="no_images"))
     result: dict[str, Any] = {
         "created": int(time.time()),
         "model": model,
@@ -444,8 +447,11 @@ async def request(
     try:
         payload = json.loads(raw)
         normalized = normalize_response(payload, model=source.upstream)
+    except ImageResponseError:
+        raise
     except (json.JSONDecodeError, ValueError) as exc:
-        raise ValueError(str(exc)) from exc
+        code = "invalid_upstream_json" if isinstance(exc, json.JSONDecodeError) else "image_result_error"
+        raise ImageResponseError(present_error(parse_antigravity_error({}, http_status=status), local_code=code)) from exc
     response_headers.pop("content-length", None)
     response_headers["content-type"] = "application/json"
     return httpx.Response(

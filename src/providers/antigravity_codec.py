@@ -24,6 +24,7 @@ import uuid
 from typing import Any, Iterator
 
 from ..oauth import antigravity as ag_provider
+from ..antigravity.request_context import RequestIdentity
 from . import antigravity_schema
 
 
@@ -297,8 +298,10 @@ def _tool_output_parts(output: Any) -> tuple[dict, list[dict]]:
 
 
 def _thinking_config(payload: dict) -> dict[str, Any] | None:
-    from ..antigravity import argon
+    from ..antigravity import argon, fixed_thinking
     model = str(payload.get("model") or "")
+    if fixed_thinking.family(model):
+        return fixed_thinking.thinking_config(model, payload)
     if argon.is_argon(model):
         return argon.thinking_config(model, payload)
     reasoning = payload.get("reasoning")
@@ -315,8 +318,10 @@ def _thinking_config(payload: dict) -> dict[str, Any] | None:
         "low": "low",
         "medium": "medium",
         "high": "high",
-        "xhigh": "high",
     }
+    if effort == "xhigh":
+        from ..openai.transform.guard import GuardError
+        raise GuardError(400, "invalid_request_error", "This Antigravity model has no verified xhigh thinking mapping", param="reasoning", scope="candidate")
     level = mapping.get(effort)
     if not level:
         return None
@@ -702,6 +707,7 @@ def wrap_cloud_code(
     stream: bool = False,
     session_id: str | None = None,
     enabled_credit_types: list[str] | tuple[str, ...] | None = None,
+    request_identity: RequestIdentity | None = None,
 ) -> dict[str, Any]:
     """Wrap a Gemini generateContent body in the Cloud Code envelope."""
     request = dict(gemini or {})
@@ -738,8 +744,9 @@ def wrap_cloud_code(
             if gen.get("maxOutputTokens") is None:
                 gen["maxOutputTokens"] = 64000
     else:
+        from ..antigravity import fixed_thinking
         gen = request.get("generationConfig")
-        if isinstance(gen, dict):
+        if isinstance(gen, dict) and not fixed_thinking.family(model):
             gen.pop("maxOutputTokens", None)
             if not gen:
                 request.pop("generationConfig", None)
@@ -758,6 +765,12 @@ def wrap_cloud_code(
         ),
         "request": request,
     }
+    if request_identity is not None and not image:
+        envelope["requestId"] = request_identity.request_id
+        request["sessionId"] = format_session_id(request_identity.cascade)
+        labels = request_identity.labels()
+        if labels:
+            request["labels"] = labels
     if enabled_credit_types:
         cleaned_types = [str(t).strip() for t in enabled_credit_types if str(t).strip()]
         if cleaned_types:
@@ -1027,7 +1040,9 @@ class GeminiStreamToResponses:
     """Convert Gemini / Cloud Code candidates SSE into Responses SSE."""
 
     def __init__(self, *, model: str, request_body: dict | None = None, stream_mode: str = "auto",
-                 namespace_tool_map: Any = None, local_store_context: dict | None = None):
+                 namespace_tool_map: Any = None, local_store_context: dict | None = None,
+                 request_identity: RequestIdentity | None = None):
+        self.request_identity = request_identity
         self.namespace_tool_map = namespace_tool_map
         self.local_store_context = local_store_context
         # auto is envelope-based, never content-based: public Gemini is delta;
@@ -1060,6 +1075,9 @@ class GeminiStreamToResponses:
         self.finish_message: str | None = None
         self.prompt_feedback: dict | None = None
         self.upstream_error: Any = None
+        # Trusted, per-attempt original error, separate from Responses/SSE text.
+        self.google_error = None
+        self.local_error_code = None
         # Per-attempt observation read by the failover runtime.
         self.request_failure: tuple[str, str] | None = None
         self.item_status = "completed"
@@ -1102,6 +1120,7 @@ class GeminiStreamToResponses:
         })
 
     def _wire_error(self, code: str, message: str) -> bytes:
+        self.local_error_code = code
         error = {"code": code, "message": message, "raw": self.buffer}
         if self.wire_format == "json":
             self.finished = True
@@ -1124,6 +1143,11 @@ class GeminiStreamToResponses:
                 return b""  # A JSON response may also span arbitrary network chunks.
             self.finished = True
             self.buffer = ""
+            data = unwrap_cloud_code(payload)
+            error = data.get("error", payload.get("error")) if isinstance(payload, dict) else None
+            if error is not None:
+                from .antigravity_errors import GoogleErrorObservation
+                self.google_error = GoogleErrorObservation.capture(error)
             response = gemini_to_responses(payload, model=self.model, namespace_tool_map=self.namespace_tool_map)
             self.request_failure = request_failure_info(response)
             self._save_local_response(response)
@@ -1204,6 +1228,8 @@ class GeminiStreamToResponses:
             self.usage_meta.update(meta)
             self.usage = _usage_from_gemini(self.usage_meta)
         if data.get("error") is not None:
+            from .antigravity_errors import GoogleErrorObservation
+            self.google_error = GoogleErrorObservation.capture(data["error"])
             self.upstream_error = data["error"]
         feedback = data.get("promptFeedback", data.get("prompt_feedback"))
         if isinstance(feedback, dict):
@@ -1593,6 +1619,13 @@ class GeminiStreamToResponses:
         })
 
     def _save_local_response(self, response: dict) -> None:
+        from .antigravity_errors import LOCAL_ERROR_MESSAGES
+        error = response.get("error")
+        if self.google_error is None and isinstance(error, dict) and error.get("code") in LOCAL_ERROR_MESSAGES:
+            self.local_error_code = error["code"]
+        if self.request_identity is not None:
+            from ..antigravity.request_context import complete_response
+            complete_response(self.request_identity, response)
         ctx = self.local_store_context
         if ctx is None:
             return
@@ -1613,6 +1646,10 @@ class GeminiStreamToResponses:
             # Verify the record rather than advertising a phantom anchor.
             store.lookup(response["id"], api_key_name=ctx["api_key_name"])
             response["store"] = True
+            identity = ctx.get("antigravity_identity")
+            if isinstance(identity, RequestIdentity):
+                from ..antigravity.request_context import remember_response
+                remember_response(response["id"], identity)
         except Exception:
             # A useful generation is not discarded due to persistence trouble,
             # but never advertise a resumable response that was not stored.

@@ -531,6 +531,8 @@ async def test_send_antigravity_envelope_and_normalized_response(setup,monkeypat
     assert wire['model']=='gemini-3.1-flash-image' and wire['requestType']=='image_gen'
     assert wire['request']['generationConfig']['responseModalities']==['IMAGE']
     assert wire['request']['generationConfig']['imageConfig']=={'aspectRatio':'3:2','imageSize':'1K'}
+    assert 'maxOutputTokens' not in wire['request']['generationConfig']
+    assert 'systemInstruction' not in wire['request']
     assert 'private-test-token' not in seen[0].content.decode()
 
 
@@ -544,6 +546,8 @@ def test_antigravity_2k_and_edit_envelopes(setup):
     request=ag_images.build_request(edited,prompt='edit',n=1,action='edit')
     parts=request['contents'][0]['parts']
     assert parts[0]=={'text':'edit'} and parts[1]=={'text':'Reference image 1:'}
+    assert 'maxOutputTokens' not in request['generationConfig']
+    assert 'systemInstruction' not in request
     assert parts[2]['inlineData']['mimeType']=='image/png'
     assert base64.b64decode(parts[2]['inlineData']['data'])==png()
     assert parts[3]['text'].startswith('Edit mask for reference image 1:')
@@ -613,7 +617,9 @@ async def test_antigravity_upstream_error_redacts_project_identity(setup,monkeyp
     message=response.json()['error']['message']
     assert response.status_code==403
     assert 'project-secret-42' not in message and 'ag@example.test' not in message
-    assert '[private]' in message
+    assert 'account authentication or permission failed' in message
+    assert response.json()['error']['code'] == 'upstream_http_403'
+    assert 'denied' not in json.dumps(response.json())
 
 
 @pytest.mark.asyncio
