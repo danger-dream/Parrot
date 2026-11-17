@@ -64,6 +64,7 @@ def _error_chunk(response: Response) -> bytes:
         str(error.get("type") or errors.ErrTypeOpenAI.SERVER),
         str(error.get("message") or "upstream request failed"),
         code=error.get("code"),
+        details=error.get("details") if isinstance(error.get("details"), dict) else None,
     )
 
 

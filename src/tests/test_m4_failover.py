@@ -1396,6 +1396,88 @@ async def test_http_started_stream_error_or_truncation_does_not_rebind(m, stream
     assert "error" in body_text
 
 
+class _DisconnectAfterChunks(httpx.AsyncByteStream):
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            await asyncio.sleep(0)
+            yield chunk
+        raise httpx.RemoteProtocolError(
+            "peer closed connection without sending complete message body (incomplete chunked read)"
+        )
+
+
+def sse_disconnect_after_visible_output():
+    chunks = [
+        b'data: {"type":"message_start","message":{"id":"msg_cut","role":"assistant","usage":{"input_tokens":10}}}\n\n',
+        b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+        b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}\n\n',
+    ]
+    return httpx.Response(200, stream=_DisconnectAfterChunks(chunks),
+                          headers={"content-type": "text/event-stream"})
+
+
+def _terminal_error_details(body_text: str, ingress: str) -> dict:
+    for block in body_text.split("\n\n"):
+        data = next((line[6:] for line in block.splitlines() if line.startswith("data: ")), None)
+        if not data or data == "[DONE]":
+            continue
+        obj = json.loads(data)
+        if ingress == "responses" and obj.get("type") == "error":
+            return obj["details"]
+        if ingress != "responses" and isinstance(obj.get("error"), dict):
+            return obj["error"]["details"]
+    raise AssertionError(f"no terminal error frame in {body_text!r}")
+
+
+@pytest.mark.parametrize("ingress", ["anthropic", "chat", "responses"])
+async def test_post_commit_disconnect_error_frame_carries_retryable_details(m, ingress):
+    _setup(m)
+    router = MockRouter()
+    router.register("https://cha", lambda r: sse_disconnect_after_visible_output())
+    _install_channels(m, [_make_channel(m, "chA", "https://cha")])
+
+    messages = [{"role": "user", "content": "hi"}]
+    body = {"model": "glm-5", "stream": True, "max_tokens": 100}
+    if ingress == "responses":
+        body["input"] = [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+    else:
+        body["messages"] = messages
+    resp, rid, sr, mc = await _call_proxy(m, router, body, ingress_protocol=ingress)
+    assert resp.status_code == 200
+    body_text = await _consume_streaming_to_string(resp)
+    await _close_background(resp, mc)
+
+    details = _terminal_error_details(body_text, ingress)
+    root = details["root_cause"]
+    assert root["classification"] == "transport_error"
+    assert root["status"] == 200
+    assert root["retryable"] is True
+    assert root["retry_scope"] == "request"
+    assert "incomplete chunked read" in root["message"]
+    assert [a["classification"] for a in details["attempts"]] == ["transport_error"]
+    assert m["log_db"].log_detail(rid)["retry_chain"][0]["outcome"] == "transport_error"
+
+
+async def test_post_commit_truncation_error_frame_carries_retryable_details(m):
+    _setup(m)
+    router = MockRouter()
+    router.register("https://cha", lambda r: sse_truncated_after_visible_output())
+    _install_channels(m, [_make_channel(m, "chA", "https://cha")])
+
+    body = {"model": "glm-5", "stream": True, "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]}
+    resp, rid, sr, mc = await _call_proxy(m, router, body)
+    body_text = await _consume_streaming_to_string(resp)
+    await _close_background(resp, mc)
+
+    root = _terminal_error_details(body_text, "anthropic")["root_cause"]
+    assert root["classification"] == "transport_error"
+    assert (root["retryable"], root["retry_scope"]) == (True, "request")
+
+
 async def test_responses_error_before_visible_chunk_switches(m, monkeypatch):
     _setup(m)
     monkeypatch.setattr(m["failover"], "_overload_retry_delay_seconds", lambda _ordinal: 0.0)

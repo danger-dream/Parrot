@@ -12,6 +12,7 @@ import pytest
 from src.tests.test_antigravity_oauth import _import_modules, _add_ag_account
 from src.tests.test_antigravity_compatibility import clean, _body, BASE, MODEL
 from src.tests import test_protocol_fake_upstreams as fake
+from src.tests.test_stream_error_details import terminal_details
 
 PATHS = {"responses": "/v1/responses", "chat": "/v1/chat/completions", "anthropic": "/v1/messages"}
 PROJECTS = ["proj-a", "proj-b", "proj-c"]
@@ -192,6 +193,11 @@ async def test_failure_after_visible_output_keeps_health(rig, ingress):
     assert len(state["projects"]) == 1 and health == []
     row, _chain = latest_log()
     assert row["status"] == "error" and row["http_status"] == 400
+    # Same contract as before commit: a request fault, but a fresh sample may succeed.
+    root = terminal_details(response.text)["root_cause"]
+    assert (root["classification"], root["code"], root["status"]) == (
+        "invalid_request", "gemini_malformed_function_call", 400)
+    assert (root["retryable"], root["retry_scope"]) == (True, "request")
 
 
 @pytest.mark.asyncio

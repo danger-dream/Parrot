@@ -970,6 +970,7 @@ def _anthropic_error_payload_from_response(response: Response, body: bytes) -> d
     message = "upstream error"
     err_type = "api_error"
     code: str | None = None
+    details: dict | None = None
     try:
         obj = json.loads(body.decode("utf-8")) if body else {}
     except Exception:
@@ -981,6 +982,7 @@ def _anthropic_error_payload_from_response(response: Response, body: bytes) -> d
             err_type = str(err.get("type") or err.get("error_type") or err_type)
             raw_code = err.get("code")
             code = str(raw_code) if raw_code is not None else None
+            details = err.get("details") if isinstance(err.get("details"), dict) else None
         elif obj.get("message"):
             message = str(obj.get("message"))
     if protocol_errors.is_context_length_code_or_message(code, message):
@@ -990,6 +992,8 @@ def _anthropic_error_payload_from_response(response: Response, body: bytes) -> d
     error = {"type": err_type, "message": message}
     if code is not None:
         error["code"] = code
+    if details is not None:
+        error["details"] = details
     return {"type": "error", "error": error}
 
 
@@ -1140,7 +1144,10 @@ def _responses_error_payload_from_response(response: Response, body: bytes) -> d
             "object": "response",
             "created_at": int(__import__("time").time()),
             "status": "failed",
-            "error": {"type": str(err.get("type") or "api_error"), "message": message},
+            "error": {
+                "type": str(err.get("type") or "api_error"), "message": message,
+                **({"details": err["details"]} if isinstance(err.get("details"), dict) else {}),
+            },
             "output": [],
         },
     }

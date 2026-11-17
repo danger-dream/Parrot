@@ -21,6 +21,7 @@ from src.oauth.workbuddy import auth
 from src.providers.workbuddy_codec import WorkBuddyStream
 from src.providers.workbuddy_errors import UNAPPROVED_CHANNEL_MESSAGE
 from src.tests import test_protocol_fake_upstreams as fake
+from src.tests.test_stream_error_details import terminal_details
 from src.tests.test_workbuddy_channel import ev, frames, request_body
 
 
@@ -165,6 +166,10 @@ async def test_sse_rejection_never_cools_or_fakes_success(pool, ingress, stream,
     if committed:
         assert "partial-content" in response.text
         assert '"error"' in response.text
+    if committed and ingress == "responses":
+        root = terminal_details(response.text)["root_cause"]
+        assert (root["classification"], str(root["code"]), root["status"]) == ("invalid_request", "11128", 400)
+        assert (root["retryable"], root["retry_scope"]) == (False, "none")
     assert len(p.requests) == 1 and source.closed.is_set()
     assert_rejection_logged_without_health_effects(p, before)
     p.response_factory = lambda req: httpx.Response(200, stream=fake.ChunkedByteStream(frames()),

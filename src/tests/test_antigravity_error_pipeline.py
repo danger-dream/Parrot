@@ -8,6 +8,7 @@ import pytest
 from fastapi.responses import JSONResponse
 
 from src.tests.test_antigravity_package_a import _patch_failover_runtime, FailoverChannel
+from src.tests.test_stream_error_details import terminal_details
 from src.providers.antigravity_errors import parse_antigravity_error
 from src.providers.antigravity_codec import GeminiStreamToResponses
 from src.protocols.runtime import AttemptResult, prepare_non_stream_response
@@ -264,6 +265,9 @@ async def test_local_stream_failure_diagnostic(monkeypatch, ingress, ending, cod
     assert code in output and 'rejected' not in output and SECRET not in output
     assert 'http_status' in output and '200' in output
     assert 'http_status\\": null' not in output
+    root = terminal_details(output)['root_cause']
+    assert root['code'] == code and SECRET not in root['message']
+    assert (root['retryable'], root['retry_scope']) == (True, 'request')
     if ending == 'thought_eof':
         assert result.stream_started
         decoder = ctx['antigravity_stream']

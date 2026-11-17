@@ -3915,6 +3915,52 @@ async def test_http_responses_oauth_ws_non_stream_close_before_terminal_is_error
 
 
 @pytest.mark.asyncio
+async def test_http_responses_sse_unexpected_ws_failure_ends_with_retryable_error_frame(monkeypatch, m):
+    cfg = _setup(m)
+    cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
+    ch = _make_oauth_channel_for_failover(m, name="stream-unexpected@example.com")
+
+    class BrokenWs(FakeOAuthHttpStreamWs):
+        async def recv(self):
+            if self._events:
+                return self._events.pop(0)
+            raise OSError("private socket failure detail")
+
+    async def fake_token(account_key):
+        return "tok"
+
+    fake_ws = BrokenWs([
+        {"type": "response.created", "response": {"id": "resp_unexpected"}},
+        {"type": "response.output_text.delta", "output_index": 0,
+         "content_index": 0, "delta": "partial"},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_ws
+
+    monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
+    monkeypatch.setattr(m["failover"], "_connect_oauth_responses_ws", fake_connect)
+    response, rid = await _call_failover_responses(
+        m, ch, {"model": "test-model", "stream": True, "input": "hello"},
+    )
+    text = b"".join([chunk async for chunk in response.body_iterator]).decode()
+    assert response.status_code == 200
+    assert "partial" in text and "private socket failure detail" not in text
+    error_frame = next(
+        frame for frame in (json.loads(line[6:]) for line in text.splitlines() if line.startswith("data: "))
+        if frame.get("type") == "error"
+    )
+    assert error_frame["message"] == "upstream websocket stream error"
+    root = error_frame["details"]["root_cause"]
+    assert root["classification"] == "transport_error"
+    assert (root["retryable"], root["retry_scope"]) == (True, "request")
+    assert fake_ws.closed
+    detail = m["log_db"].log_detail(rid)
+    assert detail["log"]["status"] == "error"
+    assert "private socket failure detail" in detail["log"]["error_message"]
+
+
+@pytest.mark.asyncio
 async def test_http_responses_sse_close_diagnostic_is_private_and_request_bound(monkeypatch, m, caplog):
     cfg = _setup(m)
     cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
@@ -3941,6 +3987,13 @@ async def test_http_responses_sse_close_diagnostic_is_private_and_request_bound(
     assert response.status_code == 200
     assert "partial" in text and "upstream websocket closed" in text
     assert "ws-close-diagnostic" not in text
+    error_frame = next(
+        frame for frame in (json.loads(line[6:]) for line in text.splitlines() if line.startswith("data: "))
+        if frame.get("type") == "error"
+    )
+    root = error_frame["details"]["root_cause"]
+    assert (root["classification"], root["status"]) == ("transport_error", None)
+    assert (root["retryable"], root["retry_scope"]) == (True, "request")
     detail = m["log_db"].log_detail(rid)
     assert detail["log"]["status"] == "error"
     assert detail["log"]["error_message"] == "upstream websocket closed"

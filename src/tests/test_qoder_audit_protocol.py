@@ -13,6 +13,7 @@ from src.providers.qoder_codec import QoderStream, Splitter
 from src.tests.test_qoder_auth import stored
 from src.tests.test_qoder_channel import env, call, request_body, frame
 from src.tests import test_protocol_fake_upstreams as fake
+from src.tests.test_stream_error_details import terminal_details
 
 
 def delta(value):
@@ -290,6 +291,9 @@ async def test_committed_errors_never_replay_and_preserve_status(env, monkeypatc
     assert row['status'] != 'success'
     assert row['http_status'] == {'105': 401, '112': 429, '406': 400, '10605': 503}[code]
     assert not config.get()['oauthAccounts'][0].get('disabled_reason')
+    root = terminal_details(text)['root_cause']
+    assert root['status'] == row['http_status'] and code in str(root['code'])
+    assert root['retryable'] is (code != '406')
 
 
 @pytest.mark.parametrize('ingress', ['chat', 'responses', 'anthropic'])

@@ -77,16 +77,17 @@ def sse_error_for_ingress(
     message: str,
     *,
     code: str | None = None,
+    details: dict | None = None,
 ) -> bytes:
     if ingress == "anthropic":
         if protocol_errors.is_context_length_code_or_message(code, message):
             message = protocol_errors.context_length_error_message_for_claude_code(message)
             code = protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
-        return errors.sse_error_line(anth_err_type, message, code=code)
+        return errors.sse_error_line(anth_err_type, message, code=code, details=details)
     mapped = translate_error_type(anth_err_type, ingress)
     if ingress == "chat":
-        return errors.sse_error_line_chat(mapped, message, code=code)
-    return errors.sse_error_line_responses(mapped, message, code=code)
+        return errors.sse_error_line_chat(mapped, message, code=code, details=details)
+    return errors.sse_error_line_responses(mapped, message, code=code, details=details)
 
 
 def json_error_for_ingress(

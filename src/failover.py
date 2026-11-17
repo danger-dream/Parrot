@@ -832,8 +832,9 @@ def _sse_error_for_ingress(
     message: str,
     *,
     code: Optional[str] = None,
+    details: Optional[dict] = None,
 ) -> bytes:
-    return sse_error_for_ingress(ingress, anth_err_type, message, code=code)
+    return sse_error_for_ingress(ingress, anth_err_type, message, code=code, details=details)
 
 
 def _json_error_for_ingress(
@@ -1392,11 +1393,15 @@ def _structured_attempt_error(
         classification = "rate_limit_error"
     elif status is not None and status >= 500:
         classification = "upstream_server_error"
-    elif status is not None:
+    elif status is not None and not 200 <= status < 300:
         classification = "upstream_http_error"
     elif "timeout" in str(result.outcome or ""):
         classification = "timeout"
-    elif result.outcome in ("connect_error", "transport_error", "proxy_connect_error"):
+    elif result.outcome in (
+        "connect_error", "transport_error", "proxy_connect_error", "connection_lifecycle",
+        "closed_before_first_byte", "stream_truncated", "upstream_closed",
+    ):
+        # A 2xx status only says the response started; the body failure is the cause.
         classification = "transport_error"
     else:
         classification = str(result.outcome or "upstream_error")
@@ -1436,6 +1441,28 @@ def _structured_attempt_error(
         "retry_scope": retry_scope,
         "openai_oauth_html_403": result.openai_oauth_html_403,
     }
+
+
+def _committed_stream_failure_details(
+    channel: Optional[Channel],
+    outcome: str,
+    message: str,
+    *,
+    http_status: Optional[int] = None,
+    code: Optional[str] = None,
+    translator_ctx: Optional[dict] = None,
+    full_response_text: Optional[str] = None,
+) -> dict:
+    """Terminal details for a stream whose bytes already reached downstream.
+
+    Earlier failed candidates are omitted: they did not end this response, and
+    their higher-priority classifications must not replace the committed cause.
+    """
+    result = AttemptResult(
+        outcome=outcome, error_detail=message, http_status=http_status, error_code=code,
+        translator_ctx=translator_ctx, full_response_text=full_response_text,
+    )
+    return _structured_failure_details([_structured_attempt_error(result, 1, channel)])
 
 
 def _structured_failure_details(attempts: list[dict]) -> dict:
@@ -4933,6 +4960,10 @@ async def _consume_oauth_responses_ws_stream(
                             errors.ErrType.INVALID_REQUEST,
                             msg,
                             code=protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE,
+                            details=_committed_stream_failure_details(
+                                ch, "request_invalid", msg, http_status=400,
+                                code=protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE,
+                            ),
                         )
                     return
                 step = await read_next_responses_ws_step(
@@ -4961,6 +4992,9 @@ async def _consume_oauth_responses_ws_stream(
                     yield _sse_error_for_ingress(
                         "responses", errors.ErrType.TIMEOUT,
                         err.error_detail or step.outcome,
+                        details=_committed_stream_failure_details(
+                            ch, step.outcome, err.error_detail or step.outcome,
+                        ),
                     )
                     return
                 if step.outcome in ("upstream_closed", "connection_lifecycle"):
@@ -4970,12 +5004,22 @@ async def _consume_oauth_responses_ws_stream(
                         http_status=(502 if step.outcome == "upstream_closed" else None),
                     )
                     await await_ws_owned(finalize_error(err))
-                    yield _sse_error_for_ingress("responses", errors.ErrType.API, err.error_detail or "upstream websocket closed")
+                    yield _sse_error_for_ingress(
+                        "responses", errors.ErrType.API, err.error_detail or "upstream websocket closed",
+                        details=_committed_stream_failure_details(
+                            ch, step.outcome, err.error_detail or "upstream websocket closed",
+                        ),
+                    )
                     return
                 if step.outcome == "blacklist_hit":
                     err = AttemptResult(outcome="blacklist_hit", error_detail=step.error_detail, http_status=503)
                     await await_ws_owned(finalize_error(err))
-                    yield _sse_error_for_ingress("responses", errors.ErrType.API, err.error_detail or "blacklist")
+                    yield _sse_error_for_ingress(
+                        "responses", errors.ErrType.API, err.error_detail or "blacklist",
+                        details=_committed_stream_failure_details(
+                            ch, "blacklist_hit", err.error_detail or "blacklist",
+                        ),
+                    )
                     return
                 if step.outcome == "request_invalid":
                     err = AttemptResult(
@@ -4984,14 +5028,19 @@ async def _consume_oauth_responses_ws_stream(
                         http_status=400,
                     )
                     await await_ws_owned(finalize_error(err))
+                    invalid_code = (
+                        protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
+                        if _is_context_length_exceeded_error(err.error_detail)
+                        else None
+                    )
                     yield _sse_error_for_ingress(
                         "responses",
                         errors.ErrType.INVALID_REQUEST,
                         err.error_detail or "invalid request",
-                        code=(
-                            protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
-                            if _is_context_length_exceeded_error(err.error_detail)
-                            else None
+                        code=invalid_code,
+                        details=_committed_stream_failure_details(
+                            ch, "request_invalid", err.error_detail or "invalid request",
+                            http_status=400, code=invalid_code,
                         ),
                     )
                     return
@@ -5018,14 +5067,21 @@ async def _consume_oauth_responses_ws_stream(
             raise
         except Exception as exc:
             interrupted = True
-            if not state["finalized"]:
-                lifecycle = connection_lifecycle_outcome(exc)
-                await await_ws_owned(finalize_error(AttemptResult(
-                    outcome=lifecycle or "transport_error",
-                    error_detail=f"websocket stream error: {exc}"[:2000],
-                    http_status=None if lifecycle else 502,
-                )))
-            raise
+            if state["finalized"]:
+                raise
+            lifecycle = connection_lifecycle_outcome(exc)
+            outcome = lifecycle or "transport_error"
+            await await_ws_owned(finalize_error(AttemptResult(
+                outcome=outcome,
+                error_detail=f"websocket stream error: {exc}"[:2000],
+                http_status=None if lifecycle else 502,
+            )))
+            # The exception text stays in the private log.
+            public_message = "upstream websocket stream error"
+            yield _sse_error_for_ingress(
+                "responses", errors.ErrType.API, public_message,
+                details=_committed_stream_failure_details(ch, outcome, public_message),
+            )
         finally:
             if not interrupted and state["finalized"] and _has_oauth_ws_terminal(tracker):
                 _close_completed_oauth_ws(upstream_ws, terminal_release)
@@ -6193,14 +6249,29 @@ async def _consume_stream(
             return None
         return getattr((translator_ctx or {}).get("qoder_stream"), "error_mapping", None)
 
+    def _terminal_details(outcome, message, code=None):
+        # The persisted terminal facts, when present, are the classification of record.
+        terminal = state.get("terminal_error")
+        if terminal is not None:
+            outcome, message, status, terminal_code = terminal
+            code = terminal_code or code
+        else:
+            status = upstream_status
+        return _committed_stream_failure_details(
+            ch, outcome, message, http_status=status, code=code,
+            translator_ctx=translator_ctx, full_response_text=tracker.get_full_response(),
+        )
+
     def _public_sse_error(protocol, err_type, message, *, code=None, outcome=None):
+        outcome = outcome or ("timeout" if err_type == "timeout_error" else "request_invalid" if err_type == "invalid_request_error" else "transport_error")
+        details = _terminal_details(outcome, message, code)
         if getattr(ch, "provider", "") == "antigravity":
             _, signal = _antigravity_error_evidence(AttemptResult(
-                outcome=outcome or ("timeout" if err_type == "timeout_error" else "request_invalid" if err_type == "invalid_request_error" else "transport_error"), http_status=upstream_status, translator_ctx=translator_ctx,
+                outcome=outcome, http_status=upstream_status, translator_ctx=translator_ctx,
             ))
             message = safe_error_message(signal)
             code = signal["public_code"]
-        return _sse_error_for_ingress(protocol, err_type, message, code=code)
+        return _sse_error_for_ingress(protocol, err_type, message, code=code, details=details)
 
     def _workbuddy_responses_error(chunks):
         if getattr(ch, "provider", "") == "antigravity":
@@ -6208,7 +6279,8 @@ async def _consume_stream(
             # original response, and no stream that has committed is replayed.
             _, signal = _antigravity_error_evidence(AttemptResult(outcome="stream_upstream_error", http_status=upstream_status, translator_ctx=translator_ctx))
             public_error = {"type": "api_error", "code": signal["public_code"],
-                            "message": safe_error_message(signal)}
+                            "message": safe_error_message(signal),
+                            "details": _terminal_details("stream_upstream_error", safe_error_message(signal))}
             tail, blocks = upstream.split_sse_events(b"".join(chunks))
             output = []
             for block in blocks:
@@ -6255,7 +6327,12 @@ async def _consume_stream(
                 # Keep partial output/usage and the original sequence number.
                 # This provider-local trusted error bypasses only the generic
                 # business-code mapping, not other vendors' Responses mapping.
-                data = {**data, "response": {**data["response"], "error": dict(error)}}
+                data = {**data, "response": {**data["response"], "error": {
+                    **error, "details": _terminal_details(
+                        "request_invalid" if workbuddy_stream_error.get("http_status") == 400 else "account_restricted",
+                        error["message"], error["code"],
+                    ),
+                }}}
                 return [*prefix, b"event: response.failed\ndata: " +
                         json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode() + b"\n\n"]
             if kind in {"error", "response.incomplete", "response.completed"}:
@@ -6272,15 +6349,17 @@ async def _consume_stream(
         generation_failure = antigravity_request_failure(
             ch, http_status=upstream_status, translator_ctx=translator_ctx,
         )
+        terminal_code = None
         if rejection is not None:
-            outcome, message = "request_invalid", rejection[1]
+            outcome, message, terminal_code = "request_invalid", rejection[1], rejection[0]
         elif generation_failure is not None:
-            outcome, message = "request_invalid", generation_failure[1]
+            outcome, message, terminal_code = "request_invalid", generation_failure[1], generation_failure[0]
         mapped = _qoder_stream_mapping()
         terminal_status = upstream_status
         if mapped is not None:
             terminal_status = mapped["status"]
             message = mapped["error"]["message"]
+            terminal_code = mapped["error"].get("code")
             outcome = ("request_invalid" if terminal_status == 400 else
                        "quota_exhausted" if terminal_status == 429 else "stream_upstream_error")
         request_elapsed_ms = _elapsed_ms(start_monotonic)
@@ -6295,6 +6374,12 @@ async def _consume_stream(
         quota_result = _request_invalid_result_if_needed(quota_result, ch)
         if quota_result.outcome == "account_restricted":
             outcome, message, failure_policy = quota_result.outcome, quota_result.error_detail, "runtime"
+            terminal_code = quota_result.error_code
+        state["terminal_error"] = (
+            outcome, message,
+            400 if outcome == "request_invalid" else 403 if outcome == "account_restricted" else terminal_status,
+            terminal_code,
+        )
         if rejection is not None or quota_result.outcome == "account_restricted":
             workbuddy_stream_error.update(
                 http_status=400 if rejection is not None else 403,

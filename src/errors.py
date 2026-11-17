@@ -62,9 +62,10 @@ def json_error_response(
     )
 
 
-def sse_error_line(err_type: str, message: str, *, code: Optional[str] = None) -> bytes:
+def sse_error_line(err_type: str, message: str, *, code: Optional[str] = None,
+                   details: Optional[dict] = None) -> bytes:
     """生成一条符合 Anthropic SSE 规范的 error event（含结尾空行）。"""
-    payload = json.dumps(build_error_payload(err_type, message, code=code), ensure_ascii=False)
+    payload = json.dumps(build_error_payload(err_type, message, code=code, details=details), ensure_ascii=False)
     return f"event: error\ndata: {payload}\n\n".encode("utf-8")
 
 
@@ -111,29 +112,31 @@ def json_error_openai(status: int, err_type: str, message: str,
     )
 
 
-def sse_error_line_chat(err_type: str, message: str, *, code: Optional[str] = None) -> bytes:
+def sse_error_line_chat(err_type: str, message: str, *, code: Optional[str] = None,
+                        details: Optional[dict] = None) -> bytes:
     """Chat Completions 流内错误：用一条 `data: {error:...}` 帧收尾，之后 [DONE]。"""
     payload = json.dumps(
-        _openai_error_body(err_type, message, code=code), ensure_ascii=False,
+        _openai_error_body(err_type, message, code=code, details=details), ensure_ascii=False,
     )
     return f"data: {payload}\n\n".encode("utf-8")
 
 
 def sse_error_line_responses(err_type: str, message: str,
                              *, sequence_number: int = 0,
-                             code: Optional[str] = None) -> bytes:
+                             code: Optional[str] = None,
+                             details: Optional[dict] = None) -> bytes:
     """Responses 流内错误：用 `event: error\\ndata: {...}` 帧。"""
-    payload = json.dumps(
-        {
-            "type": "error",
-            "code": code,
-            "message": message,
-            "param": None,
-            "sequence_number": int(sequence_number),
-            "error_type": err_type,
-        },
-        ensure_ascii=False,
-    )
+    frame = {
+        "type": "error",
+        "code": code,
+        "message": message,
+        "param": None,
+        "sequence_number": int(sequence_number),
+        "error_type": err_type,
+    }
+    if details is not None:
+        frame["details"] = details
+    payload = json.dumps(frame, ensure_ascii=False)
     return f"event: error\ndata: {payload}\n\n".encode("utf-8")
 
 

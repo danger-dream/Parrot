@@ -14,6 +14,7 @@ from src.channel.workbuddy_oauth_channel import merge_tool_call_messages
 from src.providers.workbuddy_errors import ACCOUNT_RESTRICTED_MESSAGE
 from src.protocols.runtime import AttemptResult, request_invalid_result_if_needed
 from src.tests import test_protocol_fake_upstreams as fake
+from src.tests.test_stream_error_details import terminal_details
 from src.tests.test_workbuddy_channel import ev, frames, wire_json
 from src.tests.test_workbuddy_request_rejection import pool, health_state, latest, call, PATHS, MODEL
 
@@ -136,6 +137,10 @@ async def test_restricted_account_pauses_all_models_without_refresh_or_ladder(po
     if stream and transport == "sse_after_content":
         assert len(pool.requests) == 1 and "11140" in response.text and "do-not-expose" not in response.text
         assert row["http_status"] == 403
+        if ingress == "responses":
+            root = terminal_details(response.text)["root_cause"]
+            assert (root["classification"], root["status"]) == ("permission_error", 403)
+            assert "do-not-expose" not in json.dumps(root)
     else:
         assert len(pool.requests) == 2
     pool.requests.clear()
