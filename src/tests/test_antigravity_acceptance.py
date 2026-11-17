@@ -135,6 +135,7 @@ async def test_endpoint_change_at_async_preparation_boundaries_never_dispatches(
 @pytest.mark.parametrize("changed", ["selected", "catalog", "source", "bare", "tier"])
 @pytest.mark.asyncio
 async def test_token_wait_rechecks_selected_models_source_and_both_model_identities(m, monkeypatch, rig, changed):
+    m["config"].update(lambda cfg: cfg["modelRegistry"].update(enabled=True))
     api, ch, seen, tokens, failures = rig
     async def token(*a, **k):
         tokens.append(True)
@@ -160,6 +161,7 @@ async def test_token_wait_rechecks_selected_models_source_and_both_model_identit
 @pytest.mark.parametrize("alias", [False, True])
 @pytest.mark.asyncio
 async def test_bare_disable_after_scheduling_cannot_be_bypassed_by_private_fields(m, monkeypatch, rig, ingress, alias):
+    m["config"].update(lambda cfg: cfg["modelRegistry"].update(enabled=True))
     from src import scheduler
     api, ch, seen, tokens, failures = rig
     if alias:
