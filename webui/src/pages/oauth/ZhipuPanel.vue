@@ -185,6 +185,9 @@ function onProjectSaved(): void {
         <Btn size="sm" :disabled="!cards.week.length" :loading="acting === 'useWEEK'" @click="run('use', 'WEEK')"><RotateCcw /> 用 7 天卡</Btn>
       </template>
     </SubBlock>
+    <SubBlock v-else-if="pick(snap, 'credentialMode') === 'api_key'" title="官方重置卡">
+      <p class="faint small">API Key 导入无法查询重置卡，请使用 OAuth 登录。</p>
+    </SubBlock>
   </Teleport>
 
   <Teleport defer :to="`#${scope}-info`">
