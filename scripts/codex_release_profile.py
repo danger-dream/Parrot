@@ -14,9 +14,9 @@ import subprocess
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1] / "src/openai/codex_profiles"
-TAG = "rust-v0.159.0"
-COMMIT = "687a119f0fcaace47e1f1abcc77cec6c813fd6da"
-BASELINE = "rust-v0.157.0-alpha.10"
+TAG = "rust-v0.169.0"
+COMMIT = "d32063f96c2dff1dc96af839b3952abb6acfeda4"
+BASELINE = "rust-v0.159.0"
 SOURCE_FILES = (
     "codex-rs/Cargo.toml",
     "codex-rs/models-manager/models.json",
@@ -63,8 +63,21 @@ def generate(source: Path) -> dict[Path, bytes]:
         },
         "clientVersion": version,
         "identity": {"originator": "codex_cli_rs", "userAgent": f"codex_cli_rs/{version} (Unknown unknown; unknown) unknown"},
-        # Reviewed request struct still rejects these API-only fields; WS beta unchanged.
-        "protocol": {**baseline["protocol"], "ultraReasoningEffortFallback": True},
+        # Reviewed request struct moves standard base instructions into developer input,
+        # omits empty Lite tool prefixes, serializes routing fields first, carries
+        # prompt_cache_options.ttl and fragments large WS messages; WS beta unchanged.
+        "protocol": {
+            **baseline["protocol"],
+            "requestFieldPolicies": {
+                **baseline["protocol"]["requestFieldPolicies"],
+                "prompt_cache_options": "passthrough",
+            },
+            "ultraReasoningEffortFallback": True,
+            "instructionsInInput": True,
+            "omitEmptyLiteToolsPrefix": True,
+            "routingFieldsFirst": True,
+            "responsesWebsocketMaxFrameBytes": 1024 * 1024,
+        },
         "models": {},
     }
     artifacts: dict[Path, bytes] = {}

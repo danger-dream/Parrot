@@ -207,10 +207,13 @@ async def test_codex_bare_system_not_normalized(monkeypatch):
     ch=m['OpenAIOAuthChannel'](m['oauth_manager'].get_account('openai:o@openai.test:acct-123'))
     body={'model':'gpt-5.1','input':[{'role':'system','content':'ONLY USE Z'}, {'role':'user','content':'hi'}]}
     sent=json.loads((await ch.build_upstream_request(copy.deepcopy(body),'gpt-5.1',ingress_protocol='responses')).body)
-    assert all(x.get('role')!='system' for x in sent['input']) and 'ONLY USE Z' in sent['instructions']
+    # Codex 0.169+ carries instructions as the leading developer input item.
+    assert all(x.get('role')!='system' for x in sent['input']) and 'instructions' not in sent
+    assert sent['input'][0]['role']=='developer' and 'ONLY USE Z' in sent['input'][0]['content'][0]['text']
     body['input'][0]['type']='message'
     sent2=json.loads((await ch.build_upstream_request(body,'gpt-5.1',ingress_protocol='responses')).body)
-    assert all(x.get('role')!='system' for x in sent2['input']) and 'ONLY USE Z' in sent2['instructions']
+    assert all(x.get('role')!='system' for x in sent2['input']) and 'instructions' not in sent2
+    assert sent2['input'][0]['role']=='developer' and 'ONLY USE Z' in sent2['input'][0]['content'][0]['text']
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('target',['openai-chat','anthropic'])

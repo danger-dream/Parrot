@@ -583,6 +583,8 @@ class OpenAIOAuthChannel(Channel):
             supported_reasoning_efforts=model_policy.reasoning_efforts,
             multi_agent_reasoning_effort=model_policy.multi_agent_reasoning_effort,
             ultra_reasoning_effort_fallback=codex_protocol_profile(prov_cfg).ultra_reasoning_effort_fallback,
+            instructions_in_input=codex_protocol_profile(prov_cfg).instructions_in_input,
+            omit_empty_lite_tools_prefix=codex_protocol_profile(prov_cfg).omit_empty_lite_tools_prefix,
             lite_thread_context=lite_thread_context,
             transport=responses_transport,
             use_responses_lite=responses_lite,
@@ -691,6 +693,8 @@ class OpenAIOAuthChannel(Channel):
         upstream_url, headers = apply_codex_workspace_routing(
             upstream_url, headers, current_account,
         )
+        if codex_protocol_profile(prov_cfg).routing_fields_first:
+            payload = codex_oauth_transform.order_codex_request_fields(payload)
         return UpstreamRequest(
             url=upstream_url,
             headers=headers,

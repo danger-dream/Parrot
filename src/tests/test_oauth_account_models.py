@@ -52,11 +52,11 @@ def test_openai_codex_request_headers_url_and_parser(monkeypatch):
         "access_token": "tok", "workspace_id": "ws",
     })
     assert result.models == ["gpt-visible", "gpt-no-tiers", "gpt-hidden"]
-    assert seen["url"] == "https://chatgpt.com/backend-api/codex/models?client_version=0.159.0"
+    assert seen["url"] == "https://chatgpt.com/backend-api/codex/models?client_version=0.169.0"
     assert seen["headers"]["authorization"] == "Bearer tok"
     assert seen["headers"]["ChatGPT-Account-ID"] == "ws"
     assert seen["headers"]["originator"] == "codex_cli_rs"
-    assert seen["headers"]["user-agent"].startswith("codex_cli_rs/0.159.0 ")
+    assert seen["headers"]["user-agent"].startswith("codex_cli_rs/0.169.0 ")
     assert result.catalog["models"] == [{
         "id": "gpt-visible",
         "serviceTiers": [
@@ -118,7 +118,7 @@ def test_openai_gpt6_astra_catalog_shape_is_normalized_without_stringifying_leve
     )
 
     result = oauth_model_discovery.discover_openai({"access_token": "tok"})
-    assert result.client_version == "0.159.0"
+    assert result.client_version == "0.169.0"
     assert result.models == ["gpt-6-astra", "legacy-reasoning-shape"]
     astra, legacy = result.catalog["models"]
     assert astra == {
@@ -160,7 +160,7 @@ def test_codex_user_agent_and_model_cache_follow_current_runtime(monkeypatch):
     monkeypatch.setenv("TERM_PROGRAM", "TestTerm")
     monkeypatch.setenv("TERM_PROGRAM_VERSION", "2.0")
     ua = codex_constants.codex_cli_user_agent()
-    assert ua == "codex_cli_rs/0.159.0 (TestOS 9.1; test-arch) TestTerm/2.0"
+    assert ua == "codex_cli_rs/0.169.0 (TestOS 9.1; test-arch) TestTerm/2.0"
     assert oauth_manager.OPENAI_MODEL_SYNC_SUCCESS_TTL_SECONDS == 300
     assert oauth_manager.OAUTH_MODEL_SYNC_SUCCESS_TTL_SECONDS == 21600
 
@@ -805,7 +805,7 @@ def test_openai_catalog_is_allowlisted_and_raw_payload_is_not_retained(monkeypat
     }] }))
     result = oauth_model_discovery.discover_openai({"access_token": "tok"})
     assert result.models == ["gpt-rich"]
-    assert result.catalog == {"schema": 2, "clientVersion": "0.159.0", "models": [{
+    assert result.catalog == {"schema": 2, "clientVersion": "0.169.0", "models": [{
         "id": "gpt-rich", "name": "GPT Rich", "description": "Useful",
         "baseInstructions": "literal account instructions",
         "contextWindow": 200000, "contextWindowMaxMode": 1000000,

@@ -50,9 +50,11 @@ from .openai.codex_identity import (
 )
 from .openai.codex_identity_mapper import ProtocolIdentityMap
 from .openai.responses_ws_runtime import (
+    codex_ws_message,
     flatten_ws_response_headers,
     identity_expose_frame,
     identity_log_text,
+    order_codex_ws_frame,
     prepare_oauth_responses_ws_request_parts,
 )
 from .proxy.connector import SOCKS5Connector, SS2022Connector
@@ -4065,7 +4067,8 @@ async def _try_openai_oauth_responses_ws_channel(
                     )
                     assert projected_frame is not None
                     first_frame = json.dumps(
-                        projected_frame, ensure_ascii=False, separators=(",", ":")
+                        order_codex_ws_frame(projected_frame),
+                        ensure_ascii=False, separators=(",", ":"),
                     )
             result = await _consume_oauth_responses_ws(
                 upstream_ws,
@@ -4309,7 +4312,7 @@ async def _consume_oauth_responses_ws(
         on_dispatch()
         proxy_bytes.count(up=_frame_size(first_frame))
         await wait_ws_round_io(
-            upstream_ws.send(first_frame),
+            upstream_ws.send(codex_ws_message(first_frame)),
             timing=timing,
             round_timeouts=round_timeouts,
         )

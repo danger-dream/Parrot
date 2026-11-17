@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 from typing import Any
+import uuid
 
 from ..channel.compatibility import apply_forced_openai_fast_mode
 from ..channel.openai_oauth_channel import OpenAIOAuthChannel, _provider_cfg
@@ -168,6 +169,14 @@ def _codex_transform_policy_kwargs(channel: Any, model: str | None, body: dict) 
     configured_default = provider_config.get("defaultInstructions")
     if base_instructions is None and isinstance(configured_default, str):
         base_instructions = configured_default.strip() or None
+    meta = (body or {}).get("client_metadata")
+    meta = meta if isinstance(meta, dict) else {}
+    thread_context = (
+        str((body or {}).get("prompt_cache_key") or "").strip()
+        or str(meta.get("thread_id") or meta.get("session_id") or "").strip()
+    )
+    if not thread_context and not policy.use_responses_lite:
+        thread_context = str(uuid.uuid4())
     return {
         "base_instructions": base_instructions,
         "default_reasoning_effort": policy.default_reasoning_effort,
@@ -177,7 +186,9 @@ def _codex_transform_policy_kwargs(channel: Any, model: str | None, body: dict) 
         "supported_reasoning_efforts": policy.reasoning_efforts,
         "multi_agent_reasoning_effort": policy.multi_agent_reasoning_effort,
         "ultra_reasoning_effort_fallback": codex_protocol_profile(provider_config).ultra_reasoning_effort_fallback,
-        "lite_thread_context": str((body or {}).get("prompt_cache_key") or "").strip(),
+        "instructions_in_input": codex_protocol_profile(provider_config).instructions_in_input,
+        "omit_empty_lite_tools_prefix": codex_protocol_profile(provider_config).omit_empty_lite_tools_prefix,
+        "lite_thread_context": thread_context,
         "use_responses_lite": policy.use_responses_lite,
         "request_field_policies": dict(
             codex_protocol_profile(provider_config).request_field_policies
@@ -206,6 +217,40 @@ def _mark_codex_responses_lite_frame(
         client_metadata = {}
     client_metadata[CODEX_RESPONSES_LITE_WS_METADATA_KEY] = "true"
     frame_obj["client_metadata"] = client_metadata
+
+
+def order_codex_ws_frame(frame: dict, *, channel=None) -> dict:
+    if channel is not None and not isinstance(channel, OpenAIOAuthChannel):
+        return frame
+    if not codex_protocol_profile(_provider_cfg()).routing_fields_first:
+        return frame
+    return codex_oauth_transform.order_codex_request_fields(frame)
+
+
+def codex_ws_message(payload: str | bytes, *, channel=None) -> str | bytes | list[str]:
+    """Split a large text message into fragments of at most the profile frame size.
+
+    Fragments end on UTF-8 character boundaries because each one is sent as str.
+    """
+    if not isinstance(payload, str) or (
+        channel is not None and not isinstance(channel, OpenAIOAuthChannel)
+    ):
+        return payload
+    limit = codex_protocol_profile(_provider_cfg()).websocket_max_frame_bytes
+    if not limit or len(payload) <= limit // 4:
+        return payload
+    raw = payload.encode("utf-8")
+    if len(raw) <= limit:
+        return payload
+    fragments: list[str] = []
+    start = 0
+    while start < len(raw):
+        end = min(start + limit, len(raw))
+        while end < len(raw) and raw[end] & 0xC0 == 0x80:
+            end -= 1
+        fragments.append(raw[start:end].decode("utf-8"))
+        start = end
+    return fragments
 
 
 def build_oauth_responses_ws_frame(body: dict, resolved_model: str, *, channel=None) -> dict:
@@ -282,7 +327,9 @@ def prepare_oauth_responses_ws_request_parts(
         create_client_metadata=True,
     )
     assert projected is not None
-    frame = json.dumps(projected, ensure_ascii=False, separators=(",", ":"))
+    frame = json.dumps(
+        order_codex_ws_frame(projected), ensure_ascii=False, separators=(",", ":"),
+    )
     return ws_url, headers, frame, ProtocolIdentityMap.from_request(body, snapshot)
 
 

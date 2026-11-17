@@ -65,6 +65,10 @@ class CodexProtocolProfile:
     request_field_policies: Mapping[str, str]
     models: Mapping[str, CodexModelPolicy]
     ultra_reasoning_effort_fallback: bool = False
+    instructions_in_input: bool = False
+    omit_empty_lite_tools_prefix: bool = False
+    routing_fields_first: bool = False
+    websocket_max_frame_bytes: int | None = None
 
     def model_policy(self, model: str | None) -> CodexModelPolicy | None:
         return self.models.get(str(model or "").strip())
@@ -130,7 +134,7 @@ def _safe_request_field_policies(value: Any) -> Mapping[str, str]:
     allowed_fields = {
         "max_output_tokens", "max_completion_tokens", "max_tokens",
         "temperature", "top_p", "frequency_penalty", "presence_penalty",
-        "prompt_cache_retention",
+        "prompt_cache_retention", "prompt_cache_options",
     }
     allowed_policies = {"unsupported", "passthrough", "map:max_output_tokens"}
     policies: dict[str, str] = {}
@@ -230,6 +234,15 @@ def _optional_capability(record: Mapping[str, Any], key: str) -> bool | None:
     value = record.get(key)
     if value is not None and not isinstance(value, bool):
         raise CodexConfigurationError(f"Codex model policy {key} must be boolean")
+    return value
+
+
+def _optional_frame_limit(record: Mapping[str, Any], key: str) -> int | None:
+    value = record.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not 1024 <= value <= 64 * 1024 * 1024:
+        raise CodexConfigurationError(f"Codex profile protocol.{key} must be an integer byte limit")
     return value
 
 
@@ -381,6 +394,18 @@ def _load_profile(profile_id: str) -> CodexProtocolProfile:
         models=models,
         ultra_reasoning_effort_fallback=bool(
             _optional_capability(protocol, "ultraReasoningEffortFallback")
+        ),
+        instructions_in_input=bool(
+            _optional_capability(protocol, "instructionsInInput")
+        ),
+        omit_empty_lite_tools_prefix=bool(
+            _optional_capability(protocol, "omitEmptyLiteToolsPrefix")
+        ),
+        routing_fields_first=bool(
+            _optional_capability(protocol, "routingFieldsFirst")
+        ),
+        websocket_max_frame_bytes=_optional_frame_limit(
+            protocol, "responsesWebsocketMaxFrameBytes"
         ),
     )
 

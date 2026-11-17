@@ -615,7 +615,7 @@ def test_channel_responses_ingress(m):
     assert h["chatgpt-account-id"] == "acct-123"
     assert "openai-beta" not in h
     assert h["originator"] == "codex_cli_rs"
-    assert h["version"] == "0.159.0"
+    assert h["version"] == "0.169.0"
     assert h["accept"] == "text/event-stream"
     assert h["user-agent"] == m["CODEX_CLI_USER_AGENT"]
     assert h["authorization"].startswith("Bearer ")
@@ -855,7 +855,11 @@ def test_channel_responses_ingress_official_catalog_enables_responses_lite(m):
         assert h["x-openai-internal-codex-responses-lite"] == "true", model
         assert payload["model"] == model
         assert payload["parallel_tool_calls"] is False
-        assert payload["input"][0]["type"] == "additional_tools"
+        # Codex 0.169+ omits the empty tools prefix; base instructions lead.
+        assert payload["input"][0]["internal_chat_message_metadata_passthrough"] == {
+            "content_item_kinds": ["model.base_instructions"],
+        }
+        assert all(item.get("type") != "additional_tools" for item in payload["input"])
 
     # Explicit catalog matching must not turn unrelated models into Lite.
     non_lite = _apply_transform(m["transform"], {
@@ -874,7 +878,7 @@ def test_channel_responses_ingress_official_catalog_enables_responses_lite(m):
         "gpt-5.6-luna", ingress_protocol="responses",
     ))
     h = {k.lower(): v for k, v in req.headers.items()}
-    assert h["version"] == "0.159.0"
+    assert h["version"] == "0.169.0"
     assert h["user-agent"] == m["CODEX_CLI_USER_AGENT"]
     assert h["x-openai-internal-codex-responses-lite"] == "true"
     payload = json.loads(req.body)
@@ -886,14 +890,13 @@ def test_channel_responses_ingress_official_catalog_enables_responses_lite(m):
     assert payload["parallel_tool_calls"] is False
     assert payload["reasoning"]["context"] == "all_turns"
     assert "tools" not in payload
-    assert payload["input"][0]["id"].startswith("at_")
-    assert payload["input"][0]["type"] == "additional_tools"
-    assert payload["input"][0]["role"] == "developer"
-    assert payload["input"][0]["tools"] == []
     from src.openai.codex_constants import codex_protocol_profile
     base = codex_protocol_profile().model_policy("gpt-5.6-luna").base_instructions
-    assert payload["input"][1]["content"] == [{"type": "input_text", "text": base}]
-    assert payload["input"][2] == {"type": "message", "role": "user", "content": "hi"}
+    assert payload["input"][0]["id"].startswith("msg_")
+    assert payload["input"][0]["role"] == "developer"
+    assert payload["input"][0]["content"] == [{"type": "input_text", "text": base}]
+    assert payload["input"][1] == {"type": "message", "role": "user", "content": "hi"}
+    assert len(payload["input"]) == 2
     print("  [PASS] channel: official Responses Lite catalog + future GPT-5.6 prefix")
 
 
@@ -955,7 +958,7 @@ def test_channel_account_catalog_lite_true_false_and_missing_precedence(m):
         headers = {str(key).lower(): str(value) for key, value in req.headers.items()}
         payload = json.loads(req.body)
         assert ("x-openai-internal-codex-responses-lite" in headers) is is_lite
-        assert (payload["input"][0]["type"] == "additional_tools") is is_lite
+        assert (payload.get("reasoning", {}).get("context") == "all_turns") is is_lite
 
     with pytest.raises(Exception, match="No explicit Responses Lite policy"):
         asyncio.run(ch.build_upstream_request(
@@ -1031,12 +1034,11 @@ def test_channel_gpt6_replay_keeps_lite_prefix_first(m):
         body, "gpt-6-astra", ingress_protocol="responses",
     ))
     payload = json.loads(req.body)
-    assert payload["input"][0]["type"] == "additional_tools"
+    assert payload["input"][0]["type"] == "message"
     assert payload["input"][0]["role"] == "developer"
-    assert payload["input"][1]["role"] == "developer"
-    assert payload["input"][2]["type"] == "reasoning"
-    assert payload["input"][2]["encrypted_content"] == encrypted_content
-    assert payload["input"][3] == {
+    assert payload["input"][1]["type"] == "reasoning"
+    assert payload["input"][1]["encrypted_content"] == encrypted_content
+    assert payload["input"][2] == {
         "type": "message", "role": "user", "content": "continue",
     }
 
@@ -1333,14 +1335,17 @@ def test_channel_chat_keeps_dynamic_system_at_tail_for_cache(m, model):
     assert len({payload["prompt_cache_key"] for payload in payloads}) == 1
     assert len({request.headers["session-id"] for request in requests}) == 1
     if model == "gpt-6-astra":
-        prefix = payloads[0]["input"][:2]
-        assert [item["type"] for item in prefix] == ["additional_tools", "message"]
-        assert prefix[1]["content"] == [{"type": "input_text", "text": "stable root system\n\nstable second instruction"}]
-        assert all(payload["input"][:2] == prefix for payload in payloads)
-        histories = [payload["input"][2:] for payload in payloads]
+        prefix = payloads[0]["input"][:1]
+        assert [item["type"] for item in prefix] == ["message"]
+        assert prefix[0]["content"] == [{"type": "input_text", "text": "stable root system\n\nstable second instruction"}]
+        assert all(payload["input"][:1] == prefix for payload in payloads)
+        histories = [payload["input"][1:] for payload in payloads]
     else:
-        assert all(payload["instructions"] == "stable root system\n\nstable second instruction" for payload in payloads)
-        histories = [payload["input"] for payload in payloads]
+        prefix = payloads[0]["input"][:1]
+        assert prefix[0]["type"] == "message" and prefix[0]["role"] == "developer"
+        assert prefix[0]["content"] == [{"type": "input_text", "text": "stable root system\n\nstable second instruction"}]
+        assert all("instructions" not in payload and payload["input"][:1] == prefix for payload in payloads)
+        histories = [payload["input"][1:] for payload in payloads]
     assert [item["role"] for item in histories[0]] == ["user", "assistant", "developer", "user"]
     assert histories[0][2]["content"] == [{"type": "input_text", "text": "<total_tokens>15000000 tokens left</total_tokens>"}]
     for previous, current in zip(histories, histories[1:]):
@@ -1374,11 +1379,13 @@ def test_channel_anthropic_billing_header_keeps_cache_key_and_prefix(m, model):
     assert len({payload["prompt_cache_key"] for payload in payloads}) == 1
     assert len({request.headers["session-id"] for request in requests}) == 1
     if model == "gpt-6-astra":
-        prefix = payloads[0]["input"][:2]
-        assert prefix[1]["content"] == [{"type": "input_text", "text": "stable root system"}]
-        assert all(payload["input"][:2] == prefix for payload in payloads)
+        prefix = payloads[0]["input"][:1]
+        assert prefix[0]["content"] == [{"type": "input_text", "text": "stable root system"}]
+        assert all(payload["input"][:1] == prefix for payload in payloads)
     else:
-        assert all(payload["instructions"] == "stable root system" for payload in payloads)
+        prefix = payloads[0]["input"][:1]
+        assert prefix[0]["content"] == [{"type": "input_text", "text": "stable root system"}]
+        assert all("instructions" not in payload and payload["input"][:1] == prefix for payload in payloads)
 
 
 def test_channel_anthropic_ingress_keeps_history_system_at_tail_for_cache(m):
@@ -1401,8 +1408,10 @@ def test_channel_anthropic_ingress_keeps_history_system_at_tail_for_cache(m):
     req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="anthropic"))
     payload = json.loads(req.body)
 
-    assert payload["instructions"] == "stable root system"
-    roles = [item.get("role") for item in payload["input"] if item.get("type") == "message"]
+    assert "instructions" not in payload
+    assert payload["input"][0]["role"] == "developer"
+    assert payload["input"][0]["content"] == [{"type": "input_text", "text": "stable root system"}]
+    roles = [item.get("role") for item in payload["input"][1:] if item.get("type") == "message"]
     assert roles == ["user", "developer", "user"]
     assert any(
         item.get("role") == "developer" and item.get("content") == [{"type": "input_text", "text": "dynamic reminder should stay in tail"}]
@@ -1736,7 +1745,8 @@ def test_openai_oauth_short_config_overrides_codex_url_and_default_instructions(
     req = asyncio.run(ch.build_upstream_request({"model": "gpt-5.1", "input": "hi"}, "gpt-5.1", ingress_protocol="responses"))
     payload = json.loads(req.body)
     assert req.url == "https://example.test/backend-api/codex/responses"
-    assert payload["instructions"] == "Custom default instructions."
+    assert "instructions" not in payload
+    assert payload["input"][0]["content"] == [{"type": "input_text", "text": "Custom default instructions."}]
     assert req.headers.get("user-agent") == m["CODEX_CLI_USER_AGENT"]
     print("  [PASS] openaiOAuth short config overrides Codex URL/instructions")
 
@@ -1762,8 +1772,8 @@ def test_config_backfills_openai_oauth_from_legacy_provider(m):
         "mode": "per-oauth-account",
         "newIdentityGenerationVersion": 1,
     }
-    assert merged["openaiOAuth"]["codexCliVersion"] == "0.159.0"
-    assert merged["openaiOAuth"]["codexProtocolProfile"] == "rust-v0.159.0"
+    assert merged["openaiOAuth"]["codexCliVersion"] == "0.169.0"
+    assert merged["openaiOAuth"]["codexProtocolProfile"] == "rust-v0.169.0"
     assert merged["openaiOAuth"]["codexProfileAutoUpdate"] is True
     assert "defaultModels" not in merged["openaiOAuth"]
     assert "codexUpstreamUrl" not in merged["openaiOAuth"]

@@ -1784,7 +1784,9 @@ def test_map_ws_create_frame_applies_model_guard_and_codex_transform(m):
         },
     }, "gpt-6-astra", channel=oauth_catalog_false)
     assert non_lite_mapped["input"][0]["type"] == "message"
-    assert non_lite_mapped["instructions"] != ""
+    assert non_lite_mapped["input"][0]["role"] == "developer"
+    assert non_lite_mapped["input"][0]["content"][0]["text"] != ""
+    assert "instructions" not in non_lite_mapped
     assert "ws_request_header_x_openai_internal_codex_responses_lite" not in non_lite_mapped["client_metadata"]
 
     first_with_previous = m["responses_ws"]._map_ws_create_frame_for_upstream({

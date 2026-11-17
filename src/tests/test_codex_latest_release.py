@@ -20,9 +20,9 @@ from src.openai import codex_constants as constants, codex_identity
 from src.openai.responses_ws_runtime import build_oauth_responses_ws_frame
 from src.state_store import StateStore
 
-VERSION = "0.159.0"
+VERSION = "0.169.0"
 PROFILE = f"rust-v{VERSION}"
-OLD = {"codexCliVersion": "0.153.4", "codexProtocolProfile": "rust-v0.153.4"}
+OLD = {"codexCliVersion": "0.159.0", "codexProtocolProfile": "rust-v0.159.0"}
 ROOT = Path(__file__).parents[2]
 PROFILES = ROOT / "src/openai/codex_profiles"
 
@@ -70,7 +70,7 @@ def load(provider=None, accounts=None, *, legacy=False):
 
 @pytest.mark.parametrize("auto", [None, True, False])
 @pytest.mark.parametrize("legacy", [False, True])
-@pytest.mark.parametrize("old_version", ["0.153.4", "0.157.0-alpha.10"])
+@pytest.mark.parametrize("old_version", ["0.153.4", "0.157.0-alpha.10", "0.159.0"])
 def test_existing_config_upgrades_or_pins_without_rotating_identity(auto, legacy, monkeypatch, old_version):
     previous = {"codexCliVersion": old_version, "codexProtocolProfile": f"rust-v{old_version}"}
     provider = dict(previous)
@@ -123,12 +123,12 @@ def test_latest_profile_packaged_hashes_and_baselines():
     profile = constants.current_codex_protocol_profile()
     assert (profile.profile_id, profile.client_version) == (PROFILE, VERSION)
     manifest = json.loads((PROFILES / f"{PROFILE}.json").read_text())
-    assert manifest["source"]["codexCommit"] == "687a119f0fcaace47e1f1abcc77cec6c813fd6da"
-    baseline_raw = (PROFILES / "rust-v0.157.0-alpha.10.json").read_bytes()
-    assert hashlib.sha256(baseline_raw).hexdigest() == manifest["source"]["baselineProfilesSha256"]["rust-v0.157.0-alpha.10"]
+    assert manifest["source"]["codexCommit"] == "d32063f96c2dff1dc96af839b3952abb6acfeda4"
+    baseline_raw = (PROFILES / "rust-v0.159.0.json").read_bytes()
+    assert hashlib.sha256(baseline_raw).hexdigest() == manifest["source"]["baselineProfilesSha256"]["rust-v0.159.0"]
     fresh = {model for model, row in manifest["models"].items() if row["sourceCodexTag"] == PROFILE}
-    assert len(fresh) == 10
-    assert {"gpt-6-astra", "gpt-6-sol", "gpt-6-luna"} <= fresh
+    assert len(fresh) == 12
+    assert {"gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"} <= fresh
     for model in fresh:
         row = manifest["models"][model]
         raw = (PROFILES / row["baseInstructionsFile"]).read_bytes()
@@ -139,7 +139,8 @@ def test_latest_profile_packaged_hashes_and_baselines():
     for model in set(manifest["models"]) - fresh:
         assert manifest["models"][model] == old["models"][model]
     # Runtime behavior stays account-first; new remote IDs need no static row.
-    assert profile.model_policy("gpt-6.1-sol") is None
+    assert profile.model_policy("gpt-6.2-sol") is None
+    assert profile.model_policy("gpt-6.2-astra") is None
 
 
 def test_latest_profile_matches_authoritative_release_source():
@@ -163,12 +164,12 @@ def test_latest_profile_matches_authoritative_release_source():
 
 
 @pytest.mark.parametrize("current,minimum,expected", [
-    (VERSION, "0.155.0", True), ("0.153.4", "0.155.0", False),
-    (VERSION, "0.159.0", True), (VERSION, "0.159.0-alpha.9", True),
-    (VERSION, "0.160.0-alpha.1", False), (VERSION, VERSION, True),
+    (VERSION, "0.166.0", True), ("0.159.0", "0.166.0", False),
+    (VERSION, "0.169.0", True), (VERSION, "0.169.0-alpha.11", True),
+    (VERSION, "0.170.0-alpha.1", False), (VERSION, VERSION, True),
     ("0.157.0-alpha.10", "0.157.0", False),
     ("0.157.0-alpha.10", "0.157.0-alpha.11", False),
-    ("0.159.0+build.1", VERSION, True), ("0.157.0-alpha.01", VERSION, None),
+    ("0.169.0+build.1", VERSION, True), ("0.157.0-alpha.01", VERSION, None),
     ("0.157.0-alpha..1", VERSION, None), ("01.157.0", VERSION, None),
 ])
 def test_semver_release_and_prerelease_gates(current, minimum, expected):
@@ -200,7 +201,7 @@ async def request(monkeypatch, model, body=None, *, pin=False, records=None, tra
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["http", "websocket"])
-@pytest.mark.parametrize("model,lite,effort", [("gpt-6-sol", True, "medium"), ("gpt-6-luna", True, "medium"), ("gpt-6-astra", True, "low"), ("gpt-5.4", False, "medium")])
+@pytest.mark.parametrize("model,lite,effort", [("gpt-6.1-sol", True, "low"), ("gpt-6-sol", True, "medium"), ("gpt-6-luna", True, "medium"), ("gpt-6-astra", True, "low"), ("gpt-5.4", False, "medium")])
 async def test_latest_source_models_real_http_ws_shape(monkeypatch, transport, model, lite, effort):
     req, body = await request(monkeypatch, model, {
         "temperature": 0.7, "max_output_tokens": 123,
@@ -229,7 +230,11 @@ async def test_latest_source_models_real_http_ws_shape(monkeypatch, transport, m
         else:
             assert headers[constants.CODEX_RESPONSES_LITE_HEADER] == "true"
     else:
-        assert body["instructions"] == base
+        assert "instructions" not in body
+        assert body["input"][0]["id"].startswith("msg_")
+        assert body["input"][0]["role"] == "developer"
+        assert body["input"][0]["content"][0]["text"] == base
+        assert body["input"][0]["internal_chat_message_metadata_passthrough"] == {"content_item_kinds": ["model.base_instructions"]}
         assert body["tools"][0]["name"] == "echo"
         assert "context" not in body["reasoning"]
         assert constants.CODEX_RESPONSES_LITE_WS_METADATA_KEY not in metadata
@@ -239,11 +244,11 @@ async def test_latest_source_models_real_http_ws_shape(monkeypatch, transport, m
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["http", "websocket"])
 async def test_new_model_minimum_passes_current_but_rejects_old_pin(monkeypatch, transport):
-    records = [{"id": "gpt-6-sol", "useResponsesLite": True, "minimalClientVersion": "0.155.0"}]
-    _, body = await request(monkeypatch, "gpt-6-sol", records=records, transport=transport)
-    assert body["model"] == "gpt-6-sol"
+    records = [{"id": "gpt-6.2-sol", "useResponsesLite": True, "minimalClientVersion": "0.166.0"}]
+    _, body = await request(monkeypatch, "gpt-6.2-sol", records=records, transport=transport)
+    assert body["model"] == "gpt-6.2-sol"
     with pytest.raises(Exception, match="below model .* minimum") as error:
-        await request(monkeypatch, "gpt-6-sol", records=records, pin=True, transport=transport)
+        await request(monkeypatch, "gpt-6.2-sol", records=records, pin=True, transport=transport)
     assert error.value.scope == "candidate"
 
 
@@ -259,7 +264,7 @@ async def test_latest_ultra_mapping_and_capability_overrides(monkeypatch, transp
     }, records=[{"id": "gpt-6-sol", "supportVerbosity": False, "supportsReasoningSummaryParameter": False}], transport=transport)
     assert body["text"] == {"format": {"type": "json_object"}}
     assert "summary" not in body["reasoning"]
-    assert body["input"][1]["content"][0]["text"] == "caller instructions"
+    assert body["input"][0]["content"][0]["text"] == "caller instructions"
 
 
 @pytest.mark.asyncio
@@ -278,12 +283,19 @@ async def test_latest_ultra_uses_effective_catalog_not_static_profile(monkeypatc
     _, body = await request(monkeypatch, "catalog-ultra", {"reasoning": {"effort": "ultra"}}, records=records, transport=transport)
     assert body["reasoning"]["effort"] == expected
     if target is None:
+        loaded = load({"codexCliVersion": "0.153.4", "codexProtocolProfile": "rust-v0.153.4", "codexProfileAutoUpdate": False}, [account("catalog-ultra", records)])
+        acc = loaded["oauthAccounts"][0]
+        async def token(key): return "test-access"
+        monkeypatch.setattr(oauth_manager, "ensure_valid_token", token)
         with pytest.raises(ValueError, match="requires explicit model-scoped"):
-            await request(monkeypatch, "catalog-ultra", {"reasoning": {"effort": "ultra"}}, records=records, pin=True, transport=transport)
+            await OpenAIOAuthChannel(acc).build_upstream_request(
+                {"model": "catalog-ultra", "input": "hello", "prompt_cache_key": "release-thread", "reasoning": {"effort": "ultra"}},
+                "catalog-ultra", ingress_protocol="responses", responses_transport=transport,
+            )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("old_version", ["0.153.4", "0.157.0-alpha.10"])
+@pytest.mark.parametrize("old_version", ["0.153.4", "0.157.0-alpha.10", "0.159.0"])
 @pytest.mark.parametrize("transport", ["http", "websocket"])
 @pytest.mark.parametrize("service_tier", [None, "ultrafast"])
 async def test_upgrade_refreshes_fresh_old_catalog_and_routes_remote_sol(
@@ -291,9 +303,9 @@ async def test_upgrade_refreshes_fresh_old_catalog_and_routes_remote_sol(
 ):
     from src import model_pricing
 
-    model = "gpt-6.1-sol"
+    model = "gpt-6.2-sol"
     old_profile = f"rust-v{old_version}"
-    acc = account("gpt-6-sol", [{"id": "gpt-6-sol", "useResponsesLite": True}])
+    acc = account("gpt-6.1-sol", [{"id": "gpt-6.1-sol", "useResponsesLite": True}])
     acc["account_model_catalog"].update(schema=2, clientVersion=old_version.split("-", 1)[0])
     acc.update(last_model_sync=datetime.now(timezone.utc).isoformat(),
                last_model_sync_client_version=old_version, last_model_sync_profile=old_profile,
@@ -315,8 +327,9 @@ async def test_upgrade_refreshes_fresh_old_catalog_and_routes_remote_sol(
         def json(self):
             return {"models": [{
                 "slug": model, "visibility": "list", "use_responses_lite": True,
-                "minimal_client_version": "0.153.0", "context_window": 272000,
+                "minimal_client_version": "0.166.0", "context_window": 500000,
                 "max_context_window": 872000, "default_reasoning_level": "low",
+                "input_modalities": ["text", "image", "audio"],
                 "supported_reasoning_levels": [{"effort": e} for e in ("low", "medium", "high", "xhigh", "max", "ultra")],
                 "multi_agent_reasoning_effort": "xhigh",
                 "service_tiers": [{"id": "priority", "name": "Fast"}, {"id": "ultrafast", "name": "Ultrafast"}],
@@ -334,7 +347,7 @@ async def test_upgrade_refreshes_fresh_old_catalog_and_routes_remote_sol(
     monkeypatch.setattr(model_pricing, "refresh_metadata_after_model_sync", refresh_metadata)
     results = await oauth_manager.oauth_model_sync_once(notify_changes=False)
     assert len(results) == 1 and results[0]["action"] == "updated"
-    assert calls[0][0].endswith("client_version=0.159.0")
+    assert calls[0][0].endswith("client_version=0.169.0")
     assert "If-None-Match" not in calls[0][1]["headers"]
     config.reload()
     saved = config.get()["oauthAccounts"][0]
@@ -392,3 +405,124 @@ def test_each_provider_model_sync_ttl_only_openai_five_minutes(provider, ttl):
     acc["last_model_sync_error"] = ""
     acc[key] = {"models": []}
     assert oauth_manager._model_sync_due(acc, now=now)
+
+
+OFFICIAL_INCREMENTAL_LITE_INPUT = [
+    {"id": "msg_official", "type": "message", "role": "developer",
+     "content": [{"type": "input_text", "text": "official base"}],
+     "internal_chat_message_metadata_passthrough": {"content_item_kinds": ["model.base_instructions"]}},
+    {"id": "at_history", "type": "additional_tools", "role": "developer",
+     "tools": [{"type": "function", "name": "echo", "parameters": {"type": "object"}}]},
+    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["http", "websocket"])
+async def test_official_incremental_tools_lite_prefix_is_not_rewrapped(monkeypatch, transport):
+    # Codex 0.169 (incremental_tools on by default) sends base instructions first
+    # and tool catalogs in history, with no top-level instructions or tools.
+    _, body = await request(monkeypatch, "gpt-6.1-sol", {
+        "input": copy.deepcopy(OFFICIAL_INCREMENTAL_LITE_INPUT),
+    }, transport=transport)
+    assert "instructions" not in body and "tools" not in body
+    assert [item.get("id") for item in body["input"]] == ["msg_official", "at_history", None]
+    assert body["input"][0]["content"][0]["text"] == "official base"
+    assert body["reasoning"]["context"] == "all_turns"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["http", "websocket"])
+async def test_lite_prefix_omits_empty_tools_only_on_latest_profile(monkeypatch, transport):
+    _, latest = await request(monkeypatch, "gpt-6-sol", transport=transport)
+    assert [(item["type"], item["role"]) for item in latest["input"]] == [("message", "developer"), ("message", "user")]
+    _, with_tools = await request(monkeypatch, "gpt-6-sol", {
+        "tools": [{"type": "function", "name": "echo", "parameters": {"type": "object"}}],
+    }, transport=transport)
+    assert [item["type"] for item in with_tools["input"][:2]] == ["additional_tools", "message"]
+    _, pinned = await request(monkeypatch, "gpt-6-sol", pin=True, transport=transport)
+    assert pinned["input"][0]["type"] == "additional_tools" and pinned["input"][0]["tools"] == []
+    assert pinned["input"][1]["role"] == "developer"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["http", "websocket"])
+@pytest.mark.parametrize("options,expected", [
+    ({"ttl": "30m"}, {"ttl": "30m"}), ({"ttl": "12h", "mode": "explicit"}, {"ttl": "12h"}),
+    ({"ttl": "1h"}, None), ("12h", None),
+])
+async def test_prompt_cache_options_ttl_passthrough_only_on_latest_profile(monkeypatch, transport, options, expected):
+    _, body = await request(monkeypatch, "gpt-6-sol", {"prompt_cache_options": options}, transport=transport)
+    assert body.get("prompt_cache_options") == expected
+    _, pinned = await request(monkeypatch, "gpt-6-sol", {"prompt_cache_options": options}, pin=True, transport=transport)
+    assert "prompt_cache_options" not in pinned
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-5.4"])
+async def test_latest_wire_serializes_routing_fields_first(monkeypatch, model):
+    from src.openai.responses_ws_runtime import prepare_oauth_responses_ws_request_parts
+    from src.openai.transform.codex_oauth_transform import _CODEX_REQUEST_FIELD_ORDER
+
+    def assert_official_order(keys, head):
+        assert keys[:len(head)] == head
+        known = [key for key in keys if key in _CODEX_REQUEST_FIELD_ORDER]
+        assert known == sorted(known, key=_CODEX_REQUEST_FIELD_ORDER.index)
+
+    async def build(pin, transport):
+        loaded = load({**OLD, "codexProfileAutoUpdate": not pin}, [account(model)])
+        async def token(key): return "test-access"
+        monkeypatch.setattr(oauth_manager, "ensure_valid_token", token)
+        channel = OpenAIOAuthChannel(loaded["oauthAccounts"][0])
+        body = {"model": model, "input": "x" * 4096, "prompt_cache_key": "release-thread",
+                "service_tier": "priority", "prompt_cache_options": {"ttl": "30m"}}
+        req = await channel.build_upstream_request(
+            copy.deepcopy(body), model, ingress_protocol="responses", responses_transport=transport,
+        )
+        if transport == "http":
+            return list(json.loads(req.body))
+        _, _, frame, _ = prepare_oauth_responses_ws_request_parts(req, body, model, channel=channel)
+        return list(json.loads(frame))
+
+    assert_official_order(await build(False, "http"), ["model", "stream", "service_tier", "input"])
+    assert_official_order(await build(False, "websocket"), ["type", "model", "stream", "service_tier", "input"])
+    pinned = await build(True, "http")
+    assert pinned.index("stream") > pinned.index("input")
+
+
+def test_large_ws_message_fragments_on_latest_profile_only():
+    from src.openai.responses_ws_runtime import codex_ws_message
+
+    limit = constants.current_codex_protocol_profile().websocket_max_frame_bytes
+    assert limit == 1024 * 1024
+    load({**OLD, "codexProfileAutoUpdate": True})
+    payload = json.dumps({"type": "response.create", "input": "a" * (limit - 1) + "é中" * (limit // 2)},
+                         ensure_ascii=False)
+    fragments = codex_ws_message(payload)
+    assert isinstance(fragments, list) and len(fragments) > 2
+    assert "".join(fragments) == payload
+    assert all(0 < len(fragment.encode()) <= limit for fragment in fragments)
+    small = json.dumps({"type": "response.create", "input": "a" * 1024})
+    assert codex_ws_message(small) is small
+    load({**OLD, "codexProfileAutoUpdate": False})
+    assert codex_ws_message(payload) is payload
+
+
+@pytest.mark.asyncio
+async def test_fragmented_ws_message_reassembles_byte_identical():
+    import websockets
+    from src.openai.responses_ws_runtime import codex_ws_message
+
+    load({**OLD, "codexProfileAutoUpdate": True})
+    payload = json.dumps({"type": "response.create", "input": "é" * (3 * 1024 * 1024)}, ensure_ascii=False)
+    received = []
+
+    async def handler(ws):
+        received.append(await ws.recv())
+
+    async with websockets.serve(handler, "127.0.0.1", 0, max_size=None) as server:
+        port = server.sockets[0].getsockname()[1]
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as client:
+            await client.send(codex_ws_message(payload))
+            await client.close()
+    assert received == [payload]

@@ -15,7 +15,7 @@ from src.openai.responses_ws_runtime import build_oauth_responses_ws_frame, map_
 from src.state_store import StateStore
 
 KEY = "openai:models@example.test:workspace-test"
-VERSION = "0.159.0"
+VERSION = "0.169.0"
 
 
 @pytest.fixture
@@ -128,12 +128,11 @@ async def test_remote_instructions_survive_discovery_disk_and_wire(env, transpor
     config.update(lambda cfg: cfg["openaiOAuth"].update(defaultInstructions="fallback must not override empty"))
     _, payload = await request(channel, "gpt-6-sol", transport=transport)
     developers = [item for item in payload["input"] if item.get("type") == "message" and item.get("role") == "developer"]
-    if lite:
-        assert ([item["content"][0]["text"] for item in developers]) == ([instructions] if instructions else [])
-    else:
-        assert payload.get("instructions", "") == instructions
+    assert "instructions" not in payload
+    assert ([item["content"][0]["text"] for item in developers]) == ([instructions] if instructions.strip() else [])
     _, explicit = await request(channel, "gpt-6-sol", {"instructions": "request wins"}, transport)
-    assert (explicit["input"][1]["content"][0]["text"] if lite else explicit["instructions"]) == "request wins"
+    assert "instructions" not in explicit
+    assert explicit["input"][0]["content"][0]["text"] == "request wins"
 
 
 @pytest.mark.asyncio
@@ -145,7 +144,7 @@ async def test_null_defaults_empty_levels_and_legacy_instructions(env, transport
     policy = channel.codex_model_policy("gpt-6-astra")
     assert (policy.default_reasoning_effort, policy.default_verbosity, policy.multi_agent_reasoning_effort, policy.reasoning_efforts) == (None, None, None, ())
     _, payload = await request(channel, "gpt-6-astra", transport=transport)
-    assert payload["input"][1]["content"][0]["text"] == "legacy remote"
+    assert payload["input"][0]["content"][0]["text"] == "legacy remote"
     assert payload["reasoning"] == {"context": "all_turns"}
     assert "text" not in payload
     # Explicit caller values must not be replaced, nor max mapped via stale metadata.
@@ -160,7 +159,7 @@ async def test_null_remote_instructions_do_not_revive_profile(env):
     assert "baseInstructions" in oauth_manager.get_account(KEY)["account_model_catalog"]["models"][0]
     assert channel.codex_model_policy("gpt-6-sol").base_instructions is None
     _, payload = await request(channel, "gpt-6-sol")
-    assert len(payload["input"]) == 2  # empty tools + user, no bundled developer
+    assert len(payload["input"]) == 1  # user only: no empty tools prefix, no bundled developer
 
 
 @pytest.mark.asyncio
@@ -175,7 +174,8 @@ async def test_lite_tool_constraints_are_not_broadened(env, transport, choice, w
     tools = [{"type": "function", "name": name, "parameters": {"type": "object", "properties": {}}} for name in ["lookup", "write"]]
     _, payload = await request(channel, "gpt-6-sol", {"tools": tools, "tool_choice": choice}, transport)
     assert payload["tool_choice"] == wire_choice
-    assert [tool["name"] for tool in payload["input"][0]["tools"]] == names
+    assert [tool["name"] for item in payload["input"] if item.get("type") == "additional_tools"
+            for tool in item["tools"]] == names
     assert payload["parallel_tool_calls"] is False
     assert "tools" not in payload
 
@@ -289,7 +289,11 @@ async def test_default_instructions_remains_profile_first_fallback(env, pin, tra
     channel = await sync(env, [record("gpt-5.5", use_responses_lite=False)])
     _, payload = await request(channel, "gpt-5.5", transport=transport)
     expected = "deployment fallback" if pin else constants.codex_protocol_profile().model_policy("gpt-5.5").base_instructions
-    assert payload["instructions"] == expected
+    if pin:
+        assert payload["instructions"] == expected
+    else:
+        assert "instructions" not in payload
+        assert payload["input"][0]["content"][0]["text"] == expected
 
 
 @pytest.mark.asyncio

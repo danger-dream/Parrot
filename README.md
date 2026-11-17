@@ -158,15 +158,15 @@ Codex 的版本、User-Agent、端点、WS beta、模型能力和请求字段策
 {
   "openaiOAuth": {
     "codexProfileAutoUpdate": true,
-    "codexCliVersion": "0.159.0",
-    "codexProtocolProfile": "rust-v0.159.0"
+    "codexCliVersion": "0.169.0",
+    "codexProtocolProfile": "rust-v0.169.0"
   }
 }
 ```
 
-需要固定已审核旧版时，将 `codexProfileAutoUpdate` 显式设为 `false`，并同时配置完全匹配的 `codexCliVersion` 和 `codexProtocolProfile`（例如 `0.153.4` / `rust-v0.153.4`，旧档案保持不变）。缺失、空值、非法 SemVer、未知 profile 或版本不匹配时，Codex 模型目录、OAuth identity、HTTP 与 WebSocket 请求都会 fail closed。
+需要固定已审核旧版时，将 `codexProfileAutoUpdate` 显式设为 `false`，并同时配置完全匹配的 `codexCliVersion` 和 `codexProtocolProfile`（例如 `0.153.4` / `rust-v0.153.4` 或 `0.159.0` / `rust-v0.159.0`，旧档案保持不变）。缺失、空值、非法 SemVer、未知 profile 或版本不匹配时，Codex 模型目录、OAuth identity、HTTP 与 WebSocket 请求都会 fail closed。
 
-当前选择正式发布 tag `rust-v0.159.0`。默认自动跟随的现有安装更新并重启后会迁移版本/profile，旧版本模型缓存立即重新同步；无需手动改配置或添加 `gpt-6.1-sol`。实际模型权限、Lite 和思考档位仍以认证账户目录为准，不用内置名单授予权限。`service_tier="ultrafast"` 已支持透传及显示，但须账户模型目录提供该档位；它不同于 `reasoning.effort="ultra"`，也不会由 Fast（priority）开关自动启用。来源哈希、离线复核方式及保留旧模型基线见 [Codex 发布档案](docs/codex-release-profile.md)。
+当前选择正式发布 tag `rust-v0.169.0`。默认自动跟随的现有安装更新并重启后会迁移版本/profile，旧版本模型缓存立即重新同步；无需手动改配置或添加 `gpt-6.2-sol` / `gpt-6.2-astra`。实际模型权限、Lite 和思考档位仍以认证账户目录为准，不用内置名单授予权限。`service_tier="ultrafast"` 已支持透传及显示，但须账户模型目录提供该档位；它不同于 `reasoning.effort="ultra"`，也不会由 Fast（priority）开关自动启用。来源哈希、离线复核方式及保留旧模型基线见 [Codex 发布档案](docs/codex-release-profile.md)。
 
 模型策略按“账户认证 `/models` 的显式字段 → 选中 profile 的同名模型记录”解析。两处都没有 `useResponsesLite` 时拒绝该 Codex 模型请求；`ultra` 依据有效模型档位与 `multiAgentReasoningEffort` 映射，最新 profile 按官方算法允许缺省时回退到 `max` / 最后一个非 ultra 档位，旧 pin 保留严格映射边界。目录中的 `defaultReasoningEffort` / `defaultVerbosity` 优先于 profile，且只补调用方未提供的字段。模型 profile 的基础指令优先于用户可选的 `defaultInstructions`；下游显式 instructions、已成形的官方 Lite prefix 和 WebSocket incremental continuation 保持权威。profile 标记为 unsupported 的输出、采样或缓存参数会在发网前剥掉，不会把请求打回客户端；缺失策略仍 fail closed。
 
@@ -592,8 +592,8 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
   },
   "openaiOAuth": {
     "codexProfileAutoUpdate": true,
-    "codexCliVersion": "0.159.0",
-    "codexProtocolProfile": "rust-v0.159.0",
+    "codexCliVersion": "0.169.0",
+    "codexProtocolProfile": "rust-v0.169.0",
     "codexIdentity": { "mode": "per-oauth-account", "newIdentityGenerationVersion": 1 },
     "quotaProbe": { "enabled": false, "input": "1", "instructions": "reply ok" }
   },

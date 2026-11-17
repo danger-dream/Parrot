@@ -675,6 +675,47 @@ def _has_responses_lite_input_prefix(raw_input: Any) -> bool:
     )
 
 
+def _has_base_instructions_input_prefix(raw_input: Any) -> bool:
+    """Return whether input already starts with an official base-instructions item."""
+    if not isinstance(raw_input, list) or not raw_input:
+        return False
+    first = raw_input[0]
+    if not isinstance(first, dict):
+        return False
+    metadata = first.get("internal_chat_message_metadata_passthrough")
+    return bool(
+        first.get("type") == "message"
+        and first.get("role") == "developer"
+        and isinstance(metadata, dict)
+        and metadata.get("content_item_kinds") == ["model.base_instructions"]
+    )
+
+
+def _has_official_lite_prefix(raw_input: Any) -> bool:
+    """Codex 0.169+ omits an empty tools prefix; incremental tools live in history."""
+    return (
+        _has_responses_lite_input_prefix(raw_input)
+        or _has_base_instructions_input_prefix(raw_input)
+    )
+
+
+# Serde declaration order of ResponsesApiRequest / ResponseCreateWsRequest:
+# routing fields precede potentially multi-megabyte input.
+_CODEX_REQUEST_FIELD_ORDER = (
+    "type", "model", "stream", "service_tier", "previous_response_id", "input",
+    "tools", "tool_choice", "parallel_tool_calls", "reasoning", "store",
+    "stream_options", "include", "prompt_cache_key", "prompt_cache_options",
+    "text", "generate", "client_metadata", "access_programs",
+)
+
+
+def order_codex_request_fields(body: dict) -> dict:
+    """Return the body with official Codex field order; other keys keep theirs."""
+    ordered = {key: body[key] for key in _CODEX_REQUEST_FIELD_ORDER if key in body}
+    ordered.update((key, value) for key, value in body.items() if key not in ordered)
+    return ordered
+
+
 def _prepare_responses_lite_tool_choice(body: dict, thread_context: str | None) -> None:
     """Compile constrained choices to Lite's string choice + tool definitions.
 
@@ -761,6 +802,7 @@ def _apply_responses_lite_body(
     thread_context: str | None,
     add_input_prefix: bool = True,
     existing_prefix_is_authoritative: bool = False,
+    omit_empty_tools: bool = False,
 ) -> None:
     """Adapt Codex request body to official Responses Lite wire shape.
 
@@ -787,7 +829,7 @@ def _apply_responses_lite_body(
 
     if add_input_prefix and not (
         existing_prefix_is_authoritative
-        and _has_responses_lite_input_prefix(existing_input)
+        and _has_official_lite_prefix(existing_input)
     ):
         context = str(thread_context or "").strip()
         if not context:
@@ -795,15 +837,17 @@ def _apply_responses_lite_body(
                 "Responses Lite prefix generation requires explicit thread/session context"
             )
         prefix_namespace = uuid.uuid5(uuid.NAMESPACE_OID, context)
-        tools_json = json.dumps(
-            tools, ensure_ascii=False, separators=(",", ":")
-        )
-        prefix: list[dict[str, Any]] = [{
-            "id": f"at_{uuid.uuid5(prefix_namespace, tools_json)}",
-            "type": "additional_tools",
-            "role": "developer",
-            "tools": tools,
-        }]
+        prefix: list[dict[str, Any]] = []
+        if tools or not omit_empty_tools:
+            tools_json = json.dumps(
+                tools, ensure_ascii=False, separators=(",", ":")
+            )
+            prefix.append({
+                "id": f"at_{uuid.uuid5(prefix_namespace, tools_json)}",
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": tools,
+            })
         if isinstance(instructions, str) and instructions.strip():
             prefix.append({
                 "id": f"msg_{uuid.uuid5(prefix_namespace, instructions)}",
@@ -830,6 +874,56 @@ def _apply_responses_lite_body(
     body["reasoning"] = reasoning
 
 
+def _apply_base_instructions_input_prefix(
+    body: dict,
+    *,
+    thread_context: str | None,
+    add_input_prefix: bool = True,
+    existing_prefix_is_authoritative: bool = False,
+) -> None:
+    """Move base instructions into a developer input item for standard Responses.
+
+    Matches Codex c9253c4977 (#51156): standard Responses requests drop top-level
+    ``instructions`` and prepend the same deterministic ``msg_<uuid5>`` developer
+    message used by Responses Lite, while keeping top-level ``tools`` and standard
+    ``parallel_tool_calls`` / ``reasoning`` behavior.
+    """
+    instructions = body.get("instructions")
+    _coerce_input_to_list(body)
+    existing_input = body.get("input")
+    if not isinstance(existing_input, list):
+        existing_input = []
+
+    if (
+        add_input_prefix
+        and not (
+            existing_prefix_is_authoritative
+            and _has_base_instructions_input_prefix(existing_input)
+        )
+        and isinstance(instructions, str)
+        and instructions.strip()
+    ):
+        context = str(thread_context or "").strip()
+        if not context:
+            raise ValueError(
+                "Codex base instructions prefix generation requires explicit thread/session context"
+            )
+        prefix_namespace = uuid.uuid5(uuid.NAMESPACE_OID, context)
+        body["input"] = [{
+            "id": f"msg_{uuid.uuid5(prefix_namespace, instructions)}",
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": instructions}],
+            "internal_chat_message_metadata_passthrough": {
+                "content_item_kinds": ["model.base_instructions"],
+            },
+        }, *existing_input]
+    else:
+        body["input"] = existing_input
+
+    body.pop("instructions", None)
+
+
 def apply_codex_oauth_transform(
     body: dict,
     *,
@@ -843,6 +937,8 @@ def apply_codex_oauth_transform(
     supported_reasoning_efforts: tuple[str, ...] | list[str] | None = None,
     multi_agent_reasoning_effort: str | None = None,
     ultra_reasoning_effort_fallback: bool = False,
+    instructions_in_input: bool = False,
+    omit_empty_lite_tools_prefix: bool = False,
     lite_thread_context: str | None = None,
     transport: str = _CODEX_TRANSPORT_HTTP,
     use_responses_lite: bool | None = None,
@@ -897,9 +993,13 @@ def apply_codex_oauth_transform(
     # the field so Codex-incompatible client limits do not fail the request.
     # Missing policy still fails closed.
     policies = request_field_policies or {}
-    # Official Codex clients never send prompt_cache_options (GPT-5.6+ cache
-    # TTL/breakpoint mode); the audited profiles carry no policy for it.
-    body.pop("prompt_cache_options", None)
+    # Codex 0.169+ sends only prompt_cache_options.ttl (30m/12h); older audited
+    # profiles carry no policy and never send the field.
+    cache_options = body.pop("prompt_cache_options", None)
+    if policies.get("prompt_cache_options") == "passthrough" and isinstance(cache_options, dict):
+        ttl = cache_options.get("ttl")
+        if ttl in ("30m", "12h"):
+            body["prompt_cache_options"] = {"ttl": ttl}
     controlled_fields = (
         "max_output_tokens", "max_completion_tokens", "max_tokens",
         "temperature", "top_p", "frequency_penalty", "presence_penalty",
@@ -963,13 +1063,22 @@ def apply_codex_oauth_transform(
 
     # 5.5) HTTP/SSE store=false normally filters persisted references. Native WS
     # v2 item identity belongs to its previous_response_id continuation protocol.
-    # An already-formed official Lite prefix is likewise authoritative and carries
-    # deterministic at_/msg_ identities generated by Codex, so preserve it whole.
+    # An already-formed official Lite or base-instructions prefix is likewise
+    # authoritative and carries deterministic at_/msg_ identities generated by
+    # Codex, so preserve it whole.
     lite_prefixed = bool(
-        responses_lite and _has_responses_lite_input_prefix(body.get("input"))
+        responses_lite and _has_official_lite_prefix(body.get("input"))
+    )
+    base_instructions_prefixed = bool(
+        instructions_in_input
+        and not responses_lite
+        and _has_base_instructions_input_prefix(body.get("input"))
     )
     _normalize_codex_input(
-        body, preserve_references=(native_responses_ws or lite_prefixed),
+        body,
+        preserve_references=(
+            native_responses_ws or lite_prefixed or base_instructions_prefixed
+        ),
     )
 
     # 5.6) Model defaults only fill omitted caller fields.  Empty/invalid explicit
@@ -1030,16 +1139,17 @@ def apply_codex_oauth_transform(
             )
         reasoning["effort"] = target
 
-    # 6) Official Lite full requests already carry instructions in their developer
-    # prefix; incremental WS frames refer to that prefix via previous_response_id.
-    # Neither may gain profile instructions on a repeated transform.
-    lite_ws_incremental = bool(
+    # 6) Official full requests with input-prefixed instructions already carry
+    # instructions in their developer prefix; incremental WS frames refer to that
+    # prefix via previous_response_id. Neither may gain profile instructions on a
+    # repeated transform.
+    ws_incremental = bool(
         native_responses_ws
-        and responses_lite
+        and (responses_lite or instructions_in_input)
         and _first_non_empty_string(body.get("previous_response_id"))
     )
     if _is_empty_str(body.get("instructions")) and not (
-        lite_ws_incremental or lite_prefixed
+        ws_incremental or lite_prefixed or base_instructions_prefixed
     ):
         if isinstance(base_instructions, str) and base_instructions.strip():
             body["instructions"] = base_instructions
@@ -1050,8 +1160,16 @@ def apply_codex_oauth_transform(
         _apply_responses_lite_body(
             body,
             thread_context=lite_thread_context,
-            add_input_prefix=not lite_ws_incremental,
+            add_input_prefix=not ws_incremental,
             existing_prefix_is_authoritative=lite_prefixed,
+            omit_empty_tools=omit_empty_lite_tools_prefix,
+        )
+    elif instructions_in_input:
+        _apply_base_instructions_input_prefix(
+            body,
+            thread_context=lite_thread_context,
+            add_input_prefix=not ws_incremental,
+            existing_prefix_is_authoritative=base_instructions_prefixed,
         )
 
     return body

@@ -110,6 +110,7 @@ from .handler import (
     _sanitize_headers,
 )
 from .responses_ws_runtime import (
+    codex_ws_message,
     dump_frame,
     flatten_ws_response_headers,
     identity_expose_frame,
@@ -117,6 +118,7 @@ from .responses_ws_runtime import (
     loads_frame,
     map_ws_create_frame_for_upstream,
     merge_responses_ws_headers,
+    order_codex_ws_frame,
     request_body_from_ws_create,
     sync_prompt_cache_key_to_ws_create,
     sync_translated_body_to_ws_create,
@@ -3920,11 +3922,13 @@ async def _relay_ws_session(
             first_upstream_obj,
             dispatch_metadata=dispatch_metadata,
         )
-        payload_to_send: str | bytes = _dump_frame(first_upstream_obj)
+        payload_to_send: str | bytes = _dump_frame(
+            order_codex_ws_frame(first_upstream_obj, channel=ch)
+        )
         on_dispatch()
         proxy_bytes.count(up=_frame_size(payload_to_send))
         await wait_ws_round_io(
-            upstream_ws.send(payload_to_send),
+            upstream_ws.send(codex_ws_message(payload_to_send, channel=ch)),
             timing=timing,
             round_timeouts=round_timeouts,
         )
