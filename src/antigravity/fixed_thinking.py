@@ -57,7 +57,9 @@ def intent(model: str, body: dict, ingress: str) -> tuple[str | None, bool]:
     return effort, summary != "none"
 
 
-def resolve(model: str, selected: list[str], body: dict, ingress: str) -> str | None:
+def resolve(model: str, selected: list[str], body: dict, ingress: str, *, allow_tier_alias: bool = True) -> str | None:
+    if not allow_tier_alias and model not in selected:
+        return None
     base = family(model)
     if base is None:
         return model if model in selected else None
@@ -68,6 +70,8 @@ def resolve(model: str, selected: list[str], body: dict, ingress: str) -> str | 
         if effort is not None and model != f"{base}-{effort}":
             _fail(f"Model {model} conflicts with effort {effort}")
         return model if model in selected else None
+    if not allow_tier_alias:
+        return model
     if effort is None:
         if base in selected:
             return base

@@ -165,8 +165,10 @@ class AntigravityOAuthChannel(Channel):
 
     def resolve_request_model(self, requested_model: str, body: dict, ingress: str) -> Optional[str]:
         from ..antigravity import argon, fixed_thinking
+        from ..model_registry import runtime as model_registry
         policy = fixed_thinking if fixed_thinking.family(requested_model) else argon
-        return policy.resolve(requested_model, self._selected_request_models(), body, ingress)
+        return policy.resolve(requested_model, self._selected_request_models(), body, ingress,
+                              allow_tier_alias=model_registry.enabled())
 
     def list_client_models(self) -> list[str]:
         return list(self.models)
@@ -228,8 +230,9 @@ class AntigravityOAuthChannel(Channel):
         thinking_config = None
         policy = fixed_thinking if fixed_thinking.family(resolved_model) else argon if argon.is_argon(resolved_model) else None
         if policy is not None:
-            selected = self._selected_request_models()
-            expected = policy.resolve(str(requested_body.get("model") or resolved_model), selected, requested_body, ingress_protocol)
+            expected = self.resolve_request_model(
+                str(requested_body.get("model") or resolved_model), requested_body, ingress_protocol,
+            )
             if expected != resolved_model:
                 raise guard.GuardError(400, "invalid_request_error", "Antigravity thinking tiers must resolve to an enabled exact model before dispatch", param="model", scope="candidate")
             thinking_config = policy.thinking_config(

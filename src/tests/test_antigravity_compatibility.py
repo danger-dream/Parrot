@@ -27,6 +27,7 @@ def clean(m):
     m["config"].update(lambda cfg: cfg.update(
         modelBindings={"defaults": {}, "scoped": {}, "legacyMigrationVersion": 1},
         modelMetadata={}, modelMetadataOverrides={"defaults": {}, "scoped": {}}, modelCenter={},
+        modelRegistry={"enabled": False},
     ))
     cooldown.clear("oauth:antigravity:state@gmail.com:proj-state", notify_recovered=False)
     yield
@@ -316,6 +317,7 @@ def _body(ingress, model, effort=None, summary=False):
 @pytest.mark.parametrize("bare", [False, True])
 @pytest.mark.asyncio
 async def test_argon_supported_intent_preserves_exact_wire_tier_and_summary(m, monkeypatch, ingress, level, bare):
+    m["config"].update(lambda cfg: cfg["modelRegistry"].update(enabled=bare))
     model = BASE + "-" + level
     body = _body(ingress, BASE if bare else model, level if bare else None, summary=True)
     wire, req, ch = await _wire(m, monkeypatch, body, ingress, models=list(VARIANTS))
@@ -337,6 +339,7 @@ async def test_argon_unknown_effort_is_not_promoted(m, monkeypatch, ingress, eff
 
 @pytest.mark.asyncio
 async def test_argon_conflicts_budget_and_ambiguous_bare_fail_without_default(m, monkeypatch):
+    m["config"].update(lambda cfg: cfg["modelRegistry"].update(enabled=True))
     with pytest.raises(GuardError, match="conflicts"):
         await _wire(m, monkeypatch, _body("responses", MODEL, "high"))
     with pytest.raises(GuardError, match="requires explicit"):
@@ -371,6 +374,7 @@ async def test_argon_no_summary_request_and_other_gemini_are_unchanged(m, monkey
 
 
 def test_scheduler_resolves_before_cooldown_and_respects_selected_disabled_and_endpoint(m, monkeypatch):
+    m["config"].update(lambda cfg: cfg["modelRegistry"].update(enabled=True))
     from src import scheduler, cooldown
     om = m["oauth_manager"]
     ak = _add_ag_account(om, models=list(VARIANTS), disabledModels=[BASE + "-high"])
@@ -516,6 +520,7 @@ def test_manual_variant_binding_alias_and_scoped_price_override_win(m, official_
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.asyncio
 async def test_bare_tier_schedule_dispatch_response_and_attempt_accounting_agree(m, monkeypatch, ingress, official_catalog, stream):
+    m["config"].update(lambda cfg: cfg["modelRegistry"].update(enabled=True))
     import httpx
     from src import scheduler, failover, upstream, log_db, model_metadata, cooldown
     from src.transports import http_runtime
@@ -580,6 +585,7 @@ async def test_bare_tier_schedule_dispatch_response_and_attempt_accounting_agree
 
 @pytest.mark.asyncio
 async def test_resolved_argon_429_owns_exact_tier_health_not_bare_or_other_tiers(m, monkeypatch):
+    m["config"].update(lambda cfg: cfg["modelRegistry"].update(enabled=True))
     import httpx
     from src import scheduler, failover, upstream, log_db, cooldown
     from src.transports import http_runtime

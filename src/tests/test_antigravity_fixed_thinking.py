@@ -62,6 +62,7 @@ async def test_directory_key_selects_thinking_without_level_conversion(m, monkey
 @pytest.mark.asyncio
 async def test_bare_hydrogen_requires_explicit_available_tier(m, monkeypatch, ingress):
     _setup(m)
+    m["config"].update(lambda cfg: cfg.update(modelRegistry={"enabled": True}))
     base = "gemini-4-hydrogen"
     wire, _, _ = await _wire(m, monkeypatch, _body(base, ingress, "xhigh"), ingress,
                               models=[base + "-medium", base + "-xhigh"])

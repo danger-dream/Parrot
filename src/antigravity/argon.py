@@ -61,7 +61,9 @@ def intent(body: dict, ingress: str) -> tuple[str | None, bool]:
     return effort, wants_summary
 
 
-def resolve(model: str, selected: list[str], body: dict, ingress: str) -> str | None:
+def resolve(model: str, selected: list[str], body: dict, ingress: str, *, allow_tier_alias: bool = True) -> str | None:
+    if not allow_tier_alias and model not in selected:
+        return None
     if not is_argon(model):
         return model if model in selected else None
     if not any(is_argon(item) for item in selected):
@@ -71,6 +73,8 @@ def resolve(model: str, selected: list[str], body: dict, ingress: str) -> str | 
         if level is not None and level != VARIANTS[model]:
             _fail(f"Argon model {model} conflicts with effort {level}; select the matching model and effort explicitly")
         return model if model in selected else None
+    if not allow_tier_alias:
+        return model
     if level is None:
         if BASE in selected:
             return BASE
