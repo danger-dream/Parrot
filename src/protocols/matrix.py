@@ -1113,6 +1113,7 @@ def capabilities_for_channel(channel) -> ChannelCapabilities:
     if bool(getattr(channel, "upstream_stream_only", False)):
         transports.discard("http-json")
     native_state: set[str] = set()
+    translated_state: set[str] = set()
     if protocol == "openai-responses" and ch_type == "oauth" and provider == "antigravity":
         # Cloud Code is Gemini HTTP, not a Codex state/WS backend. The channel
         # expands tenant-checked local history/references and reversibly flattens
@@ -1161,6 +1162,7 @@ def capabilities_for_channel(channel) -> ChannelCapabilities:
                 "background",
                 "audio",
             })
+            translated_state.add("namespace")
     if protocol == "openai-responses" and ch_type == "oauth" and provider != "xai":
         transports.add("ws")
     if channel.__class__.__name__ == "OpenAIOAuthChannel":
@@ -1169,6 +1171,7 @@ def capabilities_for_channel(channel) -> ChannelCapabilities:
         protocol=protocol,
         transports=frozenset(transports),
         native_state=frozenset(native_state),
+        translated_state=frozenset(translated_state),
         # Cursor's AgentService bridge still has no SelectedImage transport.
         supports_images=not is_cursor,
     )
