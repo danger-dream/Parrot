@@ -152,6 +152,80 @@ def _sanitize_request_schemas(request: dict, *, model: str) -> None:
                 gen[key] = antigravity_schema.clean_response_schema(schema)
 
 
+def _has_unmatched_function_response_ref(value: Any, valid_names: set[str]) -> bool:
+    stack = [value]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            if "$ref" in cur:
+                ref_val = cur.get("$ref")
+                if not isinstance(ref_val, str) or ref_val not in valid_names:
+                    return True
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return False
+
+
+def _function_response_part_names(fr: dict) -> set[str]:
+    names: set[str] = set()
+    parts = fr.get("parts")
+    if not isinstance(parts, list):
+        return names
+    for item in parts:
+        if not isinstance(item, dict):
+            continue
+        for key in ("inlineData", "inline_data", "fileData", "file_data"):
+            blob = item.get(key)
+            if isinstance(blob, dict):
+                dn = blob.get("displayName") or blob.get("display_name")
+                if isinstance(dn, str) and dn:
+                    names.add(dn)
+    return names
+
+
+def _sanitize_function_responses(request: dict) -> None:
+    contents = request.get("contents")
+    if not isinstance(contents, list):
+        return
+    copied_contents = False
+    for c_idx, content in enumerate(contents):
+        if not isinstance(content, dict):
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            continue
+        new_parts: list[Any] | None = None
+        for idx, part in enumerate(parts):
+            if not isinstance(part, dict):
+                continue
+            fr_key = "functionResponse" if isinstance(part.get("functionResponse"), dict) else (
+                "function_response" if isinstance(part.get("function_response"), dict) else ""
+            )
+            if not fr_key:
+                continue
+            fr = part[fr_key]
+            resp = fr.get("response")
+            if isinstance(resp, dict) and _has_unmatched_function_response_ref(
+                resp, _function_response_part_names(fr),
+            ):
+                if new_parts is None:
+                    new_parts = list(parts)
+                new_fr = dict(fr)
+                new_fr["response"] = {"result": _json_dumps(resp)}
+                new_part = dict(part)
+                new_part[fr_key] = new_fr
+                new_parts[idx] = new_part
+        if new_parts is not None:
+            if not copied_contents:
+                contents = list(contents)
+                request["contents"] = contents
+                copied_contents = True
+            new_content = dict(content)
+            new_content["parts"] = new_parts
+            contents[c_idx] = new_content
+
+
 def _delta_from_snapshot(previous: str, current: str) -> str:
     if current.startswith(previous):
         return current[len(previous):]
@@ -292,8 +366,13 @@ def _tool_output_parts(output: Any) -> tuple[dict, list[dict]]:
             response = json.loads(output)
         except json.JSONDecodeError:
             response = {"result": output}
+        else:
+            if isinstance(response, dict) and _has_unmatched_function_response_ref(response, set()):
+                response = {"result": output}
     else:
         response = output
+        if isinstance(response, dict) and _has_unmatched_function_response_ref(response, set()):
+            response = {"result": _json_dumps(response)}
     return response if isinstance(response, dict) else {"result": response}, images
 
 
@@ -753,6 +832,7 @@ def wrap_cloud_code(
 
     _sanitize_request_schemas(request, model=model)
     _sanitize_thought_signatures(request)
+    _sanitize_function_responses(request)
 
     envelope: dict[str, Any] = {
         "project": project_id,
