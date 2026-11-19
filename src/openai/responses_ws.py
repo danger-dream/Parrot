@@ -2807,6 +2807,11 @@ async def _try_sse_channel(
             body.setdefault("_codex_turn_serialization_leases", {})
         http_body = dict(body)
         http_body["stream"] = True
+        http_body = failover_runtime._apply_candidate_prompt_rules(
+            ch, resolved_model, http_body,
+            ingress_protocol="responses",
+            api_key_name=api_key_name,
+        )
         http_body = failover_runtime._candidate_budget_body(ch, resolved_model, http_body)
         upstream_req = await ch.build_upstream_request(http_body, resolved_model, ingress_protocol="responses")
         oauth_manager.observe_request_credentials(ch, upstream_req)
@@ -3899,13 +3904,18 @@ async def _relay_ws_session(
     # Send first frame upstream before accepting downstream. If upstream rejects
     # before a downstream-visible event, the attempt can still fail over.
     try:
-        first_upstream_obj = _map_ws_create_frame_for_upstream(first_obj, resolved_model, channel=ch)
+        from .. import failover as failover_runtime
+        rewritten_first = failover_runtime._apply_candidate_prompt_rules(
+            ch, resolved_model, first_obj,
+            ingress_protocol="responses",
+            api_key_name=api_key_name,
+        )
+        first_upstream_obj = _map_ws_create_frame_for_upstream(rewritten_first, resolved_model, channel=ch)
         first_upstream_obj = _apply_identity_snapshot_to_frame(first_upstream_obj)
         dispatch_metadata = build_dispatch_metadata(
             first_upstream_obj,
             getattr(ch, "protocol", "openai-responses"),
         )
-        from .. import failover as failover_runtime
 
         # Clamp an oversized requested output to this route's maxOutputTokens
         # before the safety-net budget check, mirroring the HTTP paths.

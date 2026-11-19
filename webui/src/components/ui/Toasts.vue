@@ -6,18 +6,20 @@ const icons = { info: Info, success: CircleCheck, warning: TriangleAlert, error:
 </script>
 
 <template>
-  <div class="toasts" :class="{ shifted: inspector.open && ui.width >= 1280 }" aria-live="polite">
-    <TransitionGroup name="toast">
-      <div v-for="t in toasts" :key="t.id" class="toast glass" :class="`t-${t.tone}`">
-        <component :is="icons[t.tone]" class="ic" />
-        <div class="body">
-          <p class="title">{{ t.title }}</p>
-          <p v-if="t.detail" class="detail">{{ t.detail }}</p>
+  <Teleport to="body">
+    <div class="toasts" :class="{ shifted: inspector.open && ui.width >= 1280 }" aria-live="polite">
+      <TransitionGroup name="toast">
+        <div v-for="t in toasts" :key="t.id" class="toast glass" :class="`t-${t.tone}`">
+          <component :is="icons[t.tone]" class="ic" />
+          <div class="body">
+            <p class="title">{{ t.title }}</p>
+            <p v-if="t.detail" class="detail">{{ t.detail }}</p>
+          </div>
+          <button class="close" aria-label="关闭" @click="dismissToast(t.id)"><X /></button>
         </div>
-        <button class="close" aria-label="关闭" @click="dismissToast(t.id)"><X /></button>
-      </div>
-    </TransitionGroup>
-  </div>
+      </TransitionGroup>
+    </div>
+  </Teleport>
 </template>
 
 <style scoped>
@@ -25,7 +27,7 @@ const icons = { info: Info, success: CircleCheck, warning: TriangleAlert, error:
   position: fixed;
   top: calc(var(--topbar-h) + 10px);
   right: 14px;
-  z-index: 90;
+  z-index: 4000;
   display: flex;
   flex-direction: column;
   gap: 8px;

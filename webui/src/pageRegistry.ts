@@ -18,6 +18,7 @@ export const modulePages: Record<string, () => Promise<RouteComponent>> = {
   network: () => import('@/pages/network/NetworkPage.vue'),
   alerts: () => import('@/pages/alerts/AlertsPage.vue'),
   blacklist: () => import('@/pages/blacklist/BlacklistPage.vue'),
+  promptRules: () => import('@/pages/rules/PromptRulesPage.vue'),
   retention: () => import('@/pages/retention/RetentionPage.vue'),
   updates: () => import('@/pages/updates/UpdatesPage.vue'),
 }

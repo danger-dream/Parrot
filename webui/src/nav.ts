@@ -20,6 +20,7 @@ import {
   Search,
   Settings2,
   ShieldCheck,
+  SlidersHorizontal,
   Waypoints,
 } from '@lucide/vue'
 
@@ -233,6 +234,16 @@ export const navGroups: NavGroup[] = [
         phase: 3,
         summary: '按渠道屏蔽的关键词。',
         features: ['默认规则', '按渠道规则'],
+      },
+      {
+        key: 'promptRules',
+        label: '请求改写规则',
+        icon: SlidersHorizontal,
+        tint: 'var(--purple)',
+        to: '/prompt-rules',
+        phase: 3,
+        summary: '出站请求的关键词替换、包裹与系统提示词调整。',
+        features: ['关键词替换与包裹', '系统提示词前置/追加', '本地试运行测试'],
       },
       {
         key: 'retention',

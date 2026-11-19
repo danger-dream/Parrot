@@ -277,3 +277,10 @@ listNotifications
 markNotificationsRead
 deleteUpdateBackup
 clearUpdateBackups
+getPromptRules
+updatePromptRulesSettings
+createPromptRule
+updatePromptRule
+deletePromptRule
+reorderPromptRules
+testPromptRules

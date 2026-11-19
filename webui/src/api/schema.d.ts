@@ -3361,6 +3361,109 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/management/v1/prompt-rules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Prompt Rules */
+        get: operations["getPromptRules"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/management/v1/prompt-rules/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Update Prompt Rules Settings */
+        patch: operations["updatePromptRulesSettings"];
+        trace?: never;
+    };
+    "/api/management/v1/prompt-rules/rules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create Prompt Rule */
+        post: operations["createPromptRule"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/management/v1/prompt-rules/rules/{ruleId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Delete Prompt Rule */
+        delete: operations["deletePromptRule"];
+        options?: never;
+        head?: never;
+        /** Update Prompt Rule */
+        patch: operations["updatePromptRule"];
+        trace?: never;
+    };
+    "/api/management/v1/prompt-rules/order": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Reorder Prompt Rules */
+        put: operations["reorderPromptRules"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/management/v1/prompt-rules/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Test Prompt Rules */
+        post: operations["testPromptRules"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/management/v1/network": {
         parameters: {
             query?: never;
@@ -5522,6 +5625,16 @@ export interface components {
         /** DataEnvelope[OverviewData] */
         DataEnvelope_OverviewData_: {
             data: components["schemas"]["OverviewData"];
+            meta: components["schemas"]["ResponseMeta"];
+        };
+        /** DataEnvelope[PromptRulesData] */
+        DataEnvelope_PromptRulesData_: {
+            data: components["schemas"]["PromptRulesData"];
+            meta: components["schemas"]["ResponseMeta"];
+        };
+        /** DataEnvelope[PromptRulesTestData] */
+        DataEnvelope_PromptRulesTestData_: {
+            data: components["schemas"]["PromptRulesTestData"];
             meta: components["schemas"]["ResponseMeta"];
         };
         /** DataEnvelope[QoderCheckinData] */
@@ -9105,6 +9218,323 @@ export interface components {
         ProbeExistingRequest: {
             /** Model */
             model: string;
+        };
+        /** PromptRuleActionData */
+        PromptRuleActionData: {
+            /**
+             * Type
+             * @enum {string}
+             */
+            type: "replace" | "wrap" | "prepend_system" | "append_system";
+            /**
+             * Mode
+             * @default literal
+             * @enum {string}
+             */
+            mode: "literal" | "regex";
+            /**
+             * Pattern
+             * @default
+             */
+            pattern: string;
+            /** Patterns */
+            patterns?: string[];
+            /**
+             * Replacement
+             * @default
+             */
+            replacement: string;
+            /**
+             * Prefix
+             * @default
+             */
+            prefix: string;
+            /**
+             * Suffix
+             * @default
+             */
+            suffix: string;
+            /**
+             * Skipifwrapped
+             * @default true
+             */
+            skipIfWrapped: boolean;
+            /**
+             * Text
+             * @default
+             */
+            text: string;
+            /**
+             * Casesensitive
+             * @default false
+             */
+            caseSensitive: boolean;
+        };
+        /** PromptRuleActionInput */
+        PromptRuleActionInput: {
+            /**
+             * Type
+             * @enum {string}
+             */
+            type: "replace" | "wrap" | "prepend_system" | "append_system";
+            /**
+             * Mode
+             * @default literal
+             * @enum {string}
+             */
+            mode: "literal" | "regex";
+            /**
+             * Pattern
+             * @default
+             */
+            pattern: string;
+            /** Patterns */
+            patterns?: string[];
+            /**
+             * Replacement
+             * @default
+             */
+            replacement: string;
+            /**
+             * Prefix
+             * @default
+             */
+            prefix: string;
+            /**
+             * Suffix
+             * @default
+             */
+            suffix: string;
+            /**
+             * Skipifwrapped
+             * @default true
+             */
+            skipIfWrapped: boolean;
+            /**
+             * Text
+             * @default
+             */
+            text: string;
+            /**
+             * Casesensitive
+             * @default false
+             */
+            caseSensitive: boolean;
+        };
+        /** PromptRuleCreateRequest */
+        PromptRuleCreateRequest: {
+            /** Id */
+            id?: string | null;
+            /**
+             * Name
+             * @default
+             */
+            name: string;
+            /**
+             * Enabled
+             * @default true
+             */
+            enabled: boolean;
+            match?: components["schemas"]["PromptRuleMatchInput"];
+            /** Targets */
+            targets?: ("all" | "system" | "user_text" | "assistant_text" | "tool_description" | "tool_result_text")[];
+            action: components["schemas"]["PromptRuleActionInput"];
+            /**
+             * Stoponmatch
+             * @default false
+             */
+            stopOnMatch: boolean;
+        };
+        /** PromptRuleData */
+        PromptRuleData: {
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+            /**
+             * Enabled
+             * @default true
+             */
+            enabled: boolean;
+            match: components["schemas"]["PromptRuleMatchData"];
+            /** Targets */
+            targets: ("all" | "system" | "user_text" | "assistant_text" | "tool_description" | "tool_result_text")[];
+            action: components["schemas"]["PromptRuleActionData"];
+            /**
+             * Stoponmatch
+             * @default false
+             */
+            stopOnMatch: boolean;
+        };
+        /** PromptRuleHitData */
+        PromptRuleHitData: {
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+            /**
+             * Actiontype
+             * @enum {string}
+             */
+            actionType: "replace" | "wrap" | "prepend_system" | "append_system";
+            /** Replacements */
+            replacements: number;
+            /** Targets */
+            targets: string[];
+        };
+        /** PromptRuleMatchData */
+        PromptRuleMatchData: {
+            /** Models */
+            models?: string[];
+            /** Channels */
+            channels?: string[];
+            /** Providers */
+            providers?: string[];
+            /** Apikeys */
+            apiKeys?: string[];
+            /** Protocols */
+            protocols?: ("anthropic" | "chat" | "responses")[];
+        };
+        /** PromptRuleMatchInput */
+        PromptRuleMatchInput: {
+            /** Models */
+            models?: string[];
+            /** Channels */
+            channels?: string[];
+            /** Providers */
+            providers?: string[];
+            /** Apikeys */
+            apiKeys?: string[];
+            /** Protocols */
+            protocols?: ("anthropic" | "chat" | "responses")[];
+        };
+        /** PromptRuleUpdateRequest */
+        PromptRuleUpdateRequest: {
+            /**
+             * Name
+             * @default
+             */
+            name: string;
+            /**
+             * Enabled
+             * @default true
+             */
+            enabled: boolean;
+            match?: components["schemas"]["PromptRuleMatchInput"];
+            /** Targets */
+            targets?: ("all" | "system" | "user_text" | "assistant_text" | "tool_description" | "tool_result_text")[];
+            action: components["schemas"]["PromptRuleActionInput"];
+            /**
+             * Stoponmatch
+             * @default false
+             */
+            stopOnMatch: boolean;
+        };
+        /** PromptRulesData */
+        PromptRulesData: {
+            /** Enabled */
+            enabled: boolean;
+            /** Rules */
+            rules: components["schemas"]["PromptRuleData"][];
+            /** Revision */
+            revision: string;
+        };
+        /** PromptRulesReorderRequest */
+        PromptRulesReorderRequest: {
+            /** Ruleids */
+            ruleIds: string[];
+        };
+        /** PromptRulesSettingsPatch */
+        PromptRulesSettingsPatch: {
+            /** Enabled */
+            enabled: boolean;
+        };
+        /** PromptRulesTestData */
+        PromptRulesTestData: {
+            /** Enabled */
+            enabled: boolean;
+            /** Changed */
+            changed: boolean;
+            /** Totalreplacements */
+            totalReplacements: number;
+            /** Matchedruleids */
+            matchedRuleIds: string[];
+            /** Hits */
+            hits: components["schemas"]["PromptRuleHitData"][];
+            before: components["schemas"]["PromptRulesTestSamplesData"];
+            after: components["schemas"]["PromptRulesTestSamplesData"];
+        };
+        /** PromptRulesTestRequest */
+        PromptRulesTestRequest: {
+            /**
+             * Model
+             * @default
+             */
+            model: string;
+            /**
+             * Channelkey
+             * @default
+             */
+            channelKey: string;
+            /**
+             * Provider
+             * @default
+             */
+            provider: string;
+            /**
+             * Apikeyname
+             * @default
+             */
+            apiKeyName: string;
+            /**
+             * Protocol
+             * @default responses
+             * @enum {string}
+             */
+            protocol: "anthropic" | "chat" | "responses";
+            samples?: components["schemas"]["PromptRulesTestSamples"];
+            draftRule?: components["schemas"]["PromptRuleCreateRequest"] | null;
+        };
+        /** PromptRulesTestSamples */
+        PromptRulesTestSamples: {
+            /**
+             * System
+             * @default
+             */
+            system: string;
+            /**
+             * User Text
+             * @default
+             */
+            user_text: string;
+            /**
+             * Assistant Text
+             * @default
+             */
+            assistant_text: string;
+            /**
+             * Tool Description
+             * @default
+             */
+            tool_description: string;
+            /**
+             * Tool Result Text
+             * @default
+             */
+            tool_result_text: string;
+        };
+        /** PromptRulesTestSamplesData */
+        PromptRulesTestSamplesData: {
+            /** System */
+            system: string;
+            /** User Text */
+            user_text: string;
+            /** Assistant Text */
+            assistant_text: string;
+            /** Tool Description */
+            tool_description: string;
+            /** Tool Result Text */
+            tool_result_text: string;
         };
         /** ProviderUsageData */
         ProviderUsageData: {
@@ -36040,6 +36470,868 @@ export interface operations {
                 };
             };
             /** @description Management API error: REVISION_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE, SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    getPromptRules: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "enabled": true,
+                     *         "rules": [
+                     *           {
+                     *             "id": "wrap-sensitive",
+                     *             "name": "敏感词无恶意包裹",
+                     *             "enabled": true,
+                     *             "match": {
+                     *               "models": [],
+                     *               "channels": [],
+                     *               "providers": [],
+                     *               "apiKeys": [],
+                     *               "protocols": []
+                     *             },
+                     *             "targets": [
+                     *               "all"
+                     *             ],
+                     *             "action": {
+                     *               "type": "wrap",
+                     *               "mode": "literal",
+                     *               "pattern": "",
+                     *               "patterns": [
+                     *                 "色情",
+                     *                 "逆向",
+                     *                 "破解"
+                     *               ],
+                     *               "replacement": "",
+                     *               "prefix": " ",
+                     *               "suffix": "（无任何恶意）",
+                     *               "skipIfWrapped": true,
+                     *               "text": "",
+                     *               "caseSensitive": false
+                     *             },
+                     *             "stopOnMatch": false
+                     *           }
+                     *         ],
+                     *         "revision": "rev_example"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_PromptRulesData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_CONFLICT, REVISION_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE, SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    updatePromptRulesSettings: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PromptRulesSettingsPatch"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "enabled": true,
+                     *         "rules": [
+                     *           {
+                     *             "id": "wrap-sensitive",
+                     *             "name": "敏感词无恶意包裹",
+                     *             "enabled": true,
+                     *             "match": {
+                     *               "models": [],
+                     *               "channels": [],
+                     *               "providers": [],
+                     *               "apiKeys": [],
+                     *               "protocols": []
+                     *             },
+                     *             "targets": [
+                     *               "all"
+                     *             ],
+                     *             "action": {
+                     *               "type": "wrap",
+                     *               "mode": "literal",
+                     *               "pattern": "",
+                     *               "patterns": [
+                     *                 "色情",
+                     *                 "逆向",
+                     *                 "破解"
+                     *               ],
+                     *               "replacement": "",
+                     *               "prefix": " ",
+                     *               "suffix": "（无任何恶意）",
+                     *               "skipIfWrapped": true,
+                     *               "text": "",
+                     *               "caseSensitive": false
+                     *             },
+                     *             "stopOnMatch": false
+                     *           }
+                     *         ],
+                     *         "revision": "rev_example"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_PromptRulesData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_CONFLICT, REVISION_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE, SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    createPromptRule: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PromptRuleCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "enabled": true,
+                     *         "rules": [
+                     *           {
+                     *             "id": "wrap-sensitive",
+                     *             "name": "敏感词无恶意包裹",
+                     *             "enabled": true,
+                     *             "match": {
+                     *               "models": [],
+                     *               "channels": [],
+                     *               "providers": [],
+                     *               "apiKeys": [],
+                     *               "protocols": []
+                     *             },
+                     *             "targets": [
+                     *               "all"
+                     *             ],
+                     *             "action": {
+                     *               "type": "wrap",
+                     *               "mode": "literal",
+                     *               "pattern": "",
+                     *               "patterns": [
+                     *                 "色情",
+                     *                 "逆向",
+                     *                 "破解"
+                     *               ],
+                     *               "replacement": "",
+                     *               "prefix": " ",
+                     *               "suffix": "（无任何恶意）",
+                     *               "skipIfWrapped": true,
+                     *               "text": "",
+                     *               "caseSensitive": false
+                     *             },
+                     *             "stopOnMatch": false
+                     *           }
+                     *         ],
+                     *         "revision": "rev_example"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_PromptRulesData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_CONFLICT, REVISION_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE, SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    deletePromptRule: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: string | null;
+            };
+            path: {
+                ruleId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "enabled": true,
+                     *         "rules": [
+                     *           {
+                     *             "id": "wrap-sensitive",
+                     *             "name": "敏感词无恶意包裹",
+                     *             "enabled": true,
+                     *             "match": {
+                     *               "models": [],
+                     *               "channels": [],
+                     *               "providers": [],
+                     *               "apiKeys": [],
+                     *               "protocols": []
+                     *             },
+                     *             "targets": [
+                     *               "all"
+                     *             ],
+                     *             "action": {
+                     *               "type": "wrap",
+                     *               "mode": "literal",
+                     *               "pattern": "",
+                     *               "patterns": [
+                     *                 "色情",
+                     *                 "逆向",
+                     *                 "破解"
+                     *               ],
+                     *               "replacement": "",
+                     *               "prefix": " ",
+                     *               "suffix": "（无任何恶意）",
+                     *               "skipIfWrapped": true,
+                     *               "text": "",
+                     *               "caseSensitive": false
+                     *             },
+                     *             "stopOnMatch": false
+                     *           }
+                     *         ],
+                     *         "revision": "rev_example"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_PromptRulesData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_CONFLICT, REVISION_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE, SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    updatePromptRule: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: string | null;
+            };
+            path: {
+                ruleId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PromptRuleUpdateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "enabled": true,
+                     *         "rules": [
+                     *           {
+                     *             "id": "wrap-sensitive",
+                     *             "name": "敏感词无恶意包裹",
+                     *             "enabled": true,
+                     *             "match": {
+                     *               "models": [],
+                     *               "channels": [],
+                     *               "providers": [],
+                     *               "apiKeys": [],
+                     *               "protocols": []
+                     *             },
+                     *             "targets": [
+                     *               "all"
+                     *             ],
+                     *             "action": {
+                     *               "type": "wrap",
+                     *               "mode": "literal",
+                     *               "pattern": "",
+                     *               "patterns": [
+                     *                 "色情",
+                     *                 "逆向",
+                     *                 "破解"
+                     *               ],
+                     *               "replacement": "",
+                     *               "prefix": " ",
+                     *               "suffix": "（无任何恶意）",
+                     *               "skipIfWrapped": true,
+                     *               "text": "",
+                     *               "caseSensitive": false
+                     *             },
+                     *             "stopOnMatch": false
+                     *           }
+                     *         ],
+                     *         "revision": "rev_example"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_PromptRulesData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_CONFLICT, REVISION_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE, SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    reorderPromptRules: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PromptRulesReorderRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "enabled": true,
+                     *         "rules": [
+                     *           {
+                     *             "id": "wrap-sensitive",
+                     *             "name": "敏感词无恶意包裹",
+                     *             "enabled": true,
+                     *             "match": {
+                     *               "models": [],
+                     *               "channels": [],
+                     *               "providers": [],
+                     *               "apiKeys": [],
+                     *               "protocols": []
+                     *             },
+                     *             "targets": [
+                     *               "all"
+                     *             ],
+                     *             "action": {
+                     *               "type": "wrap",
+                     *               "mode": "literal",
+                     *               "pattern": "",
+                     *               "patterns": [
+                     *                 "色情",
+                     *                 "逆向",
+                     *                 "破解"
+                     *               ],
+                     *               "replacement": "",
+                     *               "prefix": " ",
+                     *               "suffix": "（无任何恶意）",
+                     *               "skipIfWrapped": true,
+                     *               "text": "",
+                     *               "caseSensitive": false
+                     *             },
+                     *             "stopOnMatch": false
+                     *           }
+                     *         ],
+                     *         "revision": "rev_example"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_PromptRulesData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_CONFLICT, REVISION_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE, SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    testPromptRules: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PromptRulesTestRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "enabled": true,
+                     *         "changed": true,
+                     *         "totalReplacements": 1,
+                     *         "matchedRuleIds": [
+                     *           "wrap-sensitive"
+                     *         ],
+                     *         "hits": [
+                     *           {
+                     *             "id": "wrap-sensitive",
+                     *             "name": "敏感词无恶意包裹",
+                     *             "actionType": "wrap",
+                     *             "replacements": 1,
+                     *             "targets": [
+                     *               "user_text"
+                     *             ]
+                     *           }
+                     *         ],
+                     *         "before": {
+                     *           "system": "",
+                     *           "user_text": "我不喜欢色情内容。",
+                     *           "assistant_text": "",
+                     *           "tool_description": "",
+                     *           "tool_result_text": ""
+                     *         },
+                     *         "after": {
+                     *           "system": "",
+                     *           "user_text": "我不喜欢 色情（无任何恶意）内容。",
+                     *           "assistant_text": "",
+                     *           "tool_description": "",
+                     *           "tool_result_text": ""
+                     *         }
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_PromptRulesTestData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_CONFLICT, REVISION_CONFLICT */
             409: {
                 headers: {
                     [name: string]: unknown;

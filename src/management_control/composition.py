@@ -34,7 +34,13 @@ from .observability import (
 )
 from .operations import OperationRegistry, OperationStore
 from .proxy import ProxyControl
-from .system import ContentBlacklistControl, NotificationInboxControl, SettingsControl, TelegramRetentionAdapter
+from .system import (
+    ContentBlacklistControl,
+    NotificationInboxControl,
+    PromptRulesControl,
+    SettingsControl,
+    TelegramRetentionAdapter,
+)
 from .system.runtime import SystemRuntimeControl
 
 
@@ -53,6 +59,7 @@ class SystemNetworkControls:
     blacklist: ContentBlacklistControl
     network: NetworkControl
     notifications: NotificationInboxControl = field(default_factory=NotificationInboxControl)
+    prompt_rules: PromptRulesControl = field(default_factory=PromptRulesControl)
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +157,7 @@ def build_management_controls(
                 audit_sink=audit_sink,
             ),
             notifications=NotificationInboxControl(audit_sink=audit_sink),
+            prompt_rules=PromptRulesControl(audit_sink=audit_sink),
         ),
         system_runtime=SystemRuntimeControl(audit_sink=audit_sink),
         telegram_retention=TelegramRetentionAdapter(retention),

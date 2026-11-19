@@ -3895,16 +3895,57 @@ def _invalid_ws_status_detail(exc: InvalidStatus) -> tuple[Optional[int], str]:
     return status, (f"HTTP {status}: {text}" if status else str(exc))[:2000]
 
 
+def _apply_candidate_prompt_rules(
+    ch: Channel,
+    resolved_model: str,
+    body: dict,
+    *,
+    ingress_protocol: str,
+    api_key_name: Optional[str] = None,
+) -> dict:
+    from . import prompt_rules
+    ch_key = str(getattr(ch, "key", "") or "")
+    provider = str(getattr(ch, "provider", "") or getattr(ch, "provider_id", "") or "")
+    if not provider and ch_key.startswith("oauth:"):
+        parts = ch_key.split(":")
+        if len(parts) >= 2:
+            provider = parts[1]
+    try:
+        rewritten, report = prompt_rules.apply_to_request(
+            body,
+            ingress_protocol=ingress_protocol,
+            requested_model=str(body.get("model") or ""),
+            resolved_model=resolved_model,
+            channel_key=ch_key,
+            channel_name=str(getattr(ch, "display_name", "") or ""),
+            provider=provider,
+            api_key_name=str(api_key_name or body.get("_api_key_name") or ""),
+        )
+    except Exception as exc:
+        print(f"[prompt_rules] unexpected error for {ch_key}/{resolved_model}, bypassing rules: {exc}")
+        return body
+    if report.changed:
+        ids = ",".join(f"{h.rule_id}({h.replacements})" for h in report.hits)
+        print(f"[prompt_rules] {ch_key}/{resolved_model}: {report.total_replacements} rewrite(s) [{ids}]")
+    return rewritten
+
+
 async def _build_oauth_responses_ws_upstream_request(
     ch: OpenAIOAuthChannel,
     body: dict,
     resolved_model: str,
+    *,
+    api_key_name: Optional[str] = None,
 ) -> tuple[
     str, dict[str, str], str, Optional[dict], ProtocolIdentityMap,
     UpstreamDispatchMetadata | None,
 ]:
     # 复用 OAuth channel 的鉴权 / session 隔离 / header 构造；只把 URL 改成 WS，
     # body 用 response.create frame 单独生成，避免把 HTTP JSON body 直接发成 WS frame。
+    body = _apply_candidate_prompt_rules(
+        ch, resolved_model, body, ingress_protocol="responses", api_key_name=api_key_name,
+    )
+    body = _candidate_budget_body(ch, resolved_model, body)
     req = await ch.build_upstream_request(
         body, resolved_model, ingress_protocol="responses",
         defer_device_fingerprint=True,
@@ -3952,12 +3993,11 @@ async def _try_openai_oauth_responses_ws_channel(
     idle_timeout = int(timeouts.get("idle", 120))
 
     try:
-        body = _candidate_budget_body(ch, resolved_model, body)
         (
             ws_url, ws_headers, first_frame, translator_ctx, identity_state,
             dispatch_metadata,
         ) = await _build_oauth_responses_ws_upstream_request(
-            ch, body, resolved_model,
+            ch, body, resolved_model, api_key_name=api_key_name,
         )
     except asyncio.CancelledError:
         await await_ws_owned(_finish_cancelled_failover_attempt(
@@ -5165,6 +5205,11 @@ async def _try_channel(
     # candidate, then the final structured wire payload is checked before any
     # transport or dispatch-price freeze.
     try:
+        body = _apply_candidate_prompt_rules(
+            ch, resolved_model, body,
+            ingress_protocol=ingress_protocol,
+            api_key_name=api_key_name,
+        )
         body = _candidate_budget_body(ch, resolved_model, body)
         upstream_req = await ch.build_upstream_request(
             body, resolved_model, ingress_protocol=ingress_protocol,

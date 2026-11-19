@@ -296,6 +296,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "default": [],
         "byChannel": {},
     },
+    "promptRules": {
+        "enabled": True,
+        "rules": [],
+    },
     # ─── 通知开关（事件级分类） ───────────────────────────────────
     # enabled = 总开关；events 里每个事件可独立开关。
     # notifier.notify_event(key, text) 会同时检查 enabled 和 events[key]。
