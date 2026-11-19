@@ -501,9 +501,20 @@ class TestCrossProcessNotify:
 # ─── stage_update（mock 外部命令）─────────────────────────────────
 
 class TestStageUpdate:
+    @staticmethod
+    def _allow_source_integrity(monkeypatch, mode: str = "docker") -> None:
+        monkeypatch.setattr(
+            updater,
+            "_check_source_integrity",
+            lambda *, mode=mode, expected_commit=None: updater.source_integrity.SourceIntegrityReport(
+                ok=True, mode=mode or "docker", source_kind="manifest" if mode == "docker" else "git"
+            ),
+        )
+
     def test_backup_failure_keeps_idle_recoverable(self, monkeypatch):
         config.update(lambda c: c["updateChecker"].__setitem__("runtimeMode", "docker"))
         updater._mode_cache = None
+        self._allow_source_integrity(monkeypatch, "docker")
         # docker 备份失败（inspect 不到镜像）
         monkeypatch.setattr(updater, "_docker_backup",
                             lambda tag: (False, "", "cannot inspect"))
@@ -518,6 +529,7 @@ class TestStageUpdate:
     def test_pull_failure_after_backup(self, monkeypatch):
         config.update(lambda c: c["updateChecker"].__setitem__("runtimeMode", "docker"))
         updater._mode_cache = None
+        self._allow_source_integrity(monkeypatch, "docker")
         monkeypatch.setattr(updater, "_docker_backup",
                             lambda tag: (True, "ref-1", "backup ok"))
         monkeypatch.setattr(updater, "_docker_pull",
@@ -530,6 +542,7 @@ class TestStageUpdate:
     def test_success_enters_staged(self, monkeypatch):
         config.update(lambda c: c["updateChecker"].__setitem__("runtimeMode", "docker"))
         updater._mode_cache = None
+        self._allow_source_integrity(monkeypatch, "docker")
         monkeypatch.setattr(updater, "_docker_backup",
                             lambda tag: (True, "ref-1", "backup ok"))
         monkeypatch.setattr(updater, "_docker_pull",
@@ -545,12 +558,22 @@ class TestStageUpdate:
     def test_src_local_changes_rejected(self, monkeypatch):
         config.update(lambda c: c["updateChecker"].__setitem__("runtimeMode", "systemd"))
         updater._mode_cache = None
-        monkeypatch.setattr(updater, "_src_is_git_repo", lambda: True)
-        monkeypatch.setattr(updater, "_src_has_local_changes", lambda: True)
+        report = updater.source_integrity._build_report(
+            mode="systemd",
+            source_kind="git",
+            changes=[
+                updater.source_integrity.SourceChange("src/failover.py", updater.source_integrity.KIND_MODIFIED),
+                updater.source_integrity.SourceChange("src/custom_patch.py", updater.source_integrity.KIND_ADDED),
+            ],
+        )
+        monkeypatch.setattr(updater, "_check_source_integrity", lambda *, mode=None, expected_commit=None: report)
         ok, detail = updater.stage_update("v0.23.0")
         assert ok is False
-        assert "未提交改动" in detail or "改动" in detail
+        assert "src/failover.py" in detail
+        assert "src/custom_patch.py" in detail
+        assert "已阻止更新" in detail
         assert updater.load_state()["stage"] == updater.STAGE_FAILED
+        assert "src/failover.py" in updater.get_update_log()
 
 
 # ─── 并发锁 ───────────────────────────────────────────────────────
@@ -585,6 +608,16 @@ class TestConcurrencyLock:
 # ─── 重启前 state.db fail-closed 护栏 ─────────────────────────────
 
 class TestRestartDatabaseGuard:
+    @pytest.fixture(autouse=True)
+    def _clean_source_integrity(self, monkeypatch):
+        monkeypatch.setattr(
+            updater,
+            "_check_source_integrity",
+            lambda *, mode=None, expected_commit=None: updater.source_integrity.SourceIntegrityReport(
+                ok=True, mode=mode or updater.MODE_BARE, source_kind="git"
+            ),
+        )
+
     def _stage_bare_update(self, backup_ref: str = "src-test-guard") -> None:
         updater.save_state(
             stage=updater.STAGE_STAGED,
@@ -787,6 +820,13 @@ class TestSilentIdleAutoUpdate:
         monkeypatch.setattr(notifier, "notify_event", lambda event, text, **kw: notifications.append(text))
         monkeypatch.setattr(updater, "_detect_mode", lambda: updater.MODE_BARE)
         monkeypatch.setattr(updater, "_src_is_git_repo", lambda: False)
+        monkeypatch.setattr(
+            updater,
+            "_check_source_integrity",
+            lambda *, mode=None, expected_commit=None: updater.source_integrity.SourceIntegrityReport(
+                ok=True, mode=mode or updater.MODE_BARE, source_kind="git"
+            ),
+        )
         monkeypatch.setattr(updater, "_src_backup", lambda tag: (True, "src-0.36.5", "ok"))
         monkeypatch.setattr(updater, "_src_stage", lambda tag: (True, "downloaded"))
         monkeypatch.setattr(updater, "_prune_backups_locked", lambda: None)

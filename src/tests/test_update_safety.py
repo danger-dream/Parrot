@@ -34,6 +34,13 @@ def isolated_update(monkeypatch, tmp_path):
     monkeypatch.setattr(updater, "_docker_list_backup_tags", lambda: [])
     monkeypatch.setattr(updater, "_progress_cb", None)
     monkeypatch.setattr(updater, "_src_is_git_repo", lambda: False)
+    monkeypatch.setattr(
+        updater,
+        "_check_source_integrity",
+        lambda *, mode=None, expected_commit=None: updater.source_integrity.SourceIntegrityReport(
+            ok=True, mode=mode or updater.MODE_BARE, source_kind="git"
+        ),
+    )
     monkeypatch.setattr(updater, "_prepare_state_restart", lambda st: "verified")
     def forbidden(*args, **kwargs):
         raise AssertionError("external updater operation not stubbed")

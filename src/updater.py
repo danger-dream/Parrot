@@ -26,7 +26,7 @@
 安全红线：
 - 仅 admin 能触发（路由层保证）。
 - 所有外部命令参数固定，无字符串拼接注入面。
-- 源码形态有未提交改动 → 拒绝更新（避免 reset 吃掉本地改动）。
+- 源码与 Docker 形态在更新与重启前均强制校验受管源码完整性；发现任何本地修改/补丁/挂载覆盖均列出被修改的文件并阻止更新，不提供强制更新方法。
 - 全局更新锁，防并发重复触发。
 - 重启前 StateStore 必须严格 flush 并验证 runtime/durable JSON snapshots；失败则拒绝重启。
 - 重启后健康检查失败 → 自动回滚到备份。
@@ -49,7 +49,7 @@ import threading
 import time
 from typing import Optional
 
-from . import __version__, config, network, notifier, state_db
+from . import __version__, config, network, notifier, source_integrity, state_db
 from . import update_supervisor
 
 
@@ -185,6 +185,7 @@ def reset_state() -> None:
         target_tag=None, backup_ref=None, message=None,
         chat_id=None, notify_msg_id=None, silent=False,
         source_target_commit=None, source_guard_digest=None,
+        source_staged_commit=None,
     )
 
 
@@ -309,13 +310,92 @@ def _git(args: list[str], timeout: int = 120) -> tuple[int, str]:
     return _run(["git", "-C", _app_dir()] + args, timeout=timeout)
 
 
+def _git_raw(args: list[str], timeout: int = 30) -> tuple[int, str]:
+    """执行 git 命令并保留原始 stdout（不 strip、不混入 stderr），供 -z 解析使用。"""
+    if _stopping.is_set():
+        return 130, "update interrupted by shutdown"
+    cmd = ["git", "-C", _app_dir(), *args]
+    try:
+        p = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                out, err = p.communicate(timeout=0.2)
+                return p.returncode, (out if p.returncode == 0 else (err or out or ""))
+            except subprocess.TimeoutExpired:
+                if not _stopping.is_set() and time.monotonic() < deadline:
+                    continue
+                try:
+                    os.killpg(p.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    p.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(p.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    p.communicate()
+                return (130, "update interrupted by shutdown") if _stopping.is_set() else (124, f"timeout after {timeout}s")
+    except FileNotFoundError as exc:
+        return 127, f"command not found: {exc}"
+    except Exception as exc:
+        return 1, f"exec error: {exc}"
+
+
+def _source_integrity_excludes() -> list[str]:
+    """Runtime-only data paths excluded from source integrity checks (never managed source)."""
+    excludes = list(_source_data_excludes())
+    app = Path(_app_dir()).resolve()
+    data_root = Path(config.DATA_DIR).resolve()
+    if data_root == app:
+        for name in (".update_log", ".update_result"):
+            if name not in excludes:
+                excludes.append(name)
+        try:
+            for item in data_root.iterdir():
+                if item.name.startswith(".update_result."):
+                    rel = item.relative_to(app).as_posix()
+                    if rel not in excludes:
+                        excludes.append(rel)
+        except OSError:
+            pass
+    return excludes
+
+
+def _check_source_integrity(
+    *,
+    mode: Optional[str] = None,
+    expected_commit: Optional[str] = None,
+) -> source_integrity.SourceIntegrityReport:
+    """统一的更新前/重启前源码完整性校验（源码与 Docker 形态一致，无强制绕过）。"""
+    resolved_mode = mode or _detect_mode()
+    return source_integrity.check_source_integrity(
+        mode=resolved_mode,
+        app_dir=_app_dir(),
+        data_dir=config.DATA_DIR,
+        current_version=__version__,
+        excludes=_source_integrity_excludes(),
+        git_runner=_git_raw,
+        expected_commit=expected_commit,
+    )
+
+
+def _record_source_integrity_failure(report: source_integrity.SourceIntegrityReport) -> None:
+    for line in report.detail_lines:
+        append_update_log(f"❌ {line}")
+
+
 def _src_has_local_changes() -> bool:
-    """工作树有未提交改动 → True（拒绝自动更新，避免 reset 吃掉本地改动）。"""
-    rc, out = _git(["status", "--porcelain"])
-    if rc != 0:
-        # 不是 git 仓库或 git 不可用，按"无改动"处理，让上层用其它判断兜底
-        return False
-    return bool(out.strip())
+    """受管源码存在本地修改/补丁或无法验证完整性 → True。"""
+    return not _check_source_integrity(mode=MODE_BARE).ok
 
 
 def _src_is_git_repo() -> bool:
@@ -333,7 +413,15 @@ def _source_data_excludes() -> list[str]:
     app = Path(_app_dir()).resolve()
     cfg = config.get()
     runtime, durable, legacy = state_db._paths()
-    paths = [config.path(), _backup_root(), runtime, durable, legacy, state_db._manifest_path(runtime)]
+    paths = [
+        config.path(),
+        _backup_root(),
+        os.path.join(config.DATA_DIR, "queued-body-spool"),
+        runtime,
+        durable,
+        legacy,
+        state_db._manifest_path(runtime),
+    ]
     if Path(config.DATA_DIR).resolve() != app:
         paths.append(config.DATA_DIR)
     for value in (cfg.get("logDir", "logs"),
@@ -467,7 +555,10 @@ def _src_pull(target_tag: str, prev_commit: str = "") -> tuple[bool, str]:
                 update_supervisor.restore_dependencies(str(Path(snapshot["root"]) / "snapshot.json"))
             return False, (f"dependency install/check failed: {out3[-300:]}; "
                            f"source/dependency rollback={restored}")
-    save_state(target_code_digest=update_supervisor.code_digest(_app_dir(), _source_data_excludes()))
+    save_state(
+        target_code_digest=update_supervisor.code_digest(_app_dir(), _source_data_excludes()),
+        source_staged_commit=_src_current_commit() or None,
+    )
     return True, f"checked out {target_tag}"
 
 
@@ -502,8 +593,10 @@ def _src_restart() -> tuple[bool, str]:
                                   if meta.get("commit") else []),
         }
         if st.get("source_target_commit"):
-            if _src_has_local_changes() or _src_current_commit() != meta.get("commit"):
-                return False, "source changed after staging; refusing to overwrite local work"
+            integrity = _check_source_integrity(mode=mode, expected_commit=meta.get("commit") or None)
+            if not integrity.ok:
+                _record_source_integrity_failure(integrity)
+                return False, integrity.summary
             target_commit = st["source_target_commit"]
             rc, diff = _git(["diff", "--name-only", meta["commit"], target_commit], timeout=30)
             if rc != 0:
@@ -1214,19 +1307,21 @@ def stage_update(target_tag: str, *, chat_id: Optional[int] = None,
                    silent=bool(silent),
                    message="开始备份",
                    supervisor_id=None, supervisor_result=None, target_code_digest=None,
-                   source_target_commit=None, source_guard_digest=None,
+                   source_target_commit=None, source_guard_digest=None, source_staged_commit=None,
                    silent_error_notified=None, silent_error_attempt_at=None, cancelled_target=None)
-        _emit(STAGE_BACKING_UP, f"📦 正在备份当前版本 v{__version__} …", silent=silent)
 
-        # 源码形态：先挡掉未提交改动
-        if mode in (MODE_SYSTEMD, MODE_BARE) and _src_is_git_repo():
-            if _src_has_local_changes():
-                save_state(stage=STAGE_FAILED, message="工作树有未提交改动，已拒绝更新")
-                fail_msg = "❌ 源码目录有未提交改动，已拒绝自动更新（避免覆盖本地改动）"
-                _emit(STAGE_FAILED, fail_msg, silent=silent)
-                if silent:
-                    notify_silent_failure("工作树有未提交改动，已拒绝更新")
-                return False, "工作树有未提交改动"
+        # 源码完整性检查（源码与 Docker 形态统一执行；发现任何本地修改即列出文件并阻止更新，不提供强制更新）
+        integrity = _check_source_integrity(mode=mode)
+        if not integrity.ok:
+            _record_source_integrity_failure(integrity)
+            save_state(stage=STAGE_FAILED, message=integrity.summary)
+            _emit(STAGE_FAILED, f"❌ {integrity.summary}", silent=silent)
+            if silent:
+                notify_silent_failure(integrity.summary)
+            return False, integrity.summary
+        append_update_log(f"✅ 源码完整性校验通过（形态 {mode} · {integrity.source_kind}）")
+
+        _emit(STAGE_BACKING_UP, f"📦 正在备份当前版本 v{__version__} …", silent=silent)
 
         # ① 备份
         if mode == MODE_DOCKER:
@@ -1314,8 +1409,67 @@ def _restart_guard_failed(detail: str) -> tuple[bool, str]:
     return False, public_detail
 
 
+def _expected_restart_commit(st: dict, mode: str) -> Optional[str]:
+    if mode == MODE_DOCKER:
+        return None
+    if st.get("source_target_commit"):
+        bref = st.get("backup_ref") or ""
+        if bref:
+            meta_path = Path(_backup_root()) / (bref + ".json")
+            if meta_path.is_file():
+                try:
+                    return (json.loads(meta_path.read_text(encoding="utf-8")) or {}).get("commit") or None
+                except Exception:
+                    return None
+        return None
+    staged_commit = st.get("source_staged_commit")
+    if staged_commit:
+        return str(staged_commit)
+    target_tag = st.get("target_tag") or ""
+    if target_tag:
+        rc, out = _git_raw(["rev-parse", "--verify", f"{target_tag}^{{commit}}"], timeout=15)
+        if rc == 0 and out.strip():
+            return out.strip()
+    return None
+
+
+def _restore_docker_staged_tag(st: dict) -> None:
+    backup_ref = st.get("backup_ref") or ""
+    if not backup_ref:
+        return
+    try:
+        with open(os.path.join(_backup_root(), backup_ref + ".json"), encoding="utf-8") as f:
+            meta = json.load(f)
+        digest = meta.get("digest") or ""
+        if digest:
+            _tag_image_for_compose(digest, meta.get("image") or _cfg()["image"])
+    except Exception:
+        pass
+
+
+def _restart_source_guard_failed(
+    report: source_integrity.SourceIntegrityReport,
+    *,
+    st: dict,
+    mode: str,
+    is_silent: bool,
+) -> tuple[bool, str]:
+    _record_source_integrity_failure(report)
+    detail = report.summary
+    if is_silent:
+        if mode == MODE_DOCKER:
+            _restore_docker_staged_tag(st)
+        save_state(stage=STAGE_FAILED, message=detail)
+        _emit(STAGE_FAILED, f"❌ {detail}", silent=True)
+        notify_silent_failure(detail)
+        return False, detail
+    save_state(stage=STAGE_STAGED, message=detail)
+    _emit(STAGE_STAGED, f"❌ {detail}", silent=False)
+    return False, detail
+
+
 def confirm_restart(*, silent: bool = False, require_idle_seconds: float | None = None) -> tuple[bool, str]:
-    """第二阶段：数据库保护成功后才允许重启并由新进程 resume。
+    """第二阶段：源码完整性复核与数据库保护成功后才允许重启并由新进程 resume。
 
     用 _op_lock 防止「连点两次确认」触发两次备份或重启（TOCTOU）。
     """
@@ -1342,6 +1496,24 @@ def confirm_restart(*, silent: bool = False, require_idle_seconds: float | None 
                 return False, "当前仍有请求在运行或尚未达到空闲静默窗口"
         is_silent = bool(silent or st.get("silent"))
         mode = st.get("mode") or _detect_mode()
+
+        # 重启前再次核对源码完整性，阻断 staged 之后到激活之间的本地改动或挂载覆盖。
+        integrity = _check_source_integrity(
+            mode=mode,
+            expected_commit=_expected_restart_commit(st, mode),
+        )
+        if not integrity.ok:
+            return _restart_source_guard_failed(integrity, st=st, mode=mode, is_silent=is_silent)
+        if mode in (MODE_SYSTEMD, MODE_BARE):
+            expected_digest = st.get("source_guard_digest") if st.get("source_target_commit") else st.get("target_code_digest")
+            if expected_digest and update_supervisor.code_digest(_app_dir(), _source_data_excludes()) != expected_digest:
+                digest_report = source_integrity._build_report(
+                    mode=mode,
+                    source_kind="digest",
+                    changes=(),
+                    error="暂存后的受管源码摘要发生变化，疑似存在未登记的本地改动",
+                )
+                return _restart_source_guard_failed(digest_report, st=st, mode=mode, is_silent=is_silent)
 
         # Fail closed: both snapshots must be installed and read-back verified.
         try:

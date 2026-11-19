@@ -78,7 +78,16 @@ async function startStage(): Promise<void> {
     local.value = 'none'
   } else {
     local.value = 'failed'
-    message.value = op ? operationFailureText(op) : stage.error.value || '暂存失败'
+    let detail = op ? operationFailureText(op) : stage.error.value || '暂存失败'
+    if (op) {
+      try {
+        const st = (await api.get<UpdateState>('/updates/state')).data
+        if (st.stage === 'failed' && st.message) detail = st.message
+      } catch {
+        /* keep operation failure text */
+      }
+    }
+    message.value = detail
   }
   emit('changed')
 }
@@ -161,7 +170,14 @@ async function follow(operationId: string, bootBefore: number): Promise<void> {
             const ov = (await api.get<{ uptimeSeconds: number }>('/overview')).data
             if (Date.now() - ov.uptimeSeconds * 1000 < bootBefore + 5000) {
               local.value = 'failed'
-              message.value = `重启未执行：${operationFailureText(op)}`
+              let detail = operationFailureText(op)
+              try {
+                const st = (await api.get<UpdateState>('/updates/state')).data
+                if (st.message && (st.stage === 'failed' || st.stage === 'staged')) detail = st.message
+              } catch {
+                /* keep operation failure text */
+              }
+              message.value = `重启未执行：${detail}`
               emit('changed')
               return
             }
@@ -244,6 +260,7 @@ const stagedVersion = computed(() => props.state?.targetVersion || props.state?.
 
     <template v-else-if="view === 'staged'">
       <p class="ok"><CircleCheck /> {{ showVersion(stagedVersion) }} 已备份并下载完成，等待你确认重启。</p>
+      <p v-if="state?.message && state.message.includes('阻止')" class="warn"><TriangleAlert /> {{ state.message }}</p>
       <p class="txt muted">在任何浏览器或 Telegram 里都可以继续这一步；确认时会重新签发一次性的激活凭据。</p>
       <div class="acts">
         <Btn variant="danger" :loading="busy" @click="activate"><Power /> 重启并激活</Btn>

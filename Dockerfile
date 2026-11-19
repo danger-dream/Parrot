@@ -54,6 +54,12 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 COPY --chown=app:app server.py ./
 COPY --chown=app:app src ./src
 
+# 生成只读受管源码清单，供容器内自更新前校验本地修改与挂载覆盖
+RUN mkdir -p /usr/local/share/parrot \
+    && python -m src.source_integrity --write-manifest /usr/local/share/parrot/source-manifest.json --app-dir /app \
+    && python -m src.source_integrity --verify-manifest /usr/local/share/parrot/source-manifest.json --app-dir /app \
+    && chmod 0444 /usr/local/share/parrot/source-manifest.json
+
 # 数据目录（挂载点）
 RUN mkdir -p /app/data && chown -R app:app /app
 
