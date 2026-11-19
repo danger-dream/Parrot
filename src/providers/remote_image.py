@@ -196,9 +196,15 @@ async def prepare_antigravity_images(payload: dict, *, tool_outputs: bool = Fals
     try:
         return await (inline_tool_output_images(payload) if tool_outputs else inline_remote_images(payload))
     except (RemoteImageDownloadError, httpx.RequestError) as exc:
-        raise GuardError(502, "api_error", "Remote input image download failed", param="input", scope="request") from exc
+        raise GuardError(
+            502, "api_error", "Remote input image download failed",
+            param="input", scope="request", code="antigravity_remote_image_failed",
+        ) from exc
     except RemoteImageError as exc:
-        raise GuardError(400, "invalid_request_error", str(exc), param="input", scope="request") from exc
+        raise GuardError(
+            400, "invalid_request_error", str(exc),
+            param="input", scope="request", code="antigravity_invalid_image",
+        ) from exc
 
 
 def validate_inline_tool_image(inline: dict) -> None:
@@ -206,15 +212,27 @@ def validate_inline_tool_image(inline: dict) -> None:
     from ..openai.transform.guard import GuardError
     mime, data = inline.get("mimeType"), inline.get("data")
     if mime not in ALLOWED_MIME or not isinstance(data, str) or not data:
-        raise GuardError(400, "invalid_request_error", "Unsupported Antigravity tool image MIME or empty data", scope="candidate")
+        raise GuardError(
+            400, "invalid_request_error", "Unsupported Antigravity tool image MIME or empty data",
+            scope="candidate", code="antigravity_unsupported_tool_result",
+        )
     if len(data) > ((MAX_IMAGE_BYTES + 2) // 3) * 4:
-        raise GuardError(400, "invalid_request_error", "Antigravity tool image exceeds image size limit", scope="candidate")
+        raise GuardError(
+            400, "invalid_request_error", "Antigravity tool image exceeds image size limit",
+            scope="candidate", code="antigravity_unsupported_tool_result",
+        )
     try:
         decoded = base64.b64decode(data, validate=True)
     except (ValueError, TypeError) as exc:
-        raise GuardError(400, "invalid_request_error", "Invalid base64 tool image", scope="candidate") from exc
+        raise GuardError(
+            400, "invalid_request_error", "Invalid base64 tool image",
+            scope="candidate", code="antigravity_unsupported_tool_result",
+        ) from exc
     if len(decoded) > MAX_IMAGE_BYTES:
-        raise GuardError(400, "invalid_request_error", "Antigravity tool image exceeds image size limit", scope="candidate")
+        raise GuardError(
+            400, "invalid_request_error", "Antigravity tool image exceeds image size limit",
+            scope="candidate", code="antigravity_unsupported_tool_result",
+        )
 
 
 async def inline_tool_output_images(payload: dict[str, Any]) -> dict[str, Any]:

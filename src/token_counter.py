@@ -179,6 +179,27 @@ def _collect_messages(messages: Any, segments: list[str]) -> None:
         if not isinstance(message, dict):
             _add(segments, message)
             continue
+        typ = str(message.get("type") or "")
+        if typ in {"function_call_output", "custom_tool_call_output"}:
+            _add(segments, message.get("call_id"))
+            _collect_content(message.get("output"), segments)
+            continue
+        if typ == "function_call":
+            _add(segments, message.get("call_id"))
+            _add(segments, message.get("namespace"))
+            _add(segments, message.get("name"))
+            _add(segments, message.get("arguments"))
+            continue
+        if typ == "custom_tool_call":
+            _add(segments, message.get("call_id"))
+            _add(segments, message.get("namespace"))
+            _add(segments, message.get("name"))
+            _add(segments, message.get("input"))
+            continue
+        if typ == "reasoning":
+            _collect_content(message.get("summary"), segments)
+            _collect_content(message.get("content"), segments)
+            continue
         _add(segments, message.get("role"))
         _add(segments, message.get("name"))
         _collect_content(message.get("content"), segments)
@@ -198,6 +219,9 @@ def _collect_tools(tools: Any, segments: list[str]) -> None:
         _add(segments, tool.get("name"))
         _add(segments, tool.get("description"))
         _add(segments, tool.get("input_schema"))
+        _add(segments, tool.get("parameters"))
+        if tool.get("type") == "namespace":
+            _collect_tools(tool.get("tools"), segments)
         fn = tool.get("function")
         if isinstance(fn, dict):
             _add(segments, fn.get("name"))
@@ -239,14 +263,7 @@ def count_request_tokens(body: dict[str, Any] | None, *, model: str | None = Non
 
 def count_message_tokens(message: Any, *, model: str | None = None) -> int:
     segments: list[str] = []
-    if isinstance(message, dict):
-        _add(segments, message.get("role"))
-        _add(segments, message.get("name"))
-        _collect_content(message.get("content"), segments)
-        _add(segments, message.get("tool_calls"))
-        _add(segments, message.get("function_call"))
-    else:
-        _add(segments, message)
+    _collect_messages([message], segments)
     if not segments:
         return 0
     return count_text_tokens("\n".join(segments), model=model)

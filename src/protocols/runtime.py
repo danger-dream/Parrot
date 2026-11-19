@@ -367,6 +367,16 @@ async def prepare_non_stream_response(
             dynamic_map=dynamic_map,
             translator_ctx=translator_ctx,
         )
+        tail = await provider_registry.finish_response_bytes(
+            channel,
+            dynamic_map=dynamic_map,
+            translator_ctx=translator_ctx,
+        )
+        if tail:
+            if isinstance(restored, bytes):
+                restored = restored + tail
+            else:
+                restored = str(restored) + tail.decode("utf-8", errors="replace")
     except Exception as exc:
         # Restoration is a downstream presentation concern.  Preserve the
         # exact upstream body so terminal billing can still inspect actual cost,

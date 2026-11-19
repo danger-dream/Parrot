@@ -1925,6 +1925,7 @@ async def open_response_with_proxy_chain(
                 persist_dispatch=persist_dispatch,
             )
             result.http_status = exc.status
+            result.error_code = getattr(exc, "code", None)
             return OpenedHttpResponse(error=result)
         except BusinessTimeoutError as exc:
             detail = f"{exc.outcome} while opening upstream response"

@@ -29,13 +29,15 @@ class GuardError(Exception):
     """
 
     def __init__(self, status: int, err_type: str, message: str,
-                 *, param: str | None = None, scope: GuardScope = "request"):
+                 *, param: str | None = None, scope: GuardScope = "request",
+                 code: str | None = None):
         super().__init__(message)
         self.status = int(status)
         self.err_type = err_type
         self.message = message
         self.param = param
         self.scope = scope
+        self.code = code
 
 
 def _fail(status: int, err_type: str, message: str, *, param: str | None = None,

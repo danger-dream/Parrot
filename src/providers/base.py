@@ -100,6 +100,12 @@ class OpenAIApiAdapter(ProviderAdapter):
     name = "openai-api"
     capabilities = OPENAI_API_CAPABILITIES
 
+    async def finish_response_bytes(self, ctx: ProviderAttemptContext) -> bytes:
+        if ctx is not None and ctx.dynamic_map:
+            from .. import search_tool_wire
+            return search_tool_wire.flush_bytes(ctx.dynamic_map)
+        return b""
+
 
 class CursorOAuthAdapter(ProviderAdapter):
     name = "cursor-oauth"

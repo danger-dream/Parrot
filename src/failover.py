@@ -1340,10 +1340,14 @@ def _antigravity_error_evidence(result: AttemptResult):
     failure = decoder.request_failure if isinstance(decoder, GeminiStreamToResponses) else None
     if failure and failure[0] in REQUEST_FAILURE_CODES:
         signal["diagnostic"]["generation_code"] = failure[0]
+    from .providers.antigravity_errors import LOCAL_ERROR_MESSAGES
     local_code = decoder.local_error_code if isinstance(decoder, GeminiStreamToResponses) else None
     if not local_code and signal["classification"] == "unknown":
-        local_code = ("timeout" if "timeout" in result.outcome else
-                      "transport_error" if result.outcome in {"connect_error", "proxy_connect_error", "connection_lifecycle"} else result.outcome)
+        if isinstance(result.error_code, str) and result.error_code in LOCAL_ERROR_MESSAGES:
+            local_code = result.error_code
+        else:
+            local_code = ("timeout" if "timeout" in result.outcome else
+                          "transport_error" if result.outcome in {"connect_error", "proxy_connect_error", "connection_lifecycle"} else result.outcome)
     if local_code == "transform_error" and not isinstance(decoder, GeminiStreamToResponses):
         local_code = "request_transform_error"
     return raw, present_error(signal, local_code=local_code)
@@ -3975,6 +3979,7 @@ async def _try_openai_oauth_responses_ws_channel(
             return AttemptResult(
                 outcome=outcome,
                 error_detail=str(getattr(exc, "message", exc))[:2000],
+                error_code=getattr(exc, "code", None),
                 http_status=int(getattr(exc, "status", 400)),
             )
         return AttemptResult(outcome="transform_error", error_detail=f"transform error: {exc}")
@@ -5200,6 +5205,7 @@ async def _try_channel(
             return AttemptResult(
                 outcome=outcome,
                 error_detail=str(getattr(exc, "message", exc))[:2000],
+                error_code=getattr(exc, "code", None),
                 http_status=int(getattr(exc, "status", 400)),
             )
         traceback.print_exc()

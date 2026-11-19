@@ -16,7 +16,10 @@ def family(model: str) -> str | None:
 
 
 def _fail(message: str) -> None:
-    raise GuardError(400, "invalid_request_error", message, param="reasoning", scope="candidate")
+    raise GuardError(
+        400, "invalid_request_error", message,
+        param="reasoning", scope="candidate", code="antigravity_thinking_unsupported",
+    )
 
 
 def intent(model: str, body: dict, ingress: str) -> tuple[str | None, bool]:

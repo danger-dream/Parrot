@@ -63,16 +63,24 @@ def _as_json_str(value: Any) -> str:
         return "{}"
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-JSON constant {value}")
+
+
 def _parse_args(raw: Any) -> dict[str, Any]:
     if isinstance(raw, dict):
         return raw
-    if isinstance(raw, str) and raw.strip():
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        if not raw.strip():
+            return {}
         try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
+            parsed = json.loads(raw, parse_constant=_reject_json_constant)
+        except (ValueError, TypeError, RecursionError):
             return {"_raw": raw}
         return parsed if isinstance(parsed, dict) else {"_raw": raw}
-    return {}
+    return {"_raw": _as_json_str(raw)}
 
 
 def _part_thought_signature(part: dict) -> str:
@@ -150,6 +158,80 @@ def _sanitize_request_schemas(request: dict, *, model: str) -> None:
             schema = gen.get(key)
             if isinstance(schema, dict):
                 gen[key] = antigravity_schema.clean_response_schema(schema)
+
+
+def _has_unmatched_function_response_ref(value: Any, valid_names: set[str]) -> bool:
+    stack = [value]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            if "$ref" in cur:
+                ref_val = cur.get("$ref")
+                if not isinstance(ref_val, str) or ref_val not in valid_names:
+                    return True
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return False
+
+
+def _function_response_part_names(fr: dict) -> set[str]:
+    names: set[str] = set()
+    parts = fr.get("parts")
+    if not isinstance(parts, list):
+        return names
+    for item in parts:
+        if not isinstance(item, dict):
+            continue
+        for key in ("inlineData", "inline_data", "fileData", "file_data"):
+            blob = item.get(key)
+            if isinstance(blob, dict):
+                dn = blob.get("displayName") or blob.get("display_name")
+                if isinstance(dn, str) and dn:
+                    names.add(dn)
+    return names
+
+
+def _sanitize_function_responses(request: dict) -> None:
+    contents = request.get("contents")
+    if not isinstance(contents, list):
+        return
+    copied_contents = False
+    for c_idx, content in enumerate(contents):
+        if not isinstance(content, dict):
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            continue
+        new_parts: list[Any] | None = None
+        for idx, part in enumerate(parts):
+            if not isinstance(part, dict):
+                continue
+            fr_key = "functionResponse" if isinstance(part.get("functionResponse"), dict) else (
+                "function_response" if isinstance(part.get("function_response"), dict) else ""
+            )
+            if not fr_key:
+                continue
+            fr = part[fr_key]
+            resp = fr.get("response")
+            if isinstance(resp, dict) and _has_unmatched_function_response_ref(
+                resp, _function_response_part_names(fr),
+            ):
+                if new_parts is None:
+                    new_parts = list(parts)
+                new_fr = dict(fr)
+                new_fr["response"] = {"result": _json_dumps(resp)}
+                new_part = dict(part)
+                new_part[fr_key] = new_fr
+                new_parts[idx] = new_part
+        if new_parts is not None:
+            if not copied_contents:
+                contents = list(contents)
+                request["contents"] = contents
+                copied_contents = True
+            new_content = dict(content)
+            new_content["parts"] = new_parts
+            contents[c_idx] = new_content
 
 
 def _delta_from_snapshot(previous: str, current: str) -> str:
@@ -281,19 +363,32 @@ def _tool_output_parts(output: Any) -> tuple[dict, list[dict]]:
                 image = _part_from_content_item(part)
                 inline = (image or {}).get("inlineData")
                 if not inline:
-                    raise GuardError(400, "invalid_request_error", "Antigravity tool images require image data or a supported HTTPS URL", scope="candidate")
+                    raise GuardError(
+                        400, "invalid_request_error",
+                        "Antigravity tool images require image data or a supported HTTPS URL",
+                        scope="candidate", code="antigravity_unsupported_tool_result",
+                    )
                 remote_image.validate_inline_tool_image(inline)
                 images.append(image)
             else:
-                raise GuardError(400, "invalid_request_error", "Antigravity tool results support text and images, not opaque files or unknown content parts", scope="candidate")
+                raise GuardError(
+                    400, "invalid_request_error",
+                    "Antigravity tool results support text and images, not opaque files or unknown content parts",
+                    scope="candidate", code="antigravity_unsupported_tool_result",
+                )
         return {"result": "\n".join(texts)}, images
     if isinstance(output, str):
         try:
             response = json.loads(output)
         except json.JSONDecodeError:
             response = {"result": output}
+        else:
+            if isinstance(response, (dict, list)) and _has_unmatched_function_response_ref(response, set()):
+                response = {"result": output}
     else:
         response = output
+        if isinstance(response, (dict, list)) and _has_unmatched_function_response_ref(response, set()):
+            response = {"result": _json_dumps(response)}
     return response if isinstance(response, dict) else {"result": response}, images
 
 
@@ -321,7 +416,11 @@ def _thinking_config(payload: dict) -> dict[str, Any] | None:
     }
     if effort == "xhigh":
         from ..openai.transform.guard import GuardError
-        raise GuardError(400, "invalid_request_error", "This Antigravity model has no verified xhigh thinking mapping", param="reasoning", scope="candidate")
+        raise GuardError(
+            400, "invalid_request_error",
+            "This Antigravity model has no verified xhigh thinking mapping",
+            param="reasoning", scope="candidate", code="antigravity_thinking_unsupported",
+        )
     level = mapping.get(effort)
     if not level:
         return None
@@ -411,47 +510,74 @@ def prepare_responses_request(payload: dict, *, api_key_name: str = "") -> tuple
     """
     from ..openai.transform import guard, responses_to_chat, responses_to_anthropic as bridge
 
-    def fail(message: str, param: str) -> None:
-        raise guard.GuardError(400, "invalid_request_error", message, param=param, scope="candidate")
+    def fail(message: str, param: str, *, code: str | None = None) -> None:
+        raise guard.GuardError(400, "invalid_request_error", message, param=param, scope="candidate", code=code)
 
     for key in ("conversation", "background"):
         if payload.get(key):
-            fail(f"Antigravity has no OpenAI {key} backend; use local previous_response_id or explicit input", key)
+            fail(
+                f"Antigravity has no OpenAI {key} backend; use local previous_response_id or explicit input",
+                key, code="antigravity_unsupported_input",
+            )
     prepared = copy.deepcopy(payload)
     items = responses_to_chat.resolve_input_items(payload, api_key_name=api_key_name)
     for item in items:
         if not isinstance(item, dict):
-            fail("Gemini input items must be objects", "input")
+            fail("Gemini input items must be objects", "input", code="antigravity_unsupported_input")
         typ = item.get("type") or ("message" if item.get("role") else "")
         if typ not in {"message", "reasoning", "function_call", "function_call_output"}:
-            fail(f"Antigravity cannot replay OpenAI input type {typ!r} as Gemini content", "input")
-        if typ == "function_call" and not _complete_call(item):
-            fail("Cannot replay malformed function_call arguments as Gemini Struct", "input")
+            fail(
+                f"Antigravity cannot replay OpenAI input type {typ!r} as Gemini content",
+                "input", code="antigravity_unsupported_input",
+            )
+        if typ == "function_call":
+            # Historical tool calls from other models may carry truncated or
+            # non-JSON arguments after the client already rejected them; keep
+            # them replayable via _parse_args() as long as the function name is
+            # valid so switching a conversation to Gemini does not break it.
+            name = item.get("name")
+            if not isinstance(name, str) or not name.strip():
+                fail(
+                    "Cannot replay function_call without a valid function name",
+                    "input", code="antigravity_invalid_function_call",
+                )
         if typ == "message" and isinstance(item.get("content"), list):
             for part in item["content"]:
                 if not isinstance(part, dict):
                     continue
                 nested = part.get("file") if isinstance(part.get("file"), dict) else {}
                 if part.get("file_id") or nested.get("file_id"):
-                    fail("OpenAI file_id has no local Gemini file content; provide file_data or file_url", "input")
+                    fail(
+                        "OpenAI file_id has no local Gemini file content; provide file_data or file_url",
+                        "input", code="antigravity_unsupported_input",
+                    )
     tools = prepared.get("tools") or []
     # Only ordinary client functions are promised here. Hosted tools and
     # custom/grammar tools need their own execution/validation contract.
     for tool in tools:
         if not isinstance(tool, dict):
-            fail("Gemini tools must be objects", "tools")
+            fail("Gemini tools must be objects", "tools", code="antigravity_unsupported_tool")
         typ = tool.get("type") or "function"
         if typ == "namespace":
             if any(not isinstance(child, dict) or child.get("type", "function") != "function"
                    for child in tool.get("tools") or []):
-                fail("Antigravity namespace children must be ordinary function tools", "tools")
+                fail(
+                    "Antigravity namespace children must be ordinary function tools",
+                    "tools", code="antigravity_unsupported_tool",
+                )
             if tool.get("description"):
                 for child in tool.get("tools") or []:
                     child["description"] = str(tool["description"]) + "\n" + str(child.get("description") or "")
         elif typ == "custom":
-            fail("Antigravity requires JSON-schema function tools; custom tool format conversion is not implemented", "tools")
+            fail(
+                "Antigravity requires JSON-schema function tools; custom tool format conversion is not implemented",
+                "tools", code="antigravity_unsupported_tool",
+            )
         elif typ != "function":
-            fail(f"Antigravity has no execution backend for OpenAI tool type {typ!r}", "tools")
+            fail(
+                f"Antigravity has no execution backend for OpenAI tool type {typ!r}",
+                "tools", code="antigravity_unsupported_tool",
+            )
     plan = bridge.NamespaceToolMap()
     prepared["tools"] = bridge._flatten_response_tools(tools, plan)
     prepared["tool_choice"] = bridge._map_tool_choice(prepared.get("tool_choice"), plan)
@@ -461,7 +587,7 @@ def prepare_responses_request(payload: dict, *, api_key_name: str = "") -> tuple
         prepared["tools"] = [tool for tool in prepared["tools"] if tool["name"] in selected]
         mode = choice.get("mode", "auto")
         if mode not in {"auto", "required"}:
-            fail("allowed_tools mode must be auto or required", "tool_choice")
+            fail("allowed_tools mode must be auto or required", "tool_choice", code="antigravity_unsupported_tool")
         # Gemini's AUTO has no reliable subset restriction; expose exactly the
         # permitted declarations instead of silently widening allowed tools.
         prepared["tool_choice"] = mode
@@ -753,6 +879,7 @@ def wrap_cloud_code(
 
     _sanitize_request_schemas(request, model=model)
     _sanitize_thought_signatures(request)
+    _sanitize_function_responses(request)
 
     envelope: dict[str, Any] = {
         "project": project_id,

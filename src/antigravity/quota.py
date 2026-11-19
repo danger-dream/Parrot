@@ -212,10 +212,15 @@ def apply_request_429(
         if delay is None:
             delay = parse_google_duration(retry_after)
         if delay is None or not 0 < delay <= MAX_RESET_SECONDS:
-            # Existing maximum finite ladder window; never reach its permanent
-            # rung just because Google omitted a reset/delay.
-            windows = config.get().get("errorWindows") or [1, 3, 5, 10, 15, 0]
-            delay = min(MAX_RESET_SECONDS, max((int(w) for w in windows if int(w) > 0), default=15) * 60)
+            windows = [int(w) for w in (config.get().get("errorWindows") or [1, 3, 5, 10, 15, 0]) if int(w) > 0]
+            if signal["classification"] in {"quota_exhausted", "validation_required"}:
+                # Quota exhaustion or validation challenge without an explicit
+                # reset keeps the maximum finite window; never permanent.
+                delay = min(MAX_RESET_SECONDS, max(windows, default=15) * 60)
+            else:
+                # Transient/RPM 429s from Cloud Code often omit retryDelay;
+                # start at the shortest finite window instead of locking 15m.
+                delay = min(MAX_RESET_SECONDS, min(windows, default=1) * 60)
         until = int((time.time() + delay) * 1000)
         if signal["quota_exhausted"] and not used_credits and oauth_manager.antigravity_credits_usable(account_key):
             _record_model_quota_exhausted_until(account_key, model, until)

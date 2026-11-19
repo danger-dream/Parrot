@@ -234,7 +234,11 @@ class AntigravityOAuthChannel(Channel):
                 str(requested_body.get("model") or resolved_model), requested_body, ingress_protocol,
             )
             if expected != resolved_model:
-                raise guard.GuardError(400, "invalid_request_error", "Antigravity thinking tiers must resolve to an enabled exact model before dispatch", param="model", scope="candidate")
+                raise guard.GuardError(
+                    400, "invalid_request_error",
+                    "Antigravity thinking tiers must resolve to an enabled exact model before dispatch",
+                    param="model", scope="candidate", code="antigravity_thinking_unsupported",
+                )
             thinking_config = policy.thinking_config(
                 resolved_model, requested_body, ingress_protocol,
                 **({"metadata": generation_metadata} if policy is fixed_thinking else {}),

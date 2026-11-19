@@ -660,3 +660,41 @@ def test_restore_flush_preserves_eof_recovery_and_is_idempotent():
     raw += restore_antigravity_bytes(b"", converter=converter, flush=True)
     assert terminal(events(raw))["status"] == "failed"
     assert restore_antigravity_bytes(b"", converter=converter, flush=True) == b""
+
+
+@pytest.mark.parametrize("raw_args,expected_args", [
+    ('{"action":"edit_file","params":{"path":"/a"}', {"_raw": '{"action":"edit_file","params":{"path":"/a"}'}),
+    ("[1, 2, 3]", {"_raw": "[1, 2, 3]"}),
+    ('{"x": NaN}', {"_raw": '{"x": NaN}'}),
+    ("", {}),
+    (None, {}),
+    ({"ok": True}, {"ok": True}),
+])
+def test_historical_malformed_function_call_arguments_replay_as_gemini_struct(raw_args, expected_args):
+    request = {
+        "model": "gemini-4-neon",
+        "input": [
+            {"role": "user", "content": "edit file"},
+            {"type": "function_call", "call_id": "call_bad_1", "name": "Servers", "arguments": raw_args},
+            {"type": "function_call_output", "call_id": "call_bad_1", "output": "error: 工具参数必须是 JSON 对象"},
+            {"role": "user", "content": "continue"},
+        ],
+    }
+    prepared, _ = prepare_responses_request(request)
+    wire = responses_to_gemini(prepared)
+    fc_part = wire["contents"][1]["parts"][0]["functionCall"]
+    fr_part = wire["contents"][2]["parts"][0]["functionResponse"]
+    assert fc_part == {"name": "Servers", "args": expected_args, "id": "call_bad_1"}
+    assert fr_part == {"name": "Servers", "id": "call_bad_1", "response": {"result": "error: 工具参数必须是 JSON 对象"}}
+
+
+def test_function_call_without_valid_name_still_fails_with_typed_guard_code():
+    from src.openai.transform.guard import GuardError
+    with pytest.raises(GuardError) as exc_info:
+        prepare_responses_request({
+            "input": [{"type": "function_call", "call_id": "call_noname", "name": "  ", "arguments": "{}"}],
+        })
+    assert exc_info.value.status == 400
+    assert exc_info.value.scope == "candidate"
+    assert exc_info.value.code == "antigravity_invalid_function_call"
+

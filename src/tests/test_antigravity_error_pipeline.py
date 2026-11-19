@@ -324,3 +324,43 @@ def test_decoder_before_response_does_not_invent_http_status(outcome, code, phra
     error = _structured_attempt_error(result, 1, FailoverChannel('ag:first'))
     assert error['code'] == code and phrase in error['message']
     assert 'http_status' not in error['message'] and SECRET not in error['message']
+
+
+@pytest.mark.parametrize('guard_code,phrase', [
+    ('antigravity_thinking_unsupported', 'thinking tier or reasoning effort'),
+    ('antigravity_model_unavailable', 'unavailable or changed before dispatch'),
+    ('antigravity_unsupported_input', 'input items or server-side state fields'),
+    ('antigravity_unsupported_tool', 'tool definitions or tool_choice modes'),
+    ('antigravity_unsupported_tool_result', 'tool results only support text and supported images'),
+    ('antigravity_invalid_function_call', 'without a valid function name'),
+    ('antigravity_remote_image_failed', 'download the remote input image'),
+    ('antigravity_invalid_image', 'rejected the input image URL or format'),
+])
+def test_typed_antigravity_guard_code_surfaces_specific_safe_message(guard_code, phrase):
+    from src.failover import _structured_attempt_error
+    result = AttemptResult(
+        outcome='candidate_guard',
+        http_status=400,
+        error_code=guard_code,
+        error_detail=SECRET,
+    )
+    error = _structured_attempt_error(result, 1, FailoverChannel('ag:first'))
+    assert error['code'] == guard_code
+    assert phrase in error['message']
+    assert 'thinking-tier compatibility' not in error['message']
+    assert SECRET not in error['message']
+
+
+def test_unknown_guard_error_code_falls_back_safely_without_leaking_secret():
+    from src.failover import _structured_attempt_error
+    result = AttemptResult(
+        outcome='candidate_guard',
+        http_status=400,
+        error_code=SECRET,
+        error_detail=SECRET,
+    )
+    error = _structured_attempt_error(result, 1, FailoverChannel('ag:first'))
+    assert error['code'] == 'candidate_guard'
+    assert 'thinking-tier compatibility' in error['message']
+    assert SECRET not in error['message']
+

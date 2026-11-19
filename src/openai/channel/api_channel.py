@@ -23,7 +23,7 @@ from ...channel.compatibility import (
     normalize_models,
 )
 from ...channel.url_utils import resolve_upstream_url
-from ... import cache_hints, json_bytes, local_web_tools, model_metadata, model_pricing
+from ... import cache_hints, json_bytes, local_web_tools, model_metadata, model_pricing, search_tool_wire
 from ...providers import registry as provider_registry
 from .. import deepseek_reasoning
 from ..transform import (
@@ -427,7 +427,9 @@ class OpenAIApiChannel(Channel):
         )
 
     def _build_responses_passthrough(self, body: dict, resolved_model: str) -> UpstreamRequest:
-        payload = dict(body)
+        payload, dynamic_map = search_tool_wire.compile_responses_namespace(
+            dict(body), stream=bool(body.get("stream")),
+        )
         payload = provider_registry.filter_request_payload(self, payload, protocol="openai-responses")
         payload["model"] = resolved_model
         self._apply_compatibility(
@@ -437,7 +439,7 @@ class OpenAIApiChannel(Channel):
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/responses"),
             headers=self._headers(),
             body=json_bytes.dumps_utf8(payload, separators=(",", ":")),
-            dynamic_tool_map=None,
+            dynamic_tool_map=dynamic_map,
             dispatch_metadata=build_dispatch_metadata(payload, self.protocol),
             translator_ctx=None,
         )
@@ -518,8 +520,9 @@ class OpenAIApiChannel(Channel):
 
     async def restore_response(self, chunk: bytes,
                                dynamic_map: Optional[dict] = None) -> bytes:
-        # OpenAI 家族不做工具名还原，原样返回。非流式 DeepSeek 响应在此
-        # 缓存；SSE 流由 failover 在收到明确终态后从 builder 缓存。
+        if dynamic_map:
+            chunk = search_tool_wire.restore_bytes(chunk, dynamic_map)
+        # 非流式 DeepSeek 响应在此缓存；SSE 流由 failover 在收到明确终态后从 builder 缓存。
         if self._is_deepseek():
             try:
                 obj = json.loads(chunk)

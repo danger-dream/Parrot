@@ -13,7 +13,10 @@ def is_argon(model: str) -> bool:
 
 
 def _fail(message: str) -> None:
-    raise GuardError(400, "invalid_request_error", message, param="reasoning", scope="candidate")
+    raise GuardError(
+        400, "invalid_request_error", message,
+        param="reasoning", scope="candidate", code="antigravity_thinking_unsupported",
+    )
 
 
 def intent(body: dict, ingress: str) -> tuple[str | None, bool]:

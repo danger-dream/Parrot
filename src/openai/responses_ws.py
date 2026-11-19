@@ -2435,7 +2435,7 @@ async def _try_ws_channel(
         except GuardError as exc:
             last_error = _WsAttemptResult(
                 outcome="candidate_guard" if getattr(exc, "scope", "request") == "candidate" else "request_invalid",
-                error_detail=exc.message, http_status=exc.status,
+                error_detail=exc.message, error_code=getattr(exc, "code", None), http_status=exc.status,
                 proxy_name=proxy_name_used, proxy_bytes=proxy_bytes, upstream_protocol=ch_proto,
             )
         except BusinessTimeoutError as exc:
@@ -3938,6 +3938,7 @@ async def _relay_ws_session(
             else "guard_error"
         )
         result.error_detail = str(getattr(exc, "message", exc))[:2000]
+        result.error_code = getattr(exc, "code", None)
         result.http_status = int(getattr(exc, "status", 400))
         sync_tracker_result()
         return _apply_ws_snapshot(result, timing, terminal=True)
