@@ -444,12 +444,40 @@ def _filter_replay_for_input(input_items: list[Any], replay_items: list[dict[str
     return filtered
 
 
-def _insert_index(input_items: list[Any], replay_items: list[dict[str, Any]]) -> int:
+def _is_assistant_turn_item(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    typ = item.get("type")
+    if typ in ("function_call", "custom_tool_call"):
+        return True
+    return typ == "message" and item.get("role") == "assistant"
+
+
+def _insert_index(
+    input_items: list[Any],
+    replay_items: list[dict[str, Any]],
+    anchor_items: list[dict[str, Any]] | None = None,
+) -> int | None:
+    # Keep unfiltered replay items as call-id anchors: when Chat/Anthropic
+    # clients already echo the tool call in input_items, _filter_replay_for_input
+    # drops the duplicate function_call and leaves only reasoning, which must
+    # still attach to that turn rather than jumping back to an older text reply.
+    anchor_source = anchor_items if anchor_items is not None else replay_items
     replay_call_ids: set[str] = set()
-    for item in replay_items:
+    for item in anchor_source:
         if item.get("type") in ("function_call", "custom_tool_call"):
             replay_call_ids.update(_comparable_call_ids(item.get("call_id")))
     if replay_call_ids:
+        for idx, item in enumerate(input_items):
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") not in ("function_call", "custom_tool_call"):
+                continue
+            call_id = _clean_str(item.get("call_id"))
+            if call_id and call_id in replay_call_ids:
+                while idx > 0 and _is_assistant_turn_item(input_items[idx - 1]):
+                    idx -= 1
+                return idx
         for idx, item in enumerate(input_items):
             if not isinstance(item, dict):
                 continue
@@ -458,10 +486,20 @@ def _insert_index(input_items: list[Any], replay_items: list[dict[str, Any]]) ->
             call_id = _clean_str(item.get("call_id"))
             if not call_id or call_id in replay_call_ids:
                 return idx
+        # Cached reasoning belonged to a tool-call turn no longer present in
+        # input_items (e.g. branched/rewound history); do not splice it earlier.
+        return None
+
+    last_assistant_idx: int | None = None
     for idx in range(len(input_items) - 1, -1, -1):
-        item = input_items[idx]
-        if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "assistant":
-            return idx
+        if _is_assistant_turn_item(input_items[idx]):
+            last_assistant_idx = idx
+            break
+    if last_assistant_idx is not None:
+        while last_assistant_idx > 0 and _is_assistant_turn_item(input_items[last_assistant_idx - 1]):
+            last_assistant_idx -= 1
+        return last_assistant_idx
+
     for idx, item in enumerate(input_items):
         is_instruction_prefix = bool(
             isinstance(item, dict)
@@ -516,7 +554,9 @@ def inject_replay_items(payload: dict[str, Any], scope: dict[str, str] | None) -
     if not filtered:
         return 0
     filtered = _align_tool_call_ids(input_items, filtered)
-    idx = _insert_index(input_items, filtered)
+    idx = _insert_index(input_items, filtered, anchor_items=replay_items)
+    if idx is None:
+        return 0
     payload["input"] = list(input_items[:idx]) + filtered + list(input_items[idx:])
     return len(filtered)
 
