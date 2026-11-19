@@ -233,33 +233,50 @@ def model_at_generation_endpoint(account: dict, model: str) -> bool:
     )
 
 
-def generation_model_metadata(account: dict, model: str) -> dict:
-    if not model_at_generation_endpoint(account, model):
-        return {}
+def _source_generation_metadata(source: dict) -> dict:
+    result = {}
+    enum = ag_catalog.model_enum(source.get("modelEnum"))
+    if enum:
+        result["modelEnum"] = enum
+    level = ag_catalog.thinking_level(source.get("thinkingLevel"))
+    if level is not None:
+        result["thinkingLevel"] = level
+    for field in ("maxOutputTokens", "minThinkingBudget"):
+        value = source.get(field)
+        if type(value) is int and value > 0:
+            result[field] = value
+    return result
+
+
+def generation_endpoint_models(account: dict) -> dict[str, dict]:
+    """All enabled model metadata observed at the account's active generation endpoint."""
     catalog = account.get("account_model_catalog") or {}
-    if not isinstance(catalog, dict) or catalog.get("antigravityGenerationBaseUrl") != effective_request_base_url(account):
+    base = effective_request_base_url(account)
+    if not isinstance(catalog, dict) or catalog.get("antigravityGenerationBaseUrl") != base:
         return {}
     records = catalog.get("models")
-    for record in records if isinstance(records, list) else []:
-        if not isinstance(record, dict) or record.get("id") != model:
+    if not isinstance(records, list):
+        return {}
+    out: dict[str, dict] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        model = str(record.get("id") or "").strip()
+        if not model or ag_catalog.disabled(model, record):
             continue
         sources = record.get("antigravitySources")
         for source in sources if isinstance(sources, list) else []:
-            if not isinstance(source, dict) or source.get("baseUrl") != catalog["antigravityGenerationBaseUrl"]:
+            if not isinstance(source, dict) or source.get("baseUrl") != base or source.get("disabled") is True:
                 continue
-            result = {}
-            enum = ag_catalog.model_enum(source.get("modelEnum"))
-            if enum:
-                result["modelEnum"] = enum
-            level = ag_catalog.thinking_level(source.get("thinkingLevel"))
-            if level is not None:
-                result["thinkingLevel"] = level
-            for field in ("maxOutputTokens", "minThinkingBudget"):
-                value = source.get(field)
-                if type(value) is int and value > 0:
-                    result[field] = value
-            return result
-    return {}
+            out[model] = _source_generation_metadata(source)
+            break
+    return out
+
+
+def generation_model_metadata(account: dict, model: str) -> dict:
+    if not model_at_generation_endpoint(account, model):
+        return {}
+    return dict(generation_endpoint_models(account).get(model) or {})
 
 
 def model_enum_at_generation_endpoint(account: dict, model: str) -> str:

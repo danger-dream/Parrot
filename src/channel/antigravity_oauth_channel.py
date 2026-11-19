@@ -163,12 +163,26 @@ class AntigravityOAuthChannel(Channel):
                           or not model_state.is_source_enabled(self.key, model)):
                 raise DispatchGuardError(400, "invalid_request_error", "Model is disabled for this source", param="model", scope="candidate")
 
+    def _generation_catalog_models(self) -> dict[str, dict]:
+        live = oauth_manager.get_account(self.account_key)
+        if not isinstance(live, dict) or ag_provider.effective_request_base_url(live) != self.base_url:
+            return {}
+        return ag_provider.generation_endpoint_models(live)
+
     def resolve_request_model(self, requested_model: str, body: dict, ingress: str) -> Optional[str]:
         from ..antigravity import argon, fixed_thinking
         from ..model_registry import runtime as model_registry
-        policy = fixed_thinking if fixed_thinking.family(requested_model) else argon
-        return policy.resolve(requested_model, self._selected_request_models(), body, ingress,
-                              allow_tier_alias=model_registry.enabled())
+        catalog_models = self._generation_catalog_models()
+        if fixed_thinking.family(requested_model, catalog_models=catalog_models):
+            return fixed_thinking.resolve(
+                requested_model, self._selected_request_models(), body, ingress,
+                allow_tier_alias=model_registry.enabled(),
+                catalog_models=catalog_models,
+            )
+        return argon.resolve(
+            requested_model, self._selected_request_models(), body, ingress,
+            allow_tier_alias=model_registry.enabled(),
+        )
 
     def list_client_models(self) -> list[str]:
         return list(self.models)
@@ -220,15 +234,19 @@ class AntigravityOAuthChannel(Channel):
                 if ag_provider.generation_model_metadata(live, resolved_model) != generation_metadata:
                     raise DispatchGuardError(400, "invalid_request_error", "Antigravity model metadata changed before dispatch", param="model", scope="candidate")
         validate()
-        generation_metadata = ag_provider.generation_model_metadata(
-            oauth_manager.get_account(self.account_key) or {}, resolved_model,
-        )
+        live_account = oauth_manager.get_account(self.account_key) or {}
+        catalog_models = ag_provider.generation_endpoint_models(live_account)
+        generation_metadata = ag_provider.generation_model_metadata(live_account, resolved_model)
         forced_max_output = (
             None if antigravity_codec.is_image_model(resolved_model)
             else generation_policy.max_output_tokens(generation_metadata)
         )
         thinking_config = None
-        policy = fixed_thinking if fixed_thinking.family(resolved_model) else argon if argon.is_argon(resolved_model) else None
+        policy = (
+            fixed_thinking
+            if fixed_thinking.family(resolved_model, catalog_models=catalog_models, metadata=generation_metadata)
+            else argon if argon.is_argon(resolved_model) else None
+        )
         if policy is not None:
             expected = self.resolve_request_model(
                 str(requested_body.get("model") or resolved_model), requested_body, ingress_protocol,
@@ -241,7 +259,10 @@ class AntigravityOAuthChannel(Channel):
                 )
             thinking_config = policy.thinking_config(
                 resolved_model, requested_body, ingress_protocol,
-                **({"metadata": generation_metadata} if policy is fixed_thinking else {}),
+                **(
+                    {"metadata": generation_metadata, "catalog_models": catalog_models}
+                    if policy is fixed_thinking else {}
+                ),
             )
         stream = _wants_stream(requested_body)
         identity_context = request_context.context_of(requested_body)
