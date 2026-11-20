@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from src import failover, oauth_manager as om, quota_errors
+from src import error_rule_effects, error_rules, oauth_manager as om, quota_errors
 from src.tests.notification_helpers import capture
 from src.tests.test_zhipu_provider import account_env, credential  # noqa: F401
 
@@ -60,6 +60,22 @@ def _channel(key):
                            key="oauth:" + key, state_key=om.account_state_key(account))
 
 
+def _attempt(http_status, error_detail):
+    return SimpleNamespace(success=False, stream_started=False, outcome="http_error", http_status=http_status,
+                           error_detail=error_detail, full_response_text=None, error_code=None,
+                           retry_after_seconds=None)
+
+
+def _handle(ch, result):
+    """The preset account-block rule, as failover applies it; None when no rule matches."""
+    obs = error_rules.observe(ch, "GLM-5.3", result)
+    found = error_rules.match(obs)
+    if found is None:
+        return None
+    error_rule_effects.run_steps(ch, "GLM-5.3", found, obs, found.steps, message=result.error_detail)
+    return found
+
+
 def test_block_disables_account_once_and_notifies(account_env, monkeypatch):
     events = []
     capture(monkeypatch, lambda kind, text, record: events.append((kind, text)))
@@ -67,16 +83,18 @@ def test_block_disables_account_once_and_notifies(account_env, monkeypatch):
     om.add_account(account)
     key = om.get_account_key(account)
     ch = _channel(key)
-    result = SimpleNamespace(http_status=429, error_detail=_error("1309", DOCUMENTED["1309"][1]))
+    result = _attempt(429, _error("1309", DOCUMENTED["1309"][1]))
 
-    assert failover._apply_zhipu_account_block(ch, result) is True
+    found = _handle(ch, result)
+    assert found.id == "preset.zhipu-plan-expired" and found.final == "next"
     stored = om.get_account(key)
     assert (stored["enabled"], stored["disabled_reason"]) == (False, "plan_expired")
     assert [kind for kind, _ in events] == ["account.access.blocked"]
     assert quota_errors.ACCOUNT_BLOCK_LABELS["plan_expired"] in events[0][1] and "1309" in events[0][1]
 
     # Already disabled: the attempt still moves on, without a second write or notice.
-    assert failover._apply_zhipu_account_block(ch, result) is True
+    error_rule_effects._notified.clear()
+    assert _handle(ch, result) is not None
     assert len(events) == 1
 
     om.set_enabled(key, True)
@@ -92,12 +110,12 @@ def test_block_keeps_a_manual_disable_and_skips_api_channels(account_env, monkey
     key = om.get_account_key(account)
     ch = _channel(key)
     om.set_enabled(key, False, reason="user")
-    result = SimpleNamespace(http_status=429, error_detail=_error("1113", DOCUMENTED["1113"][1]))
+    result = _attempt(429, _error("1113", DOCUMENTED["1113"][1]))
 
-    assert failover._apply_zhipu_account_block(ch, result) is True
+    assert _handle(ch, result).id == "preset.zhipu-arrears"
     assert om.get_account(key)["disabled_reason"] == "user"
     assert events == []
 
     api = SimpleNamespace(type="api", provider="zhipu", base_url="https://open.bigmodel.cn/api/anthropic",
                           key="api:glm", account_key=None, state_key=None)
-    assert failover._apply_zhipu_account_block(api, result) is False
+    assert _handle(api, result) is None

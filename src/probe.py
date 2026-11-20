@@ -24,6 +24,7 @@ import httpx
 from . import channel_state, config, cooldown, network, quota_errors
 from .channel import registry
 from .channel.base import Channel
+from .protocols.runtime import exception_text
 from .protocols.terminal import non_stream_terminal_error
 from .proxy.routing_types import provider_for_channel
 
@@ -184,7 +185,7 @@ async def probe_channel_model(
             return False, int((time.time() - t0) * 1000), f"timeout: {exc}"
         except Exception as exc:
             safe_diagnostics.report(exc)
-            return False, int((time.time() - t0) * 1000), f"transport: {exc}"
+            return False, int((time.time() - t0) * 1000), f"transport: {exception_text(exc)}"
 
         elapsed_ms = int((time.time() - t0) * 1000)
 
@@ -285,6 +286,13 @@ async def recovery_run_once() -> int:
         # time.  Do not turn the generic recovery loop into a 30-second quota poll.
         if quota_errors.active_quota_cooldown(entry, now_ms=now_ms):
             continue
+        # An error rule that pauses until a known moment (in its steps or its
+        # thresholds) owns the recovery time; ladder-only rules are probed as usual.
+        if entry.get("rule_id"):
+            from . import error_rules
+            found = error_rules.find_rule(entry["rule_id"])
+            if found is not None and any(s["mode"] != "ladder" for s in found.pause_steps()):
+                continue
 
         ch = registry.get_channel(entry["channel_key"])
         if ch is None or ch.type != "api" or not ch.enabled:
@@ -330,8 +338,11 @@ async def recovery_run_once() -> int:
                     )
                     continue
 
-            # 其他失败：只打日志，不额外记 cooldown（本身就在 cooldown 中）
-            print("[probe] recovery check still failing; see management_failure diagnostics")
+            # 其他失败：只打日志，不额外记 cooldown（本身就在 cooldown 中）。
+            # 只打印失败类别（如 "HTTP 500"），上游正文不进日志。
+            kind = (reason or "unknown").split(":", 1)[0][:40]
+            print(f"[probe] recovery check still failing for {ch.key}:{entry['model']} ({kind}); "
+                  "see management_failure diagnostics")
     return cleared
 
 

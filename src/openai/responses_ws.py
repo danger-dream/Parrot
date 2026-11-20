@@ -1090,6 +1090,18 @@ async def _handle_responses_ws_lane(websocket: WebSocket) -> None:
             f"[scheduler] no channels ingress=responses_ws model={model}: "
             f"{exclusion_summary}"
         )
+        from .. import error_rules
+        ruled = error_rules.unavailable_response(result.exclusions, model)
+        if ruled is not None:
+            if not skip_log:
+                await asyncio.to_thread(
+                    log_db.finish_error, request_id, ruled["message"], 0,
+                    http_status=ruled["status"], affinity_hit=(1 if result.affinity_hit else 0),
+                    total_ms=None,
+                    request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
+                )
+            await websocket.close(code=4000 + int(ruled["status"]), reason=_trim_reason(ruled["message"]))
+            return
         if not skip_log:
             await asyncio.to_thread(
                 log_db.finish_error, request_id, msg, 0,

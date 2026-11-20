@@ -258,11 +258,15 @@ def _filter_candidates(requested_model: str,
                 detail = f"plan-excluded until={until}"
             else:
                 detail = f"until={until}"
-            excluded.append({
+            item = {
                 "channel": ch.key,
                 "reason": "cooldown",
                 "detail": detail,
-            })
+            }
+            if state.get("rule_id") and isinstance(until, int) and until > 0:
+                # An error rule's pause: the entrypoint may answer as that rule says.
+                item.update(rule=state["rule_id"], until=until)
+            excluded.append(item)
             continue
         if concurrency.is_saturated(channel_state.effect_key(ch)):
             excluded.append({"channel": ch.key, "reason": "saturated"})

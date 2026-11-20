@@ -77,6 +77,7 @@ export const BLOCKED_REASON: Record<string, string> = {
   plan_expired: '套餐已到期或失效，续订后手动启用',
   fair_use_limited: '被判定不符合公平使用策略，到官网申请解除后手动启用',
   key_not_allowed: 'API Key 仅限企业编程套餐使用，更换 Key 后手动启用',
+  error_rule: '被错误处理规则停用，处理好后手动启用',
 }
 
 const REASON_LABEL: Record<string, string> = {

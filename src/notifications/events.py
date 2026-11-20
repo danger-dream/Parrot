@@ -26,6 +26,8 @@ EFFECTS = {
     "catalog_updated": "",
     "model_changed": "上游返回的模型名与发出的不一致。",
     "model_conflict": "多处上游信息报告的模型不一致，无法确定实际模型。",
+    "upload_extended": "已按请求体大小放宽本次上传时限，请求照常发送。",
+    "rule_applied": "已按规则处理这次上游错误。",
     "route_blocked": "",
     "history_unavailable": "这次响应的历史没有保存，之后用 previous_response_id 续接可能失败。",
     "action_unknown": "结果未知，可能已经提交；不会自动重复提交。",

@@ -539,6 +539,15 @@ def is_connection_lifecycle_error(
     )
 
 
+def exception_text(exc: BaseException) -> str:
+    """Diagnostic text for a transport exception; never an empty string.
+
+    httpx/httpcore/websockets raise several disconnect errors without a
+    message, which otherwise leaves details such as ``"transport: "``.
+    """
+    return str(exc) or type(exc).__name__
+
+
 def connection_lifecycle_outcome(
     exc: BaseException | None = None,
     *,
@@ -938,7 +947,7 @@ def failover_final_http_status(result: Any | None) -> int:
     """HTTP status for the final all-candidates-failed JSON response."""
     outcome = getattr(result, "outcome", None)
     if outcome in (
-        "connection_timeout", "http_connect_timeout", "pool_timeout",
+        "connection_timeout", "upload_timeout", "http_connect_timeout", "pool_timeout",
         "write_timeout", "read_timeout", "transport_timeout",
         "connect_timeout", "first_byte_timeout", "idle_timeout", "total_timeout",
     ):
@@ -957,7 +966,7 @@ def upstream_ws_http_status_from_attempt(result: Any) -> int:
         return int(http_status)
     outcome = getattr(result, "outcome", None)
     if outcome in (
-        "connection_timeout", "http_connect_timeout", "pool_timeout",
+        "connection_timeout", "upload_timeout", "http_connect_timeout", "pool_timeout",
         "write_timeout", "read_timeout", "transport_timeout",
         "connect_timeout", "first_byte_timeout", "idle_timeout", "total_timeout",
     ):
@@ -978,7 +987,7 @@ def responses_ws_http_status_from_attempt(result: Any | None) -> int:
         return int(getattr(result, "http_status"))
     outcome = getattr(result, "outcome", None) if result is not None else None
     if outcome in (
-        "connection_timeout", "http_connect_timeout", "pool_timeout",
+        "connection_timeout", "upload_timeout", "http_connect_timeout", "pool_timeout",
         "write_timeout", "read_timeout", "transport_timeout",
         "connect_timeout", "first_byte_timeout", "idle_timeout", "total_timeout",
     ):

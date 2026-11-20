@@ -245,8 +245,9 @@ def _rename_rows(domain:str,old:str,new:str,*,replace_conflicts:bool=False)->Non
 def perf_rename_channel(old_key:str,new_key:str)->None:
     if old_key!=new_key:_rename_rows("performance_stats",old_key,new_key,replace_conflicts=True)
 
-def error_save(channel_key:str,model:str,error_count:int,cooldown_until:int|None,message:str|None)->None:
+def error_save(channel_key:str,model:str,error_count:int,cooldown_until:int|None,message:str|None,*,rule_id:str|None=None)->None:
     row={"channel_key":channel_key,"model":model,"error_count":error_count,"cooldown_until":cooldown_until,"last_error_message":message,"last_error_at":now_ms()}
+    if rule_id:row["rule_id"]=rule_id
     _mut("channel_errors",lambda d:d.__setitem__(_key(channel_key,model),row))
 def error_load(channel_key:str,model:str):return _get("channel_errors",_key(channel_key,model))
 def error_load_all():return _all("channel_errors")

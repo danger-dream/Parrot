@@ -28,6 +28,8 @@ SCENES = {
     'account.catalog.changed': ({'added': ['new'], 'removed': ['old']}, 'confirmed', 'catalog_updated'),
     'request.model.changed': ({'requested_model': 'asked', 'outbound_model': 'sent', 'actual_model': 'reported', 'request_id': 'safe-rid'}, 'confirmed', 'model_changed'),
     'request.model.conflict': ({'requested_model': 'asked', 'outbound_model': 'sent', 'signals': [{'source': 'header', 'models': ['a']}, {'source': 'body', 'models': ['b']}]}, 'confirmed', 'model_conflict'),
+    'request.upload.large': ({'model': 'm', 'size_mb': 47.5, 'upload_seconds': 186, 'api_key_name': 'fixture-key', 'request_id': 'safe-rid'}, 'confirmed', 'upload_extended'),
+    'error.rule.matched': ({'rule_name': 'MiniMax Token Plan 用尽', 'category': '额度用尽', 'model': 'm', 'error_code': '2067', 'reset_at': '2027-01-01T00:00:00Z'}, 'confirmed', 'rule_applied'),
     'channel.model.frozen': ({'model': 'm', 'count': 6, 'error_code': 'repeated_upstream_failure'}, 'confirmed', 'model_paused'),
     'channel.model.recovered': ({'model': 'm', 'previous': '永久冻结'}, 'confirmed', 'model_resumed'),
     'model.entitlement.blocked': ({'model': 'm', 'error_code': '1311', 'retry_at': '2027-01-01T00:00:00Z'}, 'confirmed', 'model_paused'),
@@ -41,7 +43,8 @@ SCENES = {
 
 def scene(kind):
     facts, status, code = SCENES[kind]
-    subject = subjects.system() if kind.startswith('system.') else subjects.system('请求路由', kind='route') if kind.startswith('routing.') else event().subject
+    subject = subjects.system() if kind.startswith('system.') else subjects.system('请求路由', kind='route') if kind.startswith('routing.') \
+        else subjects.system('请求上传', kind='route') if kind.startswith('request.upload.') else event().subject
     scope = 'model' if kind.startswith(('model.', 'channel.')) else 'account'
     return NotificationEvent(kind, subject, Effect(status, code), copy.deepcopy(facts), scope=scope,
                              scope_ref='m' if scope == 'model' else '', occurred_at=1792108800)

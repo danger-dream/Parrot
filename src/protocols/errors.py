@@ -313,7 +313,7 @@ def classify_attempt_outcome(outcome: str, http_status: int | None) -> Normalize
     if http_status is not None:
         return normalize_http_status(http_status, message=outcome, raw={"outcome": outcome})
     if outcome in (
-        "connection_timeout", "http_connect_timeout", "pool_timeout",
+        "connection_timeout", "upload_timeout", "http_connect_timeout", "pool_timeout",
         "write_timeout", "read_timeout", "transport_timeout",
         # Historical compatibility for pre-business-semantics rows.
         "connect_timeout", "first_byte_timeout", "idle_timeout", "total_timeout",

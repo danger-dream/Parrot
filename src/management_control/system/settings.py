@@ -163,6 +163,7 @@ class SettingsControl(DomainControl):
             "firstByte": _int(raw.get("firstByte"), 30, minimum=1),
             "idle": _int(raw.get("idle"), 30, minimum=1),
             "total": _int(raw.get("total"), 600, minimum=1),
+            "uploadMinKBps": _int(raw.get("uploadMinKBps"), 256, minimum=1),
         }
         return _with_revision(TimeoutSettings, **values)
 
@@ -399,7 +400,7 @@ class SettingsControl(DomainControl):
 
     def update_timeouts(self, context, patch, *, expected_revision=None) -> TimeoutSettings:
         self._write(context, Capability.WRITE)
-        self._keys(patch, {"connect", "firstByte", "idle", "total"})
+        self._keys(patch, {"connect", "firstByte", "idle", "total", "uploadMinKBps"})
         for key, value in patch.items(): self._integer(value, key, 1)
         return self._update(context, "timeouts", patch, expected_revision, lambda cfg: cfg.setdefault("timeouts", {}).update(patch))
 

@@ -172,6 +172,23 @@ def can_retry_429_with_credits(
     return oauth_manager.antigravity_credits_usable(account_key)
 
 
+def credit_retry_available(
+    raw: Any, *, account_key: str, expected_state_key: str | None = None,
+    used_credits: bool = False, http_status: int = 429,
+) -> bool:
+    """Whether :func:`apply_request_429` would retry with credits; reads only, records nothing."""
+    from .. import channel_state, oauth_manager
+
+    if used_credits:
+        return False
+    signal = parse_antigravity_error(raw, http_status=http_status)
+    if signal["stop_failover"] or signal["account_quota_exhausted"] or not signal["quota_exhausted"]:
+        return False
+    if expected_state_key is not None:
+        account_key = channel_state.resolve(expected_state_key).removeprefix("oauth:")
+    return oauth_manager.antigravity_credits_usable(account_key)
+
+
 def apply_request_429(
     channel_key: str, model: str, raw: Any, *, account_key: str,
     expected_state_key: str | None = None, retry_after: Any = None,

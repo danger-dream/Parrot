@@ -81,6 +81,24 @@ async def test_six_real_ingress_paths(env, ingress, stream):
     assert row["status"] == "success" and row["upstream_protocol"] == "anthropic"
 
 
+@pytest.mark.parametrize("max_tokens,expected", [
+    (120, {"thinking": {"type": "disabled"}}),
+    (4096, {"thinking": {"type": "enabled"}, "output_config": {"effort": "high"}}),
+])
+async def test_chat_effort_thinking_respects_small_output_cap(env, max_tokens, expected):
+    seen = []
+
+    def wire(req):
+        payload = json.loads(req.content)
+        seen.append({k: payload[k] for k in ("thinking", "output_config") if k in payload})
+        return fake._anthropic_response("Zhipu fixture")
+    value = body("chat")
+    value.update(max_tokens=max_tokens, reasoning_effort="high", thinking={"type": "adaptive"})
+    response, text, requests = await call(env, "chat", value, wire)
+    assert response.status_code == 200 and "Zhipu fixture" in text, text
+    assert seen == [expected]
+
+
 async def test_no_message_reorder_or_claude_rewrite_explicit_params(env):
     payload = body("anthropic")
     payload.update(thinking={"type": "enabled", "budget_tokens": 2048}, output_config={"effort": "low"},

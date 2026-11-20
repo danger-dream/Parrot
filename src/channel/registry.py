@@ -595,7 +595,7 @@ def _update_api_channel_serialized(name: str, patch: dict) -> dict | None:
                 target["cc_mimicry"] = True
         if "enabled" in patch:
             target["enabled"] = bool(patch["enabled"])
-            target["disabled_reason"] = None if patch["enabled"] else "user"
+            target["disabled_reason"] = None if patch["enabled"] else (patch.get("disabled_reason") or "user")
         if "maxConcurrent" in patch:
             try:
                 target["maxConcurrent"] = max(0, int(patch["maxConcurrent"] or 0))

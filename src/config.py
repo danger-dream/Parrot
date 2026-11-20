@@ -150,6 +150,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "firstByte": 30,
         "idle": 120,    # chunk 之间最长空闲；上游推理慢需要更宽松
         "total": 600,
+        # 请求体上传期限按体积计算：max(connect, 体积 / 该速率)。大请求体
+        # （如累积大量截图的长会话）经慢代理上传时不会被误判为连接超时。
+        "uploadMinKBps": 256,
     },
     "shutdown": {
         # SIGTERM/SIGINT 后进入 drain，最多等待活跃请求/流式响应完成的秒数。
@@ -299,6 +302,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "promptRules": {
         "enabled": True,
         "rules": [],
+    },
+    # 上游错误处理规则：用户规则按顺序优先，其后是预置规则（presets 只存开关），
+    # 都没命中再交给内置处理与默认重试/冷却策略。
+    "errorRules": {
+        "enabled": True,
+        "rules": [],
+        "presets": {},
     },
     # ─── 通知开关（事件级分类） ───────────────────────────────────
     # enabled = 总开关；events 里每个事件可独立开关。

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { RouterLink, useRouter } from 'vue-router'
 import { ArrowRight, Brain, Globe, ShieldAlert, Star, TriangleAlert, Zap } from '@lucide/vue'
 import { api, ApiError, enc } from '@/api/client'
 import { onEvent } from '@/api/events'
@@ -16,6 +17,8 @@ import ProviderIcon from '@/components/ProviderIcon.vue'
 import Segmented from '@/components/ui/Segmented.vue'
 import Skeleton from '@/components/ui/Skeleton.vue'
 import BodyViewer from './BodyViewer.vue'
+import { handOffError, refreshRuleNames, ruleNames } from '@/pages/errorRules/ruleNames'
+import type { Phase, TestResult } from '@/pages/errorRules/model'
 
 // Request detail — everything Telegram's single-log page shows (`logs_menu._render_detail`):
 // identity, upstream observations, Tokens, billing (with per-attempt formulas), request timing and
@@ -146,6 +149,75 @@ const chain = computed(() => {
   for (const rest of byAttempt.values()) loose.push(...rest)
   return { items, loose }
 })
+
+// ---- error rules: which rule handled each failed attempt ----
+const router = useRouter()
+const NON_UPSTREAM = new Set(['', 'success', 'open', 'connected', 'client_disconnected', 'cancelled', 'guard_error', 'candidate_guard', 'transform_error', 'queue_timeout'])
+const TRANSPORT = new Set(['connection_timeout', 'upload_timeout', 'first_byte_timeout', 'idle_timeout', 'total_timeout', 'connect_error', 'transport_error', 'connection_lifecycle'])
+
+// An old failure handled by the default policy may be covered by a rule created since.
+const currentRule = ref<Record<string, TestResult['matched']>>({})
+
+watch(
+  attempts,
+  (list) => {
+    if (list.some((a) => a.errorRuleId)) refreshRuleNames().catch(() => undefined)
+    void lookupCurrentRules(list)
+  },
+  { immediate: true },
+)
+
+async function lookupCurrentRules(list: Json[]): Promise<void> {
+  for (const a of list) {
+    const key = String(a.id)
+    if (!canCreateRule(a) || key in currentRule.value) continue
+    const sample = attemptSample(a, str(a.model))
+    try {
+      const res = await api.post<TestResult>('/error-rules/test', { ...sample, body: sample.body.slice(0, 65536) })
+      currentRule.value = { ...currentRule.value, [key]: res.data.matched ?? null }
+    } catch {
+      currentRule.value = { ...currentRule.value, [key]: null }
+    }
+  }
+}
+
+function ruleLink(id: string, layer: string): { path: string; query?: Record<string, string> } {
+  return layer === 'user' ? { path: '/error-rules', query: { edit: id } } : { path: '/error-rules' }
+}
+
+function ruleText(a: Json): string {
+  const id = str(a.errorRuleId)
+  const known = ruleNames.rules[id]
+  const name = known ? `${known.layer === 'preset' ? '预置规则' : '我的规则'}「${known.name}」` : `规则 ${id}（已删除）`
+  const cat = ruleNames.categories[str(a.errorCategory)]
+  return cat ? `${name} · ${cat}` : name
+}
+
+function canCreateRule(a: Json): boolean {
+  return !a.errorRuleId && !!a.errorDetail && !NON_UPSTREAM.has(str(a.outcome))
+}
+
+function attemptSample(a: Json, model: string) {
+  const detailText = str(a.errorDetail)
+  const m = detailText.match(/^HTTP (\d{3}):\s*/)
+  const outcome = str(a.outcome)
+  const status = m ? Number(m[1]) : null
+  const phase: Phase = !status && TRANSPORT.has(outcome) ? 'transport'
+    : outcome === 'stream_upstream_error' || outcome === 'upstream_error_json' || status === 200 ? 'stream' : 'http'
+  return {
+    provider: channelProvider(str(a.channelKey)),
+    channelKey: str(a.channelKey),
+    model,
+    status,
+    phase,
+    body: m ? detailText.slice(m[0].length) : detailText,
+  }
+}
+
+function createRuleFrom(a: Json, model: string): void {
+  handOffError(attemptSample(a, model))
+  void router.push({ path: '/error-rules', query: { create: '1' } })
+}
 
 function roundView(p: Json) {
   return {
@@ -341,6 +413,15 @@ function bodyPurgedText(at: string | null | undefined): string {
               <p v-if="num(c.a.attemptElapsedMs) !== null" class="t-line">渠道尝试全程（外层）：{{ ms(num(c.a.attemptElapsedMs)) }}</p>
               <p v-if="c.stages.length" class="t-line">可靠阶段（可能重叠，不相加）：{{ metricText(c.stages) }}</p>
               <p v-if="c.a.errorDetail" class="t-err">{{ errorSummary(str(c.a.errorDetail)) }}</p>
+              <p v-if="c.a.errorRuleId" class="t-line">
+                错误处理：<RouterLink :to="ruleLink(str(c.a.errorRuleId), ruleNames.rules[str(c.a.errorRuleId)]?.layer || '')" class="rule-lnk">{{ ruleText(c.a) }}</RouterLink>
+              </p>
+              <p v-else-if="currentRule[String(c.a.id)]" class="t-line faint">
+                错误处理：当时按默认策略 · 现在由<RouterLink :to="ruleLink(currentRule[String(c.a.id)]!.id, currentRule[String(c.a.id)]!.layer)" class="rule-lnk">「{{ currentRule[String(c.a.id)]!.name }}」</RouterLink>处理
+              </p>
+              <p v-else-if="canCreateRule(c.a)" class="t-line faint">
+                错误处理：默认策略 · <button type="button" class="rule-lnk" @click="createRuleFrom(c.a, c.model)">为这个错误创建处理规则</button>
+              </p>
               <ul v-if="c.children.length" class="rounds">
                 <li v-for="(p, j) in c.children" :key="j" :class="{ bad: !roundView(p).ok }">
                   <p class="r-head">
@@ -498,7 +579,14 @@ function bodyPurgedText(at: string | null | undefined): string {
   font-weight: 600;
   min-width: 0;
 }
-.model .lnk {
+.model .rule-lnk {
+  color: var(--accent, var(--blue));
+  cursor: pointer;
+}
+.rule-lnk:hover {
+  text-decoration: underline;
+}
+.lnk {
   word-break: break-all;
 }
 .arrow {

@@ -3464,6 +3464,143 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/management/v1/error-rules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Error Rules */
+        get: operations["getErrorRules"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/management/v1/error-rules/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Update Error Rules Settings */
+        patch: operations["updateErrorRulesSettings"];
+        trace?: never;
+    };
+    "/api/management/v1/error-rules/rules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create Error Rule */
+        post: operations["createErrorRule"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/management/v1/error-rules/rules/{ruleId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Delete Error Rule */
+        delete: operations["deleteErrorRule"];
+        options?: never;
+        head?: never;
+        /** Update Error Rule */
+        patch: operations["updateErrorRule"];
+        trace?: never;
+    };
+    "/api/management/v1/error-rules/order": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Reorder Error Rules */
+        put: operations["reorderErrorRules"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/management/v1/error-rules/presets/{ruleId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Update Error Rule Preset */
+        patch: operations["updateErrorRulePreset"];
+        trace?: never;
+    };
+    "/api/management/v1/error-rules/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Test Error Rules */
+        post: operations["testErrorRules"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/management/v1/error-rules/recent": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Recent Upstream Errors */
+        get: operations["getRecentUpstreamErrors"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/management/v1/network": {
         parameters: {
             query?: never;
@@ -5432,6 +5569,21 @@ export interface components {
             data: components["schemas"]["ErrorCooldownSettingsData"];
             meta: components["schemas"]["ResponseMeta"];
         };
+        /** DataEnvelope[ErrorRulesData] */
+        DataEnvelope_ErrorRulesData_: {
+            data: components["schemas"]["ErrorRulesData"];
+            meta: components["schemas"]["ResponseMeta"];
+        };
+        /** DataEnvelope[ErrorRulesRecentData] */
+        DataEnvelope_ErrorRulesRecentData_: {
+            data: components["schemas"]["ErrorRulesRecentData"];
+            meta: components["schemas"]["ResponseMeta"];
+        };
+        /** DataEnvelope[ErrorRulesTestData] */
+        DataEnvelope_ErrorRulesTestData_: {
+            data: components["schemas"]["ErrorRulesTestData"];
+            meta: components["schemas"]["ResponseMeta"];
+        };
         /** DataEnvelope[ImageAccountStateData] */
         DataEnvelope_ImageAccountStateData_: {
             data: components["schemas"]["ImageAccountStateData"];
@@ -6040,6 +6192,631 @@ export interface components {
             code: string;
             /** Message */
             message: string;
+        };
+        /** ErrorRuleBuiltinData */
+        ErrorRuleBuiltinData: {
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+            /** Description */
+            description: string;
+            /** Setting */
+            setting: string;
+            /**
+             * Link
+             * @default
+             */
+            link: string;
+        };
+        /** ErrorRuleCategoryData */
+        ErrorRuleCategoryData: {
+            /**
+             * Id
+             * @enum {string}
+             */
+            id: "rate_limit" | "quota_exhausted" | "plan_excluded" | "account_blocked" | "request_invalid" | "content_blocked" | "upstream_busy" | "observe";
+            /** Label */
+            label: string;
+            /** Description */
+            description: string;
+            handling: components["schemas"]["ErrorRuleHandlingData"];
+        };
+        /** ErrorRuleCondData */
+        ErrorRuleCondData: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "cond";
+            /**
+             * Field
+             * @enum {string}
+             */
+            field: "status" | "code" | "message" | "body" | "provider" | "channel" | "channelType" | "model" | "phase" | "path";
+            /**
+             * Op
+             * @enum {string}
+             */
+            op: "eq" | "ne" | "in" | "not_in" | "contains" | "not_contains" | "starts_with" | "regex" | "exists" | "not_exists" | "gt" | "gte" | "lt" | "lte";
+            /**
+             * Path
+             * @default
+             */
+            path: string;
+            /** Values */
+            values?: string[];
+        };
+        /** ErrorRuleCondInput */
+        ErrorRuleCondInput: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "cond";
+            /**
+             * Field
+             * @enum {string}
+             */
+            field: "status" | "code" | "message" | "body" | "provider" | "channel" | "channelType" | "model" | "phase" | "path";
+            /**
+             * Op
+             * @enum {string}
+             */
+            op: "eq" | "ne" | "in" | "not_in" | "contains" | "not_contains" | "starts_with" | "regex" | "exists" | "not_exists" | "gt" | "gte" | "lt" | "lte";
+            /**
+             * Path
+             * @default
+             */
+            path: string;
+            /** Values */
+            values?: string[];
+        };
+        /** ErrorRuleData */
+        ErrorRuleData: {
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+            /**
+             * Enabled
+             * @default true
+             */
+            enabled: boolean;
+            /**
+             * Note
+             * @default
+             */
+            note: string;
+            when: components["schemas"]["ErrorRuleGroupData"];
+            /**
+             * Category
+             * @enum {string}
+             */
+            category: "rate_limit" | "quota_exhausted" | "plan_excluded" | "account_blocked" | "request_invalid" | "content_blocked" | "upstream_busy" | "observe";
+            /** Steps */
+            steps: components["schemas"]["ErrorRuleStepData"][];
+            /**
+             * Final
+             * @enum {string}
+             */
+            final: "next" | "respond" | "pass";
+            /** Thresholds */
+            thresholds: components["schemas"]["ErrorRuleThresholdData"][];
+            response: components["schemas"]["ErrorRuleResponseData"];
+            /**
+             * Group
+             * @default
+             */
+            group: string;
+        };
+        /** ErrorRuleGroupData */
+        ErrorRuleGroupData: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "group";
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "all" | "any";
+            /** Items */
+            items: (components["schemas"]["ErrorRuleCondData"] | components["schemas"]["ErrorRuleGroupData"])[];
+        };
+        /** ErrorRuleGroupInput */
+        ErrorRuleGroupInput: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "group";
+            /**
+             * Mode
+             * @default all
+             * @enum {string}
+             */
+            mode: "all" | "any";
+            /** Items */
+            items?: (components["schemas"]["ErrorRuleCondInput"] | components["schemas"]["ErrorRuleGroupInput"])[];
+        };
+        /** ErrorRuleHandledByData */
+        ErrorRuleHandledByData: {
+            /** Layer */
+            layer: string;
+            /** Ruleid */
+            ruleId?: string | null;
+            /** Rulename */
+            ruleName?: string | null;
+            /** Category */
+            category?: string | null;
+        };
+        /** ErrorRuleHandlingData */
+        ErrorRuleHandlingData: {
+            /** Steps */
+            steps: components["schemas"]["ErrorRuleStepData"][];
+            /**
+             * Final
+             * @enum {string}
+             */
+            final: "next" | "respond" | "pass";
+            /** Thresholds */
+            thresholds: components["schemas"]["ErrorRuleThresholdData"][];
+            response: components["schemas"]["ErrorRuleResponseData"];
+        };
+        /** ErrorRuleHitStatData */
+        ErrorRuleHitStatData: {
+            /** Count */
+            count: number;
+            /** Lastat */
+            lastAt?: number | null;
+        };
+        /** ErrorRuleInput */
+        ErrorRuleInput: {
+            /** Name */
+            name: string;
+            /**
+             * Enabled
+             * @default true
+             */
+            enabled: boolean;
+            /**
+             * Note
+             * @default
+             */
+            note: string;
+            when: components["schemas"]["ErrorRuleGroupInput"];
+            /**
+             * Category
+             * @enum {string}
+             */
+            category: "rate_limit" | "quota_exhausted" | "plan_excluded" | "account_blocked" | "request_invalid" | "content_blocked" | "upstream_busy" | "observe";
+            /** Steps */
+            steps?: components["schemas"]["ErrorRuleStepInput"][] | null;
+            /** Final */
+            final?: ("next" | "respond" | "pass") | null;
+            /** Thresholds */
+            thresholds?: components["schemas"]["ErrorRuleThresholdInput"][] | null;
+            response?: components["schemas"]["ErrorRuleResponseInput"] | null;
+        };
+        /** ErrorRuleMatchedData */
+        ErrorRuleMatchedData: {
+            /**
+             * Layer
+             * @enum {string}
+             */
+            layer: "draft" | "user" | "preset";
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+            /**
+             * Category
+             * @enum {string}
+             */
+            category: "rate_limit" | "quota_exhausted" | "plan_excluded" | "account_blocked" | "request_invalid" | "content_blocked" | "upstream_busy" | "observe";
+        };
+        /** ErrorRuleObservationData */
+        ErrorRuleObservationData: {
+            /** Phase */
+            phase: string;
+            /** Status */
+            status?: number | null;
+            /** Provider */
+            provider: string;
+            /** Model */
+            model: string;
+            /** Codes */
+            codes: string[];
+            /** Message */
+            message: string;
+            data?: components["schemas"]["JsonValue"];
+        };
+        /** ErrorRulePlanData */
+        ErrorRulePlanData: {
+            /** Passthrough */
+            passthrough: boolean;
+            /** Steps */
+            steps: components["schemas"]["ErrorRulePlanStepData"][];
+            /**
+             * Final
+             * @enum {string}
+             */
+            final: "next" | "respond" | "pass";
+            /** Thresholds */
+            thresholds: components["schemas"]["ErrorRulePlanThresholdData"][];
+            response?: components["schemas"]["ErrorRulePlanResponseData"] | null;
+        };
+        /** ErrorRulePlanResponseData */
+        ErrorRulePlanResponseData: {
+            /** Status */
+            status: number;
+            /** Message */
+            message: string;
+            /** Retryafter */
+            retryAfter?: number | null;
+            /** Ruleid */
+            ruleId: string;
+        };
+        /** ErrorRulePlanStepData */
+        ErrorRulePlanStepData: {
+            /**
+             * Type
+             * @enum {string}
+             */
+            type: "retry" | "pause" | "deprioritize" | "disable" | "notify";
+            /** Delayseconds */
+            delaySeconds?: number | null;
+            /** Times */
+            times?: number | null;
+            /** Scope */
+            scope?: ("model" | "account") | null;
+            /** Mode */
+            mode?: ("fixed" | "message_time" | "retry_after" | "usage_window" | "boundary" | "ladder") | null;
+            /** Seconds */
+            seconds?: number | null;
+            /** Pattern */
+            pattern?: string | null;
+            /** Timezone */
+            timezone?: string | null;
+            /** Boundaryhours */
+            boundaryHours?: number | null;
+            /** Fallbackseconds */
+            fallbackSeconds?: number | null;
+            /** Reason */
+            reason?: string | null;
+            /** Repeathours */
+            repeatHours?: number | null;
+            /** Until */
+            until?: number | null;
+            /** Source */
+            source?: string | null;
+            /** Untiltext */
+            untilText?: string | null;
+        };
+        /** ErrorRulePlanThresholdData */
+        ErrorRulePlanThresholdData: {
+            /** Count */
+            count: number;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "consecutive" | "window";
+            /** Windowminutes */
+            windowMinutes: number;
+            /**
+             * Scope
+             * @enum {string}
+             */
+            scope: "model" | "account" | "rule";
+            /** Steps */
+            steps: components["schemas"]["ErrorRulePlanStepData"][];
+            /** Current */
+            current?: number | null;
+        };
+        /** ErrorRulePresetPatch */
+        ErrorRulePresetPatch: {
+            /** Enabled */
+            enabled: boolean;
+        };
+        /** ErrorRuleProviderData */
+        ErrorRuleProviderData: {
+            /** Id */
+            id: string;
+            /** Channelcount */
+            channelCount: number;
+        };
+        /** ErrorRuleRecentGroupData */
+        ErrorRuleRecentGroupData: {
+            /** Id */
+            id: string;
+            /** Provider */
+            provider: string;
+            /**
+             * Phase
+             * @enum {string}
+             */
+            phase: "http" | "stream" | "transport";
+            /** Status */
+            status?: number | null;
+            /** Outcome */
+            outcome: string;
+            /** Codes */
+            codes: string[];
+            /** Message */
+            message: string;
+            /** Sample */
+            sample: string;
+            /** Count */
+            count: number;
+            /** Firstat */
+            firstAt?: number | null;
+            /** Lastat */
+            lastAt?: number | null;
+            /** Channels */
+            channels: string[];
+            /** Models */
+            models: string[];
+            /**
+             * Channeltype
+             * @default
+             */
+            channelType: string;
+            handledBy?: components["schemas"]["ErrorRuleHandledByData"] | null;
+            currentRule?: components["schemas"]["ErrorRuleMatchedData"] | null;
+        };
+        /** ErrorRuleResponseData */
+        ErrorRuleResponseData: {
+            /**
+             * Status
+             * @default 0
+             */
+            status: number;
+            /**
+             * Message
+             * @default
+             */
+            message: string;
+            /**
+             * Retryafter
+             * @default false
+             */
+            retryAfter: boolean;
+        };
+        /** ErrorRuleResponseInput */
+        ErrorRuleResponseInput: {
+            /**
+             * Status
+             * @default 0
+             */
+            status: number;
+            /**
+             * Message
+             * @default
+             */
+            message: string;
+            /**
+             * Retryafter
+             * @default false
+             */
+            retryAfter: boolean;
+        };
+        /** ErrorRuleStepData */
+        ErrorRuleStepData: {
+            /**
+             * Type
+             * @enum {string}
+             */
+            type: "retry" | "pause" | "deprioritize" | "disable" | "notify";
+            /** Delayseconds */
+            delaySeconds?: number | null;
+            /** Times */
+            times?: number | null;
+            /** Scope */
+            scope?: ("model" | "account") | null;
+            /** Mode */
+            mode?: ("fixed" | "message_time" | "retry_after" | "usage_window" | "boundary" | "ladder") | null;
+            /** Seconds */
+            seconds?: number | null;
+            /** Pattern */
+            pattern?: string | null;
+            /** Timezone */
+            timezone?: string | null;
+            /** Boundaryhours */
+            boundaryHours?: number | null;
+            /** Fallbackseconds */
+            fallbackSeconds?: number | null;
+            /** Reason */
+            reason?: string | null;
+            /** Repeathours */
+            repeatHours?: number | null;
+        };
+        /** ErrorRuleStepInput */
+        ErrorRuleStepInput: {
+            /**
+             * Type
+             * @enum {string}
+             */
+            type: "retry" | "pause" | "deprioritize" | "disable" | "notify";
+            /** Delayseconds */
+            delaySeconds?: number | null;
+            /** Times */
+            times?: number | null;
+            /** Scope */
+            scope?: ("model" | "account") | null;
+            /** Mode */
+            mode?: ("fixed" | "message_time" | "retry_after" | "usage_window" | "boundary" | "ladder") | null;
+            /** Seconds */
+            seconds?: number | null;
+            /** Pattern */
+            pattern?: string | null;
+            /** Timezone */
+            timezone?: string | null;
+            /** Boundaryhours */
+            boundaryHours?: number | null;
+            /** Fallbackseconds */
+            fallbackSeconds?: number | null;
+            /** Reason */
+            reason?: string | null;
+            /** Repeathours */
+            repeatHours?: number | null;
+        };
+        /** ErrorRuleThresholdData */
+        ErrorRuleThresholdData: {
+            /** Count */
+            count: number;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "consecutive" | "window";
+            /** Windowminutes */
+            windowMinutes: number;
+            /**
+             * Scope
+             * @enum {string}
+             */
+            scope: "model" | "account" | "rule";
+            /** Steps */
+            steps: components["schemas"]["ErrorRuleStepData"][];
+        };
+        /** ErrorRuleThresholdInput */
+        ErrorRuleThresholdInput: {
+            /** Count */
+            count: number;
+            /**
+             * Mode
+             * @default consecutive
+             * @enum {string}
+             */
+            mode: "consecutive" | "window";
+            /**
+             * Windowminutes
+             * @default 10
+             */
+            windowMinutes: number;
+            /**
+             * Scope
+             * @default model
+             * @enum {string}
+             */
+            scope: "model" | "account" | "rule";
+            /** Steps */
+            steps: components["schemas"]["ErrorRuleStepInput"][];
+        };
+        /** ErrorRuleTraceData */
+        ErrorRuleTraceData: {
+            /**
+             * Layer
+             * @enum {string}
+             */
+            layer: "draft" | "user" | "preset";
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+            /**
+             * Category
+             * @enum {string}
+             */
+            category: "rate_limit" | "quota_exhausted" | "plan_excluded" | "account_blocked" | "request_invalid" | "content_blocked" | "upstream_busy" | "observe";
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "matched" | "missed" | "skipped";
+            /** Reason */
+            reason: string;
+        };
+        /** ErrorRulesData */
+        ErrorRulesData: {
+            /** Enabled */
+            enabled: boolean;
+            /** Rules */
+            rules: components["schemas"]["ErrorRuleData"][];
+            /** Presets */
+            presets: components["schemas"]["ErrorRuleData"][];
+            /** Builtins */
+            builtins: components["schemas"]["ErrorRuleBuiltinData"][];
+            /** Categories */
+            categories: components["schemas"]["ErrorRuleCategoryData"][];
+            /** Providers */
+            providers: components["schemas"]["ErrorRuleProviderData"][];
+            /** Channelproviders */
+            channelProviders: {
+                [key: string]: string;
+            };
+            /** Stats */
+            stats: {
+                [key: string]: components["schemas"]["ErrorRuleHitStatData"];
+            };
+            /** Statswindowdays */
+            statsWindowDays: number;
+            /** Revision */
+            revision: string;
+        };
+        /** ErrorRulesRecentData */
+        ErrorRulesRecentData: {
+            /** Hours */
+            hours: number;
+            /** Total */
+            total: number;
+            /** Truncated */
+            truncated: boolean;
+            /** Groups */
+            groups: components["schemas"]["ErrorRuleRecentGroupData"][];
+        };
+        /** ErrorRulesReorderRequest */
+        ErrorRulesReorderRequest: {
+            /** Ruleids */
+            ruleIds: string[];
+        };
+        /** ErrorRulesSettingsPatch */
+        ErrorRulesSettingsPatch: {
+            /** Enabled */
+            enabled: boolean;
+        };
+        /** ErrorRulesTestData */
+        ErrorRulesTestData: {
+            observation: components["schemas"]["ErrorRuleObservationData"];
+            /** Trace */
+            trace: components["schemas"]["ErrorRuleTraceData"][];
+            matched?: components["schemas"]["ErrorRuleMatchedData"] | null;
+            plan?: components["schemas"]["ErrorRulePlanData"] | null;
+        };
+        /** ErrorRulesTestRequest */
+        ErrorRulesTestRequest: {
+            /**
+             * Channelkey
+             * @default
+             */
+            channelKey: string;
+            /**
+             * Provider
+             * @default
+             */
+            provider: string;
+            /**
+             * Model
+             * @default
+             */
+            model: string;
+            /**
+             * Phase
+             * @default http
+             * @enum {string}
+             */
+            phase: "http" | "stream" | "transport";
+            /** Status */
+            status?: number | null;
+            /**
+             * Body
+             * @default
+             */
+            body: string;
+            draftRule?: components["schemas"]["ErrorRuleInput"] | null;
         };
         /** ExistingChannelDiscoveryRequest */
         ExistingChannelDiscoveryRequest: {
@@ -7915,6 +8692,10 @@ export interface components {
             requestModelChanged: boolean;
             /** Requestmodelconflict */
             requestModelConflict: boolean;
+            /** Requestuploadlarge */
+            requestUploadLarge: boolean;
+            /** Errorrulematched */
+            errorRuleMatched: boolean;
             /** Channelmodelfrozen */
             channelModelFrozen: boolean;
             /** Channelmodelrecovered */
@@ -7998,6 +8779,10 @@ export interface components {
             requestModelChanged?: boolean | null;
             /** Requestmodelconflict */
             requestModelConflict?: boolean | null;
+            /** Requestuploadlarge */
+            requestUploadLarge?: boolean | null;
+            /** Errorrulematched */
+            errorRuleMatched?: boolean | null;
             /** Channelmodelfrozen */
             channelModelFrozen?: boolean | null;
             /** Channelmodelrecovered */
@@ -12043,6 +12828,8 @@ export interface components {
             idle: number;
             /** Total */
             total: number;
+            /** Uploadminkbps */
+            uploadMinKBps: number;
             /** Revision */
             revision: string;
         };
@@ -12056,6 +12843,8 @@ export interface components {
             idle?: number | null;
             /** Total */
             total?: number | null;
+            /** Uploadminkbps */
+            uploadMinKBps?: number | null;
         };
         /**
          * TimeseriesBucket
@@ -33200,6 +33989,7 @@ export interface operations {
                      *         "firstByte": 30,
                      *         "idle": 120,
                      *         "total": 600,
+                     *         "uploadMinKBps": 256,
                      *         "revision": "rev_example"
                      *       },
                      *       "meta": {
@@ -33285,6 +34075,7 @@ export interface operations {
                      *         "firstByte": 30,
                      *         "idle": 120,
                      *         "total": 600,
+                     *         "uploadMinKBps": 256,
                      *         "revision": "rev_example"
                      *       },
                      *       "meta": {
@@ -37302,6 +38093,1661 @@ export interface operations {
                      *     }
                      */
                     "application/json": components["schemas"]["DataEnvelope_PromptRulesTestData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_CONFLICT, REVISION_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE, SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    getErrorRules: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "enabled": true,
+                     *         "rules": [
+                     *           {
+                     *             "id": "rule-1a2b3c4d",
+                     *             "name": "MiniMax Token Plan 用尽",
+                     *             "enabled": true,
+                     *             "note": "",
+                     *             "when": {
+                     *               "kind": "group",
+                     *               "mode": "all",
+                     *               "items": [
+                     *                 {
+                     *                   "kind": "cond",
+                     *                   "field": "provider",
+                     *                   "op": "in",
+                     *                   "path": "",
+                     *                   "values": [
+                     *                     "minimax"
+                     *                   ]
+                     *                 },
+                     *                 {
+                     *                   "kind": "cond",
+                     *                   "field": "path",
+                     *                   "op": "ne",
+                     *                   "path": "$.base_resp.status_code",
+                     *                   "values": [
+                     *                     "0"
+                     *                   ]
+                     *                 },
+                     *                 {
+                     *                   "kind": "group",
+                     *                   "mode": "any",
+                     *                   "items": [
+                     *                     {
+                     *                       "kind": "cond",
+                     *                       "field": "message",
+                     *                       "op": "contains",
+                     *                       "path": "",
+                     *                       "values": [
+                     *                         "Token Plan"
+                     *                       ]
+                     *                     },
+                     *                     {
+                     *                       "kind": "cond",
+                     *                       "field": "code",
+                     *                       "op": "in",
+                     *                       "path": "",
+                     *                       "values": [
+                     *                         "2067"
+                     *                       ]
+                     *                     }
+                     *                   ]
+                     *                 }
+                     *               ]
+                     *             },
+                     *             "category": "quota_exhausted",
+                     *             "steps": [
+                     *               {
+                     *                 "type": "retry",
+                     *                 "delaySeconds": 2,
+                     *                 "times": 1
+                     *               },
+                     *               {
+                     *                 "type": "pause",
+                     *                 "scope": "model",
+                     *                 "mode": "usage_window",
+                     *                 "seconds": 900,
+                     *                 "pattern": "",
+                     *                 "timezone": "+08:00",
+                     *                 "boundaryHours": 5,
+                     *                 "fallbackSeconds": 900
+                     *               },
+                     *               {
+                     *                 "type": "notify",
+                     *                 "repeatHours": 6
+                     *               }
+                     *             ],
+                     *             "final": "next",
+                     *             "thresholds": [
+                     *               {
+                     *                 "count": 3,
+                     *                 "mode": "consecutive",
+                     *                 "windowMinutes": 10,
+                     *                 "scope": "model",
+                     *                 "steps": [
+                     *                   {
+                     *                     "type": "pause",
+                     *                     "scope": "account",
+                     *                     "mode": "fixed",
+                     *                     "seconds": 1800,
+                     *                     "pattern": "",
+                     *                     "timezone": "+08:00",
+                     *                     "boundaryHours": 0,
+                     *                     "fallbackSeconds": 900
+                     *                   }
+                     *                 ]
+                     *               }
+                     *             ],
+                     *             "response": {
+                     *               "status": 429,
+                     *               "message": "MiniMax quota: {$.error.message}",
+                     *               "retryAfter": true
+                     *             },
+                     *             "group": ""
+                     *           }
+                     *         ],
+                     *         "presets": [],
+                     *         "builtins": [],
+                     *         "categories": [],
+                     *         "providers": [
+                     *           {
+                     *             "id": "minimax",
+                     *             "channelCount": 1
+                     *           }
+                     *         ],
+                     *         "channelProviders": {
+                     *           "api:MiniMax": "minimax"
+                     *         },
+                     *         "stats": {
+                     *           "rule-1a2b3c4d": {
+                     *             "count": 3,
+                     *             "lastAt": 1795180000
+                     *           }
+                     *         },
+                     *         "statsWindowDays": 7,
+                     *         "revision": "rev_example"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_ErrorRulesData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_CONFLICT, REVISION_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE, SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    updateErrorRulesSettings: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ErrorRulesSettingsPatch"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "enabled": true,
+                     *         "rules": [
+                     *           {
+                     *             "id": "rule-1a2b3c4d",
+                     *             "name": "MiniMax Token Plan 用尽",
+                     *             "enabled": true,
+                     *             "note": "",
+                     *             "when": {
+                     *               "kind": "group",
+                     *               "mode": "all",
+                     *               "items": [
+                     *                 {
+                     *                   "kind": "cond",
+                     *                   "field": "provider",
+                     *                   "op": "in",
+                     *                   "path": "",
+                     *                   "values": [
+                     *                     "minimax"
+                     *                   ]
+                     *                 },
+                     *                 {
+                     *                   "kind": "cond",
+                     *                   "field": "path",
+                     *                   "op": "ne",
+                     *                   "path": "$.base_resp.status_code",
+                     *                   "values": [
+                     *                     "0"
+                     *                   ]
+                     *                 },
+                     *                 {
+                     *                   "kind": "group",
+                     *                   "mode": "any",
+                     *                   "items": [
+                     *                     {
+                     *                       "kind": "cond",
+                     *                       "field": "message",
+                     *                       "op": "contains",
+                     *                       "path": "",
+                     *                       "values": [
+                     *                         "Token Plan"
+                     *                       ]
+                     *                     },
+                     *                     {
+                     *                       "kind": "cond",
+                     *                       "field": "code",
+                     *                       "op": "in",
+                     *                       "path": "",
+                     *                       "values": [
+                     *                         "2067"
+                     *                       ]
+                     *                     }
+                     *                   ]
+                     *                 }
+                     *               ]
+                     *             },
+                     *             "category": "quota_exhausted",
+                     *             "steps": [
+                     *               {
+                     *                 "type": "retry",
+                     *                 "delaySeconds": 2,
+                     *                 "times": 1
+                     *               },
+                     *               {
+                     *                 "type": "pause",
+                     *                 "scope": "model",
+                     *                 "mode": "usage_window",
+                     *                 "seconds": 900,
+                     *                 "pattern": "",
+                     *                 "timezone": "+08:00",
+                     *                 "boundaryHours": 5,
+                     *                 "fallbackSeconds": 900
+                     *               },
+                     *               {
+                     *                 "type": "notify",
+                     *                 "repeatHours": 6
+                     *               }
+                     *             ],
+                     *             "final": "next",
+                     *             "thresholds": [
+                     *               {
+                     *                 "count": 3,
+                     *                 "mode": "consecutive",
+                     *                 "windowMinutes": 10,
+                     *                 "scope": "model",
+                     *                 "steps": [
+                     *                   {
+                     *                     "type": "pause",
+                     *                     "scope": "account",
+                     *                     "mode": "fixed",
+                     *                     "seconds": 1800,
+                     *                     "pattern": "",
+                     *                     "timezone": "+08:00",
+                     *                     "boundaryHours": 0,
+                     *                     "fallbackSeconds": 900
+                     *                   }
+                     *                 ]
+                     *               }
+                     *             ],
+                     *             "response": {
+                     *               "status": 429,
+                     *               "message": "MiniMax quota: {$.error.message}",
+                     *               "retryAfter": true
+                     *             },
+                     *             "group": ""
+                     *           }
+                     *         ],
+                     *         "presets": [],
+                     *         "builtins": [],
+                     *         "categories": [],
+                     *         "providers": [
+                     *           {
+                     *             "id": "minimax",
+                     *             "channelCount": 1
+                     *           }
+                     *         ],
+                     *         "channelProviders": {
+                     *           "api:MiniMax": "minimax"
+                     *         },
+                     *         "stats": {
+                     *           "rule-1a2b3c4d": {
+                     *             "count": 3,
+                     *             "lastAt": 1795180000
+                     *           }
+                     *         },
+                     *         "statsWindowDays": 7,
+                     *         "revision": "rev_example"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_ErrorRulesData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_CONFLICT, REVISION_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE, SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    createErrorRule: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ErrorRuleInput"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "enabled": true,
+                     *         "rules": [
+                     *           {
+                     *             "id": "rule-1a2b3c4d",
+                     *             "name": "MiniMax Token Plan 用尽",
+                     *             "enabled": true,
+                     *             "note": "",
+                     *             "when": {
+                     *               "kind": "group",
+                     *               "mode": "all",
+                     *               "items": [
+                     *                 {
+                     *                   "kind": "cond",
+                     *                   "field": "provider",
+                     *                   "op": "in",
+                     *                   "path": "",
+                     *                   "values": [
+                     *                     "minimax"
+                     *                   ]
+                     *                 },
+                     *                 {
+                     *                   "kind": "cond",
+                     *                   "field": "path",
+                     *                   "op": "ne",
+                     *                   "path": "$.base_resp.status_code",
+                     *                   "values": [
+                     *                     "0"
+                     *                   ]
+                     *                 },
+                     *                 {
+                     *                   "kind": "group",
+                     *                   "mode": "any",
+                     *                   "items": [
+                     *                     {
+                     *                       "kind": "cond",
+                     *                       "field": "message",
+                     *                       "op": "contains",
+                     *                       "path": "",
+                     *                       "values": [
+                     *                         "Token Plan"
+                     *                       ]
+                     *                     },
+                     *                     {
+                     *                       "kind": "cond",
+                     *                       "field": "code",
+                     *                       "op": "in",
+                     *                       "path": "",
+                     *                       "values": [
+                     *                         "2067"
+                     *                       ]
+                     *                     }
+                     *                   ]
+                     *                 }
+                     *               ]
+                     *             },
+                     *             "category": "quota_exhausted",
+                     *             "steps": [
+                     *               {
+                     *                 "type": "retry",
+                     *                 "delaySeconds": 2,
+                     *                 "times": 1
+                     *               },
+                     *               {
+                     *                 "type": "pause",
+                     *                 "scope": "model",
+                     *                 "mode": "usage_window",
+                     *                 "seconds": 900,
+                     *                 "pattern": "",
+                     *                 "timezone": "+08:00",
+                     *                 "boundaryHours": 5,
+                     *                 "fallbackSeconds": 900
+                     *               },
+                     *               {
+                     *                 "type": "notify",
+                     *                 "repeatHours": 6
+                     *               }
+                     *             ],
+                     *             "final": "next",
+                     *             "thresholds": [
+                     *               {
+                     *                 "count": 3,
+                     *                 "mode": "consecutive",
+                     *                 "windowMinutes": 10,
+                     *                 "scope": "model",
+                     *                 "steps": [
+                     *                   {
+                     *                     "type": "pause",
+                     *                     "scope": "account",
+                     *                     "mode": "fixed",
+                     *                     "seconds": 1800,
+                     *                     "pattern": "",
+                     *                     "timezone": "+08:00",
+                     *                     "boundaryHours": 0,
+                     *                     "fallbackSeconds": 900
+                     *                   }
+                     *                 ]
+                     *               }
+                     *             ],
+                     *             "response": {
+                     *               "status": 429,
+                     *               "message": "MiniMax quota: {$.error.message}",
+                     *               "retryAfter": true
+                     *             },
+                     *             "group": ""
+                     *           }
+                     *         ],
+                     *         "presets": [],
+                     *         "builtins": [],
+                     *         "categories": [],
+                     *         "providers": [
+                     *           {
+                     *             "id": "minimax",
+                     *             "channelCount": 1
+                     *           }
+                     *         ],
+                     *         "channelProviders": {
+                     *           "api:MiniMax": "minimax"
+                     *         },
+                     *         "stats": {
+                     *           "rule-1a2b3c4d": {
+                     *             "count": 3,
+                     *             "lastAt": 1795180000
+                     *           }
+                     *         },
+                     *         "statsWindowDays": 7,
+                     *         "revision": "rev_example"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_ErrorRulesData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_CONFLICT, REVISION_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE, SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    deleteErrorRule: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: string | null;
+            };
+            path: {
+                ruleId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "enabled": true,
+                     *         "rules": [
+                     *           {
+                     *             "id": "rule-1a2b3c4d",
+                     *             "name": "MiniMax Token Plan 用尽",
+                     *             "enabled": true,
+                     *             "note": "",
+                     *             "when": {
+                     *               "kind": "group",
+                     *               "mode": "all",
+                     *               "items": [
+                     *                 {
+                     *                   "kind": "cond",
+                     *                   "field": "provider",
+                     *                   "op": "in",
+                     *                   "path": "",
+                     *                   "values": [
+                     *                     "minimax"
+                     *                   ]
+                     *                 },
+                     *                 {
+                     *                   "kind": "cond",
+                     *                   "field": "path",
+                     *                   "op": "ne",
+                     *                   "path": "$.base_resp.status_code",
+                     *                   "values": [
+                     *                     "0"
+                     *                   ]
+                     *                 },
+                     *                 {
+                     *                   "kind": "group",
+                     *                   "mode": "any",
+                     *                   "items": [
+                     *                     {
+                     *                       "kind": "cond",
+                     *                       "field": "message",
+                     *                       "op": "contains",
+                     *                       "path": "",
+                     *                       "values": [
+                     *                         "Token Plan"
+                     *                       ]
+                     *                     },
+                     *                     {
+                     *                       "kind": "cond",
+                     *                       "field": "code",
+                     *                       "op": "in",
+                     *                       "path": "",
+                     *                       "values": [
+                     *                         "2067"
+                     *                       ]
+                     *                     }
+                     *                   ]
+                     *                 }
+                     *               ]
+                     *             },
+                     *             "category": "quota_exhausted",
+                     *             "steps": [
+                     *               {
+                     *                 "type": "retry",
+                     *                 "delaySeconds": 2,
+                     *                 "times": 1
+                     *               },
+                     *               {
+                     *                 "type": "pause",
+                     *                 "scope": "model",
+                     *                 "mode": "usage_window",
+                     *                 "seconds": 900,
+                     *                 "pattern": "",
+                     *                 "timezone": "+08:00",
+                     *                 "boundaryHours": 5,
+                     *                 "fallbackSeconds": 900
+                     *               },
+                     *               {
+                     *                 "type": "notify",
+                     *                 "repeatHours": 6
+                     *               }
+                     *             ],
+                     *             "final": "next",
+                     *             "thresholds": [
+                     *               {
+                     *                 "count": 3,
+                     *                 "mode": "consecutive",
+                     *                 "windowMinutes": 10,
+                     *                 "scope": "model",
+                     *                 "steps": [
+                     *                   {
+                     *                     "type": "pause",
+                     *                     "scope": "account",
+                     *                     "mode": "fixed",
+                     *                     "seconds": 1800,
+                     *                     "pattern": "",
+                     *                     "timezone": "+08:00",
+                     *                     "boundaryHours": 0,
+                     *                     "fallbackSeconds": 900
+                     *                   }
+                     *                 ]
+                     *               }
+                     *             ],
+                     *             "response": {
+                     *               "status": 429,
+                     *               "message": "MiniMax quota: {$.error.message}",
+                     *               "retryAfter": true
+                     *             },
+                     *             "group": ""
+                     *           }
+                     *         ],
+                     *         "presets": [],
+                     *         "builtins": [],
+                     *         "categories": [],
+                     *         "providers": [
+                     *           {
+                     *             "id": "minimax",
+                     *             "channelCount": 1
+                     *           }
+                     *         ],
+                     *         "channelProviders": {
+                     *           "api:MiniMax": "minimax"
+                     *         },
+                     *         "stats": {
+                     *           "rule-1a2b3c4d": {
+                     *             "count": 3,
+                     *             "lastAt": 1795180000
+                     *           }
+                     *         },
+                     *         "statsWindowDays": 7,
+                     *         "revision": "rev_example"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_ErrorRulesData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_CONFLICT, REVISION_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE, SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    updateErrorRule: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: string | null;
+            };
+            path: {
+                ruleId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ErrorRuleInput"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "enabled": true,
+                     *         "rules": [
+                     *           {
+                     *             "id": "rule-1a2b3c4d",
+                     *             "name": "MiniMax Token Plan 用尽",
+                     *             "enabled": true,
+                     *             "note": "",
+                     *             "when": {
+                     *               "kind": "group",
+                     *               "mode": "all",
+                     *               "items": [
+                     *                 {
+                     *                   "kind": "cond",
+                     *                   "field": "provider",
+                     *                   "op": "in",
+                     *                   "path": "",
+                     *                   "values": [
+                     *                     "minimax"
+                     *                   ]
+                     *                 },
+                     *                 {
+                     *                   "kind": "cond",
+                     *                   "field": "path",
+                     *                   "op": "ne",
+                     *                   "path": "$.base_resp.status_code",
+                     *                   "values": [
+                     *                     "0"
+                     *                   ]
+                     *                 },
+                     *                 {
+                     *                   "kind": "group",
+                     *                   "mode": "any",
+                     *                   "items": [
+                     *                     {
+                     *                       "kind": "cond",
+                     *                       "field": "message",
+                     *                       "op": "contains",
+                     *                       "path": "",
+                     *                       "values": [
+                     *                         "Token Plan"
+                     *                       ]
+                     *                     },
+                     *                     {
+                     *                       "kind": "cond",
+                     *                       "field": "code",
+                     *                       "op": "in",
+                     *                       "path": "",
+                     *                       "values": [
+                     *                         "2067"
+                     *                       ]
+                     *                     }
+                     *                   ]
+                     *                 }
+                     *               ]
+                     *             },
+                     *             "category": "quota_exhausted",
+                     *             "steps": [
+                     *               {
+                     *                 "type": "retry",
+                     *                 "delaySeconds": 2,
+                     *                 "times": 1
+                     *               },
+                     *               {
+                     *                 "type": "pause",
+                     *                 "scope": "model",
+                     *                 "mode": "usage_window",
+                     *                 "seconds": 900,
+                     *                 "pattern": "",
+                     *                 "timezone": "+08:00",
+                     *                 "boundaryHours": 5,
+                     *                 "fallbackSeconds": 900
+                     *               },
+                     *               {
+                     *                 "type": "notify",
+                     *                 "repeatHours": 6
+                     *               }
+                     *             ],
+                     *             "final": "next",
+                     *             "thresholds": [
+                     *               {
+                     *                 "count": 3,
+                     *                 "mode": "consecutive",
+                     *                 "windowMinutes": 10,
+                     *                 "scope": "model",
+                     *                 "steps": [
+                     *                   {
+                     *                     "type": "pause",
+                     *                     "scope": "account",
+                     *                     "mode": "fixed",
+                     *                     "seconds": 1800,
+                     *                     "pattern": "",
+                     *                     "timezone": "+08:00",
+                     *                     "boundaryHours": 0,
+                     *                     "fallbackSeconds": 900
+                     *                   }
+                     *                 ]
+                     *               }
+                     *             ],
+                     *             "response": {
+                     *               "status": 429,
+                     *               "message": "MiniMax quota: {$.error.message}",
+                     *               "retryAfter": true
+                     *             },
+                     *             "group": ""
+                     *           }
+                     *         ],
+                     *         "presets": [],
+                     *         "builtins": [],
+                     *         "categories": [],
+                     *         "providers": [
+                     *           {
+                     *             "id": "minimax",
+                     *             "channelCount": 1
+                     *           }
+                     *         ],
+                     *         "channelProviders": {
+                     *           "api:MiniMax": "minimax"
+                     *         },
+                     *         "stats": {
+                     *           "rule-1a2b3c4d": {
+                     *             "count": 3,
+                     *             "lastAt": 1795180000
+                     *           }
+                     *         },
+                     *         "statsWindowDays": 7,
+                     *         "revision": "rev_example"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_ErrorRulesData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_CONFLICT, REVISION_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE, SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    reorderErrorRules: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ErrorRulesReorderRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "enabled": true,
+                     *         "rules": [
+                     *           {
+                     *             "id": "rule-1a2b3c4d",
+                     *             "name": "MiniMax Token Plan 用尽",
+                     *             "enabled": true,
+                     *             "note": "",
+                     *             "when": {
+                     *               "kind": "group",
+                     *               "mode": "all",
+                     *               "items": [
+                     *                 {
+                     *                   "kind": "cond",
+                     *                   "field": "provider",
+                     *                   "op": "in",
+                     *                   "path": "",
+                     *                   "values": [
+                     *                     "minimax"
+                     *                   ]
+                     *                 },
+                     *                 {
+                     *                   "kind": "cond",
+                     *                   "field": "path",
+                     *                   "op": "ne",
+                     *                   "path": "$.base_resp.status_code",
+                     *                   "values": [
+                     *                     "0"
+                     *                   ]
+                     *                 },
+                     *                 {
+                     *                   "kind": "group",
+                     *                   "mode": "any",
+                     *                   "items": [
+                     *                     {
+                     *                       "kind": "cond",
+                     *                       "field": "message",
+                     *                       "op": "contains",
+                     *                       "path": "",
+                     *                       "values": [
+                     *                         "Token Plan"
+                     *                       ]
+                     *                     },
+                     *                     {
+                     *                       "kind": "cond",
+                     *                       "field": "code",
+                     *                       "op": "in",
+                     *                       "path": "",
+                     *                       "values": [
+                     *                         "2067"
+                     *                       ]
+                     *                     }
+                     *                   ]
+                     *                 }
+                     *               ]
+                     *             },
+                     *             "category": "quota_exhausted",
+                     *             "steps": [
+                     *               {
+                     *                 "type": "retry",
+                     *                 "delaySeconds": 2,
+                     *                 "times": 1
+                     *               },
+                     *               {
+                     *                 "type": "pause",
+                     *                 "scope": "model",
+                     *                 "mode": "usage_window",
+                     *                 "seconds": 900,
+                     *                 "pattern": "",
+                     *                 "timezone": "+08:00",
+                     *                 "boundaryHours": 5,
+                     *                 "fallbackSeconds": 900
+                     *               },
+                     *               {
+                     *                 "type": "notify",
+                     *                 "repeatHours": 6
+                     *               }
+                     *             ],
+                     *             "final": "next",
+                     *             "thresholds": [
+                     *               {
+                     *                 "count": 3,
+                     *                 "mode": "consecutive",
+                     *                 "windowMinutes": 10,
+                     *                 "scope": "model",
+                     *                 "steps": [
+                     *                   {
+                     *                     "type": "pause",
+                     *                     "scope": "account",
+                     *                     "mode": "fixed",
+                     *                     "seconds": 1800,
+                     *                     "pattern": "",
+                     *                     "timezone": "+08:00",
+                     *                     "boundaryHours": 0,
+                     *                     "fallbackSeconds": 900
+                     *                   }
+                     *                 ]
+                     *               }
+                     *             ],
+                     *             "response": {
+                     *               "status": 429,
+                     *               "message": "MiniMax quota: {$.error.message}",
+                     *               "retryAfter": true
+                     *             },
+                     *             "group": ""
+                     *           }
+                     *         ],
+                     *         "presets": [],
+                     *         "builtins": [],
+                     *         "categories": [],
+                     *         "providers": [
+                     *           {
+                     *             "id": "minimax",
+                     *             "channelCount": 1
+                     *           }
+                     *         ],
+                     *         "channelProviders": {
+                     *           "api:MiniMax": "minimax"
+                     *         },
+                     *         "stats": {
+                     *           "rule-1a2b3c4d": {
+                     *             "count": 3,
+                     *             "lastAt": 1795180000
+                     *           }
+                     *         },
+                     *         "statsWindowDays": 7,
+                     *         "revision": "rev_example"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_ErrorRulesData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_CONFLICT, REVISION_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE, SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    updateErrorRulePreset: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: string | null;
+            };
+            path: {
+                ruleId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ErrorRulePresetPatch"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "enabled": true,
+                     *         "rules": [
+                     *           {
+                     *             "id": "rule-1a2b3c4d",
+                     *             "name": "MiniMax Token Plan 用尽",
+                     *             "enabled": true,
+                     *             "note": "",
+                     *             "when": {
+                     *               "kind": "group",
+                     *               "mode": "all",
+                     *               "items": [
+                     *                 {
+                     *                   "kind": "cond",
+                     *                   "field": "provider",
+                     *                   "op": "in",
+                     *                   "path": "",
+                     *                   "values": [
+                     *                     "minimax"
+                     *                   ]
+                     *                 },
+                     *                 {
+                     *                   "kind": "cond",
+                     *                   "field": "path",
+                     *                   "op": "ne",
+                     *                   "path": "$.base_resp.status_code",
+                     *                   "values": [
+                     *                     "0"
+                     *                   ]
+                     *                 },
+                     *                 {
+                     *                   "kind": "group",
+                     *                   "mode": "any",
+                     *                   "items": [
+                     *                     {
+                     *                       "kind": "cond",
+                     *                       "field": "message",
+                     *                       "op": "contains",
+                     *                       "path": "",
+                     *                       "values": [
+                     *                         "Token Plan"
+                     *                       ]
+                     *                     },
+                     *                     {
+                     *                       "kind": "cond",
+                     *                       "field": "code",
+                     *                       "op": "in",
+                     *                       "path": "",
+                     *                       "values": [
+                     *                         "2067"
+                     *                       ]
+                     *                     }
+                     *                   ]
+                     *                 }
+                     *               ]
+                     *             },
+                     *             "category": "quota_exhausted",
+                     *             "steps": [
+                     *               {
+                     *                 "type": "retry",
+                     *                 "delaySeconds": 2,
+                     *                 "times": 1
+                     *               },
+                     *               {
+                     *                 "type": "pause",
+                     *                 "scope": "model",
+                     *                 "mode": "usage_window",
+                     *                 "seconds": 900,
+                     *                 "pattern": "",
+                     *                 "timezone": "+08:00",
+                     *                 "boundaryHours": 5,
+                     *                 "fallbackSeconds": 900
+                     *               },
+                     *               {
+                     *                 "type": "notify",
+                     *                 "repeatHours": 6
+                     *               }
+                     *             ],
+                     *             "final": "next",
+                     *             "thresholds": [
+                     *               {
+                     *                 "count": 3,
+                     *                 "mode": "consecutive",
+                     *                 "windowMinutes": 10,
+                     *                 "scope": "model",
+                     *                 "steps": [
+                     *                   {
+                     *                     "type": "pause",
+                     *                     "scope": "account",
+                     *                     "mode": "fixed",
+                     *                     "seconds": 1800,
+                     *                     "pattern": "",
+                     *                     "timezone": "+08:00",
+                     *                     "boundaryHours": 0,
+                     *                     "fallbackSeconds": 900
+                     *                   }
+                     *                 ]
+                     *               }
+                     *             ],
+                     *             "response": {
+                     *               "status": 429,
+                     *               "message": "MiniMax quota: {$.error.message}",
+                     *               "retryAfter": true
+                     *             },
+                     *             "group": ""
+                     *           }
+                     *         ],
+                     *         "presets": [],
+                     *         "builtins": [],
+                     *         "categories": [],
+                     *         "providers": [
+                     *           {
+                     *             "id": "minimax",
+                     *             "channelCount": 1
+                     *           }
+                     *         ],
+                     *         "channelProviders": {
+                     *           "api:MiniMax": "minimax"
+                     *         },
+                     *         "stats": {
+                     *           "rule-1a2b3c4d": {
+                     *             "count": 3,
+                     *             "lastAt": 1795180000
+                     *           }
+                     *         },
+                     *         "statsWindowDays": 7,
+                     *         "revision": "rev_example"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_ErrorRulesData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_CONFLICT, REVISION_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE, SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    testErrorRules: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ErrorRulesTestRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataEnvelope_ErrorRulesTestData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_CONFLICT, REVISION_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE, SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    getRecentUpstreamErrors: {
+        parameters: {
+            query?: {
+                hours?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataEnvelope_ErrorRulesRecentData_"];
                 };
             };
             /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */

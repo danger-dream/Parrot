@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Literal
 
 import httpx
@@ -39,6 +39,7 @@ RoundMode = Literal["http_stream", "http_non_stream", "ws"]
 
 BUSINESS_TIMEOUT_OUTCOMES = frozenset({
     "connection_timeout",
+    "upload_timeout",
     "first_byte_timeout",
     "idle_timeout",
     "total_timeout",
@@ -80,14 +81,34 @@ def classify_httpx_timeout(exc: BaseException) -> str:
     raise TypeError(f"not an HTTPX timeout: {type(exc)!r}")
 
 
+DEFAULT_UPLOAD_MIN_KBPS = 256
+
+
+def upload_budget_seconds(body_bytes: int, *, connection: float, min_kbps: float) -> float:
+    """Time allowed to send one request body once the request is dispatched.
+
+    Never shorter than the connection timeout; a large body gets the time it
+    needs at the configured minimum throughput, so a healthy but slow upload
+    is not mistaken for a dead connection.
+    """
+
+    rate = max(1.0, float(min_kbps)) * 1024
+    return max(float(connection), max(0, int(body_bytes)) / rate)
+
+
 @dataclass(frozen=True)
 class RoundTimeouts:
-    """Existing config values interpreted relative to one upstream round."""
+    """Existing config values interpreted relative to one upstream round.
+
+    ``upload`` is the per-round body-send budget. ``None`` keeps the original
+    rule where ``connection`` covers both connecting and uploading.
+    """
 
     connection: float
     first_byte: float
     idle: float
     total: float
+    upload: float | None = None
 
     @classmethod
     def from_config(cls, values: dict[str, Any] | None) -> "RoundTimeouts":
@@ -98,6 +119,11 @@ class RoundTimeouts:
             idle=max(0.001, float(cfg.get("idle", 120))),
             total=max(0.001, float(cfg.get("total", 600))),
         )
+
+    def with_upload_body(self, body_bytes: int, min_kbps: float) -> "RoundTimeouts":
+        return replace(self, upload=upload_budget_seconds(
+            body_bytes, connection=self.connection, min_kbps=min_kbps,
+        ))
 
 
 @dataclass(frozen=True)
@@ -167,6 +193,7 @@ class UpstreamRoundTiming:
     # more specific unmet milestone; total remains the final hard cap.
     _DEADLINE_PRIORITY = {
         "connection_timeout": 0,
+        "upload_timeout": 0,
         "first_byte_timeout": 1,
         "idle_timeout": 2,
         "total_timeout": 3,
@@ -202,6 +229,7 @@ class UpstreamRoundTiming:
         self._outcome: str | None = None
         self._error_detail: str | None = None
 
+        self._dispatch_started_at: float | None = None
         self._connection_completed_at: float | None = None
         self._first_response_at: float | None = None
         self._last_activity_at: float | None = None
@@ -234,6 +262,14 @@ class UpstreamRoundTiming:
 
     async def wait_connection_complete(self) -> None:
         await self._connection_event.wait()
+
+    def mark_dispatch_started(self, at: float | None = None) -> None:
+        """The connection is ready and the request starts leaving the process."""
+
+        if self._dispatch_started_at is not None or self._connection_completed_at is not None:
+            return
+        self._dispatch_started_at = self._clock() if at is None else float(at)
+        self._state_changed.set()
 
     def mark_connection_complete(self, at: float | None = None) -> None:
         if self._connection_completed_at is not None:
@@ -302,11 +338,18 @@ class UpstreamRoundTiming:
             )
         ]
         if self._connection_completed_at is None:
-            candidates.append((
-                self.started_monotonic + timeouts.connection,
-                self._DEADLINE_PRIORITY["connection_timeout"],
-                "connection_timeout",
-            ))
+            if timeouts.upload is not None and self._dispatch_started_at is not None:
+                candidates.append((
+                    self._dispatch_started_at + timeouts.upload,
+                    self._DEADLINE_PRIORITY["upload_timeout"],
+                    "upload_timeout",
+                ))
+            else:
+                candidates.append((
+                    self.started_monotonic + timeouts.connection,
+                    self._DEADLINE_PRIORITY["connection_timeout"],
+                    "connection_timeout",
+                ))
         else:
             if self.request_mode in ("http_stream", "ws"):
                 if self._first_response_at is None:
@@ -593,6 +636,7 @@ class HttpAttemptTiming(UpstreamRoundTiming):
             self._phase_started[event] = now
             if event in self._DISPATCH_EVENTS and not self._dispatch_started:
                 self._dispatch_started = True
+                self.mark_dispatch_started(now)
                 if self._on_dispatch is not None:
                     try:
                         self._on_dispatch()

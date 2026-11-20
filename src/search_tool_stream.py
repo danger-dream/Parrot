@@ -15,6 +15,7 @@ import uuid
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import local_web_tools as web, upstream
+from .async_owned import await_owned
 from .protocols.sse import split_sse_events
 from .transports.chat_aggregate import ChatAggregateBuilder
 from .search_tool_policy import is_response_tool_call
@@ -705,6 +706,9 @@ def stream(body, protocol, invoke, *, request_id=None, api_key_name=None):
         finally:
             if not task.done():
                 task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            # ASGI disconnect keeps cancelling this generator at every
+            # checkpoint; a bare gather would forward each one to the producer
+            # and interrupt its attempt finalizer. Cancel exactly once.
+            await await_owned(asyncio.gather(task, return_exceptions=True))
 
     return StreamingResponse(iterate(), media_type="text/event-stream")

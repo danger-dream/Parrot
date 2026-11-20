@@ -127,7 +127,7 @@ async def test_quota_failover_across_case_variants(env, monkeypatch, model, ingr
     config.update(lambda c: c.update(oauthAccounts=[first, second], channelSelection='order', modelCenter={}))
     channels = [ZhipuOAuthChannel(first), ZhipuOAuthChannel(second)]
     fake._install_channels(env[0], channels)
-    monkeypatch.setattr(env[0]['failover'], '_notify_zhipu_quota_cooldown', lambda *a, **k: None)
+    monkeypatch.setattr(env[0]['failover'].error_rule_effects, '_notify', lambda *a, **k: None)
     attempts = []
     reset = (datetime.now(timezone(timedelta(hours=8))) + timedelta(days=2)).strftime('%Y-%m-%d %H:%M:%S')
     def wire(request):

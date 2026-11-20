@@ -41,6 +41,7 @@ class TimeoutSettings:
     firstByte: int
     idle: int
     total: int
+    uploadMinKBps: int
     revision: str
 
 

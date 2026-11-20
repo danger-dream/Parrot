@@ -87,8 +87,14 @@ class ZhipuOAuthChannel(ApiChannel):
             values = record.get("reasoningEfforts") or []
             if values and effort not in values:
                 raise guard.GuardError(400, "invalid_request_error", "Unsupported Zhipu reasoning effort", param="reasoning_effort", scope="candidate")
-            payload["thinking"] = {"type": "disabled" if effort in {"disabled", "none"} else "enabled"}
-            if effort not in {"disabled", "none", "enabled"}:
+            # Anthropic enabled thinking needs max_tokens > 1024. A derived
+            # (budget-less) effort must not turn a small explicit output cap
+            # into a rejected request; answer without thinking instead.
+            max_tokens = payload.get("max_tokens")
+            small_output = isinstance(max_tokens, int) and not isinstance(max_tokens, bool) and max_tokens <= 1024
+            enabled = effort not in {"disabled", "none"} and not small_output
+            payload["thinking"] = {"type": "enabled" if enabled else "disabled"}
+            if enabled and effort != "enabled":
                 payload["output_config"] = {**(payload.get("output_config") or {}), "effort": effort}
         if source.get(anthropic_reasoning_replay.DROP_HISTORY_KEY):
             anthropic_reasoning_replay.drop_thinking_history(payload, allow_unsigned_thinking=True)

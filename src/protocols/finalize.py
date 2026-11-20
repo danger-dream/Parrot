@@ -29,7 +29,7 @@ _WARNING_INTERVAL_SECONDS = 60.0
 # Transport failures are not evidence of permanently invalid OAuth credentials.
 # Use the attempt outcome, not vendor-controlled error text, for new failures.
 _TRANSIENT_TRANSPORT_OUTCOMES = frozenset({
-    "connection_timeout", "http_connect_timeout", "connect_timeout", "pool_timeout",
+    "connection_timeout", "upload_timeout", "http_connect_timeout", "connect_timeout", "pool_timeout",
     "write_timeout", "read_timeout", "transport_timeout", "first_byte_timeout",
     "idle_timeout", "total_timeout", "connect_error", "proxy_connect_error",
     "transport_error",
@@ -161,6 +161,9 @@ def apply_success_health_effects(
                 total_ms=total_ms,
             ),
         )
+    if plan.record_success:
+        from .. import error_rule_effects
+        _run_health_effect("error_rule_streak", lambda: error_rule_effects.reset_streak(channel_key, model))
     if plan.clear_cooldown:
         # An ordinary success can belong to a request that was already in flight
         # when another request committed a cooldown.  It may clear grace/expired

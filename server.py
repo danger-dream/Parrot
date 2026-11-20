@@ -1025,9 +1025,12 @@ class _DrainHttpMiddleware:
         except _LocalModelPolicyDenied as exc:
             await send_error(exc.response)
         except ClientDisconnect:
-            if policy_body_guard is None or key_lease is not None:
+            if response_started:
                 raise
-            # Pre-queue reader owns cleanup; no response for a disconnected peer.
+            # The peer left while its request body was still arriving; nothing
+            # can be delivered, and release_all() below frees every lease.
+            if policy_body_guard is None or key_lease is not None:
+                print(f"[http] client disconnected before the request body was complete: {method} {path}")
             return
         except apikey_limiter.ApiKeyLimitError as exc:
             if response_started:
@@ -1632,6 +1635,21 @@ async def proxy_messages(request: Request):
             f"[scheduler] no channels ingress=anthropic model={model}: "
             f"{exclusion_summary}"
         )
+        from src import error_rules
+        from src.protocols import errors as protocol_errors
+        ruled = error_rules.unavailable_response(result.exclusions, model)
+        if ruled is not None:
+            # Every candidate is paused and an error rule says what to answer meanwhile.
+            if not skip_log:
+                await asyncio.to_thread(
+                    log_db.finish_error, request_id, ruled["message"], 0,
+                    http_status=ruled["status"], affinity_hit=(1 if result.affinity_hit else 0),
+                    total_ms=int((time.monotonic() - start_monotonic) * 1000),
+                )
+            return errors.json_error_response(
+                ruled["status"], protocol_errors.legacy_anthropic_error_type_for_http_status(ruled["status"]),
+                ruled["message"], headers=error_rules.response_headers(ruled),
+            )
         # Resolve once so the log and downstream response describe the same error.
         err_type = errors.ErrType.NOT_FOUND if model_never_supported else errors.ErrType.API
         status = 404 if err_type == errors.ErrType.NOT_FOUND else 503

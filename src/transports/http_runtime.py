@@ -17,7 +17,7 @@ from typing import Any
 
 import httpx
 
-from .. import blacklist, log_db, network, upstream
+from .. import blacklist, config, log_db, network, upstream
 from ..async_owned import await_owned
 from ..antigravity import DispatchGuardError
 from ..providers import registry as provider_registry
@@ -27,6 +27,7 @@ from ..protocols.commit_gate import SseCommitGate
 from ..protocols.runtime import (
     AttemptResult,
     connection_lifecycle_outcome,
+    exception_text,
     make_stream_translator,
     toolkit_for_channel,
 )
@@ -39,6 +40,7 @@ from .http import HttpStreamRequest, open_stream
 from .policy import proxy_byte_snapshot, proxy_route_kwargs
 from .precommit_sse import notify_buffered_response_start
 from .timing import (
+    DEFAULT_UPLOAD_MIN_KBPS,
     BusinessTimeoutError,
     HttpAttemptTiming,
     RoundTimeouts,
@@ -362,7 +364,7 @@ async def read_http_error_response(
         return _with_timing(timing, AttemptResult(
             outcome=status_outcome,
             http_status=status,
-            error_detail=f"HTTP {status}: error body read timeout: {exc}",
+            error_detail=f"HTTP {status}: error body read timeout: {exception_text(exc)}",
             proxy_name=proxy_name,
             proxy_bytes_up=up,
             proxy_bytes_down=down,
@@ -373,7 +375,7 @@ async def read_http_error_response(
         return _with_timing(timing, AttemptResult(
             outcome=status_outcome,
             http_status=status,
-            error_detail=f"HTTP {status}: error body read failed: {exc}",
+            error_detail=f"HTTP {status}: error body read failed: {exception_text(exc)}",
             proxy_name=proxy_name,
             proxy_bytes_up=up,
             proxy_bytes_down=down,
@@ -428,7 +430,7 @@ async def read_non_stream_body(
         return HttpBodyReadResult(
             error=_with_timing(timing, AttemptResult(
                 outcome=classify_httpx_timeout(exc),
-                error_detail=f"non-stream body timeout: {exc}",
+                error_detail=f"non-stream body timeout: {exception_text(exc)}",
             ))
         )
     except Exception as exc:
@@ -441,7 +443,7 @@ async def read_non_stream_body(
                     http_phase="response_body",
                 ) or "transport_error",
                 http_status=response.status_code,
-                error_detail=f"read non-stream body: {exc}",
+                error_detail=f"read non-stream body: {exception_text(exc)}",
             ))
         )
 
@@ -512,7 +514,7 @@ async def aggregate_stream_as_non_stream_response(
         return StreamAsNonStreamResult(
             error=_with_timing(timing, AttemptResult(
                 outcome=classify_httpx_timeout(exc),
-                error_detail=f"first byte transport timeout: {exc} [stream-only→non-stream]",
+                error_detail=f"first byte transport timeout: {exception_text(exc)} [stream-only→non-stream]",
             ))
         )
     except Exception as exc:
@@ -525,7 +527,7 @@ async def aggregate_stream_as_non_stream_response(
                     http_phase="response_body",
                 ) or "transport_error",
                 http_status=response.status_code,
-                error_detail=f"first byte transport: {exc} [stream-only→non-stream]",
+                error_detail=f"first byte transport: {exception_text(exc)} [stream-only→non-stream]",
             ))
         )
 
@@ -650,7 +652,7 @@ async def aggregate_stream_as_non_stream_response(
             return StreamAsNonStreamResult(
                 error=with_partial_billing(_with_timing(timing, AttemptResult(
                     outcome=classify_httpx_timeout(exc),
-                    error_detail=f"read SSE timeout: {exc} [stream-only→non-stream]",
+                    error_detail=f"read SSE timeout: {exception_text(exc)} [stream-only→non-stream]",
                 )))
             )
         except Exception as exc:
@@ -663,7 +665,7 @@ async def aggregate_stream_as_non_stream_response(
                         http_phase="response_body",
                     ) or "transport_error",
                     http_status=response.status_code,
-                    error_detail=f"read SSE chunk: {exc} [stream-only→non-stream]",
+                    error_detail=f"read SSE chunk: {exception_text(exc)} [stream-only→non-stream]",
                 )))
             )
         try:
@@ -895,7 +897,7 @@ async def prepare_stream_response_start(
         return HttpStreamStartResult(
             error=_with_timing(timing, AttemptResult(
                 outcome=classify_httpx_timeout(exc),
-                error_detail=f"first byte transport timeout: {exc}",
+                error_detail=f"first byte transport timeout: {exception_text(exc)}",
             ))
         )
     except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
@@ -908,7 +910,7 @@ async def prepare_stream_response_start(
                     http_phase="response_body",
                 ) or "transport_error",
                 http_status=response.status_code,
-                error_detail=f"first byte transport: {exc}",
+                error_detail=f"first byte transport: {exception_text(exc)}",
             ))
         )
 
@@ -980,7 +982,7 @@ async def prepare_stream_response_start(
             return HttpStreamStartResult(
                 error=_with_timing(timing, _attach_precommit_response(AttemptResult(
                     outcome=classify_httpx_timeout(exc),
-                    error_detail=f"first downstream chunk timeout: {exc}",
+                    error_detail=f"first downstream chunk timeout: {exception_text(exc)}",
                 )))
             )
         except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
@@ -993,7 +995,7 @@ async def prepare_stream_response_start(
                         http_phase="response_body",
                     ) or "transport_error",
                     http_status=response.status_code,
-                    error_detail=f"first downstream chunk transport: {exc}",
+                    error_detail=f"first downstream chunk transport: {exception_text(exc)}",
                 )))
             )
         except Exception as exc:
@@ -1137,14 +1139,14 @@ async def read_next_stream_step(
             return HttpStreamReadStep(
                 kind="error",
                 err_type="api_error",
-                message=f"stream transport timeout: {exc}",
+                message=f"stream transport timeout: {exception_text(exc)}",
                 outcome=outcome,
             )
         except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
             return HttpStreamReadStep(
                 kind="error",
                 err_type="api_error",
-                message=f"stream transport error: {exc}",
+                message=f"stream transport error: {exception_text(exc)}",
                 outcome=connection_lifecycle_outcome(
                     exc,
                     http_status=upstream_status,
@@ -1562,6 +1564,23 @@ def _headers_for_physical_dispatch(headers) -> dict[str, str]:
     return out
 
 
+def request_body_bytes(body) -> int:
+    if isinstance(body, (bytes, bytearray, memoryview)):
+        return len(body)
+    if isinstance(body, str):
+        return len(body.encode("utf-8"))
+    return 0
+
+
+def upload_min_kbps() -> float:
+    """Configured minimum upload throughput (KB/s) used to size upload budgets."""
+    try:
+        value = float((config.get().get("timeouts") or {}).get("uploadMinKBps", DEFAULT_UPLOAD_MIN_KBPS))
+    except (TypeError, ValueError):
+        return float(DEFAULT_UPLOAD_MIN_KBPS)
+    return value if value >= 1 else float(DEFAULT_UPLOAD_MIN_KBPS)
+
+
 async def open_response_with_proxy_chain(
     *,
     channel,
@@ -1594,7 +1613,10 @@ async def open_response_with_proxy_chain(
         "firstByte": first_byte_timeout,
         "idle": idle_timeout,
         "total": total_timeout,
-    })
+    }).with_upload_body(request_body_bytes(upstream_req.body), upload_min_kbps())
+    # Transport write limits follow the business upload budget; the small
+    # margin lets the business deadline report upload_timeout first.
+    write_timeout = round_timeouts.upload + 0.5
 
     last_pre_header: AttemptResult | None = None
     proxy_attempt_order = 0
@@ -1621,7 +1643,7 @@ async def open_response_with_proxy_chain(
                 timeout=httpx.Timeout(
                     connect=round_timeouts.connection + 0.5,
                     read=max(330.0, round_timeouts.total + 1.0),
-                    write=30.0,
+                    write=write_timeout,
                     pool=round_timeouts.connection + 0.5,
                 ),
                 limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
@@ -1650,7 +1672,7 @@ async def open_response_with_proxy_chain(
                 client_timeout = httpx.Timeout(
                     connect=round_timeouts.connection + 0.5,
                     read=max(330.0, round_timeouts.total + 1.0),
-                    write=30.0,
+                    write=write_timeout,
                     pool=round_timeouts.connection + 0.5,
                 )
                 route_counter = _count_proxy_bytes_for(proxy_bytes)
@@ -1838,7 +1860,7 @@ async def open_response_with_proxy_chain(
                 content=upstream_req.body,
                 connect_timeout=round_timeouts.connection + 0.5,
                 read_timeout=max(330.0, round_timeouts.total + 1.0),
-                write_timeout=30.0,
+                write_timeout=write_timeout,
                 pool_timeout=round_timeouts.connection + 0.5,
                 extensions={
                     "trace": trace_with_dispatch,
@@ -1929,6 +1951,10 @@ async def open_response_with_proxy_chain(
             return OpenedHttpResponse(error=result)
         except BusinessTimeoutError as exc:
             detail = f"{exc.outcome} while opening upstream response"
+            if exc.outcome == "upload_timeout":
+                size_mb = request_body_bytes(upstream_req.body) / 1048576
+                detail += (f": {size_mb:.1f} MB request body not fully sent within "
+                           f"{round_timeouts.upload:.0f}s")
             last_pre_header = await _finish_pre_header_round(
                 owner=owner,
                 timing=timing,
@@ -1946,7 +1972,7 @@ async def open_response_with_proxy_chain(
             continue
         except httpx.TimeoutException as exc:
             outcome = classify_httpx_timeout(exc)
-            detail = f"{outcome}: {exc}"
+            detail = f"{outcome}: {exception_text(exc)}"
             last_pre_header = await _finish_pre_header_round(
                 owner=owner,
                 timing=timing,
@@ -1963,7 +1989,7 @@ async def open_response_with_proxy_chain(
                 return OpenedHttpResponse(error=last_pre_header)
             continue
         except httpx.ConnectError as exc:
-            detail = f"connect error: {exc}"
+            detail = f"connect error: {exception_text(exc)}"
             last_pre_header = await _finish_pre_header_round(
                 owner=owner,
                 timing=timing,
@@ -1980,7 +2006,7 @@ async def open_response_with_proxy_chain(
                 return OpenedHttpResponse(error=last_pre_header)
             continue
         except Exception as exc:
-            detail = f"transport: {exc}"
+            detail = f"transport: {exception_text(exc)}"
             last_pre_header = await _finish_pre_header_round(
                 owner=owner,
                 timing=timing,

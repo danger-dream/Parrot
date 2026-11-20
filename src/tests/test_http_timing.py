@@ -653,3 +653,75 @@ async def test_precommit_cancel_closes_owned_context_persists_cancel_and_rethrow
     assert updates[-1][1]["outcome"] == "cancelled"
     assert updates[-1][1]["ended_at"] is not None
     assert updates[-1][1]["total_ms"] is not None
+
+
+class _SlowUploadContext(_Context):
+    """Connects at once, then spends ``upload_seconds`` sending the body."""
+
+    def __init__(self, request, *, upload_seconds: float) -> None:
+        super().__init__(request)
+        self.write_timeout = request.write_timeout
+        self.upload_seconds = float(upload_seconds)
+
+    async def __aenter__(self):
+        await self.trace("http11.send_request_headers.started", {})
+        await self.trace("http11.send_request_headers.complete", {})
+        await self.trace("http11.send_request_body.started", {})
+        await asyncio.sleep(self.upload_seconds)
+        await self.trace("http11.send_request_body.complete", {})
+        await self.trace("http11.receive_response_headers.started", {})
+        await self.trace("http11.receive_response_headers.complete", {})
+        return self.response
+
+
+def _slow_upload_kwargs(monkeypatch, contexts, *, upload_seconds):
+    _patch_persistence(monkeypatch)
+    monkeypatch.setattr(
+        http_runtime, "_resolve_http_route_chain",
+        lambda channel, model: ([("direct", None)], None),
+    )
+
+    def open_stream(client, request):
+        ctx = _SlowUploadContext(request, upload_seconds=upload_seconds)
+        contexts.append(ctx)
+        return ctx
+
+    monkeypatch.setattr(http_runtime, "open_stream", open_stream)
+    # 1 KB/s and a 300-byte body: a 0.29s upload budget against a 0.05s connect.
+    monkeypatch.setattr(http_runtime, "upload_min_kbps", lambda: 1.0)
+    kwargs = _open_kwargs()
+    kwargs["upstream_req"] = SimpleNamespace(method="POST", url="https://unit.invalid", headers={}, body=b"x" * 300)
+    kwargs.update(connect_timeout=0.05, first_byte_timeout=1)
+    return kwargs
+
+
+@pytest.mark.asyncio
+async def test_large_body_upload_is_not_cut_by_the_connect_timeout(monkeypatch):
+    contexts = []
+    kwargs = _slow_upload_kwargs(monkeypatch, contexts, upload_seconds=0.15)
+
+    opened = await http_runtime.open_response_with_proxy_chain(**kwargs)
+
+    assert opened.ok, opened.error
+    assert opened.round_timeouts.upload == pytest.approx(300 / 1024)
+    assert contexts[0].write_timeout == pytest.approx(300 / 1024 + 0.5)
+    await opened.ctx.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_stalled_upload_reports_upload_timeout_with_body_size(monkeypatch):
+    contexts = []
+    kwargs = _slow_upload_kwargs(monkeypatch, contexts, upload_seconds=5)
+
+    opened = await http_runtime.open_response_with_proxy_chain(**kwargs)
+
+    assert opened.error is not None
+    assert opened.error.outcome == "upload_timeout"
+    assert "MB request body not fully sent within" in opened.error.error_detail
+
+
+def test_upload_budget_never_shrinks_below_connect_and_scales_with_size():
+    from src.transports.timing import upload_budget_seconds
+
+    assert upload_budget_seconds(1024, connection=30, min_kbps=256) == 30
+    assert upload_budget_seconds(47 * 1024 * 1024, connection=30, min_kbps=256) == pytest.approx(188)

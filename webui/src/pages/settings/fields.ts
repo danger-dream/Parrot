@@ -20,6 +20,7 @@ export const TIMEOUT_FIELDS: FieldDef[] = [
   { key: 'firstByte', label: '首字超时', type: 'int', min: 1, unit: '秒', humanize: 'seconds', hint: '发出请求后等待上游返回第一段内容的最长时间；推理模型思考较久时可调大。默认 30 秒。' },
   { key: 'idle', label: '空闲超时', type: 'int', min: 1, unit: '秒', humanize: 'seconds', hint: '流式输出中两段内容之间的最长间隔，超过即认为上游卡住并中断。默认 120 秒。' },
   { key: 'total', label: '总时长上限', type: 'int', min: 1, unit: '秒', humanize: 'seconds', hint: '一次请求从开始到结束的最长时间，超过会被强制结束。默认 600 秒。' },
+  { key: 'uploadMinKBps', label: '最低上传速率', type: 'int', min: 1, unit: 'KB/s', hint: '请求体上传的时限按体积计算：取「连接超时」与「体积 ÷ 此速率」中较大者，大请求体经慢代理上传不会被误判为连接超时。默认 256 KB/s。' },
 ]
 
 export const SCORING_FIELDS: FieldDef[] = [

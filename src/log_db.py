@@ -45,6 +45,9 @@ _local = threading.local()
 _write_lock = threading.RLock()
 _initialized = False
 _log_dir: str | None = None
+# Stale rows created before this process started were orphaned by a restart;
+# later ones were abandoned by a live request path.
+_PROCESS_STARTED_AT = time.time()
 
 # 日志留存清理在独立锁下串行运行；真正删除 / VACUUM 时还会持有
 # _write_lock，避免与请求流水写入交错。
@@ -285,7 +288,10 @@ def _schema_sql() -> str:
       binding_version TEXT,
       binding_revision TEXT,
       -- Cursor internal bridge response fact; never forwarded downstream.
-      cursor_conversation_id TEXT
+      cursor_conversation_id TEXT,
+      -- Error rule (user or preset) that handled this failed attempt.
+      error_rule_id   TEXT,
+      error_category  TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_retry_req ON retry_chain(request_id);
 
@@ -771,10 +777,13 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
             "binding_provider_id", "binding_model_id",
             "binding_pricing_key", "binding_source", "binding_json",
             "binding_version", "binding_revision", "cursor_conversation_id",
+            "error_rule_id", "error_category",
         ):
             if col not in retry_cols:
                 conn.execute(f"ALTER TABLE retry_chain ADD COLUMN {col} TEXT")
                 changed = True
+        if "started_at" in retry_cols:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_retry_started ON retry_chain(started_at)")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_retry_cursor_conversation "
             "ON retry_chain(channel_key, cursor_conversation_id)"
@@ -2545,7 +2554,7 @@ def _settle_retry_attempt_locked(
         dispatch_state = "sent"
     elif resolved_outcome in {
         "candidate_guard", "guard_error", "transform_error", "queue_timeout",
-        "connect_error", "proxy_connect_error", "connection_timeout",
+        "connect_error", "proxy_connect_error", "connection_timeout", "upload_timeout",
         "http_connect_timeout", "pool_timeout", "cancelled",
         "client_disconnected",
     }:
@@ -2691,10 +2700,15 @@ def update_retry_attempt(
     usage: dict | None = None,
     usage_observed: bool | None = None,
     settle: bool = True,
+    error_rule_id: str | None = None,
+    error_category: str | None = None,
 ) -> None:
     fields, vals = [], []
     if final_round_id is not None:
         fields.append("final_round_id=?"); vals.append(final_round_id)
+    if error_rule_id is not None:
+        fields.append("error_rule_id=?"); vals.append(error_rule_id)
+        fields.append("error_category=?"); vals.append(error_category)
     if connect_ms is not None:
         fields.append("connect_ms=?"); vals.append(connect_ms)
     if first_byte_ms is not None:
@@ -2741,6 +2755,67 @@ def update_retry_attempt(
                 usage=usage, usage_observed=usage_observed, final=False,
             )
         conn.commit()
+
+
+# Attempt outcomes that are not an upstream answer (local guards, client side).
+_NON_UPSTREAM_OUTCOMES = (
+    "success", "open", "client_disconnected", "cancelled", "guard_error",
+    "candidate_guard", "transform_error", "queue_timeout",
+)
+
+
+def _window_conns(since_ts: float) -> list[tuple[sqlite3.Connection, bool]]:
+    """Monthly DBs covering ``since_ts``..now, with whether they carry rule columns."""
+    out: list[tuple[sqlite3.Connection, bool]] = []
+    seen: set[str] = set()
+    for ts in (since_ts, time.time()):
+        ref = _db_ref_for_timestamp(ts)
+        if ref.path in seen or not os.path.exists(ref.path):
+            continue
+        seen.add(ref.path)
+        try:
+            conn = _get_conn_for_ref(ref)
+        except RetentionPlanError:
+            continue
+        out.append((conn, "error_rule_id" in _table_columns(conn, "retry_chain")))
+    return out
+
+
+def error_rule_hit_stats(since_ts: float) -> dict[str, dict[str, Any]]:
+    """Per error-rule hit count and latest hit time since ``since_ts``."""
+    stats: dict[str, dict[str, Any]] = {}
+    for conn, has_rules in _window_conns(since_ts):
+        if not has_rules:
+            continue
+        rows = conn.execute(
+            "SELECT error_rule_id AS rid, COUNT(*) AS n, MAX(started_at) AS last_at FROM retry_chain "
+            "WHERE started_at >= ? AND error_rule_id IS NOT NULL GROUP BY error_rule_id",
+            (float(since_ts),),
+        ).fetchall()
+        for row in rows:
+            entry = stats.setdefault(row["rid"], {"count": 0, "lastAt": None})
+            entry["count"] += int(row["n"] or 0)
+            if row["last_at"] and (entry["lastAt"] is None or row["last_at"] > entry["lastAt"]):
+                entry["lastAt"] = float(row["last_at"])
+    return stats
+
+
+def recent_upstream_failures(since_ts: float, limit: int = 1000) -> list[dict[str, Any]]:
+    """Latest failed upstream attempts (newest first), excluding local and client outcomes."""
+    lim = max(1, min(int(limit or 1000), 5000))
+    marks = ",".join("?" * len(_NON_UPSTREAM_OUTCOMES))
+    rows: list[dict[str, Any]] = []
+    for conn, has_rules in _window_conns(since_ts):
+        rule_cols = "error_rule_id, error_category" if has_rules else "NULL AS error_rule_id, NULL AS error_category"
+        found = conn.execute(
+            f"SELECT started_at, request_id, channel_key, channel_type, model, outcome, error_detail, {rule_cols} "
+            f"FROM retry_chain WHERE started_at >= ? AND outcome IS NOT NULL AND outcome NOT IN ({marks}) "
+            "ORDER BY started_at DESC LIMIT ?",
+            (float(since_ts), *_NON_UPSTREAM_OUTCOMES, lim),
+        ).fetchall()
+        rows.extend(dict(row) for row in found)
+    rows.sort(key=lambda row: row["started_at"] or 0, reverse=True)
+    return rows[:lim]
 
 
 def record_proxy_attempt(
@@ -6649,11 +6724,12 @@ def cleanup_stale_pending(timeout_seconds: int = 1800) -> int:
                        SET status=CASE WHEN ({disconnected}) THEN 'cancelled' ELSE 'error' END,
                            error_message=CASE WHEN ({disconnected})
                                THEN 'client disconnected'
-                               ELSE 'process crashed (stale pending)' END,
+                               WHEN created_at < ? THEN 'process crashed (stale pending)'
+                               ELSE 'request never finalized (stale pending)' END,
                            http_status=CASE WHEN ({disconnected}) THEN 499 ELSE http_status END,
                            finished_at=?
                        WHERE status='pending' AND request_id=?""",
-                    [(finished_at, rid) for rid in stale_ids],
+                    [(_PROCESS_STARTED_AT, finished_at, rid) for rid in stale_ids],
                 )
                 conn.commit()
                 cleaned += max(0, int(cur.rowcount or 0))

@@ -561,8 +561,12 @@ async def test_real_native_write_and_business_connection_timeout(tls_files, monk
     async with local_server(tls_files, stall_upload=True) as server:
         kwargs, second = _runtime_fixture(monkeypatch, tls_files, server["url"], body=b"x" * (2 << 20))
         kwargs["connect_timeout"] = .1
+        # A throughput floor this high keeps the upload budget at the 0.1s
+        # connect timeout, so the stalled body hits the business upload deadline
+        # before the native write timer (budget + 0.5s).
+        monkeypatch.setattr(http_runtime, "upload_min_kbps", lambda: 1e9)
         opened = await http_runtime.open_response_with_proxy_chain(**kwargs)
-        assert opened.error.outcome == "connection_timeout"
+        assert opened.error.outcome == "upload_timeout"
         assert second.stats.total_attempts == 0 and len(server["headers"]) == 1
 
 

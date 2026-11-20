@@ -2654,9 +2654,14 @@ def test_zhipu_plan_excluded_notification_says_plan_not_quota(m, monkeypatch):
     capture(monkeypatch, lambda kind, text, record: calls.append((kind, record["scope_ref"], text, record)))
     channel = SimpleNamespace(key="api:智谱 Max", type="api", display_name="智谱 Max")
     reset_ms = int(datetime(2026, 9, 18, 16, 36, 12, tzinfo=timezone(timedelta(hours=8))).timestamp() * 1000)
-    m["failover"]._notify_zhipu_quota_cooldown(
-        channel, "glm-5.3-flashx", reset_ms, plan_excluded=True,
-    )
+    rules = m["failover"].error_rules
+    found = rules.find_rule("preset.zhipu-plan-excluded")
+    obs = rules.observation_from_parts(
+        phase="http", status=429, outcome="http_error", provider="zhipu", channel_key=channel.key,
+        model="glm-5.3-flashx", body='{"error":{"code":"1311","message":"plan excluded"}}')
+    effects = m["failover"].error_rule_effects
+    effects._notified.clear()
+    effects._notify(channel, "glm-5.3-flashx", found, obs, until_ms=reset_ms, disabled=False, repeat_hours=24)
 
     assert len(calls) == 1
     event, alert, text, kwargs = calls[0]
@@ -2664,8 +2669,8 @@ def test_zhipu_plan_excluded_notification_says_plan_not_quota(m, monkeypatch):
     assert "套餐不含此模型" in text
     assert "1311" in text
     assert "周/月使用额度已达上限" not in text      # 不能沿用 1310 的措辞
-    assert "2026-09-18 16:36:12" in text
-    assert "实际影响尚未确认" in text and "下次尝试" in text
+    assert "2026-09-18 16:36" in text
+    assert "下次尝试" in text
     assert kwargs["subject"]["kind"] == "channel"
     assert kwargs["subject"]["exact_id"] == "api:智谱 Max"
 
@@ -2747,18 +2752,26 @@ def test_zhipu_quota_cooldown_notification_is_explicit_and_links_channel(m, monk
         display_name="智谱 Max",
     )
     reset_ms = int(datetime(2026, 7, 26, 10, 1, 10, tzinfo=timezone(timedelta(hours=8))).timestamp() * 1000)
-    m["failover"]._notify_zhipu_quota_cooldown(channel, "glm-5.2", reset_ms)
+    rules = m["failover"].error_rules
+    found = rules.find_rule("preset.zhipu-period-quota")
+    obs = rules.observation_from_parts(
+        phase="http", status=429, outcome="http_error", provider="zhipu", channel_key=channel.key,
+        model="glm-5.2", body='{"error":{"code":"1310","message":"weekly limit"}}')
+    effects = m["failover"].error_rule_effects
+    effects._notified.clear()
+    effects._notify(channel, "glm-5.2", found, obs, until_ms=reset_ms, disabled=False, repeat_hours=6)
 
     assert len(calls) == 1
     event, alert, text, kwargs = calls[0]
     assert event == "model.quota.blocked"
     assert alert == "glm-5.2"
-    assert "周/月额度" in text
-    assert "2026-07-26 10:01:10" in text
-    assert "涉及模型" in text and "实际影响尚未确认" in text
+    assert "周 / 月额度用尽" in text
+    assert "2026-07-26 10:01" in text
+    assert "涉及模型" in text and "1310" in text
     assert kwargs["subject"]["kind"] == "channel"
     assert kwargs["subject"]["exact_id"] == "api:智谱 Max"
-    assert kwargs["effect"] == {"status": "unknown", "code": "model_paused"}  # direct reporting cannot fabricate an uncommitted pause
+    # The rule notifies after its pause is committed.
+    assert kwargs["effect"] == {"status": "confirmed", "code": "model_paused"}
 
 
 async def test_zhipu_1310_cools_only_channel_model_until_reset_and_fails_over(m, monkeypatch):
@@ -2770,9 +2783,9 @@ async def test_zhipu_1310_cools_only_channel_model_until_reset_and_fails_over(m,
     reset_ms = int(reset_dt.timestamp() * 1000)
     notices = []
     monkeypatch.setattr(
-        m["failover"],
-        "_notify_zhipu_quota_cooldown",
-        lambda ch, model, until, **kwargs: notices.append((ch.key, model, until)),
+        m["failover"].error_rule_effects,
+        "_notify",
+        lambda ch, model, found, obs, *, until_ms, **kwargs: notices.append((ch.key, model, until_ms)),
     )
 
     def zhipu_handler(req: httpx.Request):
@@ -2818,12 +2831,14 @@ async def test_zhipu_1310_cools_only_channel_model_until_reset_and_fails_over(m,
     zhipu_channel = route.candidates[0][0]
     state = m["cooldown"].get_state(zhipu_channel.key, "glm-5.2")
     assert state is not None
-    assert state["error_count"] == 1
+    # Quota exhaustion pauses until the reset without counting as a failure.
+    assert state["error_count"] == 0
     assert state["cooldown_until"] == reset_ms
+    assert state["rule_id"] == "preset.zhipu-period-quota"
     assert m["cooldown"].is_blocked(zhipu_channel.key, "glm-5.2")
     assert zhipu_channel.enabled is True
     assert notices == [(zhipu_channel.key, "glm-5.2", reset_ms)]
-    assert m["scorer"].get_stats(zhipu_channel.key, "glm-5.2")["total_requests"] == 1
+    assert (m["scorer"].get_stats(zhipu_channel.key, "glm-5.2") or {}).get("total_requests", 0) == 0
 
 
 async def test_openai_overload_exhaustion_scores_and_cools_once(m, monkeypatch):

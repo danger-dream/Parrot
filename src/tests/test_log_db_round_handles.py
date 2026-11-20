@@ -250,6 +250,21 @@ def test_cleanup_stale_pending_preserves_known_client_disconnect_semantics(isola
     assert orphan_row["error_message"] == "process crashed (stale pending)"
 
 
+def test_cleanup_stale_pending_does_not_blame_a_crash_for_live_process_rows(
+    isolated_log_db, monkeypatch,
+):
+    created = time.time() - 1900
+    monkeypatch.setattr(log_db, "_PROCESS_STARTED_AT", created - 60)
+    abandoned = _insert("stale-live-abandoned", created)
+    log_db._request_handles.clear()
+
+    assert log_db.cleanup_stale_pending(1800) == 1
+    row = _request(abandoned.db.path, abandoned.request_id)
+    assert (row["status"], row["error_message"]) == (
+        "error", "request never finalized (stale pending)",
+    )
+
+
 def test_cleanup_stale_pending_scans_request_creation_month_after_rollover(
     isolated_log_db,
 ):

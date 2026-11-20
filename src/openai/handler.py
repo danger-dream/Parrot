@@ -38,9 +38,10 @@ from fastapi import Request
 from fastapi.responses import Response
 
 from .. import (
-    affinity, auth, config, errors, failover, fingerprint, json_bytes, local_web_tools,
+    affinity, auth, config, error_rules, errors, failover, fingerprint, json_bytes, local_web_tools,
     log_db, model_mapping, model_validation, notifier, request_body, scheduler, translation,
 )
+from ..protocols import errors as protocol_errors
 from ..client_ip import get_client_ip
 from ..channel import registry
 from ..transports.precommit_sse import run_with_keepalive
@@ -733,6 +734,19 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
             f"[scheduler] no channels ingress={ingress_protocol} model={model}: "
             f"{exclusion_summary}"
         )
+        ruled = error_rules.unavailable_response(result.exclusions, model)
+        if ruled is not None:
+            # Every candidate is paused and an error rule says what to answer meanwhile.
+            if not skip_log:
+                await asyncio.to_thread(
+                    log_db.finish_error, request_id, ruled["message"], 0,
+                    http_status=ruled["status"], affinity_hit=(1 if result.affinity_hit else 0),
+                    total_ms=int((time.monotonic() - start_monotonic) * 1000),
+                )
+            return errors.json_error_openai(
+                ruled["status"], protocol_errors.legacy_openai_error_type_for_http_status(ruled["status"]),
+                ruled["message"], headers=error_rules.response_headers(ruled),
+            )
         # Resolve once so the log and downstream response describe the same error.
         err_type = errors.ErrTypeOpenAI.NOT_FOUND if model_never_supported \
             else errors.ErrTypeOpenAI.SERVER

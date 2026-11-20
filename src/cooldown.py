@@ -97,6 +97,7 @@ def init() -> None:
                 "error_count": int(row["error_count"] or 0),
                 "cooldown_until": cooldown_until,
                 "last_error_message": message,
+                "rule_id": row.get("rule_id"),
             }
         # Publish only after every required migration write succeeds.
         _entries.clear()
@@ -145,7 +146,7 @@ def _legacy_transport_timeout(message: str | None) -> bool:
     if not isinstance(message, str):
         return False
     tokens = {
-        "connection_timeout", "http_connect_timeout", "connect_timeout",
+        "connection_timeout", "upload_timeout", "http_connect_timeout", "connect_timeout",
         "first_byte_timeout", "idle_timeout", "total_timeout",
         "pool_timeout", "write_timeout", "read_timeout", "transport_timeout",
     }
@@ -233,7 +234,8 @@ def _permanent_min_age_ms() -> int:
 
 def record_error(channel_key: str, model: str, message: str | None = None,
                *, cooldown_until: int | None = None,
-               transient_transport: bool = False) -> dict:
+               transient_transport: bool = False,
+               rule_id: str | None = None) -> dict:
     """记一次失败，按阶梯推进 cooldown_until。返回更新后的状态。
 
     防爆发式冷却三道闸（2026-04-21 新增）：
@@ -251,7 +253,9 @@ def record_error(channel_key: str, model: str, message: str | None = None,
 
     若本次推进让该 (channel, model) **首次进入永久冷却**，触发"channel_permanent"事件通知。
     """
-    usage_reset = _usage_window_reset_ms(channel_key, message)
+    # Attempt identities are opaque generation keys; reset parsers need the
+    # public channel key to recognize the provider.
+    usage_reset = _usage_window_reset_ms(channel_state.resolve(channel_key), message)
     if usage_reset is not None and (
         cooldown_until is None or (cooldown_until != _INF and cooldown_until < usage_reset)
     ):
@@ -342,11 +346,12 @@ def record_error(channel_key: str, model: str, message: str | None = None,
         state["last_error_message"] = message
         state["first_error_at"] = first_error_at
         state["last_advance_at"] = last_advance_at
+        state["rule_id"] = rule_id
         # Persist before publishing the copied state, while holding the same
         # lock used by clear(). This makes record and clear linearisable and a
         # failed save cannot create a memory-only cooldown.
         with state_db.optional_write_timeout():
-            state_db.error_save(channel_key, model, new_count, cooldown_until, message)
+            state_db.error_save(channel_key, model, new_count, cooldown_until, message, rule_id=rule_id)
         _entries[(channel_key, model)] = state
         result = dict(state)
         notification_subject = notifications.subjects.channel(channel_key) if just_became_permanent else None
@@ -357,16 +362,18 @@ def record_error(channel_key: str, model: str, message: str | None = None,
     return result
 
 
-def record_account_pause(channel_key: str, message: str, *, cooldown_until: int) -> dict:
+def record_account_pause(channel_key: str, message: str, *, cooldown_until: int,
+                         rule_id: str | None = None) -> dict:
     with _lock:
         current = get_state(channel_key, ACCOUNT_SCOPE)
         if current and _was_actively_blocked(current, _now_ms()):
             return current
-        return record_quota_pause(channel_key, ACCOUNT_SCOPE, message, cooldown_until=cooldown_until)
+        return record_quota_pause(channel_key, ACCOUNT_SCOPE, message,
+                                  cooldown_until=cooldown_until, rule_id=rule_id)
 
 
 def record_quota_pause(channel_key: str, model: str, message: str,
-                       *, cooldown_until: int) -> dict:
+                       *, cooldown_until: int, rule_id: str | None = None) -> dict:
     """Persist a bounded quota pause without recording a request failure.
 
     Shares the existing scheduling/expiry state with cooldowns. Keep prior
@@ -389,10 +396,11 @@ def record_quota_pause(channel_key: str, model: str, message: str,
         })
         state["cooldown_until"] = cooldown_until
         state["last_error_message"] = message
+        state["rule_id"] = rule_id
         with state_db.optional_write_timeout():
             state_db.error_save(
                 channel_key, model, int(state.get("error_count") or 0),
-                cooldown_until, message,
+                cooldown_until, message, rule_id=rule_id,
             )
         _entries[(channel_key, model)] = state
         return dict(state)
@@ -519,6 +527,7 @@ def active_entries(now_ms: Optional[int] = None) -> list[dict]:
                 "error_count": int(state.get("error_count", 0)),
                 "cooldown_until": cd,
                 "last_error_message": state.get("last_error_message"),
+                "rule_id": state.get("rule_id"),
             })
     return out
 

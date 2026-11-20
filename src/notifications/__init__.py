@@ -78,6 +78,16 @@ def store_failed(*, model, api_key_name, response_id, error, source):
         scope="system", source=source))
 
 
+def large_request_body(*, model, api_key_name, request_id, size_mb, upload_seconds):
+    # One notice per (key, model) per repeat window: the same client usually
+    # resends the same growing history every turn.
+    key = str(api_key_name or "")
+    return emit(NotificationEvent("request.upload.large", subjects.system("请求上传", kind="route"), Effect("confirmed", "upload_extended"),
+        {"model": str(model), "size_mb": float(size_mb), "upload_seconds": int(upload_seconds),
+         "api_key_name": key, "request_id": str(request_id or "")},
+        scope="route", scope_ref=key + ":" + str(model), source="request"))
+
+
 def _channel_title(subject):
     # The same login often exists at several services: the service name is what tells them apart.
     name = subject.label or subject.identity or "#" + subject.short_id

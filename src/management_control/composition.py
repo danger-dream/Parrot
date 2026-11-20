@@ -36,6 +36,7 @@ from .operations import OperationRegistry, OperationStore
 from .proxy import ProxyControl
 from .system import (
     ContentBlacklistControl,
+    ErrorRulesControl,
     NotificationInboxControl,
     PromptRulesControl,
     SettingsControl,
@@ -60,6 +61,7 @@ class SystemNetworkControls:
     network: NetworkControl
     notifications: NotificationInboxControl = field(default_factory=NotificationInboxControl)
     prompt_rules: PromptRulesControl = field(default_factory=PromptRulesControl)
+    error_rules: ErrorRulesControl = field(default_factory=ErrorRulesControl)
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +160,7 @@ def build_management_controls(
             ),
             notifications=NotificationInboxControl(audit_sink=audit_sink),
             prompt_rules=PromptRulesControl(audit_sink=audit_sink),
+            error_rules=ErrorRulesControl(audit_sink=audit_sink),
         ),
         system_runtime=SystemRuntimeControl(audit_sink=audit_sink),
         telegram_retention=TelegramRetentionAdapter(retention),

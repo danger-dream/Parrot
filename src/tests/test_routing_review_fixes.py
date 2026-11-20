@@ -189,7 +189,7 @@ async def test_1311_backoff_includes_queued_candidate(monkeypatch):
     async def result(*a, **kw): return AttemptResult(outcome='http_error',http_status=429,error_detail=detail,full_response_text=detail)
     monkeypatch.setattr(failover,'_try_channel', result)
     notices = []
-    monkeypatch.setattr(failover,'_notify_zhipu_quota_cooldown', lambda *a, **kw:notices.append(kw))
+    monkeypatch.setattr(failover.error_rule_effects,'_notify', lambda ch, model, found, *a, **kw:notices.append(found.id))
     async def acquire(*a, **kw): return True
     async def queue(candidates, timeout): return candidates[0]
     monkeypatch.setattr(failover.concurrency,'try_acquire',acquire)
@@ -208,7 +208,7 @@ async def test_1311_backoff_includes_queued_candidate(monkeypatch):
         minutes.append(round((state['cooldown_until']-now)/60000))
     print('PLAN_1311_COOLDOWN_MINUTES', minutes)
     assert minutes == [15,15]
-    assert len(notices) == 2 and all(n['plan_excluded'] for n in notices)
+    assert notices == ['preset.zhipu-plan-excluded'] * 2
 
 
 @pytest.mark.parametrize('limit', [4096, 1025, 1024, 512])

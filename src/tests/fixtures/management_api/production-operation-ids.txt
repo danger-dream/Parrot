@@ -284,3 +284,12 @@ updatePromptRule
 deletePromptRule
 reorderPromptRules
 testPromptRules
+getErrorRules
+updateErrorRulesSettings
+createErrorRule
+updateErrorRule
+deleteErrorRule
+reorderErrorRules
+updateErrorRulePreset
+testErrorRules
+getRecentUpstreamErrors

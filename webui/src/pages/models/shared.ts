@@ -334,6 +334,7 @@ const DISABLED_REASON: Record<string, string> = {
   plan_expired: '套餐到期',
   fair_use_limited: '公平使用限制',
   key_not_allowed: 'Key 类型不符',
+  error_rule: '被错误处理规则停用',
 }
 const HEALTH_LABEL: Record<string, string> = {
   healthy: '正常',

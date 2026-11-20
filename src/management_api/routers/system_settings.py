@@ -63,7 +63,7 @@ _RETRY = {
     "recovery": {"oauthRefresh": True, "invalidEncryptedContent": True, "claudeContext1mFallback": True},
     "revision": "rev_example",
 }
-_TIMEOUTS = {"connect": 10, "firstByte": 30, "idle": 120, "total": 600, "revision": "rev_example"}
+_TIMEOUTS = {"connect": 10, "firstByte": 30, "idle": 120, "total": 600, "uploadMinKBps": 256, "revision": "rev_example"}
 _ERROR_COOLDOWN = {"errorWindows": [1, 3, 5, 10, 15, 0], "oauthGraceCount": 3, "ladderMinIntervalSeconds": 30, "permanentMinAgeSeconds": 300, "revision": "rev_example"}
 _SCORING = {"emaAlpha": 0.25, "recentWindow": 50, "errorPenaltyFactor": 8, "explorationRate": 0.2, "revision": "rev_example"}
 _AFFINITY = {"ttlMinutes": 30, "revision": "rev_example"}

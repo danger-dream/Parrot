@@ -73,6 +73,7 @@ class TimeoutSettingsData(StrictSchema):
     firstByte: int
     idle: int
     total: int
+    uploadMinKBps: int
     revision: str
 
 
@@ -81,6 +82,7 @@ class TimeoutSettingsPatch(StrictRequestSchema):
     firstByte: int | None = Field(default=None, ge=1)
     idle: int | None = Field(default=None, ge=1)
     total: int | None = Field(default=None, ge=1)
+    uploadMinKBps: int | None = Field(default=None, ge=1)
 
 
 class ErrorCooldownSettingsData(StrictSchema):

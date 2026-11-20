@@ -51,11 +51,13 @@ const GROUPS: { title: string; items: EventDef[] }[] = [
     items: [
       { key: 'requestModelChanged', label: '上游返回的模型与请求不同', hint: '上游实际使用的模型与请求的不一致时通知。' },
       { key: 'requestModelConflict', label: '上游模型信息不一致', hint: '多个来源给出的实际模型互相矛盾时通知。' },
+      { key: 'requestUploadLarge', label: '请求体过大', hint: '某个 Key 发来的请求体大到需要放宽上传时限时通知（同一 Key 和模型 6 小时内只提醒一次），便于发现客户端重复携带大量图片或附件。' },
       { key: 'channelModelFrozen', label: '模型已永久冻结', hint: '某个渠道的模型进入永久冷却时通知。' },
       { key: 'channelModelRecovered', label: '模型限制已解除', hint: '被冻结的渠道模型恢复可用时通知。' },
       { key: 'modelEntitlementBlocked', label: '套餐不含此模型', hint: '账号套餐不支持某个模型、暂时跳过时通知。' },
       { key: 'modelEntitlementRecovered', label: '套餐模型限制已解除', hint: '上述套餐限制解除时通知。' },
       { key: 'routingUnavailable', label: '无可用渠道', hint: '某个模型找不到任何可用渠道、请求失败时通知。' },
+      { key: 'errorRuleMatched', label: '错误处理规则已触发', hint: '开了「发通知」的错误处理规则命中时通知（同一规则、渠道和模型在规则设定的间隔内只提醒一次）。额度用尽、套餐不含此模型、账号被停用这几类沿用上面对应的通知。' },
     ],
   },
   {

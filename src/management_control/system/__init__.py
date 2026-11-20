@@ -1,6 +1,7 @@
 """System settings, content blacklist and Telegram retention control exports."""
 
 from .blacklist import ContentBlacklistControl, DEFAULT_CONTENT_BLACKLIST_CONTROL
+from .error_rules import ErrorRulesControl, ErrorRulesSnapshot
 from .models import *  # noqa: F401,F403 - domain DTO export surface
 from .notifications import NotificationInboxControl, NotificationInboxPage
 from .prompt_rules import PromptRulesControl, PromptRulesSnapshot
@@ -14,6 +15,8 @@ __all__ = [
     "DEFAULT_SETTINGS_CONTROL",
     "DEFAULT_SYSTEM_RUNTIME_CONTROL",
     "DEFAULT_TELEGRAM_RETENTION_ADAPTER",
+    "ErrorRulesControl",
+    "ErrorRulesSnapshot",
     "NotificationInboxControl",
     "NotificationInboxPage",
     "PromptRulesControl",

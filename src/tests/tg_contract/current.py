@@ -47,6 +47,10 @@ WEBUI_ADDITION_CASE_IDS = ('TG-SYS-08.webui_wildcard', 'TG-SYS-08.webui_host')
 # accountAccessBlocked (2026-11-05): the notification settings list gained exactly one
 # event toggle (「账号被上游拒绝服务，已停用」) and the trace one toggle step.
 ACCESS_BLOCK_OVERRIDE_CASE_IDS = ('TG-SYS-04.001-notifications',)
+# request.upload.large (2026-11-20): the notification menu gained one event row.
+UPLOAD_NOTICE_OVERRIDE_CASE_IDS = ('TG-SYS-04.001-notifications',)
+# error.rule.matched (2026-11-20): the notification menu gained one event row.
+ERROR_RULES_OVERRIDE_CASE_IDS = ('TG-SYS-04.001-notifications',)
 SYSTEM_ADDITION_CASE_IDS = BODY_RETENTION_ADDITION_CASE_IDS + WEBUI_ADDITION_CASE_IDS
 
 
@@ -123,6 +127,20 @@ def load_current_jsonl(segment: str | Path) -> list[dict]:
             raise AssertionError('unexpected account-access overlay scope')
         replaced = set(ACCESS_BLOCK_OVERRIDE_CASE_IDS)
         overrides = [c for c in overrides if c['caseId'] not in replaced] + access_cases
+    upload_overlay = segment.parents[2] / 'upload-notice-2026-11-20' / 'overrides' / segment.name
+    if upload_overlay.exists():
+        upload_cases = load_jsonl(upload_overlay)
+        if tuple(c['caseId'] for c in upload_cases) != UPLOAD_NOTICE_OVERRIDE_CASE_IDS:
+            raise AssertionError('unexpected upload-notice overlay scope')
+        replaced = set(UPLOAD_NOTICE_OVERRIDE_CASE_IDS)
+        overrides = [c for c in overrides if c['caseId'] not in replaced] + upload_cases
+    rules_overlay = segment.parents[2] / 'error-rules-2026-11-20' / 'overrides' / segment.name
+    if rules_overlay.exists():
+        rules_cases = load_jsonl(rules_overlay)
+        if tuple(c['caseId'] for c in rules_cases) != ERROR_RULES_OVERRIDE_CASE_IDS:
+            raise AssertionError('unexpected error-rules overlay scope')
+        replaced = set(ERROR_RULES_OVERRIDE_CASE_IDS)
+        overrides = [c for c in overrides if c['caseId'] not in replaced] + rules_cases
     by_id = {case['caseId']: case for case in overrides}
     archived_ids = {case['caseId'] for case in archived}
     if len(by_id) != len(overrides):

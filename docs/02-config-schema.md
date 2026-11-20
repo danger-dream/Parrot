@@ -144,7 +144,8 @@ OAuth 备用模型已退役。普通对话只使用账户 `models` 的成功同�
     "connect": 10,                   // TCP 连接建立
     "firstByte": 30,                 // 连接后到首个数据包
     "idle": 30,                      // 两次数据包之间的最长空闲
-    "total": 600                     // 单次请求总时长
+    "total": 600,                    // 单次请求总时长
+    "uploadMinKBps": 256             // 请求体上传期限 = max(connect, 体积 / 该速率)
   },
 
   // ─── 出站网络设置 ───
@@ -605,6 +606,44 @@ MCP 端点有独立的请求体上限 `maxRequestBodyBytes`（默认 32 MiB）�
 `mcp_call_log` 是独立的 MCP 调用事实表，记录**每次工具调用**（包括没有产生任何上游调用的拒绝，例如工具被全局关闭、Key 无权限、参数非法）。真实上游调用仍分别由 `search_call_log`（`origin="mcp"`）与多媒体日志记录，两者通过 `call_id` 关联。
 
 工具返回的内容存在与摘要分表的 `mcp_call_detail`（键为 `call_id`），理由与 `request_detail` 相同：列表与统计只扫摘要表，不把工具返回的正文一起读出来。写入同样受 `logStoreBodies` 控制——关闭后不再保存新内容，已存在的记录不受影响，与实时日志正文完全同一口径。只有调用成功且确有结果时才写（被拒或失败的调用没有内容可存）。TG 的「MCP 服务 → 调用日志 → 查看结果」读取该表；记录已被留存策略清理或当时未开启正文保存时，页面会明确说明原因而不是显示空白。
+
+### 上游错误处理规则 `errorRules`
+
+```json
+"errorRules": {
+  "enabled": true,
+  "rules": [{
+    "id": "rule-1a2b3c4d", "name": "MiniMax Token Plan 用尽", "enabled": true, "note": "",
+    "when": {"kind": "group", "mode": "all", "items": [
+      {"kind": "cond", "field": "provider", "op": "in", "values": ["minimax"]},
+      {"kind": "group", "mode": "any", "items": [
+        {"kind": "cond", "field": "path", "path": "$.base_resp.status_code", "op": "ne", "values": ["0"]},
+        {"kind": "cond", "field": "code", "op": "in", "values": ["2067"]}
+      ]}
+    ]},
+    "category": "quota_exhausted",
+    "steps": [{"type": "retry", "delaySeconds": 2, "times": 1},
+              {"type": "pause", "scope": "model", "mode": "usage_window", "boundaryHours": 5, "fallbackSeconds": 900},
+              {"type": "notify", "repeatHours": 6}],
+    "final": "next",
+    "thresholds": [{"count": 3, "mode": "consecutive", "scope": "model",
+                    "steps": [{"type": "pause", "mode": "fixed", "seconds": 1800}, {"type": "notify", "repeatHours": 1}]}],
+    "response": {"status": 429, "message": "MiniMax 额度已用完：{$.error.message}，预计 {reset_at} 恢复", "retryAfter": true}
+  }],
+  "presets": {"preset.workbuddy-account-quota": {"enabled": false}}
+}
+```
+
+每次上游失败（Parrot 本地拦截和客户端断开不算）先经过几项只重发同一请求的协议级修复（思考历史被拒、encrypted_content 失效、Codex WS 恢复、账号允许时 Antigravity 用积分重试），然后按顺序找第一条命中的规则：`rules`（按列表顺序）→ 预置规则（代码自带，`presets` 只保存开关）→ 内置协议处理 → 默认重试与「错误冷却」阶梯。`enabled=false` 时前两层都不参与。`final` 为 `pass` 的规则命中后只执行自己的步骤（标记、通知等），继续往后找。
+
+- `when`：条件树。`group` 的 `mode` 为 `all`（全部满足）或 `any`（任一满足），可嵌套（最多 4 层、40 个条件）。条件的 `field`：`status`、`code`（自动从 code / error.code / error.type / base_resp.status_code 等位置和消息里的「(2067)」取出）、`message`、`body`（响应全文前 4 KB）、`provider`、`channel`、`channelType`（`oauth`/`api`）、`model`（支持通配）、`phase`（`http`/`stream`/`transport`）、`path`（JSON 路径，`$.a.b`、`$['a'].b`、`$.list[0]`、`$.list[*].code`、`$..message`）。`op`：`eq`、`ne`、`in`、`not_in`、`contains`、`not_contains`、`starts_with`、`regex`、`exists`、`not_exists`、`gt`/`gte`/`lt`/`lte`；`in`/`not_in`/`contains`/`not_contains` 的 `values` 可写多项，状态码和数字错误码可写区间 `500-599`、`5xx`。取不到值（如路径不存在）时，除 `not_exists` 外的条件都不成立。比较不区分大小写。
+- `category`：`rate_limit`、`quota_exhausted`、`plan_excluded`、`account_blocked`、`request_invalid`、`content_blocked`、`upstream_busy`、`observe`。省略 `steps`/`final`/`thresholds`/`response` 时取该类型的推荐值。
+- `steps`：每次命中时按顺序执行。`retry`（等 `delaySeconds` 秒后在同一渠道重试 `times` 次；重试成功即结束，重试后仍命中这条规则才继续往下）、`pause`（`scope`：`model`/`account`；`mode`：`fixed`/`message_time`/`retry_after`/`usage_window`/`boundary`/`ladder`，配合 `seconds`、`pattern`、`timezone`、`boundaryHours`、`fallbackSeconds`；只延长、不缩短已经生效的暂停；`account` 不能用 `ladder`，读不到时间时必须有保底时长）、`deprioritize`（记一次失败，智能调度暂时少选这个渠道）、`disable`（停用账号或渠道，`reason` 可选）、`notify`（`repeatHours` 内同一渠道和模型只提醒一次）。
+- `final`：`next`（换下一个渠道）、`respond`（直接返回给客户端）、`pass`（交给后面的规则）。
+- `thresholds`：累计触发。`scope` 为 `model`（同一渠道的同一模型）、`account`（同一渠道）或 `rule`（所有渠道合计，只能按时间窗口）；`mode` 为 `consecutive`（连续，中间成功一次就清零）或 `window`（`windowMinutes` 分钟内累计）；达到 `count` 次时执行 `steps`（不含 `retry`），然后重新计数。每次上游返回这个错误算一次，同渠道重试后又失败也算；动作里有暂停或停用时，这次请求不再往同一渠道重试。计数只保存在内存里，重启后从零开始。
+- `response`：所有渠道都不可用、或 `final=respond` 时给客户端的 `status`（0 表示保持默认）、`message` 模板、`retryAfter`。模板变量：`{model}`、`{reset_at}`、`{reset_in}`、`{provider}`、`{upstream_message}`、`{code}`，以及任意 JSON 路径如 `{$.error.message}`。
+
+按规则暂停的冷却条目带 `rule_id`；所有候选都因规则暂停时，新请求直接得到该规则设定的回复（如 429 + `Retry-After`），不再是笼统的 503。调用日志的每次尝试记录 `error_rule_id` 与 `error_category`（规则真正执行时才写；先被协议级自动修复接手的尝试不记）。管理接口读取时跳过无效的规则；配置里有无效规则时拒绝保存，避免把它悄悄丢掉。
 
 ### 超时语义（关键）
 

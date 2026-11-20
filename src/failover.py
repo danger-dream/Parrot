@@ -23,6 +23,7 @@ import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Optional, Any
 
 import httpx
@@ -33,7 +34,8 @@ from websockets.exceptions import InvalidStatus
 import threading
 
 from . import (
-    affinity, blacklist, channel_state, compact_rescue, concurrency, config, cooldown, errors, fingerprint,
+    affinity, blacklist, channel_state, compact_rescue, concurrency, config, cooldown, error_rule_effects, error_rules,
+    errors, fingerprint,
     local_web_tools, log_db, model_mapping, model_metadata, model_pricing, model_reroute, model_state, notifier, oauth_errors, oauth_manager, quota_errors, scorer, state_db,
     token_counter, upstream,
 )
@@ -74,6 +76,7 @@ from .protocols.runtime import (
     bounded_account_quota_error,
     configured_transient_retry_delays,
     connection_lifecycle_outcome,
+    exception_text,
     failover_final_http_status,
     is_context_1m_credit_error,
     is_responses_ws_visible_event_type,
@@ -126,6 +129,8 @@ from .transports import (
     ws_frame_size,
 )
 from .transports import policy as transport_policy
+from .transports.http_runtime import request_body_bytes, upload_min_kbps
+from .transports.timing import upload_budget_seconds
 
 
 # ─── OpenAI Codex 响应头 snapshot 节流 ───────────────────────────
@@ -1582,6 +1587,10 @@ async def _wait_for_overload_retry(
     return delay
 
 
+def _antigravity_credits_used(retried: set[tuple[str, str]], key: tuple[str, str], result) -> bool:
+    return key in retried or bool((result.translator_ctx or {}).get("antigravity_used_credits"))
+
+
 def _apply_codex_error_policy(ch: Channel, resolved_model: str, result) -> bool:
     """Use existing account quota/CAS and channel-model cooldown, never guessed families."""
     if not isinstance(ch, OpenAIOAuthChannel):
@@ -1622,95 +1631,107 @@ def _apply_codex_error_policy(ch: Channel, resolved_model: str, result) -> bool:
     return True
 
 
-def _apply_zhipu_account_block(ch: Channel, result) -> bool:
-    """Disable a Zhipu OAuth account the upstream refuses outright (arrears, expired plan, ...).
+@dataclass(frozen=True)
+class _RuleStep:
+    kind: str  # "retry" | "next" | "final" | "pass"
+    response: dict | None = None
 
-    These refusals carry no reset time and never clear by retrying, so the account
-    stays disabled with its reason until the operator enables it again.
+
+async def _apply_error_rule(
+    found: "error_rules.RuleMatch", obs: "error_rules.ErrorObservation", ch: Channel,
+    resolved_model: str, result: AttemptResult, *, progress: dict[tuple[str, str], list[int]],
+    deadline_ts: float, can_retry: bool,
+) -> _RuleStep:
+    """Walk a matched rule's steps; built-in handlers only see attempts it passes through.
+
+    A retry step is a checkpoint: the attempt is resent, and only when that
+    retry fails into the same rule again does the walk continue past it.
     """
-    block = quota_errors.zhipu_account_block(ch, http_status=result.http_status, error_detail=result.error_detail)
-    if block is None or ch.type != "oauth":
-        return False
-    code, reason = block
-    account_key = getattr(ch, "account_key", None)
-    disabled = False
-    with oauth_manager.account_generation_guard(getattr(ch, "state_key", None)) as current:
-        account = oauth_manager.get_account(account_key) if current and account_key else None
-        if account and account.get("enabled", True) and not account.get("disabled_reason"):
-            outcome = oauth_manager.mutate_account_if_unchanged(
-                account_key, account, lambda value: value.update(enabled=False, disabled_reason=reason))
-            disabled = outcome.get("status") == "updated"
-    if disabled:
-        print(f"[failover] disabled {ch.key}: Zhipu {code} ({reason})")
-        try:
-            notifications.account_event(
-                "account.access.blocked", account_key,
-                {"error_code": code, "error_reason": quota_errors.ACCOUNT_BLOCK_LABELS[reason]},
-                Effect("confirmed", "account_paused"), source="upstream_error")
-        except Exception as exc:
-            print(f"[failover] account block notification failed for {ch.key}: {exc}")
-    return True
+    message = result.error_detail or ""
+    connect_ms = _scorer_connect_ms(result)
+    position = progress.setdefault((found.id, ch.key), [0, 0, 0])  # step index, retries used, latest pause end
+    hit = error_rule_effects.record_hit(ch, resolved_model, found, obs, message=message, connect_ms=connect_ms)
+    if hit["until"]:
+        position[2] = max(position[2], hit["until"])
+    if hit["stopped"]:
+        can_retry = False
+    steps = found.steps
+    while position[0] < len(steps):
+        step = steps[position[0]]
+        if step["type"] == "retry":
+            if can_retry and position[1] < step["times"]:
+                delay = float(step["delaySeconds"])
+                if not (deadline_ts > 0 and time.time() + delay >= deadline_ts):
+                    position[1] += 1
+                    print(f"[error_rules] 「{found.rule['name']}」 on {ch.key}/{resolved_model}; "
+                          f"retrying same channel ({position[1]}/{step['times']}) after {delay:g}s")
+                    if delay:
+                        await asyncio.sleep(delay)
+                    return _RuleStep("retry")
+            position[0] += 1
+            position[1] = 0
+            continue
+        run = [step]
+        while position[0] + len(run) < len(steps) and steps[position[0] + len(run)]["type"] != "retry":
+            run.append(steps[position[0] + len(run)])
+        done = error_rule_effects.run_steps(ch, resolved_model, found, obs, run, message=message,
+                                            connect_ms=connect_ms)
+        if done["until"]:
+            position[2] = max(position[2], done["until"])
+        position[0] += len(run)
+    until = position[2] or None
+    response = error_rules.client_response(found.rule, obs=obs, model=resolved_model, until_ms=until)
+    paused = f" until {error_rules.format_reset_at(until)}" if until else ""
+    print(f"[error_rules] {found.layer} rule 「{found.rule['name']}」 handled {ch.key}/{resolved_model}: "
+          f"{found.category}{paused} → {found.final}")
+    if found.final == "pass":
+        return _RuleStep("pass")
+    if found.final == "respond":
+        return _RuleStep("final", response)
+    return _RuleStep("next", response)
 
 
-def _apply_zhipu_quota_cooldown(ch: Channel, resolved_model: str, result) -> bool:
-    """Apply the same quota/plan exclusion policy to immediate and queued attempts."""
-    quota_reset_ms = quota_errors.zhipu_1310_reset_ms(
-        ch,
-        http_status=result.http_status,
-        error_detail=result.error_detail,
-    )
-    # Zhipu 1311: 当前套餐尚未包含该模型。它不是"额度耗尽"，上游也不会给重置
-    # 时间。若按通用 429 走阶梯冷却，恢复循环会每 30 秒试探一次（实测半小时
-    # 73 次），既无意义又刷日志。改用有限退避窗口停下无效重试；套餐放开后
-    # 窗口到期即自动恢复调度，不做永久冻结。
-    plan_excluded = quota_reset_ms is None and quota_errors.is_zhipu_channel(ch) and \
-        quota_errors.is_zhipu_plan_excluded_message(result.error_detail)
-    if plan_excluded:
-        quota_reset_ms = quota_errors.zhipu_plan_excluded_retry_ms()
-    if quota_reset_ms is not None:
-        plan = finalize_policy.error_plan(
-            result.outcome,
-            failure_policy="runtime",
-            http_status=result.http_status,
-        )
-        if plan.record_cooldown_error:
-            cooldown.record_error(
-                channel_state.effect_key(ch),
-                resolved_model,
-                result.error_detail,
-                cooldown_until=quota_reset_ms,
-            )
-        if plan.record_failure:
-            scorer.record_failure(
-                channel_state.effect_key(ch),
-                resolved_model,
-                connect_ms=_scorer_connect_ms(result),
-            )
-        try:
-            _notify_zhipu_quota_cooldown(
-                ch, resolved_model, quota_reset_ms, plan_excluded=plan_excluded,
-            )
-        except Exception as exc:
-            print(f"[failover] quota cooldown notification failed for {ch.key}: {exc}")
-        return True
-    return False
+def _rule_response_headers(response: dict) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if response.get("retryAfter"):
+        headers["Retry-After"] = str(int(response["retryAfter"]))
+    elif errors.is_non_retryable_http_status(int(response["status"])):
+        headers["x-should-retry"] = "false"
+    return headers
 
 
-def _notify_zhipu_quota_cooldown(
-    ch: Channel, model: str, reset_ms: int, *, plan_excluded: bool = False,
-) -> None:
-    """Stable channel/model incident; dynamic retry timestamps are facts, not keys."""
-    facts = {"model": model, "error_code": "1311" if plan_excluded else "1310"}
-    if plan_excluded:
-        facts["retry_at"] = quota_errors.format_bjt_ms(reset_ms)
+async def _finish_with_rule_response(
+    response: dict | None, *, request_id: str, retry_count: int, ch: Channel, resolved_model: str,
+    result: AttemptResult, affinity_hit: int, ingress_protocol: str, start_monotonic: float,
+):
+    """End the request on a rule that stops failover; without a configured answer, relay the upstream's."""
+    if response is None:
+        status = int(result.http_status or 502)
+        message = result.error_detail or "upstream error"
+        headers = errors.NO_RETRY_HEADERS if errors.is_non_retryable_http_status(status) else None
     else:
-        facts.pop("model")
-        facts.update(models=[model], windows=["周/月额度"], reset_at=quota_errors.format_bjt_ms(reset_ms))
-    confirmed = cooldown.is_blocked(channel_state.effect_key(ch), model)
-    notifications.channel_event(
-        "model.entitlement.blocked" if plan_excluded else "model.quota.blocked",
-        channel_state.effect_key(ch), facts, Effect("confirmed" if confirmed else "unknown", "model_paused"),
-        scope_ref=model, source="upstream_quota_error")
+        status = int(response["status"])
+        message = response["message"]
+        headers = _rule_response_headers(response) or None
+    await asyncio.to_thread(
+        log_db.finish_error, request_id, (result.error_detail or message)[:4000], retry_count,
+        final_channel_key=ch.key, final_channel_type=ch.type, final_model=resolved_model,
+        connect_ms=result.connect_ms, first_token_ms=result.first_byte_ms,
+        idle_ms=result.idle_ms, total_ms=result.total_ms,
+        final_round_id=result.round_id, request_elapsed_ms=_elapsed_ms(start_monotonic),
+        http_status=status, affinity_hit=affinity_hit,
+        response_body=result.full_response_text,
+        usage=result.usage, usage_observed=result.usage_observed,
+        upstream_protocol=getattr(ch, "protocol", "anthropic"),
+        **_request_stage_kwargs(result),
+    )
+    return _json_error_for_ingress(
+        ingress_protocol, status,
+        protocol_errors.legacy_anthropic_error_type_for_http_status(status),
+        message[:2000],
+        code=getattr(result, "error_code", None),
+        headers=headers,
+    )
 
 
 def _err_type_from_outcome(outcome: str, http_status: Optional[int]) -> str:
@@ -2653,6 +2674,10 @@ async def run_failover(
     # the configured same-candidate transient retry budget.
     transient_retry_limit = _transient_retry_limit(cfg)
     transient_retries_used = 0
+    # Same-channel retries granted by error rules, per (rule, channel).
+    rule_progress: dict[tuple[str, str], list[int]] = {}
+    # Client-facing answer of the rule that handled the latest failed attempt.
+    last_rule_response: dict | None = None
     refreshed_once: set[str] = set()
     zhipu_pat_retried = False
     codex_ws_recovered: set[str] = set()
@@ -2859,6 +2884,9 @@ async def run_failover(
             quota_exhaustion = bounded_account_quota_error(result, ch)
             if ag_signal is not None and not ag_signal["account_quota_exhausted"]:
                 quota_exhaustion = None
+            rule_obs = error_rules.observe(ch, resolved_model, result)
+            rule_chain = error_rules.match_chain(rule_obs)
+            rule_match = error_rules.decisive(rule_chain)
             if not result.success and not result.stream_started:
                 structured_attempts.append(
                     _structured_attempt_error(result, attempt_order, ch),
@@ -3031,6 +3059,79 @@ async def run_failover(
             print(f"[failover] thinking history rejected for {ch.key}/{resolved_model}; retrying once without thinking history"
                   + (f", {remembered} rejected block(s) dropped on later requests" if remembered else ""))
             continue
+
+        if not result.success and not result.stream_started:
+            last_rule_response = None
+        if (
+            rule_match is not None and ag_signal is not None and result.http_status == 429
+            and str(getattr(ch, "provider", "")) == "antigravity"
+        ):
+            # Spending credits the account allows is a recovery, like the replays above: it
+            # goes before the rules, which see the attempt again only if that retry fails too.
+            from .antigravity.quota import apply_request_429, credit_retry_available
+            ag_credits_key = (ch.key, resolved_model)
+            ag_kwargs = dict(
+                account_key=ch.account_key, expected_state_key=getattr(ch, "state_key", None),
+                used_credits=_antigravity_credits_used(retried_with_antigravity_credits, ag_credits_key, result),
+                http_status=ag_signal["diagnostic"].get("http_status"),
+            )
+            if credit_retry_available(ag_raw, **ag_kwargs) and apply_request_429(
+                channel_state.effect_key(ch), resolved_model, ag_raw,
+                retry_after=result.retry_after_seconds, **ag_kwargs,
+            ):
+                retried_with_antigravity_credits.add(ag_credits_key)
+                print(f"[failover] Antigravity model quota exhausted on {ch.key}/{resolved_model}; "
+                      "retrying same channel with GOOGLE_ONE_AI credits before error rules")
+                retry_count += 1
+                continue
+
+        if rule_match is not None:
+            try:
+                # Labelled only now: the protocol recoveries above may take the attempt first.
+                if attempt_id is not None:
+                    await asyncio.to_thread(log_db.update_retry_attempt, attempt_id,
+                                            error_rule_id=rule_match.id, error_category=rule_match.category)
+                for observer in rule_chain:
+                    if observer is not rule_match:
+                        # Pass-through rules ahead of the deciding one only mark, count and notify.
+                        error_rule_effects.record_hit(ch, resolved_model, observer, rule_obs,
+                                                      message=result.error_detail or "",
+                                                      connect_ms=_scorer_connect_ms(result))
+                        error_rule_effects.run_steps(ch, resolved_model, observer, rule_obs,
+                                                     [s for s in observer.steps if s["type"] != "retry"],
+                                                     message=result.error_detail or "",
+                                                     connect_ms=_scorer_connect_ms(result))
+                step = await _apply_error_rule(
+                    rule_match, rule_obs, ch, resolved_model, result,
+                    progress=rule_progress, deadline_ts=deadline_ts,
+                    can_retry=not zhipu_body_started,
+                )
+            except asyncio.CancelledError:
+                # The client left while a retry step was waiting; the entrypoints only catch Exception.
+                await await_ws_owned(_finish_cancelled_failover_attempt(
+                    request_id=request_id, retry_count=retry_count, ch=ch, resolved_model=resolved_model,
+                    attempt_id=attempt_id, attempt_started_monotonic=attempt_started_monotonic,
+                    start_monotonic=start_monotonic, affinity_hit=affinity_hit, proxy_name=result.proxy_name,
+                    upstream_transport=("ws" if use_responses_ws else "http"), result=result,
+                    terminalize_retry=False,
+                ))
+                raise
+            if step.kind == "retry":
+                retry_count += 1
+                continue
+            if step.kind == "final":
+                return await _finish_with_rule_response(
+                    step.response, request_id=request_id, retry_count=retry_count, ch=ch,
+                    resolved_model=resolved_model, result=result, affinity_hit=affinity_hit,
+                    ingress_protocol=ingress_protocol, start_monotonic=start_monotonic,
+                )
+            if step.kind == "next":
+                last_rule_response = step.response
+                if zhipu_body_started:
+                    break
+                retry_count += 1
+                idx += 1
+                continue
 
         # 请求级 guard 错误：所有 openai 候选语义一致，切也无用，直接短路 4xx
         if result.outcome == "guard_error":
@@ -3229,16 +3330,6 @@ async def run_failover(
             retry_count += 1
             continue
 
-        if _apply_zhipu_account_block(ch, result):
-            retry_count += 1
-            idx += 1
-            continue
-
-        if _apply_zhipu_quota_cooldown(ch, resolved_model, result):
-            retry_count += 1
-            idx += 1
-            continue
-
         # OpenAI server_is_overloaded/server_error, Claude overloaded_error/529,
         # and direct xAI 503 are explicit transient signals.  The slot is already
         # released, so backoff does not occupy channel concurrency.  Intermediate
@@ -3275,10 +3366,7 @@ async def run_failover(
         if str(getattr(ch, "provider", "")) == "antigravity" and result.http_status == 429:
             from .antigravity.quota import apply_request_429
             ag_credits_key = (ch.key, resolved_model)
-            used_credits = (
-                ag_credits_key in retried_with_antigravity_credits
-                or bool((result.translator_ctx or {}).get("antigravity_used_credits"))
-            )
+            used_credits = _antigravity_credits_used(retried_with_antigravity_credits, ag_credits_key, result)
             should_retry_credits = apply_request_429(
                 channel_state.effect_key(ch), resolved_model,
                 ag_raw,
@@ -3296,21 +3384,6 @@ async def run_failover(
                 )
                 retry_count += 1
                 continue
-            retry_count += 1
-            idx += 1
-            continue
-
-        if (getattr(ch, "provider", "") == "workbuddy" and quota_exhaustion is not None
-                and quota_exhaustion.get("code") in WORKBUDDY_QUOTA_CODES):
-            # Explicit billing exhaustion is not a transient 429: never retried on this
-            # account. The credits are this account's own (other accounts keep serving the
-            # model), so pause the account's model for a bounded window without a failure
-            # record, and let the request go on to the next candidate. 402 remains when
-            # every candidate is exhausted.
-            cooldown.record_quota_pause(
-                channel_state.effect_key(ch), resolved_model, result.error_detail,
-                cooldown_until=quota_errors.finite_pause_until_ms(),
-            )
             retry_count += 1
             idx += 1
             continue
@@ -3388,6 +3461,11 @@ async def run_failover(
         err_type = protocol_errors.legacy_anthropic_error_type_for_http_status(status)
     failure_details = _structured_failure_details(structured_attempts)
     msg = str(failure_details["summary"])
+    if last_rule_response is not None:
+        # The rule that handled the final failure owns the client-facing answer.
+        status = int(last_rule_response["status"])
+        err_type = protocol_errors.legacy_anthropic_error_type_for_http_status(status)
+        msg = last_rule_response["message"]
 
     request_elapsed_ms = _elapsed_ms(start_monotonic)
     if not skip_request_log:
@@ -3424,6 +3502,8 @@ async def run_failover(
         min_ra = min(rate_limit_retry_afters)
         if min_ra > 0:
             terminal_headers["Retry-After"] = str(min(86400 * 7, max(1, math.ceil(min_ra))))
+    if last_rule_response is not None:
+        terminal_headers = _rule_response_headers(last_rule_response)
 
     return _json_error_for_ingress(
         ingress_protocol,
@@ -3895,6 +3975,37 @@ def _invalid_ws_status_detail(exc: InvalidStatus) -> tuple[Optional[int], str]:
     return status, (f"HTTP {status}: {text}" if status else str(exc))[:2000]
 
 
+_large_body_noticed: dict[tuple[str, str], float] = {}
+_LARGE_BODY_NOTICE_GAP_S = 600.0
+
+
+def _note_large_request_body(
+    ch: Channel, resolved_model: str, wire_body, *,
+    connect_timeout: float, api_key_name: Optional[str], request_id: str,
+) -> None:
+    """Surface a body that needs a stretched upload budget (see RoundTimeouts.upload)."""
+
+    size = request_body_bytes(wire_body)
+    min_kbps = upload_min_kbps()
+    budget = upload_budget_seconds(size, connection=connect_timeout, min_kbps=min_kbps)
+    if budget <= connect_timeout:
+        return
+    size_mb = round(size / 1048576, 1)
+    print(f"[upload] {api_key_name or '-'} → {ch.key}/{resolved_model}: request body {size_mb} MB, "
+          f"upload allowed {budget:.0f}s at ≥{min_kbps:g} KB/s")
+    # The notification store dedupes too; this only avoids a store transaction
+    # for every turn of a long conversation that keeps resending the body.
+    key = (str(api_key_name or ""), str(resolved_model))
+    now = time.monotonic()
+    if now - _large_body_noticed.get(key, -_LARGE_BODY_NOTICE_GAP_S) < _LARGE_BODY_NOTICE_GAP_S:
+        return
+    _large_body_noticed[key] = now
+    notifications.large_request_body(
+        model=resolved_model, api_key_name=api_key_name, request_id=request_id,
+        size_mb=size_mb, upload_seconds=int(round(budget)),
+    )
+
+
 def _apply_candidate_prompt_rules(
     ch: Channel,
     resolved_model: str,
@@ -4175,26 +4286,29 @@ async def _try_openai_oauth_responses_ws_channel(
                 except BaseException:
                     pass
                 upstream_ws = None
-            cancelled = AttemptResult(
-                outcome="cancelled",
-                error_detail="cancelled",
-                proxy_name=proxy_name,
-            )
-            _hydrate_oauth_ws_attempt_result(
-                cancelled,
-                tracker,
-                identity_state=identity_state,
-                proxy_name=proxy_name,
-                proxy_bytes=proxy_bytes,
-                translator_ctx=translator_ctx,
-            )
-            cancelled = await _finalize_ws_attempt_result(
-                cancelled,
-                proxy_attempt_id=proxy_attempt_id,
-                timing=timing,
-                proxy_bytes=proxy_bytes,
-            )
+
+            # One owned task: a repeated cancellation must not skip the
+            # request/retry records after the route round is finalized.
             async def finish_cancelled_attempt() -> None:
+                cancelled = AttemptResult(
+                    outcome="cancelled",
+                    error_detail="cancelled",
+                    proxy_name=proxy_name,
+                )
+                _hydrate_oauth_ws_attempt_result(
+                    cancelled,
+                    tracker,
+                    identity_state=identity_state,
+                    proxy_name=proxy_name,
+                    proxy_bytes=proxy_bytes,
+                    translator_ctx=translator_ctx,
+                )
+                cancelled = await _finalize_ws_attempt_result(
+                    cancelled,
+                    proxy_attempt_id=proxy_attempt_id,
+                    timing=timing,
+                    proxy_bytes=proxy_bytes,
+                )
                 if retry_attempt_id is not None:
                     await asyncio.to_thread(
                         log_db.update_retry_attempt,
@@ -4255,7 +4369,7 @@ async def _try_openai_oauth_responses_ws_channel(
         except asyncio.TimeoutError as exc:
             last_error = AttemptResult(
                 outcome="transport_timeout",
-                error_detail=f"websocket transport timeout: {exc}"[:2000],
+                error_detail=f"websocket transport timeout: {exception_text(exc)}"[:2000],
                 proxy_name=proxy_name,
             )
         except InvalidStatus as exc:
@@ -4276,7 +4390,7 @@ async def _try_openai_oauth_responses_ws_channel(
             connected = timing.connection_complete
             last_error = AttemptResult(
                 outcome="transport_error" if connected else "connect_error",
-                error_detail=f"{'websocket relay' if connected else 'connect'} error: {exc}"[:2000],
+                error_detail=f"{'websocket relay' if connected else 'connect'} error: {exception_text(exc)}"[:2000],
                 proxy_name=proxy_name,
             )
         finally:
@@ -4374,7 +4488,7 @@ async def _consume_oauth_responses_ws(
     except asyncio.TimeoutError as exc:
         return AttemptResult(
             outcome="transport_timeout",
-            error_detail=f"send first websocket frame transport timeout: {exc}",
+            error_detail=f"send first websocket frame transport timeout: {exception_text(exc)}",
             connect_ms=connect_ms,
             proxy_name=proxy_name,
             proxy_bytes_up=proxy_bytes.up,
@@ -5121,7 +5235,7 @@ async def _consume_oauth_responses_ws_stream(
             outcome = lifecycle or "transport_error"
             await await_ws_owned(finalize_error(AttemptResult(
                 outcome=outcome,
-                error_detail=f"websocket stream error: {exc}"[:2000],
+                error_detail=f"websocket stream error: {exception_text(exc)}"[:2000],
                 http_status=None if lifecycle else 502,
             )))
             # The exception text stays in the private log.
@@ -5265,6 +5379,11 @@ async def _try_channel(
     paused_result = _workbuddy_account_pause_result(ch)
     if paused_result is not None:
         return paused_result
+
+    _note_large_request_body(
+        ch, resolved_model, upstream_req.body,
+        connect_timeout=connect_timeout, api_key_name=api_key_name, request_id=request_id,
+    )
 
     if getattr(ch, "provider", None) == "workbuddy":
         original_hook = getattr(upstream_req, "stream_context_hook", None)
@@ -5561,23 +5680,27 @@ async def _try_channel(
             await _close_proxy_client(_proxy_client)
         return observed_result(result)
     except asyncio.CancelledError:
-        await asyncio.shield(_safe_exit(ctx))
-        await asyncio.shield(_close_proxy_client(_proxy_client))
-        cancelled = AttemptResult(
-            outcome="cancelled",
-            error_detail="upstream HTTP round cancelled before downstream commit",
-        )
-        cancelled = await await_ws_owned(
-            _finalize_http_attempt(opened, cancelled)
-        )
-        try:
-            await await_ws_owned(finish_cancelled_http_attempt(
-                cancelled,
-                proxy_name=_proxy_name_used,
-                proxy_bytes=_proxy_bytes,
-            ))
-        except Exception:
-            traceback.print_exc()
+        # This attempt was handed off, so nobody else terminalizes it. Settle it
+        # as one owned task: a repeated cancellation (e.g. a disconnect fanned
+        # out by a wrapper's gather) must not skip the request/retry records.
+        async def settle_cancelled() -> None:
+            await _safe_exit(ctx)
+            await _close_proxy_client(_proxy_client)
+            cancelled = AttemptResult(
+                outcome="cancelled",
+                error_detail="upstream HTTP round cancelled before downstream commit",
+            )
+            cancelled = await _finalize_http_attempt(opened, cancelled)
+            try:
+                await finish_cancelled_http_attempt(
+                    cancelled,
+                    proxy_name=_proxy_name_used,
+                    proxy_bytes=_proxy_bytes,
+                )
+            except Exception:
+                traceback.print_exc()
+
+        await await_ws_owned(settle_cancelled())
         raise
     except Exception as exc:
         traceback.print_exc()
@@ -5589,7 +5712,7 @@ async def _try_channel(
         lifecycle = connection_lifecycle_outcome(exc)
         result = AttemptResult(
             outcome=lifecycle or "transport_error",
-            error_detail=f"unexpected: {exc}",
+            error_detail=f"unexpected: {exception_text(exc)}",
         )
         return observed_result(await _finalize_http_attempt(opened, result))
 
@@ -6733,7 +6856,7 @@ async def _consume_stream(
             raise
         except BaseException as exc:
             await await_ws_owned(_emit_error_and_finalize(
-                "api_error", f"stream error: {exc}",
+                "api_error", f"stream error: {exception_text(exc)}",
                 outcome=connection_lifecycle_outcome(
                     exc,
                     http_status=upstream_status,
