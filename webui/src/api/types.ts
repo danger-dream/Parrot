@@ -124,7 +124,7 @@ export interface ServerEventMap {
   'request.updated': RequestUpdatedEvent
   'request.finished': { log: RequestLogData }
   'runtime.snapshot': ConcurrencyData
-  resync: { reason?: 'overflow' | 'enrichmentFailed' }
+  resync: { reason?: 'overflow' | 'enrichmentFailed' | 'reconnect' }
   'notification.created': Record<string, never>
   ping: Record<string, never>
 }

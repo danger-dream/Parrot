@@ -6665,6 +6665,7 @@ def cleanup_stale_pending(timeout_seconds: int = 1800) -> int:
     cutoff = time.time() - timeout_seconds
     finished_at = time.time()
     cleaned = 0
+    finished_events: list[tuple[str, str]] = []
     with _write_lock:
         current_ref = _db_ref_for_timestamp()
         for month, path in _monthly_log_files():
@@ -6737,6 +6738,8 @@ def cleanup_stale_pending(timeout_seconds: int = 1800) -> int:
                     known = _request_handles.get(request_id)
                     if known is not None and known.db.path == path:
                         _request_handles.pop(request_id, None)
+                if cur.rowcount:
+                    finished_events.extend((request_id, month) for request_id in stale_ids)
             except Exception as exc:
                 if conn is not None and conn.in_transaction:
                     try:
@@ -6752,6 +6755,9 @@ def cleanup_stale_pending(timeout_seconds: int = 1800) -> int:
                         conn.close()
                     except Exception:
                         pass
+    if finished_events and request_events.active():
+        for request_id, month in finished_events:
+            _publish_request_event("finished", {"id": request_id, "month": month})
     return cleaned
 
 

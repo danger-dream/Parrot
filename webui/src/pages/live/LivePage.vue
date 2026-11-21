@@ -8,7 +8,7 @@ import {
 import { api } from '@/api/client'
 import { eventLink, onEvent } from '@/api/events'
 import type { RequestLogData, RequestLogFilterOptionsData } from '@/api/types'
-import { live, seedFeed, type LiveRequest } from '@/stores/live'
+import { live, syncFeed, type LiveRequest } from '@/stores/live'
 import { channelName } from '@/stores/catalog'
 import { inspector } from '@/stores/ui'
 import { compact, dateTime, integer, ms, tps, usd } from '@/utils/format'
@@ -66,11 +66,8 @@ onMounted(async () => {
   seedLoading.value = !live.feed.length
   try {
     // More than the 30 shown rows, so the "recent status" bars have history from the start.
-    const res = await api.get<RequestLogData[]>('/logs', { pageSize: 200, sort: 'createdAt', descending: true })
-    seedTotal.value = res.meta.total ?? res.data.length
-    seedFeed(res.data)
-  } catch {
-    /* rows still arrive from events */
+    const total = await syncFeed({ reconcilePending: true })
+    if (total !== null) seedTotal.value = total
   } finally {
     seedLoading.value = false
     animateAfterRender()
@@ -81,7 +78,10 @@ onBeforeUnmount(() => {
   offStarted()
   offUpdated()
   offFinished()
-  live.paused = false
+  if (live.paused) {
+    live.paused = false
+    void syncFeed({ reconcilePending: true })
+  }
 })
 
 const selectedId = computed(() => (inspector.open && inspector.key.startsWith('req:') ? inspector.key.slice(4) : ''))
@@ -167,7 +167,13 @@ const pausedCount = ref(0)
 const missed = computed(() => (live.paused ? live.finished - pausedCount.value : 0))
 function togglePause(): void {
   live.paused = !live.paused
-  if (live.paused) pausedCount.value = live.finished
+  if (live.paused) {
+    pausedCount.value = live.finished
+  } else {
+    void syncFeed({ reconcilePending: true }).then((total) => {
+      if (total !== null) seedTotal.value = total
+    })
+  }
 }
 
 const statusOptions: { value: StatusFilter; label: string }[] = [

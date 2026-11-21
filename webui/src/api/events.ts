@@ -13,6 +13,7 @@ export const eventLink = reactive({
   lastMessageAt: 0,
   connectedAt: 0,
   retries: 0,
+  connectCount: 0,
 })
 
 let socket: WebSocket | null = null
@@ -60,7 +61,9 @@ function open(): void {
     eventLink.state = 'open'
     eventLink.connectedAt = Date.now()
     eventLink.retries = 0
+    eventLink.connectCount += 1
     armWatchdog()
+    if (eventLink.connectCount > 1) dispatch('resync', { reason: 'reconnect' }, new Date().toISOString())
   }
   ws.onmessage = (msg) => {
     eventLink.lastMessageAt = Date.now()
@@ -102,6 +105,7 @@ export function disconnectEvents(): void {
   socket?.close(1000, 'bye')
   socket = null
   eventLink.state = 'closed'
+  eventLink.connectCount = 0
 }
 
 export function onEvent<K extends ServerEventType>(type: K, fn: Handler<K>): () => void {
