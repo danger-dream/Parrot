@@ -2157,6 +2157,38 @@ def _publish_request_event(kind: str, payload: dict[str, Any]) -> None:
         pass
 
 
+# A managed search finishes one row once per model round; while its root id is
+# held, those finishes only record the month and the owner announces it once.
+_held_finished: dict[str, str | None] = {}
+_held_finished_lock = threading.Lock()
+
+
+def hold_finished_event(request_id: str) -> None:
+    """Defer ``finished`` for a multi-round request until it is released."""
+    with _held_finished_lock:
+        _held_finished.setdefault(_billing_root_request_id(str(request_id)), None)
+
+
+def release_finished_event(request_id: str) -> None:
+    """Announce a held request once if it was finished while held."""
+    root_request_id = _billing_root_request_id(str(request_id))
+    with _held_finished_lock:
+        month = _held_finished.pop(root_request_id, None)
+    if month is not None and request_events.active():
+        _publish_request_event("finished", {"id": root_request_id, "month": month})
+
+
+def _announce_finished(handle: RequestLogHandle) -> None:
+    with _held_finished_lock:
+        if handle.request_id in _held_finished:
+            _held_finished[handle.request_id] = handle.db.month
+            return
+    if request_events.active():
+        _publish_request_event("finished", {
+            "id": handle.request_id, "month": handle.db.month,
+        })
+
+
 def update_pending(request_id: str | RequestLogHandle, **fields: Any) -> None:
     """在 pending 阶段追加一些字段（如 fingerprint / affinity_hit）。"""
     if not fields:
@@ -3672,10 +3704,7 @@ def finish_managed_search_request(
                 (response_body, handle.request_id),
             )
         conn.commit()
-    if request_events.active():
-        _publish_request_event("finished", {
-            "id": handle.request_id, "month": handle.db.month,
-        })
+    _announce_finished(handle)
 
 
 def finish_success(
@@ -3777,10 +3806,7 @@ def finish_success(
         conn.commit()
         if _request_handles.get(handle.request_id) == handle:
             _release_request_handle(handle.request_id)
-    if request_events.active():
-        _publish_request_event("finished", {
-            "id": handle.request_id, "month": handle.db.month,
-        })
+    _announce_finished(handle)
 
     if actual_model or model_signal_conflict:
         _notify_upstream_observation(
@@ -3882,10 +3908,7 @@ def finish_error(
         conn.commit()
         if _request_handles.get(handle.request_id) == handle:
             _release_request_handle(handle.request_id)
-    if request_events.active():
-        _publish_request_event("finished", {
-            "id": handle.request_id, "month": handle.db.month,
-        })
+    _announce_finished(handle)
 
     if actual_model or model_signal_conflict:
         _notify_upstream_observation(

@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from src import log_db, local_web_tools as web, search_tool_policy as policy
+from src import log_db, local_web_tools as web, request_events, search_tool_policy as policy
 from src.tests import test_protocol_fake_upstreams as fx
 
 BJT = timezone(timedelta(hours=8))
@@ -291,3 +291,63 @@ async def test_retained_binding_lives_only_inside_a_real_next_invoke(monthly, mo
     assert len(rows(request.db.path, 'retry_chain', request.request_id)) == 1
     assert rows(sentinel.db.path, 'retry_chain', request.request_id) == []
     assert request.request_id not in log_db._request_handles
+
+
+@pytest.mark.parametrize('outcome', ['success', 'continuation_error', 'cancelled', 'first_round_error'])
+async def test_managed_search_announces_one_finished_with_final_status(monthly, monkeypatch, outcome):
+    body, route, request, _, _ = setup_route(monthly, 'responses', False)
+    entered = asyncio.Event()
+    count = 0
+
+    async def model(req):
+        nonlocal count
+        count += 1
+        if outcome == 'first_round_error':
+            return httpx.Response(404, json={'error': {'message': 'model unavailable'}})
+        if count == 1:
+            return httpx.Response(200, json=output('responses', 'search'))
+        if outcome == 'success':
+            return httpx.Response(200, json=output('responses', text='final'))
+        entered.set()
+        if outcome == 'cancelled':
+            await asyncio.Event().wait()
+        return httpx.Response(404, json={'error': {'message': 'model unavailable'}})
+
+    async def execute(calls, **kw):
+        return [web.LocalToolResult(c.id, 'result') for c in calls]
+
+    async def invoke(current):
+        response = await monthly.m['failover'].run_failover(
+            route, current, request.request_id, 'test-key', '127.0.0.1', False, time.time(),
+            ingress_protocol='responses', start_monotonic=time.monotonic())
+        monthly.clock[0] = FEB
+        return response
+
+    announced = []
+
+    def listener(kind, payload):
+        if kind == 'finished' and payload['id'] == request.request_id:
+            # The row an observer would read at announcement time.
+            announced.append((payload['month'], rows(request.db.path, 'request_log', request.request_id)[0]['status']))
+
+    monkeypatch.setattr(web, 'execute_local_tool_calls', execute)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(model))
+    monthly.m['upstream'].set_client(client)
+    unsubscribe = request_events.subscribe(listener)
+    try:
+        task = asyncio.create_task(policy.run(body, 'responses', invoke, request_id=request.request_id, api_key_name='test-key'))
+        if outcome == 'cancelled':
+            await asyncio.wait_for(entered.wait(), 2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            status = (await task).status_code
+            assert (status == 200) == (outcome == 'success')
+    finally:
+        unsubscribe()
+        await client.aclose()
+    final = {'success': 'success', 'cancelled': 'cancelled'}.get(outcome, 'error')
+    assert count == (1 if outcome == 'first_round_error' else 2)
+    assert announced == [(request.db.month, final)]
+    assert request.request_id not in log_db._held_finished

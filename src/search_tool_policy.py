@@ -824,6 +824,9 @@ async def run(body: dict, protocol: str, invoke, *, request_id=None, api_key_nam
             await _stream.commit_tools()
         return _json_response(final, response)
 
+    if request_id:
+        # Live observers see one finished request, not one per model round.
+        web.log_db.hold_finished_event(request_id)
     try:
         response = await complete()
     except asyncio.CancelledError:
@@ -839,7 +842,11 @@ async def run(body: dict, protocol: str, invoke, *, request_id=None, api_key_nam
     except Exception:
         finish_request(message="managed search failed")
         raise
-    finish_request(response)
+    else:
+        finish_request(response)
+    finally:
+        if request_id:
+            web.log_db.release_finished_event(request_id)
     return response
 
 

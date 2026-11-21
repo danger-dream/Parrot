@@ -383,7 +383,7 @@ def test_cleanup_stale_pending_emits_finished_event(tmp_path, monkeypatch):
         store.close()
 
 
-def test_managed_search_final_status_emits_finished_event(tmp_path, monkeypatch):
+def test_managed_search_announces_final_status_on_release(tmp_path, monkeypatch):
     store = MonthlyLogStore(monkeypatch, tmp_path)
     app, runtime, _ = build_app(tmp_path)
     try:
@@ -397,12 +397,13 @@ def test_managed_search_final_status_emits_finished_event(tmp_path, monkeypatch)
                     "search-live-1", "203.0.113.9", "client", "model-a", True, 1, 0, None, None,
                 )
                 assert _receive_until(ws, "request.started")["data"]["id"] == "search-live-1"
-                # A model round settles first; the logical request fails afterwards.
+                log_db.hold_finished_event("search-live-1")
+                # A model round settles first; the logical request is cancelled afterwards.
                 log_db.finish_success(handle, "api:alpha", "api", "model-a", input_tokens=3, output_tokens=4)
-                assert _receive_until(ws, "request.finished")["data"]["log"]["status"] == "success"
                 log_db.finish_managed_search_request(
                     handle, status="cancelled", http_status=499, error_message="managed search cancelled",
                 )
+                log_db.release_finished_event("search-live-1")
                 finished = _receive_until(ws, "request.finished")
                 assert finished["data"]["log"]["id"] == "search-live-1"
                 assert finished["data"]["log"]["status"] == "cancelled"
