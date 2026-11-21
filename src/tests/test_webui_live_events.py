@@ -350,3 +350,34 @@ def test_finished_event_equals_logs_list_item(tmp_path, monkeypatch):
         assert finished["data"]["log"] == item
     finally:
         store.close()
+
+
+def test_cleanup_stale_pending_emits_finished_event(tmp_path, monkeypatch):
+    store = MonthlyLogStore(monkeypatch, tmp_path)
+    app, runtime, _ = build_app(tmp_path)
+    try:
+        bus = live_module.event_bus(runtime)
+        bus.finished_delay = 0.0
+        with TestClient(app) as client:
+            credential = key_session(client).json()["data"]["credential"]
+            with client.websocket_connect(WS, headers=bearer(credential)) as ws:
+                assert ws.receive_json()["type"] == "hello"
+                old_ts = time.time() - 3600
+                handle = log_db.insert_pending(
+                    "stale-live-1", "203.0.113.9", "client", "model-a", True, 1, 0, None, None,
+                )
+                assert _receive_until(ws, "request.started")["data"]["id"] == "stale-live-1"
+                with log_db._write_lock:
+                    conn = log_db._get_conn_for_ref(handle.db)
+                    conn.execute(
+                        "UPDATE request_log SET created_at=? WHERE request_id=?",
+                        (old_ts, handle.request_id),
+                    )
+                    conn.commit()
+                    log_db._request_handles.pop(handle.request_id, None)
+                assert log_db.cleanup_stale_pending(1800) == 1
+                finished = _receive_until(ws, "request.finished")
+                assert finished["data"]["log"]["id"] == "stale-live-1"
+                assert finished["data"]["log"]["status"] == "error"
+    finally:
+        store.close()
