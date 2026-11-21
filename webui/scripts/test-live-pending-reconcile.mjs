@@ -359,7 +359,7 @@ test('reconcilePending queries status=pending when 200 newer logs push an active
   assert.equal(h.liveStore.live.feed.some((r) => r.id === 'vanished-ghost'), false)
 })
 
-test('sustained zero inFlight runtime.snapshot reconciles orphaned pending rows', async () => {
+test('pending rows unconfirmed for a minute are reconciled even while the server stays busy', async () => {
   const h = createHarness({
     async onGet() {
       return { data: [makeLog({ id: 'orphan-1', status: 'success' })], meta: { total: 1 } }
@@ -384,19 +384,94 @@ test('sustained zero inFlight runtime.snapshot reconciles orphaned pending rows'
     },
   })
 
-  // First zero snapshot only starts the grace timer (avoids racing channel acquisition).
-  ws.emitMessage({ type: 'runtime.snapshot', data: makeSnapshot(0) })
+  // Other requests keep the server busy the whole time.
+  ws.emitMessage({ type: 'runtime.snapshot', data: makeSnapshot(3) })
+  h.advanceNow(30_000)
+  ws.emitMessage({ type: 'runtime.snapshot', data: makeSnapshot(3) })
   await settled()
   assert.equal(h.getCalls.length, 0)
 
-  // Still zero after the 10s grace window: trigger authoritative /logs reconciliation.
-  h.advanceNow(10_500)
-  ws.emitMessage({ type: 'runtime.snapshot', data: makeSnapshot(0) })
+  h.advanceNow(31_000)
+  ws.emitMessage({ type: 'runtime.snapshot', data: makeSnapshot(3) })
   await settled()
 
   assert.equal(h.getCalls.length, 1)
   assert.equal(h.liveStore.live.inFlight.size, 0)
   assert.equal(h.liveStore.live.feed[0].status, 'success')
+})
+
+test('rows the server still reports as pending are re-checked at most once a minute', async () => {
+  const h = createHarness({
+    async onGet() {
+      return {
+        data: [makeLog({ id: 'queued-1', status: 'pending', durationMilliseconds: null })],
+        meta: { total: 1 },
+      }
+    },
+  })
+
+  h.events.connectEvents()
+  const ws = h.sockets[0]
+  ws.emitOpen()
+  ws.emitMessage({
+    type: 'request.started',
+    data: {
+      id: 'queued-1',
+      createdAt: '2026-11-21T04:08:21Z',
+      apiKeyName: 'gemini',
+      requestedModel: 'gemini-4-neon-xhigh',
+      protocol: 'chat',
+      isStream: true,
+      clientIp: null,
+      reasoningEffort: null,
+      fastMode: null,
+    },
+  })
+
+  h.advanceNow(61_000)
+  ws.emitMessage({ type: 'runtime.snapshot', data: makeSnapshot(0) })
+  await settled()
+  assert.equal(h.getCalls.length, 1)
+  assert.equal(h.liveStore.live.inFlight.has('queued-1'), true)
+  assert.equal(h.liveStore.live.feed[0].status, 'pending')
+
+  // Snapshots keep arriving every 2s; the confirmed row is not fetched again within the minute.
+  for (let i = 0; i < 29; i++) {
+    h.advanceNow(2_000)
+    ws.emitMessage({ type: 'runtime.snapshot', data: makeSnapshot(0) })
+    await settled()
+  }
+  assert.equal(h.getCalls.length, 1)
+
+  h.advanceNow(2_000)
+  ws.emitMessage({ type: 'runtime.snapshot', data: makeSnapshot(0) })
+  await settled()
+  assert.equal(h.getCalls.length, 2)
+})
+
+test('concurrent syncFeed calls share one run and resolve with the latest total', async () => {
+  const fetches = []
+  const h = createHarness({
+    onGet() {
+      return new Promise((resolve) => fetches.push(resolve))
+    },
+  })
+
+  const first = h.liveStore.syncFeed({ reconcilePending: true })
+  const second = h.liveStore.syncFeed({ reconcilePending: true })
+  assert.equal(first, second)
+  assert.equal(fetches.length, 1)
+
+  // The second call may carry newer state, so the run fetches once more before settling.
+  fetches[0]({ data: [], meta: { total: 5 } })
+  await settled()
+  assert.equal(fetches.length, 2)
+  fetches[1]({ data: [makeLog({ id: 'late-1' })], meta: { total: 7 } })
+
+  assert.equal(await first, 7)
+  assert.equal(await second, 7)
+  assert.equal(h.getCalls.length, 2)
+  assert.equal(h.liveStore.live.feed[0].id, 'late-1')
 })
 
 test('paused live stream ignores resync fetches until resumed', async () => {

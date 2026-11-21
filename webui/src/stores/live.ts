@@ -26,7 +26,8 @@ export interface LiveRequest {
 const WINDOW_SECONDS = 15 * 60
 const MAX_FEED = 400
 const RESYNC_PAGE_SIZE = 200
-const IDLE_RECONCILE_MS = 10_000
+// A pending row the server has not confirmed for this long is re-checked against /logs.
+const STALE_PENDING_MS = 60_000
 
 export const live = reactive({
   feed: [] as LiveRequest[],
@@ -40,12 +41,10 @@ export const live = reactive({
   paused: false,
 })
 
-let syncSeq = 0
-let syncing = false
+let syncRun: Promise<number | null> | null = null
 let syncQueued = false
-let syncTotal: number | null = null
-let idlePendingSince = 0
-let lastIdleReconcileAt = 0
+// Start of the latest reconcile attempt; rows are not re-checked within STALE_PENDING_MS of it.
+let lastReconcileAt = 0
 
 // Per-second buckets of finished requests for the last 15 minutes.
 const bucketStart = Math.floor(Date.now() / 1000) - WINDOW_SECONDS + 1
@@ -131,12 +130,9 @@ function pushFeed(item: LiveRequest): void {
   }
 }
 
-function hasPendingFeedItems(): boolean {
-  return live.inFlight.size > 0 || live.feed.some((r) => r.status === 'pending')
-}
-
-function snapshotInFlightCount(data: ConcurrencyData): number {
-  return Math.max(data.channelTotals?.inFlight ?? 0, data.apiKeyTotals?.inFlight ?? 0)
+function hasUnconfirmedPending(now: number): boolean {
+  const stale = (r: LiveRequest) => now - Math.max(r.receivedAt, lastReconcileAt) >= STALE_PENDING_MS
+  return live.feed.some((r) => r.status === 'pending' && stale(r)) || Array.from(live.inFlight.values()).some(stale)
 }
 
 onEvent('request.started', (e: RequestStartedEvent) => {
@@ -193,25 +189,12 @@ onEvent('request.finished', ({ log }) => {
 onEvent('runtime.snapshot', (data) => {
   live.snapshot = data
   live.snapshotAt = Date.now()
-  if (snapshotInFlightCount(data) > 0 || !hasPendingFeedItems()) {
-    idlePendingSince = 0
-    return
-  }
-  const now = Date.now()
-  if (!idlePendingSince) {
-    idlePendingSince = now
-    return
-  }
-  if (!live.paused && now - idlePendingSince >= IDLE_RECONCILE_MS && now - lastIdleReconcileAt >= IDLE_RECONCILE_MS) {
-    lastIdleReconcileAt = now
-    void syncFeed({ reconcilePending: true })
-  }
+  if (!live.paused && !syncRun && hasUnconfirmedPending(live.snapshotAt)) void syncFeed({ reconcilePending: true })
 })
 
 onEvent('resync', () => {
   live.resyncs += 1
   live.inFlight.clear()
-  idlePendingSince = 0
   if (!live.paused) void syncFeed({ reconcilePending: true })
 })
 
@@ -273,24 +256,30 @@ export function seedFeed(logs: RequestLogData[], opts?: { reconcilePending?: boo
   if (live.feed.length > MAX_FEED) live.feed.length = MAX_FEED
 }
 
-export async function syncFeed(opts?: { reconcilePending?: boolean }): Promise<number | null> {
-  if (syncing) {
+export function syncFeed(opts?: { reconcilePending?: boolean }): Promise<number | null> {
+  if (syncRun) {
+    // The running sync fetches once more after it lands, so every caller sees state newer than its call.
     syncQueued = true
-    return syncTotal
+    return syncRun
   }
-  syncing = true
-  const reconcilePending = opts?.reconcilePending ?? true
+  syncRun = runSync(opts?.reconcilePending ?? true).finally(() => {
+    syncRun = null
+  })
+  return syncRun
+}
+
+async function runSync(reconcilePending: boolean): Promise<number | null> {
+  let total: number | null = null
   try {
     do {
       syncQueued = false
-      const seq = ++syncSeq
       const snapshotAt = Date.now()
+      if (reconcilePending) lastReconcileAt = snapshotAt
       const res = await api.get<RequestLogData[]>('/logs', {
         pageSize: RESYNC_PAGE_SIZE,
         sort: 'createdAt',
         descending: true,
       })
-      if (seq !== syncSeq) continue
       let items = res.data
       if (reconcilePending && res.data.length >= RESYNC_PAGE_SIZE) {
         const returnedIds = new Set(res.data.map((r) => r.id))
@@ -304,18 +293,14 @@ export async function syncFeed(opts?: { reconcilePending?: boolean }): Promise<n
             sort: 'createdAt',
             descending: true,
           })
-          if (seq !== syncSeq) continue
           items = [...res.data, ...pendingRes.data.filter((r) => !returnedIds.has(r.id))]
         }
       }
-      syncTotal = res.meta.total ?? res.data.length
+      total = res.meta.total ?? res.data.length
       seedFeed(items, { reconcilePending, snapshotAt })
-      if (!hasPendingFeedItems()) idlePendingSince = 0
     } while (syncQueued && !live.paused)
-    return syncTotal
   } catch {
-    return null
-  } finally {
-    syncing = false
+    /* rows still arrive from events */
   }
+  return total
 }

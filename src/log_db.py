@@ -3672,6 +3672,10 @@ def finish_managed_search_request(
                 (response_body, handle.request_id),
             )
         conn.commit()
+    if request_events.active():
+        _publish_request_event("finished", {
+            "id": handle.request_id, "month": handle.db.month,
+        })
 
 
 def finish_success(
