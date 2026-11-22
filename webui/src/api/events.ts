@@ -63,7 +63,10 @@ function open(): void {
     eventLink.retries = 0
     eventLink.connectCount += 1
     armWatchdog()
-    if (eventLink.connectCount > 1) dispatch('resync', { reason: 'reconnect' }, new Date().toISOString())
+    // lastMessageAt still belongs to the previous connection: events after it were missed.
+    if (eventLink.connectCount > 1) {
+      dispatch('resync', { reason: 'reconnect', since: eventLink.lastMessageAt }, new Date().toISOString())
+    }
   }
   ws.onmessage = (msg) => {
     eventLink.lastMessageAt = Date.now()

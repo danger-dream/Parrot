@@ -1,7 +1,7 @@
 import { reactive, shallowReactive } from 'vue'
 import { api } from '@/api/client'
 import { onEvent } from '@/api/events'
-import type { ConcurrencyData, RequestLogData, RequestStartedEvent } from '@/api/types'
+import type { ConcurrencyData, RequestLogData, RequestStartedEvent, TimeSeriesData } from '@/api/types'
 
 export interface LiveRequest {
   id: string
@@ -28,6 +28,8 @@ const MAX_FEED = 400
 const RESYNC_PAGE_SIZE = 200
 // A pending row the server has not confirmed for this long is re-checked against /logs.
 const STALE_PENDING_MS = 60_000
+// Events a server-side resync dropped (queue overflow, failed enrichment) are this recent at most.
+const SERVER_RESYNC_GAP_MS = 2 * 60_000
 
 export const live = reactive({
   feed: [] as LiveRequest[],
@@ -43,6 +45,7 @@ export const live = reactive({
 
 let syncRun: Promise<number | null> | null = null
 let syncQueued = false
+let pendingCheck: Promise<void> | null = null
 // Start of the latest reconcile attempt; rows are not re-checked within STALE_PENDING_MS of it.
 let lastReconcileAt = 0
 
@@ -83,10 +86,11 @@ window.setInterval(() => {
   qps.version += 1
 }, 1000)
 
-export function seedQps(points: { t: string; total: number; errorCount: number }[], bucketSeconds: number): void {
+export function seedQps(points: { t: string; total: number; errorCount: number }[], bucketSeconds: number, sinceMs = 0): void {
   // Spread minute buckets from the time-series endpoint evenly across their seconds.
   for (const p of points) {
     const start = Math.floor(new Date(p.t).getTime() / 1000)
+    if ((start + bucketSeconds) * 1000 <= sinceMs) continue
     for (let s = 0; s < bucketSeconds; s++) {
       const idx = start + s - qps.origin
       if (idx < 0 || idx >= WINDOW_SECONDS) continue
@@ -175,28 +179,81 @@ onEvent('request.updated', (e) => {
   if (!live.paused && live.feed.some((r) => r.id === e.id)) pushFeed(next)
 })
 
-onEvent('request.finished', ({ log }) => {
+onEvent('request.finished', ({ log, stale }) => {
   const prev = live.inFlight.get(log.id)
   live.inFlight.delete(log.id)
   const item = fromLog(log, prev)
-  live.finished += 1
-  const ok = log.status === 'success'
-  if (!ok) live.failed += 1
-  count(ok, Date.now())
+  // A stale-pending sweep settles a request that stopped long ago; it is not a completion now.
+  if (!stale) {
+    live.finished += 1
+    const ok = log.status === 'success'
+    if (!ok) live.failed += 1
+    count(ok, Date.now())
+  }
   if (!live.paused) pushFeed(item)
 })
 
 onEvent('runtime.snapshot', (data) => {
   live.snapshot = data
   live.snapshotAt = Date.now()
-  if (!live.paused && !syncRun && hasUnconfirmedPending(live.snapshotAt)) void syncFeed({ reconcilePending: true })
+  if (!syncRun && !pendingCheck && hasUnconfirmedPending(live.snapshotAt)) void checkPending()
 })
 
-onEvent('resync', () => {
+onEvent('resync', (data) => {
   live.resyncs += 1
-  live.inFlight.clear()
-  if (!live.paused) void syncFeed({ reconcilePending: true })
+  void reseedQps(data.since || Date.now() - SERVER_RESYNC_GAP_MS)
+  // A paused list stays frozen; only the in-flight set follows the server.
+  if (live.paused) void checkPending()
+  else void syncFeed({ reconcilePending: true })
 })
+
+async function reseedQps(sinceMs: number): Promise<void> {
+  try {
+    const res = await api.get<TimeSeriesData>('/stats/timeseries', { range: '1h', bucket: 'minute' })
+    seedQps(res.data.series.find((s) => s.key === 'total')?.points || [], res.data.bucketSeconds || 60, sinceMs)
+  } catch {
+    /* the curve keeps its gap */
+  }
+}
+
+/** Confirm local pending rows against the server's pending list; a full sync only when they disagree. */
+function checkPending(): Promise<void> {
+  if (!pendingCheck) {
+    pendingCheck = runPendingCheck().finally(() => {
+      pendingCheck = null
+    })
+  }
+  return pendingCheck
+}
+
+async function runPendingCheck(): Promise<void> {
+  const snapshotAt = Date.now()
+  lastReconcileAt = snapshotAt
+  let res: { data: RequestLogData[] }
+  try {
+    res = await api.get<RequestLogData[]>('/logs', {
+      status: 'pending',
+      pageSize: RESYNC_PAGE_SIZE,
+      sort: 'createdAt',
+      descending: true,
+    })
+  } catch {
+    return
+  }
+  const active = new Set(res.data.map((r) => r.id))
+  // A full page may leave out older pending requests, so absence from it proves nothing.
+  const complete = res.data.length < RESYNC_PAGE_SIZE
+  const local = [...live.feed.filter((r) => r.status === 'pending'), ...live.inFlight.values()]
+  const ended = complete ? local.filter((r) => r.receivedAt < snapshotAt && !active.has(r.id)).map((r) => r.id) : []
+  const unseen = res.data.filter((r) => !live.inFlight.has(r.id) && !live.feed.some((f) => f.id === r.id))
+  if (!ended.length && !unseen.length) return
+  if (!live.paused) {
+    await syncFeed({ reconcilePending: true })
+    return
+  }
+  for (const id of ended) live.inFlight.delete(id)
+  for (const log of unseen) live.inFlight.set(log.id, fromLog(log, undefined, 0))
+}
 
 export function seedFeed(logs: RequestLogData[], opts?: { reconcilePending?: boolean; snapshotAt?: number }): void {
   const reconcilePending = Boolean(opts?.reconcilePending)

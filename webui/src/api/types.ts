@@ -122,9 +122,10 @@ export interface ServerEventMap {
   hello: { serverTime: string; version: string; sessionExpiresAt: string }
   'request.started': RequestStartedEvent
   'request.updated': RequestUpdatedEvent
-  'request.finished': { log: RequestLogData }
+  'request.finished': { log: RequestLogData; stale?: boolean }
   'runtime.snapshot': ConcurrencyData
-  resync: { reason?: 'overflow' | 'enrichmentFailed' | 'reconnect' }
+  // `since` (epoch ms) is set by the client on reconnect: events after it were missed.
+  resync: { reason?: 'overflow' | 'enrichmentFailed' | 'reconnect'; since?: number }
   'notification.created': Record<string, never>
   ping: Record<string, never>
 }

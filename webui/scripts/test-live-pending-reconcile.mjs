@@ -126,6 +126,9 @@ function createHarness({ onGet } = {}) {
     advanceNow(ms) {
       now += ms
     },
+    runIntervals() {
+      for (const entry of Array.from(timers.values())) if (entry.kind === 'interval') entry.fn()
+    },
     runPendingRetryTimers() {
       for (const [id, entry] of Array.from(timers.entries())) {
         if (entry.kind === 'timeout' && entry.delay < 60_000) {
@@ -209,6 +212,7 @@ test('websocket reconnect dispatches resync and reconciles missed request.finish
   ]
   const h = createHarness({
     async onGet(path) {
+      if (path === '/stats/timeseries') return { data: { bucketSeconds: 60, series: [] } }
       assert.equal(path, '/logs')
       return { data: logs, meta: { total: logs.length } }
     },
@@ -244,7 +248,7 @@ test('websocket reconnect dispatches resync and reconciles missed request.finish
   await settled()
 
   assert.equal(h.liveStore.live.resyncs, 1)
-  assert.equal(h.getCalls.length, 1)
+  assert.equal(h.getCalls.filter((c) => c.path === '/logs').length, 1)
   assert.equal(h.liveStore.live.inFlight.size, 0)
   assert.deepEqual(
     h.liveStore.live.feed.map((r) => [r.id, r.status]),
@@ -361,7 +365,8 @@ test('reconcilePending queries status=pending when 200 newer logs push an active
 
 test('pending rows unconfirmed for a minute are reconciled even while the server stays busy', async () => {
   const h = createHarness({
-    async onGet() {
+    async onGet(path, query) {
+      if (query?.status === 'pending') return { data: [], meta: { total: 0 } }
       return { data: [makeLog({ id: 'orphan-1', status: 'success' })], meta: { total: 1 } }
     },
   })
@@ -395,7 +400,8 @@ test('pending rows unconfirmed for a minute are reconciled even while the server
   ws.emitMessage({ type: 'runtime.snapshot', data: makeSnapshot(3) })
   await settled()
 
-  assert.equal(h.getCalls.length, 1)
+  // The pending list no longer has it, so one full sync fetches its terminal record.
+  assert.deepEqual(h.getCalls.map((c) => c.query.status ?? 'all'), ['pending', 'all'])
   assert.equal(h.liveStore.live.inFlight.size, 0)
   assert.equal(h.liveStore.live.feed[0].status, 'success')
 })
@@ -447,6 +453,8 @@ test('rows the server still reports as pending are re-checked at most once a min
   ws.emitMessage({ type: 'runtime.snapshot', data: makeSnapshot(0) })
   await settled()
   assert.equal(h.getCalls.length, 2)
+  // A request that is still running is confirmed by the pending list alone.
+  assert.ok(h.getCalls.every((c) => c.query.status === 'pending'))
 })
 
 test('concurrent syncFeed calls share one run and resolve with the latest total', async () => {
@@ -474,42 +482,97 @@ test('concurrent syncFeed calls share one run and resolve with the latest total'
   assert.equal(h.liveStore.live.feed[0].id, 'late-1')
 })
 
-test('paused live stream ignores resync fetches until resumed', async () => {
+test('paused resync refreshes only the in-flight set and leaves the frozen list for resume', async () => {
   const h = createHarness({
-    async onGet() {
-      return { data: [makeLog({ id: 'ghost-paused', status: 'success' })], meta: { total: 1 } }
+    async onGet(path, query) {
+      if (path === '/stats/timeseries') return { data: { bucketSeconds: 60, series: [] } }
+      if (query?.status === 'pending') {
+        return {
+          data: [
+            makeLog({ id: 'running-1', status: 'pending', durationMilliseconds: null }),
+            makeLog({ id: 'missed-start', status: 'pending', durationMilliseconds: null }),
+          ],
+          meta: { total: 2 },
+        }
+      }
+      return {
+        data: [
+          makeLog({ id: 'ghost-paused', status: 'success' }),
+          makeLog({ id: 'running-1', status: 'pending', durationMilliseconds: null }),
+          makeLog({ id: 'missed-start', status: 'pending', durationMilliseconds: null }),
+        ],
+        meta: { total: 3 },
+      }
     },
   })
 
   h.events.connectEvents()
   const ws = h.sockets[0]
   ws.emitOpen()
-  ws.emitMessage({
-    type: 'request.started',
-    data: {
-      id: 'ghost-paused',
-      createdAt: '2026-11-21T04:08:21Z',
-      apiKeyName: 'gemini',
-      requestedModel: 'gemini-4-neon-xhigh',
-      protocol: 'chat',
-      isStream: true,
-      clientIp: null,
-      reasoningEffort: null,
-      fastMode: null,
-    },
-  })
+  for (const id of ['ghost-paused', 'running-1']) {
+    ws.emitMessage({
+      type: 'request.started',
+      data: {
+        id,
+        createdAt: '2026-11-21T04:08:21Z',
+        apiKeyName: 'gemini',
+        requestedModel: 'gemini-4-neon-xhigh',
+        protocol: 'chat',
+        isStream: true,
+        clientIp: null,
+        reasoningEffort: null,
+        fastMode: null,
+      },
+    })
+  }
 
   h.liveStore.live.paused = true
+  h.advanceNow(100)
   ws.emitMessage({ type: 'resync', data: { reason: 'overflow' } })
   await settled()
-  assert.equal(h.getCalls.length, 0)
-  assert.equal(h.liveStore.live.feed[0].status, 'pending')
+  // In-flight follows the server: the finished ghost leaves, the one whose start was dropped joins.
+  assert.deepEqual([...h.liveStore.live.inFlight.keys()].sort(), ['missed-start', 'running-1'])
+  assert.ok(h.getCalls.filter((c) => c.path === '/logs').every((c) => c.query.status === 'pending'))
+  assert.deepEqual(
+    h.liveStore.live.feed.map((r) => [r.id, r.status]),
+    [['running-1', 'pending'], ['ghost-paused', 'pending']],
+  )
 
   h.liveStore.live.paused = false
   await h.liveStore.syncFeed({ reconcilePending: true })
-  assert.equal(h.getCalls.length, 1)
-  assert.equal(h.liveStore.live.feed[0].status, 'success')
-  assert.equal(h.liveStore.live.inFlight.size, 0)
+  assert.equal(h.liveStore.live.feed.find((r) => r.id === 'ghost-paused').status, 'success')
+  assert.deepEqual([...h.liveStore.live.inFlight.keys()].sort(), ['missed-start', 'running-1'])
+})
+
+test('a reconnect fills the QPS gap from the server time series without touching earlier minutes', async () => {
+  const base = Math.floor(1_700_000_000_000 / 1000)
+  const point = (sec, total, errorCount) => ({ t: new Date(sec * 1000).toISOString(), total, errorCount })
+  const h = createHarness({
+    async onGet(path) {
+      if (path === '/stats/timeseries') {
+        return { data: { bucketSeconds: 60, series: [{ key: 'total', points: [point(base - 300, 60, 0), point(base + 30, 60, 6)] }] } }
+      }
+      return { data: [], meta: { total: 0 } }
+    },
+  })
+
+  h.events.connectEvents()
+  h.sockets[0].emitOpen()
+  h.sockets[0].emitMessage({ type: 'ping', data: {} })
+  // Two minutes pass with the socket gone; the window keeps moving.
+  h.advanceNow(120_000)
+  h.runIntervals()
+  h.sockets[0].emitClose(1006, 'network blip')
+  h.runPendingRetryTimers()
+  h.sockets[1].emitOpen()
+  await settled()
+
+  const qps = h.liveStore.qps
+  const sum = (arr, fromSec) => Math.round(arr.slice(fromSec - qps.origin, fromSec - qps.origin + 60).reduce((a, b) => a + b, 0))
+  assert.equal(h.getCalls.filter((c) => c.path === '/stats/timeseries').length, 1)
+  assert.equal(sum(qps.ok, base + 30), 54)
+  assert.equal(sum(qps.err, base + 30), 6)
+  assert.equal(sum(qps.ok, base - 300), 0)
 })
 
 test('disconnectEvents resets connectCount so next login does not emit spurious reconnect resync', async () => {
@@ -523,4 +586,38 @@ test('disconnectEvents resets connectCount so next login does not emit spurious 
   h.sockets[1].emitOpen()
   await settled()
   assert.equal(h.liveStore.live.resyncs, 0)
+})
+
+test('stale finished events settle the row without counting a completion', () => {
+  const h = createHarness()
+  h.events.connectEvents()
+  const ws = h.sockets[0]
+  ws.emitOpen()
+  ws.emitMessage({
+    type: 'request.started',
+    data: {
+      id: 'stale-1',
+      createdAt: '2026-11-21T04:08:21Z',
+      apiKeyName: 'gemini',
+      requestedModel: 'gemini-4-neon-xhigh',
+      protocol: 'chat',
+      isStream: true,
+      clientIp: null,
+      reasoningEffort: null,
+      fastMode: null,
+    },
+  })
+  const errors = () => h.liveStore.qps.err.reduce((a, b) => a + b, 0)
+
+  ws.emitMessage({ type: 'request.finished', data: { log: makeLog({ id: 'stale-1', status: 'error' }), stale: true } })
+  assert.equal(h.liveStore.live.feed[0].status, 'error')
+  assert.equal(h.liveStore.live.inFlight.size, 0)
+  assert.equal(h.liveStore.live.finished, 0)
+  assert.equal(h.liveStore.live.failed, 0)
+  assert.equal(errors(), 0)
+
+  ws.emitMessage({ type: 'request.finished', data: { log: makeLog({ id: 'live-1', status: 'error' }) } })
+  assert.equal(h.liveStore.live.finished, 1)
+  assert.equal(h.liveStore.live.failed, 1)
+  assert.equal(errors(), 1)
 })
