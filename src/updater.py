@@ -49,7 +49,7 @@ import threading
 import time
 from typing import Optional
 
-from . import __version__, config, network, notifier, source_integrity, state_db
+from . import __version__, config, notifier, source_integrity, state_db
 from . import update_supervisor
 
 
@@ -288,19 +288,23 @@ def _health_url() -> str:
 
 
 def wait_healthy(timeout: int = 90) -> tuple[bool, str]:
-    """轮询 /health 直到 200 或超时。返回 (ok, detail)。"""
+    """轮询本机 /health 直到 200 或超时（始终直连，不走全局/环境代理）。返回 (ok, detail)。"""
+    import httpx
+
     url = _health_url()
     deadline = time.time() + timeout
     last = ""
-    while time.time() < deadline and not _stopping.is_set():
-        try:
-            resp = network.get_sync(url, timeout=5)
-            if resp.status_code == 200:
-                return True, "health 200"
-            last = f"http {resp.status_code}"
-        except Exception as exc:
-            last = type(exc).__name__
-        _stopping.wait(0.2)
+    with httpx.Client(trust_env=False, timeout=5) as client:
+        while time.time() < deadline and not _stopping.is_set():
+            req_timeout = max(0.1, min(5.0, deadline - time.time()))
+            try:
+                resp = client.get(url, timeout=req_timeout)
+                if resp.status_code == 200:
+                    return True, "health 200"
+                last = f"http {resp.status_code}"
+            except Exception as exc:
+                last = type(exc).__name__
+            _stopping.wait(0.2)
     return False, f"health timeout ({last})"
 
 

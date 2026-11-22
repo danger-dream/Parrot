@@ -876,3 +876,73 @@ class TestSilentIdleAutoUpdate:
         update_checker._check_once(push=True)
         assert len(notifications) == 1 and "升级安全检查未通过" in notifications[0]
         assert updater.load_state()["stage"] == updater.STAGE_IDLE
+
+
+class TestWaitHealthy:
+    def test_wait_healthy_bypasses_default_and_env_proxy(self, monkeypatch):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/health":
+                    body = b'{"status":"ok"}'
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            config.update(lambda c: (
+                c.__setitem__("listen", {"host": "127.0.0.1", "port": port}),
+                c.__setitem__("network", {
+                    "proxies": {"broken": {"type": "socks5", "url": "socks5://127.0.0.1:1"}},
+                    "routing": {"default": "broken", "directFallback": False, "channels": {}},
+                }),
+            ))
+            monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+            monkeypatch.setenv("ALL_PROXY", "socks5://127.0.0.1:1")
+
+            ok, detail = updater.wait_healthy(timeout=3)
+            assert (ok, detail) == (True, "health 200")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(2)
+
+    def test_wait_healthy_reports_last_http_status_on_timeout(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(503)
+                self.end_headers()
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            config.update(lambda c: c.__setitem__("listen", {"host": "127.0.0.1", "port": port}))
+            ok, detail = updater.wait_healthy(timeout=0.4)
+            assert ok is False
+            assert detail == "health timeout (http 503)"
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(2)
