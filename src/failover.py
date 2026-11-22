@@ -2676,6 +2676,8 @@ async def run_failover(
     transient_retries_used = 0
     # Same-channel retries granted by error rules, per (rule, channel).
     rule_progress: dict[tuple[str, str], list[int]] = {}
+    # Pass-through rules run their steps once per (rule, channel) in a request; retries only count.
+    passthrough_ran: set[tuple[str, str]] = set()
     # Client-facing answer of the rule that handled the latest failed attempt.
     last_rule_response: dict | None = None
     refreshed_once: set[str] = set()
@@ -3085,6 +3087,122 @@ async def run_failover(
                 retry_count += 1
                 continue
 
+        # Same-channel recoveries also go before the rules: a rule sees the attempt
+        # only when no recovery applies or the recovery was already used.
+        # 下游请求内容错误（例如坏 encrypted_content）：对坏 EC 做一次同渠道降级重试：
+        # 剥掉本次请求 input 里的 encrypted_content，让下游 transcript owner 在成功
+        # 响应中拿到新的 EC。
+        if (
+            result.outcome == "request_invalid"
+            and not zhipu_body_started
+            and _invalid_ec_cleanup_retry_allowed(
+                body, result.error_detail or "invalid request", cfg, retried_without_encrypted_content,
+            )
+        ):
+            cleared_replay = _maybe_clear_codex_reasoning_replay(result.translator_ctx)
+            retry_body, removed_ec = _retry_body_without_encrypted_content(body)
+            if removed_ec > 0 or cleared_replay:
+                retried_without_encrypted_content = True
+                body = retry_body
+                retry_count += 1
+                print(
+                    f"[failover] invalid encrypted_content for {ch.key}/{resolved_model}; "
+                    f"retrying same channel without {removed_ec} encrypted_content item(s)"
+                )
+                continue
+
+        # The terminal branches below settle these before a recovery could apply.
+        recovery_closed = (
+            zhipu_body_started
+            or result.outcome in ("guard_error", "request_invalid")
+            or (ag_signal is not None and ag_signal["classification"] == "validation_required")
+        )
+
+        # Only a raw request-setup model 401 may reject a PAT. A mapped 2xx
+        # business error/SSE error is already response-body and cannot replay.
+        zhipu_pat_failed = False
+        if not recovery_closed and getattr(ch, "provider", "") == "zhipu":
+            from .oauth.zhipu import runtime as zhipu_runtime
+            from .oauth.zhipu.response import replayable_rejection
+            observed = (result.translator_ctx or {}).get("zhipu_auth") or {}
+            if (not zhipu_pat_retried and observed.get("mode") == "oauth"
+                    and replayable_rejection(result) and quota_exhaustion is None
+                    and _recovery_retry_allowed("oauthRefresh", cfg)
+                    and os.environ.get("PARROT_NO_REFRESH") != "1"
+                    and getattr(getattr(result, "error_advice", None), "kind", "") not in {
+                        "usage_limit", "quota", "entitlement", "rate_limit"}):
+                zhipu_pat_retried = True
+                try:
+                    await asyncio.to_thread(zhipu_runtime.recover_project_token, ch.account_key, observed)
+                    retry_count += 1
+                    continue  # Rebuild body/auth/signer; request context survives.
+                except Exception:
+                    # Management auth errors set relogin_required under CAS;
+                    # neither those nor a network failure prove model rejection
+                    # of a newly issued token. Never disable based on the old 401.
+                    zhipu_pat_failed = True
+
+        # 未发首包失败：判断是否 OAuth 401/403 可刷一次
+        if (
+            not recovery_closed
+            and _recovery_retry_allowed("oauthRefresh", cfg)
+            and os.environ.get("PARROT_NO_REFRESH") != "1"
+            and ch.type == "oauth"
+            and getattr(ch, "provider", "") != "zhipu"
+            and result.http_status in (401, 403)
+            and (getattr(ch, "provider", "") not in {"workbuddy", "qoder"} or result.http_status == 401)
+            and not result.openai_oauth_html_403
+            and quota_exhaustion is None
+            and getattr(getattr(result, "error_advice", None), "kind", "") not in {
+                "usage_limit", "quota", "entitlement", "rate_limit",
+            }
+            and ch.key not in refreshed_once
+        ):
+            refreshed_once.add(ch.key)
+            ak = getattr(ch, "account_key", None) or getattr(ch, "email", "")
+            notification_observation = reporting.observation(ak)
+            try:
+                expected = getattr(ch, "state_key", None)
+                observed = (result.translator_ctx or {}).get("oauth_refresh")
+                await oauth_manager.force_refresh(ak, **({"expected_state_key": expected} if expected else {}),
+                                                  **({"observation": observed} if observed else {}))
+                with oauth_manager.account_generation_guard(expected) as current:
+                    if not current:
+                        raise ValueError("OAuth account generation was deleted")
+                print(f"[failover] OAuth 401/403 on {ch.key}, refreshed; retrying same channel")
+                retry_count += 1
+                continue
+            except Exception as exc:
+                print(f"[failover] OAuth refresh failed for {ch.key}: {exc}")
+                with oauth_manager.account_generation_guard(getattr(ch, "state_key", None)) as current:
+                    if not current:
+                        retry_count += 1
+                        idx += 1
+                        continue
+                from . import oauth_refresh_failure
+                refresh_error, effect = oauth_refresh_failure.apply(
+                    ak, exc, expected_state_key=getattr(ch, "state_key", None), provider=getattr(ch, "provider", ""),
+                    observation=(result.translator_ctx or {}).get("oauth_refresh"))
+                if effect is not None:
+                    reporting.refresh_failed(ak, refresh_error, effect, source="request", observation=notification_observation)
+                # fallthrough 到规则与普通失败处理
+
+        # 自动透传的 1M entitlement 不足不是渠道故障：同渠道去掉 context-1m
+        # 重试一次；渠道明确强制 1M 时不能反向撤销该兼容策略。
+        context_retry_key = (ch.key, resolved_model)
+        if (
+            not recovery_closed
+            and _recovery_retry_allowed("claudeContext1mFallback", cfg)
+            and not _channel_forces_context_1m(ch, resolved_model)
+            and _is_context_1m_credit_error(result, resolved_model, body)
+            and context_retry_key not in retried_without_context_1m
+        ):
+            retried_without_context_1m.add(context_retry_key)
+            body = _retry_body_without_context_1m(body)
+            print(f"[failover] context-1m rejected for {ch.key}/{resolved_model}; retrying same channel without context-1m")
+            retry_count += 1
+            continue
+
         if rule_match is not None:
             try:
                 # Labelled only now: the protocol recoveries above may take the attempt first.
@@ -3097,6 +3215,9 @@ async def run_failover(
                         error_rule_effects.record_hit(ch, resolved_model, observer, rule_obs,
                                                       message=result.error_detail or "",
                                                       connect_ms=_scorer_connect_ms(result))
+                        if (observer.id, ch.key) in passthrough_ran:
+                            continue
+                        passthrough_ran.add((observer.id, ch.key))
                         error_rule_effects.run_steps(ch, resolved_model, observer, rule_obs,
                                                      [s for s in observer.steps if s["type"] != "retry"],
                                                      message=result.error_detail or "",
@@ -3158,25 +3279,9 @@ async def run_failover(
                 headers=errors.NO_RETRY_HEADERS if errors.is_non_retryable_http_status(status) else None,
             )
 
-        # 下游请求内容错误（例如坏 encrypted_content）：不要冷却渠道。
-        # 对坏 EC 做一次同渠道降级重试：剥掉本次请求 input 里的 encrypted_content，
-        # 让下游 transcript owner 在成功响应中拿到新的 EC；失败则返回 400。
+        # 下游请求内容错误：不要冷却渠道；坏 EC 的降级重试已在规则之前做过，这里返回 400。
         if result.outcome == "request_invalid":
             msg = result.error_detail or "invalid request"
-            if not zhipu_body_started and _invalid_ec_cleanup_retry_allowed(
-                body, msg, cfg, retried_without_encrypted_content,
-            ):
-                cleared_replay = _maybe_clear_codex_reasoning_replay(result.translator_ctx)
-                retry_body, removed_ec = _retry_body_without_encrypted_content(body)
-                if removed_ec > 0 or cleared_replay:
-                    retried_without_encrypted_content = True
-                    body = retry_body
-                    retry_count += 1
-                    print(
-                        f"[failover] invalid encrypted_content for {ch.key}/{resolved_model}; "
-                        f"retrying same channel without {removed_ec} encrypted_content item(s)"
-                    )
-                    continue
             transient_kind = retryable_transient_error_kind(ch, result)
             if (
                 transient_retries_used < transient_retry_limit
@@ -3243,92 +3348,14 @@ async def run_failover(
             idx += 1
             continue
 
-        # Only a raw request-setup model 401 may reject a PAT. A mapped 2xx
-        # business error/SSE error is already response-body and cannot replay.
+        # The PAT recovery ran before the rules; a 401 it did not resolve marks the model.
         if getattr(ch, "provider", "") == "zhipu":
             from .oauth.zhipu import runtime as zhipu_runtime
-            from .oauth.zhipu.response import replayable_rejection
             observed = (result.translator_ctx or {}).get("zhipu_auth") or {}
-            failed_recovery = False
-            if (not zhipu_pat_retried and observed.get("mode") == "oauth"
-                    and replayable_rejection(result) and quota_exhaustion is None
-                    and _recovery_retry_allowed("oauthRefresh", cfg)
-                    and os.environ.get("PARROT_NO_REFRESH") != "1"
-                    and getattr(getattr(result, "error_advice", None), "kind", "") not in {
-                        "usage_limit", "quota", "entitlement", "rate_limit"}):
-                zhipu_pat_retried = True
-                try:
-                    await asyncio.to_thread(zhipu_runtime.recover_project_token, ch.account_key, observed)
-                    retry_count += 1
-                    continue  # Rebuild body/auth/signer; request context survives.
-                except Exception:
-                    # Management auth errors set relogin_required under CAS;
-                    # neither those nor a network failure prove model rejection
-                    # of a newly issued token. Never disable based on the old 401.
-                    failed_recovery = True
-            if (not failed_recovery and not observed.get("quota")
+            if (not zhipu_pat_failed and not observed.get("quota")
                     and result.http_status == 401 and not result.stream_started
                     and observed.get("status") == 401 and observed.get("phase") == "request_setup"):
                 await asyncio.to_thread(zhipu_runtime.mark_model_auth_error, ch, observed)
-
-        # 未发首包失败：判断是否 OAuth 401/403 可刷一次
-        if (
-            _recovery_retry_allowed("oauthRefresh", cfg)
-            and os.environ.get("PARROT_NO_REFRESH") != "1"
-            and ch.type == "oauth"
-            and getattr(ch, "provider", "") != "zhipu"
-            and result.http_status in (401, 403)
-            and (getattr(ch, "provider", "") not in {"workbuddy", "qoder"} or result.http_status == 401)
-            and not result.openai_oauth_html_403
-            and quota_exhaustion is None
-            and getattr(getattr(result, "error_advice", None), "kind", "") not in {
-                "usage_limit", "quota", "entitlement", "rate_limit",
-            }
-            and ch.key not in refreshed_once
-        ):
-            refreshed_once.add(ch.key)
-            ak = getattr(ch, "account_key", None) or getattr(ch, "email", "")
-            notification_observation = reporting.observation(ak)
-            try:
-                expected = getattr(ch, "state_key", None)
-                observed = (result.translator_ctx or {}).get("oauth_refresh")
-                await oauth_manager.force_refresh(ak, **({"expected_state_key": expected} if expected else {}),
-                                                  **({"observation": observed} if observed else {}))
-                with oauth_manager.account_generation_guard(expected) as current:
-                    if not current:
-                        raise ValueError("OAuth account generation was deleted")
-                print(f"[failover] OAuth 401/403 on {ch.key}, refreshed; retrying same channel")
-                retry_count += 1
-                continue
-            except Exception as exc:
-                print(f"[failover] OAuth refresh failed for {ch.key}: {exc}")
-                with oauth_manager.account_generation_guard(getattr(ch, "state_key", None)) as current:
-                    if not current:
-                        retry_count += 1
-                        idx += 1
-                        continue
-                from . import oauth_refresh_failure
-                refresh_error, effect = oauth_refresh_failure.apply(
-                    ak, exc, expected_state_key=getattr(ch, "state_key", None), provider=getattr(ch, "provider", ""),
-                    observation=(result.translator_ctx or {}).get("oauth_refresh"))
-                if effect is not None:
-                    reporting.refresh_failed(ak, refresh_error, effect, source="request", observation=notification_observation)
-                # fallthrough 到普通失败处理
-
-        # 自动透传的 1M entitlement 不足不是渠道故障：同渠道去掉 context-1m
-        # 重试一次；渠道明确强制 1M 时不能反向撤销该兼容策略。
-        context_retry_key = (ch.key, resolved_model)
-        if (
-            _recovery_retry_allowed("claudeContext1mFallback", cfg)
-            and not _channel_forces_context_1m(ch, resolved_model)
-            and _is_context_1m_credit_error(result, resolved_model, body)
-            and context_retry_key not in retried_without_context_1m
-        ):
-            retried_without_context_1m.add(context_retry_key)
-            body = _retry_body_without_context_1m(body)
-            print(f"[failover] context-1m rejected for {ch.key}/{resolved_model}; retrying same channel without context-1m")
-            retry_count += 1
-            continue
 
         # OpenAI server_is_overloaded/server_error, Claude overloaded_error/529,
         # and direct xAI 503 are explicit transient signals.  The slot is already
@@ -3990,16 +4017,16 @@ def _note_large_request_body(
     budget = upload_budget_seconds(size, connection=connect_timeout, min_kbps=min_kbps)
     if budget <= connect_timeout:
         return
-    size_mb = round(size / 1048576, 1)
-    print(f"[upload] {api_key_name or '-'} → {ch.key}/{resolved_model}: request body {size_mb} MB, "
-          f"upload allowed {budget:.0f}s at ≥{min_kbps:g} KB/s")
-    # The notification store dedupes too; this only avoids a store transaction
-    # for every turn of a long conversation that keeps resending the body.
+    # A long conversation resends the same growing body every turn: log and notify
+    # once per key and model per window (the notification store dedupes again).
     key = (str(api_key_name or ""), str(resolved_model))
     now = time.monotonic()
     if now - _large_body_noticed.get(key, -_LARGE_BODY_NOTICE_GAP_S) < _LARGE_BODY_NOTICE_GAP_S:
         return
     _large_body_noticed[key] = now
+    size_mb = round(size / 1048576, 1)
+    print(f"[upload] {api_key_name or '-'} → {ch.key}/{resolved_model}: request body {size_mb} MB, "
+          f"upload allowed {budget:.0f}s at ≥{min_kbps:g} KB/s")
     notifications.large_request_body(
         model=resolved_model, api_key_name=api_key_name, request_id=request_id,
         size_mb=size_mb, upload_seconds=int(round(budget)),

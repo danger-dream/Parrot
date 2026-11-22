@@ -38,6 +38,7 @@ DestroyContext = Annotated[ManagementContext, Depends(require_capability(Capabil
 Controls = Annotated[SystemNetworkControls, Depends(get_bound_system_network_controls)]
 IfMatch = Annotated[str | None, Header(alias="If-Match")]
 RuleId = Annotated[str, Path(alias="ruleId", min_length=1, max_length=64)]
+InvalidRuleKey = Annotated[str, Path(alias="key", pattern=r"^[0-9a-f]{16}$")]
 
 _RULE_EXAMPLE = {
     "id": "rule-1a2b3c4d",
@@ -89,6 +90,7 @@ def _data(snap, controls: SystemNetworkControls) -> ErrorRulesData:
     return ErrorRulesData.model_validate({
         "enabled": snap.enabled,
         "rules": list(snap.rules),
+        "invalidRules": list(snap.invalid),
         "presets": list(snap.presets),
         "builtins": controls.error_rules.builtins(),
         "categories": controls.error_rules.categories(),
@@ -144,6 +146,13 @@ def update_error_rule(rule_id: RuleId, body: ErrorRuleInput, request: Request, c
 def delete_error_rule(rule_id: RuleId, request: Request, context: DestroyContext, controls: Controls,
                       if_match: IfMatch = None):
     snap = controls.error_rules.delete_rule(context, rule_id, expected_revision=if_match)
+    return DataEnvelope(data=_data(snap, controls), meta=response_meta(request))
+
+
+@_route("/error-rules/invalid-rules/{key}", "delete", "deleteInvalidErrorRule")
+def delete_invalid_error_rule(key: InvalidRuleKey, request: Request, context: DestroyContext, controls: Controls,
+                              if_match: IfMatch = None):
+    snap = controls.error_rules.delete_invalid_rule(context, key, expected_revision=if_match)
     return DataEnvelope(data=_data(snap, controls), meta=response_meta(request))
 
 

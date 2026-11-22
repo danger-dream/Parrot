@@ -658,12 +658,15 @@ async def test_precommit_cancel_closes_owned_context_persists_cancel_and_rethrow
 class _SlowUploadContext(_Context):
     """Connects at once, then spends ``upload_seconds`` sending the body."""
 
-    def __init__(self, request, *, upload_seconds: float) -> None:
+    def __init__(self, request, *, upload_seconds: float, connect_seconds: float = 0.0) -> None:
         super().__init__(request)
         self.write_timeout = request.write_timeout
         self.upload_seconds = float(upload_seconds)
+        self.connect_seconds = float(connect_seconds)
 
     async def __aenter__(self):
+        if self.connect_seconds:
+            await asyncio.sleep(self.connect_seconds)
         await self.trace("http11.send_request_headers.started", {})
         await self.trace("http11.send_request_headers.complete", {})
         await self.trace("http11.send_request_body.started", {})
@@ -674,7 +677,7 @@ class _SlowUploadContext(_Context):
         return self.response
 
 
-def _slow_upload_kwargs(monkeypatch, contexts, *, upload_seconds):
+def _slow_upload_kwargs(monkeypatch, contexts, *, upload_seconds, connect_seconds=0.0):
     _patch_persistence(monkeypatch)
     monkeypatch.setattr(
         http_runtime, "_resolve_http_route_chain",
@@ -682,7 +685,7 @@ def _slow_upload_kwargs(monkeypatch, contexts, *, upload_seconds):
     )
 
     def open_stream(client, request):
-        ctx = _SlowUploadContext(request, upload_seconds=upload_seconds)
+        ctx = _SlowUploadContext(request, upload_seconds=upload_seconds, connect_seconds=connect_seconds)
         contexts.append(ctx)
         return ctx
 
@@ -718,6 +721,44 @@ async def test_stalled_upload_reports_upload_timeout_with_body_size(monkeypatch)
     assert opened.error is not None
     assert opened.error.outcome == "upload_timeout"
     assert "MB request body not fully sent within" in opened.error.error_detail
+
+
+@pytest.mark.asyncio
+async def test_small_body_keeps_one_connect_deadline_for_connecting_and_uploading(monkeypatch):
+    contexts = []
+    kwargs = _slow_upload_kwargs(monkeypatch, contexts, upload_seconds=0.03, connect_seconds=0.04)
+    # 300 bytes at 1 MB/s fit inside the 0.05s connect timeout: no separate upload budget.
+    monkeypatch.setattr(http_runtime, "upload_min_kbps", lambda: 1024.0)
+
+    opened = await http_runtime.open_response_with_proxy_chain(**kwargs)
+
+    # 0.04s connecting + 0.03s uploading overruns the single 0.05s deadline, as before upload budgets.
+    assert opened.error is not None and opened.error.outcome == "connection_timeout"
+    assert contexts[0].write_timeout == 30.0
+
+
+def test_small_body_has_no_separate_upload_budget():
+    from src.transports.timing import RoundTimeouts
+
+    base = RoundTimeouts.from_config({"connect": 30})
+    assert base.with_upload_body(1024, 256).upload is None
+    assert base.with_upload_body(47 * 1024 * 1024, 256).upload == pytest.approx(188)
+
+
+def test_large_body_is_logged_and_notified_once_per_key_and_model(monkeypatch, capsys):
+    from src import failover
+
+    noticed = []
+    monkeypatch.setattr(failover, "_large_body_noticed", {})
+    monkeypatch.setattr(failover, "upload_min_kbps", lambda: 256.0)
+    monkeypatch.setattr(failover.notifications, "large_request_body", lambda **kw: noticed.append(kw))
+    channel = SimpleNamespace(key="oauth:claude:a")
+    body = b"x" * (9 * 1024 * 1024)  # 36s at 256 KB/s, beyond the 30s connect timeout
+    for model in ("m", "m", "m", "other"):
+        failover._note_large_request_body(channel, model, body, connect_timeout=30,
+                                          api_key_name="k", request_id="r")
+    assert capsys.readouterr().out.count("[upload]") == 2
+    assert [n["model"] for n in noticed] == ["m", "other"]
 
 
 def test_upload_budget_never_shrinks_below_connect_and_scales_with_size():

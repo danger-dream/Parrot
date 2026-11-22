@@ -126,9 +126,19 @@ class ErrorRuleProviderData(StrictSchema):
     channelCount: int
 
 
+class ErrorRuleInvalidData(StrictSchema):
+    """A rule in config.json the runtime skips; ``key`` identifies it for deletion."""
+    key: str
+    index: int
+    id: str
+    name: str
+    error: str
+
+
 class ErrorRulesData(StrictSchema):
     enabled: bool
     rules: list[ErrorRuleData]
+    invalidRules: list[ErrorRuleInvalidData] = []
     presets: list[ErrorRuleData]
     builtins: list[ErrorRuleBuiltinData]
     categories: list[ErrorRuleCategoryData]

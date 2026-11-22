@@ -14,6 +14,7 @@ import {
   RefreshCw,
   Route,
   Sparkles,
+  Trash2,
   TriangleAlert,
   Upload,
 } from '@lucide/vue'
@@ -36,6 +37,7 @@ import RuleTester from './RuleTester.vue'
 import { storeRuleNames, takeHandOff } from './ruleNames'
 import {
   providerLabel,
+  ruleFingerprint,
   rulePayload,
   seedFromBody,
   seedFromError,
@@ -43,6 +45,7 @@ import {
   type EditorSeed,
   type ErrorRule,
   type ErrorRulesData,
+  type InvalidRule,
   type RecentGroup,
 } from './model'
 
@@ -186,6 +189,17 @@ async function removeRule(r: ErrorRule): Promise<void> {
   await mutate(`del:${r.id}`, async () => (await api.del<ErrorRulesData>(`/error-rules/rules/${enc(r.id)}`, rev())).data, '规则已删除')
 }
 
+async function removeInvalid(r: InvalidRule): Promise<void> {
+  const ok = await confirmAction({
+    title: `删除格式有误的规则「${r.name || r.id || `第 ${r.index + 1} 条`}」？`,
+    detail: '它现在不生效；删除后会从 config.json 里移除，其它规则不受影响。想保留的话，先在 config.json 里改正。',
+    confirmText: '删除',
+    danger: true,
+  })
+  if (!ok) return
+  await mutate(`del-invalid:${r.key}`, async () => (await api.del<ErrorRulesData>(`/error-rules/invalid-rules/${enc(r.key)}`, rev())).data, '已删除')
+}
+
 function moveRule(index: number, delta: -1 | 1): Promise<boolean> {
   const ids = (data.value?.rules || []).map((r) => r.id)
   const [moved] = ids.splice(index, 1)
@@ -286,30 +300,59 @@ async function importRules(e: Event): Promise<void> {
   }
   const ok = await confirmAction({
     title: `导入 ${rules.length} 条规则？`,
-    detail: '会追加到「我的规则」末尾，现有规则不受影响。导入后按列表顺序匹配，可以再调整顺序。',
+    detail: '会追加到「我的规则」末尾，现有规则不受影响；和已有规则内容相同的会跳过。导入后按列表顺序匹配，可以再调整顺序。',
     confirmText: '导入',
   })
   if (!ok) return
   busy.value = 'import'
   let added = 0
   const failed: string[] = []
+  const duplicates: string[] = []
+  const known = new Set((data.value?.rules || []).map((r) => ruleFingerprint(r)))
+  const create = async (payload: Record<string, unknown>) =>
+    (data.value = (await api.post<ErrorRulesData>('/error-rules/rules', payload, rev())).data)
   try {
     for (const raw of rules) {
       const payload: Record<string, unknown> = {}
       for (const f of RULE_FIELDS) if (raw[f] !== undefined && raw[f] !== null) payload[f] = raw[f]
+      const name = `「${String(raw.name || '未命名')}」`
+      const fingerprint = ruleFingerprint(payload)
+      if (known.has(fingerprint)) {
+        duplicates.push(name)
+        continue
+      }
       try {
-        data.value = (await api.post<ErrorRulesData>('/error-rules/rules', payload, rev())).data
+        try {
+          await create(payload)
+        } catch (err) {
+          if (!(err instanceof ApiError && err.code === 'REVISION_CONFLICT')) throw err
+          // Someone else saved meanwhile: take the current list and try this rule once more.
+          await load()
+          for (const r of data.value?.rules || []) known.add(ruleFingerprint(r))
+          if (known.has(fingerprint)) {
+            duplicates.push(name)
+            continue
+          }
+          await create(payload)
+        }
+        known.add(fingerprint)
         added += 1
       } catch (err) {
-        failed.push(`「${String(raw.name || '未命名')}」：${errorDetail(err) || errorTitle(err)}`)
+        failed.push(`${name}：${errorDetail(err) || errorTitle(err)}`)
         if (err instanceof ApiError && err.code === 'REVISION_CONFLICT') await load()
       }
     }
   } finally {
     busy.value = ''
   }
-  if (failed.length) toast(`导入了 ${added} 条，${failed.length} 条没导入`, 'warning', failed.join('\n'), 12000)
-  else toast(`导入了 ${added} 条规则，立即生效`, 'success')
+  const skippedNote = duplicates.length ? `${duplicates.length} 条和已有规则相同，已跳过：${duplicates.join('、')}` : ''
+  if (failed.length) {
+    toast(`导入了 ${added} 条，${failed.length} 条没导入`, 'warning', [...failed, skippedNote].filter(Boolean).join('\n'), 12000)
+  } else if (duplicates.length) {
+    toast(`导入了 ${added} 条规则${added ? '，立即生效' : ''}`, added ? 'success' : 'info', skippedNote, 9000)
+  } else {
+    toast(`导入了 ${added} 条规则，立即生效`, 'success')
+  }
   void recent.value?.load()
 }
 
@@ -402,6 +445,23 @@ function scrollTo(id: string): void {
             <Btn size="sm" variant="ghost" :disabled="!data.rules.length" title="把我的规则导出为 JSON 文件" @click="exportRules"><Download /> 导出</Btn>
             <Btn size="sm" variant="primary" @click="openCreate"><Plus /> 新建规则</Btn>
           </template>
+          <div v-if="data.invalidRules?.length" class="invalid-rules">
+            <p class="ir-title">
+              <TriangleAlert class="on-ico" /> config.json 里有 {{ data.invalidRules?.length }} 条规则格式有误，运行时已跳过
+            </p>
+            <p class="ir-detail">保存其它规则时会原样保留它们。可以在 config.json 里改正，也可以在这里删除。</p>
+            <ul class="ir-list">
+              <li v-for="r in data.invalidRules" :key="r.key" class="ir-row">
+                <div class="ir-text">
+                  <span class="ir-name">{{ r.name || r.id || `第 ${r.index + 1} 条` }}</span>
+                  <span class="ir-error">{{ r.error }}</span>
+                </div>
+                <Btn size="sm" variant="ghost" :loading="busy === `del-invalid:${r.key}`" :disabled="!!busy" @click="removeInvalid(r)">
+                  <Trash2 /> 删除
+                </Btn>
+              </li>
+            </ul>
+          </div>
           <div v-if="!data.rules.length" class="empty-mine">
             <p class="em-title">还没有自己的规则</p>
             <p class="em-detail">现在所有错误都由预置规则、内置处理和默认策略处理。想换一种处理方式时：</p>
@@ -465,7 +525,7 @@ function scrollTo(id: string): void {
       </div>
 
       <div id="er-builtin" class="anchor">
-        <Card title="内置处理与默认策略" subtitle="写在程序里的协议级处理，这里只做说明。大多排在规则后面，规则命中的错误不会再走到这里；「协议级自动修复」和 Antigravity 用积分重试例外，它们只是换个方式重发同一个请求，在规则之前执行。">
+        <Card title="内置处理与默认策略" subtitle="写在程序里的协议级处理，这里只做说明。大多排在规则后面，规则命中的错误不会再走到这里；「OAuth 凭据自动刷新」「协议级自动修复」和 Antigravity 用积分重试例外，它们只是换个方式重发同一个请求，在规则之前执行，重发后仍失败才交给规则。">
           <template #icon><Lock /></template>
           <ul class="builtins">
             <li v-for="b in data.builtins" :key="b.id" :class="{ last: b.id === 'default-ladder' }">
@@ -662,6 +722,50 @@ function scrollTo(id: string): void {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+.invalid-rules {
+  margin-bottom: 12px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 0.5px solid var(--orange);
+  font-size: 12.5px;
+}
+.ir-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: var(--text-orange, var(--orange));
+}
+.ir-detail {
+  margin-top: 4px;
+  color: var(--text-3);
+}
+.ir-list {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ir-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.ir-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.ir-name {
+  font-weight: 500;
+}
+.ir-error {
+  color: var(--text-3);
+  overflow-wrap: anywhere;
 }
 .empty-mine {
   padding: 18px 20px;

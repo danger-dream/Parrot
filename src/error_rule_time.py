@@ -7,6 +7,10 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import regex
+
+from .error_rule_conditions import compile_user_regex, search_user_regex
+
 
 _ABS_TIME_RE = re.compile(
     r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?"
@@ -59,8 +63,8 @@ def time_from_text(text: str, *, now_ms: int, pattern: str = "", tz: str = "+08:
     source = text or ""
     if pattern:
         try:
-            found = re.search(pattern, source, re.IGNORECASE)
-        except re.error:
+            found = search_user_regex(compile_user_regex(pattern), source)
+        except regex.error:
             return None
         if not found:
             return None

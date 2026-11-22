@@ -114,6 +114,37 @@ def test_codes_are_found_in_fields_and_in_bracketed_text():
     assert zhipu.codes[:2] == ("1308", "rate_limit_error")
 
 
+def test_backtracking_prone_regexes_are_rejected_with_a_reason():
+    for pattern, reason in [(r"(a|a)*b", "| 分支"), (r"(\w+\s?)+$", "嵌套重复"), (r"(\d)\1", "反向引用")]:
+        with pytest.raises(error_rules.ErrorRuleValidationError, match=reason):
+            error_rules.normalize_rule(_rule(cond("message", "regex", values=[pattern])))
+    with pytest.raises(error_rules.ErrorRuleValidationError, match="恢复时间提取规则.*嵌套重复"):
+        error_rules.normalize_rule(_rule(steps=[{**pause("message_time"), "pattern": r"((\d+)\s*)+"}]))
+    for pattern in (r"额度.*重置", r"reset at (\d{4}-\d{2}-\d{2})", r"(?:abc)+", r"(?:x|y){2}", r"[ab]+c"):
+        error_rules.normalize_rule(_rule(cond("message", "regex", values=[pattern])))
+
+
+def test_a_regex_search_that_runs_out_of_time_counts_as_no_match(monkeypatch, capsys):
+    from src import error_rule_conditions as conditions
+    monkeypatch.setattr(conditions, "REGEX_TIMEOUT_SECONDS", 1e-6)
+    monkeypatch.setattr(conditions, "_timed_out", set())
+    rx = conditions.compile_user_regex(r"\w+x")
+    assert conditions.search_user_regex(rx, "a" * 300000) is None
+    assert conditions.search_user_regex(rx, "a" * 300000) is None
+    assert capsys.readouterr().out.count("regex gave up") == 1
+
+
+def test_codes_survive_trailing_text_plain_text_and_long_bodies():
+    trailing = _obs('{"error":{"code":"1311","message":"当前订阅套餐暂未开放"}} (request id 7f3a)', status=429)
+    assert trailing.codes[0] == "1311" and trailing.data["error"]["code"] == "1311"
+    plain = _obs("upstream: [1311][当前订阅套餐暂未开放 GLM-5 权限]", status=429)
+    assert plain.codes == ("1311",) and plain.data is None
+    # A body longer than the excerpt still yields the outer object, so JSON paths keep working.
+    long_body = json.dumps({"error": {"code": "context_too_long", "message": "x" * 6000}})
+    long_obs = _obs(long_body, status=400)
+    assert long_obs.codes[0] == "context_too_long" and "error" in long_obs.data
+
+
 def test_json_paths_operators_and_nested_groups():
     obs = _obs(MINIMAX_2067, provider="minimax", model="MiniMax-M3.1")
     # $.base_resp.status_code ≠ 0 且 ($.error.message 包含 x 或 $..message 包含 Token Plan)
@@ -494,6 +525,165 @@ async def test_antigravity_credit_retry_runs_before_error_rules(monkeypatch, cre
         assert ran == ["ag"]
 
 
+@pytest.mark.parametrize("after_refresh", ["success", "401"])
+async def test_oauth_refresh_runs_before_a_401_rule(monkeypatch, after_refresh):
+    from contextlib import contextmanager
+
+    from fastapi.responses import JSONResponse
+
+    from src import failover, scheduler
+    from src.protocols.runtime import AttemptResult
+    from src.tests.test_antigravity_package_a import FailoverChannel, _patch_failover_runtime
+
+    rule = _rule(cond("status", "in", values=["401"]), id="blocked", category="account_blocked")
+    _patch_failover_runtime(monkeypatch, failover, cfg={
+        "timeouts": {"total": 30}, "retry": {"transient": {"enabled": True, "maxExtraAttempts": 2}},
+        "concurrency": {"queueWaitSeconds": 0}, "affinity": {},
+        "errorRules": {"enabled": True, "rules": [rule], "presets": {}},
+    })
+    monkeypatch.delenv("PARROT_NO_REFRESH", raising=False)
+    refreshed, hits = [], []
+
+    async def force_refresh(account_key, **_kw):
+        refreshed.append(account_key)
+
+    @contextmanager
+    def guard(_state_key):
+        yield True
+
+    monkeypatch.setattr(failover.oauth_manager, "force_refresh", force_refresh)
+    monkeypatch.setattr(failover.oauth_manager, "account_generation_guard", guard)
+    monkeypatch.setattr(failover.reporting, "observation", lambda *_a: None)
+    monkeypatch.setattr(error_rule_effects, "record_hit", lambda ch, model, found, *a, **k:
+                        hits.append(found.id) or {"fired": [], "until": None, "stopped": False})
+    monkeypatch.setattr(error_rule_effects, "run_steps", lambda *a, **k: {"until": None, "disabled": False, "paused": False})
+    expired = AttemptResult(outcome="http_error", http_status=401,
+                            error_detail='HTTP 401: {"error":{"type":"authentication_error","message":"token expired"}}')
+    ok = AttemptResult(outcome="success", success=True, http_status=200, response=JSONResponse({"ok": True}))
+    results = [expired, ok if after_refresh == "success" else expired]
+    calls = []
+
+    async def attempt(ch, *a, **k):
+        calls.append(ch.key)
+        return results.pop(0)
+
+    monkeypatch.setattr(failover, "_try_channel", attempt)
+    route = scheduler.ScheduleResult([(FailoverChannel("oauth:claude:a", provider="claude"), "m")], None, False)
+    response = await failover.run_failover(route, {"model": "m"}, "r", "k", "ip", False, time.time(),
+                                           ingress_protocol="responses")
+    # The expired token is refreshed first; only a 401 that survives the refresh reaches the rule.
+    assert refreshed == ["oauth:claude:a"] and calls == ["oauth:claude:a", "oauth:claude:a"]
+    if after_refresh == "success":
+        assert response.status_code == 200 and hits == []
+    else:
+        assert hits == ["blocked"]
+
+
+async def test_encrypted_content_cleanup_runs_before_a_400_rule(monkeypatch):
+    from fastapi.responses import JSONResponse
+
+    from src import failover, scheduler
+    from src.protocols.runtime import AttemptResult
+    from src.tests.test_antigravity_package_a import FailoverChannel, _patch_failover_runtime
+
+    rule = _rule(cond("status", "in", values=["400"]), id="bad", category="request_invalid")
+    _patch_failover_runtime(monkeypatch, failover, cfg={
+        "timeouts": {"total": 30}, "retry": {"transient": {"enabled": True, "maxExtraAttempts": 2}},
+        "concurrency": {"queueWaitSeconds": 0}, "affinity": {},
+        "errorRules": {"enabled": True, "rules": [rule], "presets": {}},
+    })
+    hits = []
+    monkeypatch.setattr(error_rule_effects, "record_hit", lambda ch, model, found, *a, **k:
+                        hits.append(found.id) or {"fired": [], "until": None, "stopped": False})
+    invalid = AttemptResult(
+        outcome="request_invalid", http_status=400,
+        error_detail='HTTP 400: {"error":{"code":"invalid_encrypted_content","message":"The encrypted content could not be verified."}}')
+    ok = AttemptResult(outcome="success", success=True, http_status=200, response=JSONResponse({"ok": True}))
+    results, bodies = [invalid, ok], []
+
+    async def attempt(ch, model, body, *a, **k):
+        bodies.append(body)
+        return results.pop(0)
+
+    monkeypatch.setattr(failover, "_try_channel", attempt)
+    body = {"model": "m", "input": [
+        {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "gAAAAB-stale"},
+        {"role": "user", "content": "hi"},
+    ]}
+    route = scheduler.ScheduleResult([(FailoverChannel("oauth:openai:a", provider="openai"), "m")], None, False)
+    response = await failover.run_failover(route, body, "r", "k", "ip", False, time.time(),
+                                           ingress_protocol="responses")
+    # The stale ciphertext is dropped and resent first; the respond rule never answers.
+    assert response.status_code == 200 and hits == []
+    assert len(bodies) == 2 and "gAAAAB-stale" not in json.dumps(bodies[1])
+
+
+async def test_pass_rule_steps_run_once_per_channel_while_retries_still_count(monkeypatch):
+    from fastapi.responses import JSONResponse
+
+    from src import failover, scheduler
+    from src.protocols.runtime import AttemptResult
+    from src.tests.test_antigravity_package_a import FailoverChannel, _patch_failover_runtime
+
+    marker = _rule(cond("status", "in", values=["429"]), id="mark", category="observe",
+                   steps=[{"type": "deprioritize"}], final="pass")
+    decider = _rule(cond("status", "in", values=["429"]), id="decide", category="rate_limit",
+                    steps=[retry(0, 2)], final="next")
+    _patch_failover_runtime(monkeypatch, failover, cfg={
+        "timeouts": {"total": 30}, "retry": {"transient": {"enabled": False}},
+        "concurrency": {"queueWaitSeconds": 0}, "affinity": {},
+        "errorRules": {"enabled": True, "rules": [marker, decider], "presets": {}},
+    })
+    hits, ran = [], []
+    real_hit = error_rule_effects.record_hit
+    monkeypatch.setattr(error_rule_effects, "record_hit", lambda ch, model, found, *a, **k:
+                        hits.append((found.id, ch.key)) or real_hit(ch, model, found, *a, **k))
+    monkeypatch.setattr(error_rule_effects, "run_steps", lambda ch, model, found, obs, steps, **kw:
+                        ran.append((found.id, ch.key)) or {"until": None, "disabled": False, "paused": False})
+    limited = AttemptResult(outcome="http_error", http_status=429, error_detail='HTTP 429: {"error":{"message":"slow down"}}')
+    ok = AttemptResult(outcome="success", success=True, http_status=200, response=JSONResponse({"ok": True}))
+    calls = []
+
+    async def attempt(ch, *a, **k):
+        calls.append(ch.key)
+        return ok if ch.key == "oauth:openai:b" else limited
+
+    monkeypatch.setattr(failover, "_try_channel", attempt)
+    route = scheduler.ScheduleResult([(FailoverChannel("oauth:openai:a", provider="openai"), "m"),
+                                      (FailoverChannel("oauth:openai:b", provider="openai"), "m")], None, False)
+    response = await failover.run_failover(route, {"model": "m"}, "r", "k", "ip", False, time.time(),
+                                           ingress_protocol="responses")
+    assert response.status_code == 200 and calls == ["oauth:openai:a"] * 3 + ["oauth:openai:b"]
+    # Three failures are three hits, but the marking rule acts on the channel once.
+    assert [h for h in hits if h[0] == "mark"] == [("mark", "oauth:openai:a")] * 3
+    assert [r for r in ran if r[0] == "mark"] == [("mark", "oauth:openai:a")]
+
+
+async def test_respond_without_status_answers_502_live_and_in_the_tester(monkeypatch):
+    from src import failover, scheduler
+    from src.protocols.runtime import AttemptResult
+    from src.tests.test_antigravity_package_a import FailoverChannel, _patch_failover_runtime
+
+    rule = _rule(cond("phase", "in", values=["transport"]), id="dead", category="request_invalid")
+    _patch_failover_runtime(monkeypatch, failover, cfg={
+        "timeouts": {"total": 30}, "retry": {"transient": {"enabled": False}},
+        "concurrency": {"queueWaitSeconds": 0}, "affinity": {},
+        "errorRules": {"enabled": True, "rules": [rule], "presets": {}},
+    })
+    dropped = AttemptResult(outcome="connect_error", error_detail="connect error: ConnectError")
+
+    async def attempt(*_a, **_k):
+        return dropped
+
+    monkeypatch.setattr(failover, "_try_channel", attempt)
+    ch = FailoverChannel("oauth:openai:a", provider="openai")
+    route = scheduler.ScheduleResult([(ch, "m")], None, False)
+    response = await failover.run_failover(route, {"model": "m"}, "r", "k", "ip", False, time.time(),
+                                           ingress_protocol="responses")
+    planned = error_rules.plan(error_rules.normalize_rule(rule), error_rules.observe(ch, "m", dropped))
+    assert response.status_code == 502 and planned["response"]["status"] == 502
+
+
 def test_account_pause_needs_a_definite_end():
     with pytest.raises(error_rules.ErrorRuleValidationError, match="不能用冷却阶梯"):
         error_rules.normalize_rule(_rule(steps=[{**pause("ladder"), "scope": "account"}]))
@@ -666,21 +856,43 @@ def test_management_api_crud_presets_and_dry_run(tmp_path, monkeypatch, manageme
         assert gone.status_code == 200 and gone.json()["data"]["rules"] == []
 
 
-def test_a_broken_rule_in_config_is_skipped_and_never_wiped(tmp_path, monkeypatch, management_client):
+def test_a_broken_rule_in_config_is_skipped_kept_on_save_and_deletable(tmp_path, monkeypatch, management_client):
     good = error_rules.normalize_rule(_rule(id="good", name="好规则"))
+    other = error_rules.normalize_rule(_rule(id="other", name="另一条"))
     broken = {"id": "broken", "name": "坏规则", "category": "rate_limit", "when": group("all")}
-    config_module.update(lambda c: c.__setitem__("errorRules", {"enabled": True, "rules": [good, broken], "presets": {}}))
+    config_module.update(lambda c: c.__setitem__(
+        "errorRules", {"enabled": True, "rules": [good, broken, other], "presets": {}}))
     client, key = management_client
     base = "/api/management/v1/error-rules"
     with client:
         sess = client.post("/api/management/v1/auth/sessions", json={"grantType": "managementKey", "managementKey": key})
         headers = {"Authorization": f"Bearer {sess.json()['data']['credential']}"}
         data = client.get(base, headers=headers).json()["data"]
-        assert [r["id"] for r in data["rules"]] == ["good"]
-        refused = client.patch(base + "/settings", headers={**headers, "If-Match": data["revision"]}, json={"enabled": False})
-        assert refused.status_code == 422 and "坏规则" in refused.text
-    assert [r["id"] for r in config_module.get()["errorRules"]["rules"]] == ["good", "broken"]
-    # The runtime keeps applying the good rule meanwhile.
+        assert [r["id"] for r in data["rules"]] == ["good", "other"]
+        [skipped] = data["invalidRules"]
+        assert skipped["id"] == "broken" and skipped["name"] == "坏规则" and skipped["index"] == 1
+        assert "至少设置一个条件" in skipped["error"]
+
+        # Other edits go through and leave the broken rule exactly as written, in place.
+        saved = client.delete(base + "/rules/other", headers={**headers, "If-Match": data["revision"]})
+        assert saved.status_code == 200, saved.text
+        assert config_module.get()["errorRules"]["rules"] == [good, broken]
+        data = saved.json()["data"]
+        assert [r["key"] for r in data["invalidRules"]] == [skipped["key"]]
+
+        # A hand edit of the broken rule changes the revision a stale page would write against.
+        config_module.update(lambda c: c["errorRules"]["rules"][1].__setitem__("name", "坏规则2"))
+        stale = client.delete(base + "/invalid-rules/" + skipped["key"], headers={**headers, "If-Match": data["revision"]})
+        assert stale.status_code == 409 and stale.json()["error"]["code"] == "REVISION_CONFLICT"
+        data = client.get(base, headers=headers).json()["data"]
+        removed = client.delete(base + "/invalid-rules/" + data["invalidRules"][0]["key"],
+                                headers={**headers, "If-Match": data["revision"]})
+        assert removed.status_code == 200, removed.text
+        assert removed.json()["data"]["invalidRules"] == []
+        missing = client.delete(base + "/invalid-rules/" + "0" * 16, headers={**headers, "If-Match": removed.json()["data"]["revision"]})
+        assert missing.status_code == 404
+    assert config_module.get()["errorRules"]["rules"] == [good]
+    # The runtime kept applying the good rule throughout.
     assert error_rules.match(_obs('HTTP 429: {}')).id == "good"
 
 

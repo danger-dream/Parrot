@@ -634,7 +634,7 @@ MCP 端点有独立的请求体上限 `maxRequestBodyBytes`（默认 32 MiB）�
 }
 ```
 
-每次上游失败（Parrot 本地拦截和客户端断开不算）先经过几项只重发同一请求的协议级修复（思考历史被拒、encrypted_content 失效、Codex WS 恢复、账号允许时 Antigravity 用积分重试），然后按顺序找第一条命中的规则：`rules`（按列表顺序）→ 预置规则（代码自带，`presets` 只保存开关）→ 内置协议处理 → 默认重试与「错误冷却」阶梯。`enabled=false` 时前两层都不参与。`final` 为 `pass` 的规则命中后只执行自己的步骤（标记、通知等），继续往后找。
+每次上游失败（Parrot 本地拦截和客户端断开不算）先经过几项只重发同一请求的修复（思考历史被拒、encrypted_content 失效、1M 上下文额度不足、Codex WS 恢复、OAuth 401/403 刷新凭据与智谱 PAT 重签、账号允许时 Antigravity 用积分重试），同一请求里每项对同一渠道最多做一次，重发后仍失败才交给规则；然后按顺序找第一条命中的规则：`rules`（按列表顺序）→ 预置规则（代码自带，`presets` 只保存开关）→ 内置协议处理 → 默认重试与「错误冷却」阶梯。`enabled=false` 时前两层都不参与。`final` 为 `pass` 的规则命中后只执行自己的步骤（标记、通知等），继续往后找。
 
 - `when`：条件树。`group` 的 `mode` 为 `all`（全部满足）或 `any`（任一满足），可嵌套（最多 4 层、40 个条件）。条件的 `field`：`status`、`code`（自动从 code / error.code / error.type / base_resp.status_code 等位置和消息里的「(2067)」取出）、`message`、`body`（响应全文前 4 KB）、`provider`、`channel`、`channelType`（`oauth`/`api`）、`model`（支持通配）、`phase`（`http`/`stream`/`transport`）、`path`（JSON 路径，`$.a.b`、`$['a'].b`、`$.list[0]`、`$.list[*].code`、`$..message`）。`op`：`eq`、`ne`、`in`、`not_in`、`contains`、`not_contains`、`starts_with`、`regex`、`exists`、`not_exists`、`gt`/`gte`/`lt`/`lte`；`in`/`not_in`/`contains`/`not_contains` 的 `values` 可写多项，状态码和数字错误码可写区间 `500-599`、`5xx`。取不到值（如路径不存在）时，除 `not_exists` 外的条件都不成立。比较不区分大小写。
 - `category`：`rate_limit`、`quota_exhausted`、`plan_excluded`、`account_blocked`、`request_invalid`、`content_blocked`、`upstream_busy`、`observe`。省略 `steps`/`final`/`thresholds`/`response` 时取该类型的推荐值。

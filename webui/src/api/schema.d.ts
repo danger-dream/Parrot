@@ -3533,6 +3533,23 @@ export interface paths {
         patch: operations["updateErrorRule"];
         trace?: never;
     };
+    "/api/management/v1/error-rules/invalid-rules/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Delete Invalid Error Rule */
+        delete: operations["deleteInvalidErrorRule"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/management/v1/error-rules/order": {
         parameters: {
             query?: never;
@@ -6400,6 +6417,22 @@ export interface components {
             thresholds?: components["schemas"]["ErrorRuleThresholdInput"][] | null;
             response?: components["schemas"]["ErrorRuleResponseInput"] | null;
         };
+        /**
+         * ErrorRuleInvalidData
+         * @description A rule in config.json the runtime skips; ``key`` identifies it for deletion.
+         */
+        ErrorRuleInvalidData: {
+            /** Key */
+            key: string;
+            /** Index */
+            index: number;
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+            /** Error */
+            error: string;
+        };
         /** ErrorRuleMatchedData */
         ErrorRuleMatchedData: {
             /**
@@ -6736,6 +6769,11 @@ export interface components {
             enabled: boolean;
             /** Rules */
             rules: components["schemas"]["ErrorRuleData"][];
+            /**
+             * Invalidrules
+             * @default []
+             */
+            invalidRules: components["schemas"]["ErrorRuleInvalidData"][];
             /** Presets */
             presets: components["schemas"]["ErrorRuleData"][];
             /** Builtins */
@@ -39019,6 +39057,219 @@ export interface operations {
                 "application/json": components["schemas"]["ErrorRuleInput"];
             };
         };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "data": {
+                     *         "enabled": true,
+                     *         "rules": [
+                     *           {
+                     *             "id": "rule-1a2b3c4d",
+                     *             "name": "MiniMax Token Plan 用尽",
+                     *             "enabled": true,
+                     *             "note": "",
+                     *             "when": {
+                     *               "kind": "group",
+                     *               "mode": "all",
+                     *               "items": [
+                     *                 {
+                     *                   "kind": "cond",
+                     *                   "field": "provider",
+                     *                   "op": "in",
+                     *                   "path": "",
+                     *                   "values": [
+                     *                     "minimax"
+                     *                   ]
+                     *                 },
+                     *                 {
+                     *                   "kind": "cond",
+                     *                   "field": "path",
+                     *                   "op": "ne",
+                     *                   "path": "$.base_resp.status_code",
+                     *                   "values": [
+                     *                     "0"
+                     *                   ]
+                     *                 },
+                     *                 {
+                     *                   "kind": "group",
+                     *                   "mode": "any",
+                     *                   "items": [
+                     *                     {
+                     *                       "kind": "cond",
+                     *                       "field": "message",
+                     *                       "op": "contains",
+                     *                       "path": "",
+                     *                       "values": [
+                     *                         "Token Plan"
+                     *                       ]
+                     *                     },
+                     *                     {
+                     *                       "kind": "cond",
+                     *                       "field": "code",
+                     *                       "op": "in",
+                     *                       "path": "",
+                     *                       "values": [
+                     *                         "2067"
+                     *                       ]
+                     *                     }
+                     *                   ]
+                     *                 }
+                     *               ]
+                     *             },
+                     *             "category": "quota_exhausted",
+                     *             "steps": [
+                     *               {
+                     *                 "type": "retry",
+                     *                 "delaySeconds": 2,
+                     *                 "times": 1
+                     *               },
+                     *               {
+                     *                 "type": "pause",
+                     *                 "scope": "model",
+                     *                 "mode": "usage_window",
+                     *                 "seconds": 900,
+                     *                 "pattern": "",
+                     *                 "timezone": "+08:00",
+                     *                 "boundaryHours": 5,
+                     *                 "fallbackSeconds": 900
+                     *               },
+                     *               {
+                     *                 "type": "notify",
+                     *                 "repeatHours": 6
+                     *               }
+                     *             ],
+                     *             "final": "next",
+                     *             "thresholds": [
+                     *               {
+                     *                 "count": 3,
+                     *                 "mode": "consecutive",
+                     *                 "windowMinutes": 10,
+                     *                 "scope": "model",
+                     *                 "steps": [
+                     *                   {
+                     *                     "type": "pause",
+                     *                     "scope": "account",
+                     *                     "mode": "fixed",
+                     *                     "seconds": 1800,
+                     *                     "pattern": "",
+                     *                     "timezone": "+08:00",
+                     *                     "boundaryHours": 0,
+                     *                     "fallbackSeconds": 900
+                     *                   }
+                     *                 ]
+                     *               }
+                     *             ],
+                     *             "response": {
+                     *               "status": 429,
+                     *               "message": "MiniMax quota: {$.error.message}",
+                     *               "retryAfter": true
+                     *             },
+                     *             "group": ""
+                     *           }
+                     *         ],
+                     *         "presets": [],
+                     *         "builtins": [],
+                     *         "categories": [],
+                     *         "providers": [
+                     *           {
+                     *             "id": "minimax",
+                     *             "channelCount": 1
+                     *           }
+                     *         ],
+                     *         "channelProviders": {
+                     *           "api:MiniMax": "minimax"
+                     *         },
+                     *         "stats": {
+                     *           "rule-1a2b3c4d": {
+                     *             "count": 3,
+                     *             "lastAt": 1795180000
+                     *           }
+                     *         },
+                     *         "statsWindowDays": 7,
+                     *         "revision": "rev_example"
+                     *       },
+                     *       "meta": {
+                     *         "requestId": "request-example"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DataEnvelope_ErrorRulesData_"];
+                };
+            };
+            /** @description Management API error: SESSION_REQUIRED, SESSION_EXPIRED */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: ORIGIN_DENIED, CAPABILITY_DENIED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: RESOURCE_CONFLICT, REVISION_CONFLICT */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: VALIDATION_FAILED */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Management API error: DEPENDENCY_UNAVAILABLE, SERVICE_NOT_READY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    deleteInvalidErrorRule: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: string | null;
+            };
+            path: {
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
         responses: {
             /** @description Successful Response */
             200: {

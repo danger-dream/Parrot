@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import json
 import re
+from re import _constants as _sre, _parser as _sre_parse
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Any, Callable
+
+import regex
 
 FIELDS = ("status", "code", "message", "body", "provider", "channel", "channelType", "model", "phase", "path")
 FIELD_LABELS = {
@@ -52,7 +55,10 @@ MAX_VALUES = 100
 MAX_VALUE_LEN = 300
 MAX_PATH_LEN = 200
 MAX_REGEX_LEN = 512
-_NESTED_QUANTIFIER_RE = re.compile(r"\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)\s*(?:[+*]|\{\d+,\d*\})")
+# Rule patterns run on the event loop against upstream text: one search may not stall it.
+REGEX_TIMEOUT_SECONDS = 0.05
+# Repeats bounded this low cannot multiply backtracking paths enough to matter.
+_SMALL_REPEAT = 10
 _RANGE_RE = re.compile(r"^\s*(-?\d+)\s*[-~]\s*(-?\d+)\s*$")
 _CLASS_RE = re.compile(r"^([1-5])xx$", re.IGNORECASE)
 
@@ -153,15 +159,65 @@ def value_text(value: Any) -> str:
 # ─── normalization ──────────────────────────────────────────────────
 
 
+def _regex_hazard(pattern: str) -> str:
+    """What makes ``pattern`` prone to catastrophic backtracking, or "" if nothing does."""
+
+    def walk(items, in_repeat: bool) -> str:
+        for op, av in items:
+            if op in (_sre.MAX_REPEAT, _sre.MIN_REPEAT):
+                _lo, hi, sub = av
+                repeats = hi is _sre.MAXREPEAT or hi > _SMALL_REPEAT
+                if repeats and in_repeat:
+                    return "嵌套重复（如 (a+)+）"
+                found = walk(sub, in_repeat or repeats)
+            elif op is _sre.BRANCH:
+                if in_repeat:
+                    return "重复的分组里带 | 分支（如 (a|ab)+）"
+                found = next((r for r in (walk(alt, in_repeat) for alt in av[1]) if r), "")
+            elif op in (_sre.GROUPREF, _sre.GROUPREF_EXISTS):
+                return "反向引用（如 \\1）"
+            elif op is _sre.SUBPATTERN:
+                found = walk(av[-1], in_repeat)
+            elif op in (_sre.ASSERT, _sre.ASSERT_NOT):
+                found = walk(av[1], in_repeat)
+            else:
+                found = ""
+            if found:
+                return found
+        return ""
+
+    return walk(_sre_parse.parse(pattern), False)
+
+
 def _check_regex(pattern: str) -> None:
     if len(pattern) > MAX_REGEX_LEN:
         raise ConditionError(f"正则表达式不能超过 {MAX_REGEX_LEN} 个字符")
-    if _NESTED_QUANTIFIER_RE.search(pattern):
-        raise ConditionError("正则表达式含有嵌套重复（如 (a+)+），可能导致匹配卡死，请改写")
     try:
         re.compile(pattern)
     except re.error as exc:
         raise ConditionError(f"「{pattern}」不是有效的正则表达式：{exc}") from exc
+    hazard = _regex_hazard(pattern)
+    if hazard:
+        raise ConditionError(f"正则表达式有{hazard}的写法，可能导致匹配卡死，请改写")
+
+
+_timed_out: set[str] = set()
+
+
+def compile_user_regex(pattern: str) -> regex.Pattern:
+    return regex.compile(pattern, regex.IGNORECASE | regex.V0)
+
+
+def search_user_regex(rx: regex.Pattern, text: str) -> regex.Match | None:
+    """``rx.search`` bounded in time; a search that runs out counts as no match."""
+    try:
+        return rx.search(text, timeout=REGEX_TIMEOUT_SECONDS)
+    except TimeoutError:
+        if rx.pattern not in _timed_out:
+            _timed_out.add(rx.pattern)
+            print(f"[error_rules] regex gave up after {REGEX_TIMEOUT_SECONDS:g}s and counts as no match: "
+                  f"{rx.pattern[:120]}")
+        return None
 
 
 def _number_spec(token: str, field: str) -> None:
@@ -324,10 +380,10 @@ def _equals(value: Any, target: str, wildcard: bool) -> bool:
     return _in_spec(value, target)
 
 
-def _compiled_regex(cache: dict[str, re.Pattern], pattern: str) -> re.Pattern:
+def _compiled_regex(cache: dict[str, regex.Pattern], pattern: str) -> regex.Pattern:
     found = cache.get(pattern)
     if found is None:
-        found = cache[pattern] = re.compile(pattern, re.IGNORECASE)
+        found = cache[pattern] = compile_user_regex(pattern)
     return found
 
 
@@ -348,7 +404,7 @@ def field_values(c: dict[str, Any], s: Subject) -> list[Any]:
     return [value] if value else []
 
 
-def test_cond(c: dict[str, Any], s: Subject, cache: dict[str, re.Pattern] | None = None) -> tuple[bool, list[Any]]:
+def test_cond(c: dict[str, Any], s: Subject, cache: dict[str, regex.Pattern] | None = None) -> tuple[bool, list[Any]]:
     cache = cache if cache is not None else {}
     op = c["op"]
     values = field_values(c, s)
@@ -374,7 +430,7 @@ def test_cond(c: dict[str, Any], s: Subject, cache: dict[str, re.Pattern] | None
         ok = any(text.startswith(targets[0].lower()) for text in texts)
     elif op == "regex":
         rx = _compiled_regex(cache, targets[0])
-        ok = any(rx.search(value_text(v)) for v in values)
+        ok = any(search_user_regex(rx, value_text(v)) for v in values)
     else:
         target = float(targets[0])
         nums = [n for n in (_num(v) for v in values) if n is not None]
@@ -386,7 +442,7 @@ def test_cond(c: dict[str, Any], s: Subject, cache: dict[str, re.Pattern] | None
     return ok, values
 
 
-def matches(tree: dict[str, Any], s: Subject, cache: dict[str, re.Pattern] | None = None) -> bool:
+def matches(tree: dict[str, Any], s: Subject, cache: dict[str, regex.Pattern] | None = None) -> bool:
     cache = cache if cache is not None else {}
     results = (matches(i, s, cache) if i["kind"] == "group" else test_cond(i, s, cache)[0] for i in tree["items"])
     if not tree["items"]:
@@ -432,7 +488,7 @@ def _actual(c: dict[str, Any], values: list[Any], *, provider_label: Callable[[s
 def explain_miss(tree: dict[str, Any], s: Subject, *, provider_label: Callable[[str], str] = str,
                  channel_label: Callable[[str], str] = str) -> str | None:
     """None when the tree matches; otherwise why not, in words."""
-    cache: dict[str, re.Pattern] = {}
+    cache: dict[str, regex.Pattern] = {}
 
     def walk(node: dict[str, Any]) -> str | None:
         reasons: list[str] = []

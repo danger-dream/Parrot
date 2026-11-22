@@ -108,7 +108,7 @@ _DEFAULT_MESSAGES = {
 # Code-owned handlers that stay outside the rule table; shown read-only.
 BUILTINS: tuple[dict[str, str], ...] = (
     {"id": "oauth-refresh", "name": "OAuth 凭据自动刷新",
-     "description": "OAuth 账号返回 401/403 时先刷新一次凭据再重试；刷新失败才算这个账号出错。",
+     "description": "OAuth 账号返回 401/403 时先刷新一次凭据再重试（智谱 OAuth 是重新签发项目令牌）——这一步在规则之前执行，刷新后仍失败才交给规则。",
      "setting": "系统设置 → 重试", "link": "/settings?section=retry"},
     {"id": "transient-retry", "name": "上游繁忙同渠道重试",
      "description": "OpenAI server_error/overloaded、Claude overloaded（529）、xAI 503 等明确的临时错误，在同一渠道按退避间隔重试。",

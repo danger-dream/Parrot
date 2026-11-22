@@ -1616,7 +1616,7 @@ async def open_response_with_proxy_chain(
     }).with_upload_body(request_body_bytes(upstream_req.body), upload_min_kbps())
     # Transport write limits follow the business upload budget; the small
     # margin lets the business deadline report upload_timeout first.
-    write_timeout = round_timeouts.upload + 0.5
+    write_timeout = round_timeouts.upload + 0.5 if round_timeouts.upload is not None else 30.0
 
     last_pre_header: AttemptResult | None = None
     proxy_attempt_order = 0

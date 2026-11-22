@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import re
 import time
 import uuid
@@ -29,6 +30,8 @@ class ErrorRulesSnapshot:
     rules: tuple[dict[str, Any], ...]
     presets: tuple[dict[str, Any], ...]
     revision: str
+    # Rules in config.json the runtime skips: {key, index, id, name, error}.
+    invalid: tuple[dict[str, Any], ...] = ()
 
 
 def _provider_from_key(channel_key: str) -> str:
@@ -40,6 +43,22 @@ def _channel_label(channel_key: str) -> str:
     channel = _channel(channel_key)
     name = str(getattr(channel, "display_name", "") or getattr(channel, "name", "") or "") if channel else ""
     return name or channel_key
+
+
+def _invalid_key(rule: Any) -> str:
+    return hashlib.sha256(json.dumps(rule, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()[:16]
+
+
+def _invalid_public(item: dict[str, Any]) -> dict[str, Any]:
+    rule = item["rule"]
+    fields = rule if isinstance(rule, dict) else {}
+    return {
+        "key": _invalid_key(rule),
+        "index": item["index"],
+        "id": str(fields.get("id") or "")[:120],
+        "name": str(fields.get("name") or "")[:120],
+        "error": item["error"][:500],
+    }
 
 
 def _channel(channel_key: str):
@@ -67,21 +86,27 @@ class ErrorRulesControl(DomainControl):
     # ── snapshot ────────────────────────────────────────────────────
 
     @classmethod
-    def _projection(cls, cfg: dict[str, Any]) -> dict[str, Any]:
+    def _split(cls, cfg: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         # Shows what the runtime applies: a hand-broken rule is skipped, never the whole list.
         try:
-            return engine.normalize_settings(cfg.get("errorRules"), tolerant=True)
+            return engine.split_settings(cfg.get("errorRules"))
         except engine.ErrorRuleValidationError:
-            return copy.deepcopy(engine.DEFAULT_SETTINGS)
+            return copy.deepcopy(engine.DEFAULT_SETTINGS), []
+
+    @classmethod
+    def _projection(cls, cfg: dict[str, Any]) -> dict[str, Any]:
+        return cls._split(cfg)[0]
 
     @classmethod
     def _snapshot_from(cls, cfg: dict[str, Any]) -> ErrorRulesSnapshot:
-        public = cls._projection(cfg)
+        public, skipped = cls._split(cfg)
         return ErrorRulesSnapshot(
             enabled=bool(public["enabled"]),
             rules=tuple(public["rules"]),
             presets=tuple(engine.preset_rules(public)),
-            revision=stable_revision(public),
+            # Skipped rules are part of what a write would preserve, so they guard it too.
+            revision=stable_revision({**public, "skipped": [s["rule"] for s in skipped]} if skipped else public),
+            invalid=tuple(_invalid_public(s) for s in skipped),
         )
 
     @staticmethod
@@ -106,16 +131,24 @@ class ErrorRulesControl(DomainControl):
             current = self._snapshot_from(cfg)
             self._check_revision(expected_revision, current.revision)
             try:
-                public = engine.normalize_settings(cfg.get("errorRules"))
+                public, skipped = engine.split_settings(cfg.get("errorRules"))
             except engine.ErrorRuleValidationError as exc:
-                # Saving would silently drop the broken rule; make the operator fix it first.
+                # Saving would replace the whole hand-edited block; make the operator fix it first.
                 raise self._validation_error(ValueError(
-                    f"config.json 里的错误处理规则有问题，先修正或删除它再保存：{exc}")) from exc
-            change(public)
+                    f"config.json 里的 errorRules 结构有问题，先修正它再保存：{exc}")) from exc
+            change(public, skipped)
             try:
-                cfg["errorRules"] = engine.normalize_settings(public)
+                normalized = engine.normalize_settings(public)
             except engine.ErrorRuleValidationError as exc:
                 raise self._validation_error(exc) from exc
+            # Skipped rules stay as written, near where they were, until fixed by hand or deleted.
+            rules = list(normalized["rules"])
+            for item in sorted(skipped, key=lambda s: s["index"]):
+                rules.insert(min(item["index"], len(rules)), copy.deepcopy(item["rule"]))
+            if len(rules) > engine.MAX_RULES:
+                raise self._validation_error(ValueError(
+                    f"最多 {engine.MAX_RULES} 条规则（含 {len(skipped)} 条被跳过的规则）"))
+            cfg["errorRules"] = {**normalized, "rules": rules}
             result["snapshot"] = self._snapshot_from(cfg)
 
         self._update_config(mutate)
@@ -171,7 +204,7 @@ class ErrorRulesControl(DomainControl):
         self._authorize(context, Capability.WRITE)
         if not isinstance(enabled, bool):
             raise self._validation_error(ValueError("enabled must be boolean"))
-        snap = self._mutate(expected_revision, lambda public: public.__setitem__("enabled", enabled))
+        snap = self._mutate(expected_revision, lambda public, _skipped: public.__setitem__("enabled", enabled))
         self._audit(context, "error_rules.update_settings", "errorRules", "updated")
         return snap
 
@@ -188,8 +221,10 @@ class ErrorRulesControl(DomainControl):
         payload["id"] = f"rule-{uuid.uuid4().hex[:8]}"
         normalized = self._normalized(payload)
 
-        def change(public: dict[str, Any]) -> None:
-            while normalized["id"] in {r["id"] for r in public["rules"]}:
+        def change(public: dict[str, Any], skipped: list[dict[str, Any]]) -> None:
+            taken = {r["id"] for r in public["rules"]}
+            taken.update(str(s["rule"].get("id")) for s in skipped if isinstance(s["rule"], dict))
+            while normalized["id"] in taken:
                 normalized["id"] = f"rule-{uuid.uuid4().hex[:8]}"
             public["rules"].append(normalized)
 
@@ -205,7 +240,7 @@ class ErrorRulesControl(DomainControl):
         payload["id"] = target
         normalized = self._normalized(payload)
 
-        def change(public: dict[str, Any]) -> None:
+        def change(public: dict[str, Any], _skipped: list[dict[str, Any]]) -> None:
             for index, existing in enumerate(public["rules"]):
                 if existing["id"] == target:
                     public["rules"][index] = normalized
@@ -221,7 +256,7 @@ class ErrorRulesControl(DomainControl):
         self._authorize(context, Capability.DESTRUCTIVE)
         target = str(rule_id or "").strip()
 
-        def change(public: dict[str, Any]) -> None:
+        def change(public: dict[str, Any], _skipped: list[dict[str, Any]]) -> None:
             remaining = [r for r in public["rules"] if r["id"] != target]
             if len(remaining) == len(public["rules"]):
                 raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
@@ -231,11 +266,28 @@ class ErrorRulesControl(DomainControl):
         self._audit(context, "error_rules.delete_rule", f"errorRules:{target}", "deleted")
         return snap
 
+    def delete_invalid_rule(self, context: ManagementContext, key: str, *,
+                            expected_revision: str | None = None) -> ErrorRulesSnapshot:
+        """Delete a rule the runtime skips (by the key shown with it); nothing else changes."""
+        self._authorize(context, Capability.DESTRUCTIVE)
+        target = str(key or "").strip()
+
+        def change(_public: dict[str, Any], skipped: list[dict[str, Any]]) -> None:
+            for index, item in enumerate(skipped):
+                if _invalid_key(item["rule"]) == target:
+                    del skipped[index]
+                    return
+            raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+
+        snap = self._mutate(expected_revision, change)
+        self._audit(context, "error_rules.delete_invalid_rule", f"errorRules:invalid:{target}", "deleted")
+        return snap
+
     def reorder_rules(self, context: ManagementContext, rule_ids: list[str], *,
                       expected_revision: str | None = None) -> ErrorRulesSnapshot:
         self._authorize(context, Capability.WRITE)
 
-        def change(public: dict[str, Any]) -> None:
+        def change(public: dict[str, Any], _skipped: list[dict[str, Any]]) -> None:
             by_id = {r["id"]: r for r in public["rules"]}
             if len(rule_ids) != len(by_id) or set(rule_ids) != set(by_id):
                 raise ManagementError(
@@ -256,7 +308,7 @@ class ErrorRulesControl(DomainControl):
         if not isinstance(enabled, bool):
             raise self._validation_error(ValueError("enabled must be boolean"))
         snap = self._mutate(expected_revision,
-                            lambda public: public["presets"].__setitem__(preset_id, {"enabled": enabled}))
+                            lambda public, _skipped: public["presets"].__setitem__(preset_id, {"enabled": enabled}))
         self._audit(context, "error_rules.update_preset", f"errorRules:{preset_id}", "updated")
         return snap
 

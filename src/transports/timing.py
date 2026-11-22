@@ -121,9 +121,11 @@ class RoundTimeouts:
         )
 
     def with_upload_body(self, body_bytes: int, min_kbps: float) -> "RoundTimeouts":
-        return replace(self, upload=upload_budget_seconds(
-            body_bytes, connection=self.connection, min_kbps=min_kbps,
-        ))
+        budget = upload_budget_seconds(body_bytes, connection=self.connection, min_kbps=min_kbps)
+        if budget <= self.connection:
+            # The connect timeout already covers this body: keep its single deadline from round start.
+            return self
+        return replace(self, upload=budget)
 
 
 @dataclass(frozen=True)

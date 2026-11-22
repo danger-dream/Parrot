@@ -283,6 +283,36 @@ def normalize_settings(raw: Any, *, tolerant: bool = False) -> dict[str, Any]:
     return {"enabled": enabled, "rules": rules, "presets": presets}
 
 
+def split_settings(raw: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Valid settings, plus each rule the runtime skips as ``{"index", "rule", "error"}``.
+
+    Only the rules are judged one by one; a malformed container still raises.
+    """
+    if raw is None:
+        return copy.deepcopy(DEFAULT_SETTINGS), []
+    if not isinstance(raw, dict):
+        raise ErrorRuleValidationError("errorRules 必须是对象")
+    rules_raw = raw.get("rules") or []
+    if not isinstance(rules_raw, list):
+        raise ErrorRuleValidationError("errorRules.rules 必须是列表")
+    if len(rules_raw) > MAX_RULES:
+        raise ErrorRuleValidationError(f"最多 {MAX_RULES} 条规则")
+    kept: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(rules_raw):
+        try:
+            rule = normalize_rule(item)
+            if rule["id"] in seen:
+                raise ErrorRuleValidationError(f"规则 ID 重复：{rule['id']}")
+        except ErrorRuleValidationError as exc:
+            skipped.append({"index": index, "rule": item, "error": str(exc)})
+            continue
+        seen.add(rule["id"])
+        kept.append(rule)
+    return normalize_settings({**raw, "rules": kept}, tolerant=True), skipped
+
+
 PRESETS: tuple[dict[str, Any], ...] = tuple(normalize_rule(p, preset=True) for p in PRESET_SOURCES)
 PRESET_IDS = tuple(p["id"] for p in PRESETS)
 
@@ -338,15 +368,22 @@ def provider_of(channel: Any) -> str:
 _BRACKET_CODE_RE = re.compile(r"[(\[（【]\s*(\d{3,6})\s*[)\]）】]")
 
 
+_JSON_DECODER = json.JSONDecoder()
+
+
 def _json_object(text: str) -> dict | None:
+    """The first JSON object in ``text``; text around it (prefixes, request ids) is ignored."""
     start = text.find("{")
-    if start < 0:
-        return None
-    try:
-        obj = json.loads(text[start:])
-    except Exception:
-        return None
-    return obj if isinstance(obj, dict) else None
+    for _ in range(8):
+        if start < 0:
+            return None
+        try:
+            obj, _end = _JSON_DECODER.raw_decode(text, start)
+        except ValueError:
+            start = text.find("{", start + 1)
+            continue
+        return obj if isinstance(obj, dict) else None
+    return None
 
 
 def _codes_and_message(obj: dict | None) -> tuple[list[str], str]:
@@ -394,8 +431,14 @@ def observation_from_parts(*, phase: str, status: int | None, outcome: str, prov
     if raw.startswith("HTTP ") and ":" in raw[:12]:
         raw = raw.split(":", 1)[1].strip()
     excerpt = raw[:BODY_EXCERPT]
-    obj = _json_object(excerpt) or _json_object(raw)
+    # raw_decode stops at the end of the first object, so the whole body costs no more than that object.
+    obj = _json_object(raw)
     codes, message = _codes_and_message(obj)
+    if obj is None:
+        # A plain-text error can still carry the business code: "[1311][...]", "... (2067)".
+        for code in _BRACKET_CODE_RE.findall(excerpt):
+            if code not in codes:
+                codes.append(code)
     if error_code and str(error_code) not in codes:
         codes.insert(0, str(error_code))
     decoded = json.dumps(obj, ensure_ascii=False)[:BODY_EXCERPT] if obj else excerpt
@@ -746,7 +789,8 @@ def plan(rule: dict[str, Any], obs: ErrorObservation, *, now_ms: int | None = No
     steps, latest = _plan_steps(rule["steps"], obs, now, channel)
     response = client_response(rule, obs=obs, model=obs.model, until_ms=latest, now_ms=now)
     if response is None and rule["final"] == "respond":
-        response = {"status": obs.status or 400, "message": (obs.message or "upstream error")[:300],
+        # Same fallback as failover: relay the upstream status, 502 when there was none.
+        response = {"status": obs.status or 502, "message": (obs.message or "upstream error")[:300],
                     "retryAfter": None, "ruleId": rule["id"]}
     thresholds = []
     for t in rule["thresholds"]:

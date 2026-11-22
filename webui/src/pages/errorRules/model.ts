@@ -18,6 +18,8 @@ import { providerTile } from '@/utils/providers'
 
 export type ErrorRulesData = Schemas['ErrorRulesData']
 export type ErrorRule = Schemas['ErrorRuleData']
+/** A rule in config.json the runtime skips. */
+export type InvalidRule = Schemas['ErrorRuleInvalidData']
 export type Cond = Schemas['ErrorRuleCondData']
 export type Group = Schemas['ErrorRuleGroupData']
 export type Node = Cond | Group
@@ -419,6 +421,24 @@ export function untilRelative(ms: number, now = Date.now()): string {
 
 export function clone<T>(v: T): T {
   return JSON.parse(JSON.stringify(v)) as T
+}
+
+const FINGERPRINT_FIELDS = ['name', 'note', 'when', 'category', 'steps', 'final', 'thresholds', 'response'] as const
+
+function sortedKeys(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(sortedKeys)
+  if (v && typeof v === 'object') {
+    const o = v as Record<string, unknown>
+    return Object.fromEntries(Object.keys(o).sort().map((k) => [k, sortedKeys(o[k])]))
+  }
+  return v
+}
+
+/** Content identity of a rule, ignoring its id and on/off state (an import of the same rule is a duplicate). */
+export function ruleFingerprint(r: Record<string, unknown>): string {
+  return JSON.stringify(sortedKeys(Object.fromEntries(
+    FINGERPRINT_FIELDS.map((f) => [f, r[f] ?? (f === 'note' ? '' : null)]),
+  )))
 }
 
 export function rulePayload(r: ErrorRule): Record<string, unknown> {
