@@ -2157,31 +2157,64 @@ def _publish_request_event(kind: str, payload: dict[str, Any]) -> None:
         pass
 
 
-# A managed search finishes one row once per model round; while its root id is
-# held, those finishes only record the month and the owner announces it once.
-_held_finished: dict[str, str | None] = {}
+@dataclass
+class _HeldFinish:
+    db: LogDbRef | None = None
+    status: str | None = None
+    finished_at: float | None = None
+    final: bool = False
+
+
+# A managed search finishes its row once per model round. While its root id is
+# held, round finishes keep the row pending and remember their outcome; the
+# owner writes the final status once and announces the request once.
+_held_finished: dict[str, _HeldFinish] = {}
 _held_finished_lock = threading.Lock()
 
 
 def hold_finished_event(request_id: str) -> None:
-    """Defer ``finished`` for a multi-round request until it is released."""
+    """Keep a multi-round request pending and unannounced until it is released."""
     with _held_finished_lock:
-        _held_finished.setdefault(_billing_root_request_id(str(request_id)), None)
+        _held_finished.setdefault(_billing_root_request_id(str(request_id)), _HeldFinish())
 
 
 def release_finished_event(request_id: str) -> None:
-    """Announce a held request once if it was finished while held."""
+    """Settle a held request and announce it once if any round finished it."""
     root_request_id = _billing_root_request_id(str(request_id))
     with _held_finished_lock:
-        month = _held_finished.pop(root_request_id, None)
-    if month is not None and request_events.active():
-        _publish_request_event("finished", {"id": root_request_id, "month": month})
+        held = _held_finished.pop(root_request_id, None)
+    if held is None or held.db is None:
+        return
+    if not held.final and held.status is not None:
+        # No logical finalizer ran (e.g. the first round failed): the last
+        # round's outcome is the request's outcome.
+        with _write_lock:
+            conn = _get_conn_for_ref(held.db)
+            conn.execute(
+                "UPDATE request_log SET status=?, finished_at=? WHERE request_id=? AND status='pending'",
+                (held.status, held.finished_at, root_request_id),
+            )
+            conn.commit()
+    if request_events.active():
+        _publish_request_event("finished", {"id": root_request_id, "month": held.db.month})
 
 
-def _announce_finished(handle: RequestLogHandle) -> None:
+def _round_terminal(request_id: str, status: str, finished_at: float) -> tuple[str, float | None]:
+    """Status and finish time a round writes; a held request stays pending."""
     with _held_finished_lock:
-        if handle.request_id in _held_finished:
-            _held_finished[handle.request_id] = handle.db.month
+        held = _held_finished.get(request_id)
+        if held is None:
+            return status, finished_at
+        held.status, held.finished_at = status, finished_at
+    return "pending", None
+
+
+def _announce_finished(handle: RequestLogHandle, *, final: bool = False) -> None:
+    with _held_finished_lock:
+        held = _held_finished.get(handle.request_id)
+        if held is not None:
+            held.db = handle.db
+            held.final = held.final or final
             return
     if request_events.active():
         _publish_request_event("finished", {
@@ -3704,7 +3737,7 @@ def finish_managed_search_request(
                 (response_body, handle.request_id),
             )
         conn.commit()
-    _announce_finished(handle)
+    _announce_finished(handle, final=True)
 
 
 def finish_success(
@@ -3761,9 +3794,10 @@ def finish_success(
             observed = False
         else:
             observed = bool(normalized_billing.usage_observed or any(_tokens))
+        round_status, round_finished_at = _round_terminal(handle.request_id, "success", time.time())
         conn.execute(
             """UPDATE request_log SET
-                 status='success', finished_at=?, http_status=?,
+                 status=?, finished_at=?, http_status=?,
                  final_channel_key=?, final_channel_type=?, final_model=?,
                  input_tokens=?, output_tokens=?,
                  cache_creation_tokens=?, cache_read_tokens=?,
@@ -3777,7 +3811,7 @@ def finish_success(
                  upstream_actual_model=?, safety_review=?, model_signal_conflict=?
                WHERE request_id=?""",
             (
-                time.time(), http_status,
+                round_status, round_finished_at, http_status,
                 final_channel_key, final_channel_type, final_model,
                 input_tokens, output_tokens,
                 cache_creation_tokens, cache_read_tokens,
@@ -3868,6 +3902,7 @@ def finish_error(
             observed = False
         else:
             observed = bool(normalized_billing.usage_observed)
+        round_status, round_finished_at = _round_terminal(handle.request_id, terminal_status, time.time())
         conn.execute(
             """UPDATE request_log SET
                  status=?, finished_at=?, error_message=?, http_status=?,
@@ -3882,7 +3917,7 @@ def finish_error(
                  upstream_actual_model=?, safety_review=?, model_signal_conflict=?
                WHERE request_id=?""",
             (
-                terminal_status, time.time(), error_message, http_status,
+                round_status, round_finished_at, error_message, http_status,
                 final_channel_key, final_channel_type, final_model,
                 connect_ms, first_token_ms, idle_ms, total_ms,
                 final_round_id, request_elapsed_ms,
@@ -6744,6 +6779,9 @@ def cleanup_stale_pending(timeout_seconds: int = 1800) -> int:
                     ).fetchall()
                 ]
                 active_ids = {h.request_id for h in list(_request_handles.values()) if h.db.path == path}
+                # A held managed search has no bound handle while its tools run.
+                with _held_finished_lock:
+                    active_ids.update(_held_finished)
                 stale_ids = [rid for rid in stale_ids if rid not in active_ids]
                 if not stale_ids:
                     continue
@@ -6784,7 +6822,7 @@ def cleanup_stale_pending(timeout_seconds: int = 1800) -> int:
                         pass
     if finished_events and request_events.active():
         for request_id, month in finished_events:
-            _publish_request_event("finished", {"id": request_id, "month": month})
+            _publish_request_event("finished", {"id": request_id, "month": month, "stale": True})
     return cleaned
 
 

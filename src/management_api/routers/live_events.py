@@ -56,6 +56,8 @@ def encode_event(event_type: str, data: dict[str, Any]) -> str:
     elif event_type == "request.finished":
         # Identical to one GET /logs item so clients can upsert directly.
         payload = {"log": RequestLogData.model_validate(data["log"]).model_dump(mode="json")}
+        if data.get("stale"):
+            payload["stale"] = True
     elif event_type == "runtime.snapshot":
         # Identical to GET /runtime/concurrency ``data``.
         payload = _revisioned(ConcurrencyData, data).model_dump(mode="json")

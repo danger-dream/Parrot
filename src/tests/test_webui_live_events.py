@@ -347,7 +347,7 @@ def test_finished_event_equals_logs_list_item(tmp_path, monkeypatch):
                 finished = _receive_until(ws, "request.finished")
             listed = client.get(f"{API}/logs", headers=bearer(credential)).json()["data"]
         item = next(row for row in listed if row["id"] == "e2e-1")
-        assert finished["data"]["log"] == item
+        assert finished["data"] == {"log": item}
     finally:
         store.close()
 
@@ -379,6 +379,7 @@ def test_cleanup_stale_pending_emits_finished_event(tmp_path, monkeypatch):
                 finished = _receive_until(ws, "request.finished")
                 assert finished["data"]["log"]["id"] == "stale-live-1"
                 assert finished["data"]["log"]["status"] == "error"
+                assert finished["data"]["stale"] is True
     finally:
         store.close()
 

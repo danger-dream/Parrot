@@ -352,7 +352,7 @@ Telegram 批准登录的会话和待处理的批准请求不受影响；存储�
 | `hello` | `{serverTime, version, sessionExpiresAt}`；`sessionExpiresAt` = min(绝对过期, 空闲过期) |
 | `request.started` | `{id, createdAt, apiKeyName, requestedModel, protocol, isStream, clientIp, reasoningEffort, fastMode}` |
 | `request.updated` | `{id, channelId?, model?, retryCount?}`（重试/换渠道，尽力而为；换代理路由时只有 `id`） |
-| `request.finished` | `{log: RequestLogData}`，与 `GET /logs` 列表项完全相同，可直接 upsert |
+| `request.finished` | `{log: RequestLogData, stale?}`，`log` 与 `GET /logs` 列表项完全相同，可直接 upsert；`stale: true` 表示由超时清理收尾的陈旧请求，只更新该行，不计入完成数与 QPS |
 | `runtime.snapshot` | 与 `GET /runtime/concurrency` 的 `data` 完全同形，每 2 秒一次 |
 | `resync` | `{reason}`：`overflow`（该连接队列溢出，事件已丢弃）或 `enrichmentFailed`（读库补全失败）；收到后重新拉数据 |
 | `notification.created` | `{}`：有新通知记录（见文末「通知中心」），收到后重新读取 `GET /notifications` |

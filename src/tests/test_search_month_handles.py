@@ -313,7 +313,14 @@ async def test_managed_search_announces_one_finished_with_final_status(monthly, 
             await asyncio.Event().wait()
         return httpx.Response(404, json={'error': {'message': 'model unavailable'}})
 
+    between_rounds = []
+
     async def execute(calls, **kw):
+        # The logical request is still running: no terminal row, and stale
+        # cleanup must not take it even though it has no bound handle now.
+        assert log_db.cleanup_stale_pending(1800) == 0
+        row = rows(request.db.path, 'request_log', request.request_id)[0]
+        between_rounds.append((row['status'], row['finished_at']))
         return [web.LocalToolResult(c.id, 'result') for c in calls]
 
     async def invoke(current):
@@ -349,5 +356,97 @@ async def test_managed_search_announces_one_finished_with_final_status(monthly, 
         await client.aclose()
     final = {'success': 'success', 'cancelled': 'cancelled'}.get(outcome, 'error')
     assert count == (1 if outcome == 'first_round_error' else 2)
+    assert between_rounds == ([] if outcome == 'first_round_error' else [('pending', None)])
+    assert announced == [(request.db.month, final)]
+    row = rows(request.db.path, 'request_log', request.request_id)[0]
+    assert row['status'] == final and row['finished_at'] is not None
+    assert request.request_id not in log_db._held_finished
+
+
+def test_lost_hold_leaves_a_pending_row_for_stale_cleanup(monthly):
+    _, _, request, _, _ = setup_route(monthly, 'responses', False)
+    log_db.hold_finished_event(request.request_id)
+    log_db.finish_success(request, 'api:month', 'api', 'test-model', input_tokens=3, output_tokens=2)
+    assert rows(request.db.path, 'request_log', request.request_id)[0]['status'] == 'pending'
+    assert log_db.cleanup_stale_pending(1800) == 0
+    # A crash between rounds loses the in-memory hold; the row must not stay a false success.
+    log_db._held_finished.pop(request.request_id)
+    assert log_db.cleanup_stale_pending(1800) == 1
+    row = rows(request.db.path, 'request_log', request.request_id)[0]
+    assert row['status'] == 'error' and 'stale pending' in row['error_message']
+    assert row['input_tokens'] == 3
+
+
+def search_sse():
+    item = {'type': 'function_call', 'id': 'fc-search', 'call_id': 'search', 'name': 'web_search',
+            'arguments': '{"query":"Python docs"}', 'status': 'completed'}
+    usage = {'input_tokens': 3, 'output_tokens': 2, 'total_tokens': 5}
+    payload = b''.join([
+        fx._responses_sse_event('response.created', {
+            'type': 'response.created', 'sequence_number': 1,
+            'response': {'id': 'resp-search', 'status': 'in_progress'}}),
+        fx._responses_sse_event('response.output_item.added', {
+            'type': 'response.output_item.added', 'sequence_number': 2, 'output_index': 0,
+            'item': {**item, 'arguments': '', 'status': 'in_progress'}}),
+        fx._responses_sse_event('response.function_call_arguments.done', {
+            'type': 'response.function_call_arguments.done', 'sequence_number': 3, 'output_index': 0,
+            'item_id': item['id'], 'name': item['name'], 'arguments': item['arguments']}),
+        fx._responses_sse_event('response.output_item.done', {
+            'type': 'response.output_item.done', 'sequence_number': 4, 'output_index': 0, 'item': item}),
+        fx._responses_sse_event('response.completed', {
+            'type': 'response.completed', 'sequence_number': 5,
+            'response': {'id': 'resp-search', 'status': 'completed', 'output': [item], 'usage': usage}}),
+    ])
+    return httpx.Response(200, content=payload, headers={'content-type': 'text/event-stream'})
+
+
+@pytest.mark.parametrize('outcome', ['success', 'continuation_error'])
+async def test_streamed_managed_search_announces_one_finished_with_final_status(monthly, monkeypatch, outcome):
+    body, route, request, _, _ = setup_route(monthly, 'responses', False)
+    count = 0
+
+    def model(req):
+        nonlocal count
+        count += 1
+        if count == 1:
+            return search_sse()
+        if outcome == 'success':
+            return fx._responses_sse_response('final')
+        return httpx.Response(404, json={'error': {'message': 'model unavailable'}})
+
+    between_rounds = []
+
+    async def execute(calls, **kw):
+        row = rows(request.db.path, 'request_log', request.request_id)[0]
+        between_rounds.append((row['status'], row['finished_at']))
+        return [web.LocalToolResult(c.id, 'result') for c in calls]
+
+    async def invoke(current):
+        response = await monthly.m['failover'].run_failover(
+            route, current, request.request_id, 'test-key', '127.0.0.1', bool(current.get('stream')), time.time(),
+            ingress_protocol='responses', start_monotonic=time.monotonic())
+        monthly.clock[0] = FEB
+        return response
+
+    announced = []
+
+    def listener(kind, payload):
+        if kind == 'finished' and payload['id'] == request.request_id:
+            announced.append((payload['month'], rows(request.db.path, 'request_log', request.request_id)[0]['status']))
+
+    monkeypatch.setattr(web, 'execute_local_tool_calls', execute)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(model))
+    monthly.m['upstream'].set_client(client)
+    unsubscribe = request_events.subscribe(listener)
+    try:
+        response = policy.stream(body, 'responses', invoke, request_id=request.request_id, api_key_name='test-key')
+        raw = b''.join([part async for part in response.body_iterator])
+    finally:
+        unsubscribe()
+        await client.aclose()
+    final = 'success' if outcome == 'success' else 'error'
+    assert count == 2
+    assert (b'final' in raw) == (outcome == 'success')
+    assert between_rounds == [('pending', None)]
     assert announced == [(request.db.month, final)]
     assert request.request_id not in log_db._held_finished

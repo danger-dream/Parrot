@@ -139,7 +139,8 @@ class LiveEventBus:
         self._unsubscribe: Callable[[], None] | None = None
         self._ticker: asyncio.Task | None = None
         self._flusher: asyncio.Task | None = None
-        self._pending_finished: dict[str, str | None] = {}
+        # request id -> (month, stale); stale finishes come from pending cleanup.
+        self._pending_finished: dict[str, tuple[str | None, bool]] = {}
         self._closed = False
 
     # ── wire encoding ────────────────────────────────────────────────
@@ -266,7 +267,9 @@ class LiveEventBus:
             request_id = str(payload.get("id") or "")
             if not request_id:
                 return
-            self._pending_finished[request_id] = payload.get("month")
+            previous = self._pending_finished.get(request_id)
+            stale = bool(payload.get("stale")) and (previous is None or previous[1])
+            self._pending_finished[request_id] = (payload.get("month"), stale)
             if self._flusher is None or self._flusher.done():
                 loop = self._loop
                 if loop is not None:
@@ -279,7 +282,7 @@ class LiveEventBus:
                 await asyncio.sleep(self.finished_delay)
             pending, self._pending_finished = self._pending_finished, {}
             by_month: dict[str | None, list[str]] = {}
-            for request_id, month in pending.items():
+            for request_id, (month, _stale) in pending.items():
                 by_month.setdefault(month, []).append(request_id)
             for month, ids in by_month.items():
                 try:
@@ -294,7 +297,8 @@ class LiveEventBus:
                     self.broadcast("resync", {"reason": "enrichmentFailed"})
                     continue
                 for record in records:
-                    self.broadcast("request.finished", {"log": record})
+                    stale = pending.get(str(record.get("id") or ""), (None, False))[1]
+                    self.broadcast("request.finished", {"log": record, **({"stale": True} if stale else {})})
 
     async def _tick(self) -> None:
         elapsed_since_ping = 0.0
