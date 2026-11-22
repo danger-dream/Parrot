@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from datetime import datetime, timedelta, timezone
@@ -561,7 +562,8 @@ def test_recent_errors_use_the_runtime_phase():
 # ── Management API ──────────────────────────────────────────────────
 
 
-def _client(tmp_path, monkeypatch):
+@pytest.fixture
+def management_client(tmp_path, monkeypatch):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -583,11 +585,13 @@ def _client(tmp_path, monkeypatch):
     server._initialize_management_runtime(app)
     install_management_error_handlers(app)
     install_management_routers(app)
-    return TestClient(app), key
+    yield TestClient(app), key
+    # Also unbinds the Telegram adapters, which would otherwise keep this runtime's controls.
+    asyncio.run(server._close_management_runtime(app))
 
 
-def test_management_api_crud_presets_and_dry_run(tmp_path, monkeypatch):
-    client, key = _client(tmp_path, monkeypatch)
+def test_management_api_crud_presets_and_dry_run(tmp_path, monkeypatch, management_client):
+    client, key = management_client
     base = "/api/management/v1/error-rules"
     with client:
         sess = client.post("/api/management/v1/auth/sessions", json={"grantType": "managementKey", "managementKey": key})
@@ -662,11 +666,11 @@ def test_management_api_crud_presets_and_dry_run(tmp_path, monkeypatch):
         assert gone.status_code == 200 and gone.json()["data"]["rules"] == []
 
 
-def test_a_broken_rule_in_config_is_skipped_and_never_wiped(tmp_path, monkeypatch):
+def test_a_broken_rule_in_config_is_skipped_and_never_wiped(tmp_path, monkeypatch, management_client):
     good = error_rules.normalize_rule(_rule(id="good", name="好规则"))
     broken = {"id": "broken", "name": "坏规则", "category": "rate_limit", "when": group("all")}
     config_module.update(lambda c: c.__setitem__("errorRules", {"enabled": True, "rules": [good, broken], "presets": {}}))
-    client, key = _client(tmp_path, monkeypatch)
+    client, key = management_client
     base = "/api/management/v1/error-rules"
     with client:
         sess = client.post("/api/management/v1/auth/sessions", json={"grantType": "managementKey", "managementKey": key})

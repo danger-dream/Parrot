@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 from types import SimpleNamespace
 
@@ -403,7 +404,8 @@ def test_management_api_prompt_rules_crud_reorder_cas_and_dry_run(tmp_path, monk
             auto_ids = [x["id"] for x in ra.json()["data"]["rules"] if x["name"] == "自动生成ID规则"]
             assert len(auto_ids) == 1 and auto_ids[0].startswith("rule-")
     finally:
-        runtime.close()
+        # Also unbinds the Telegram adapters, which would otherwise keep this runtime's controls.
+        asyncio.run(server._close_management_runtime(app))
 
 
 def test_regex_replacement_validation_expansion_guard_and_fail_open(monkeypatch):
