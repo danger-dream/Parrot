@@ -129,13 +129,18 @@ class ZhipuOAuthChannel(ApiChannel):
         final_url = route.url
         if route.routed:
             headers = endpoint_routing.apply_routed_headers(headers, route.headers)
-        signer = signing.for_account(dict(current, model_key=token), self.account_key, network_revision=network_revision)
+        with config.serialized_updates():
+            runtime.assert_request_current(self.account_key, current, token)
+            signer = signing.for_account(dict(current, model_key=token), self.account_key, network_revision=network_revision)
         observation = {"resolved": True, "scope": project_tokens.scope(current),
             "state_key": oauth_manager.account_state_key(current),
             "fingerprint": project_tokens.token_fingerprint(token), "mode": current.get("credential_mode")}
         ctx = {**(ctx or {}), "zhipu_stream": BusinessStream(), "zhipu_auth": observation}
         def wire_context(request, factory):
-            return BusinessContext(signer.wrap(request, factory, signing_url=logical_url), observation)
+            def checked_factory(signed_request):
+                runtime.assert_request_current(self.account_key, current, token)
+                return factory(signed_request)
+            return BusinessContext(signer.wrap(request, checked_factory, signing_url=logical_url), observation)
         return UpstreamRequest(final_url, headers,
             json_bytes.dumps_utf8(payload, separators=(",", ":")), translator_ctx=ctx,
             dispatch_metadata=build_dispatch_metadata(payload, "anthropic", headers), stream_context_hook=wire_context)

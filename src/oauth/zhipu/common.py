@@ -134,11 +134,12 @@ def require_network():
 
 
 def request(url, *, headers=None, method="GET", body=None, account_key="", timeout=None, envelope=True,
-            read_attempts=1, stage=None):
+            read_attempts=1, stage=None, total_timeout=None):
     with scope(provider="zhipu", stage=stage or ""):
         try:
             return _request(url, headers=headers, method=method, body=body, account_key=account_key,
-                            timeout=timeout, envelope=envelope, read_attempts=read_attempts, stage=stage)
+                            timeout=timeout, envelope=envelope, read_attempts=read_attempts, stage=stage,
+                            total_timeout=total_timeout)
         except ZhipuError as exc:
             if stage:
                 exc.stage = stage
@@ -146,16 +147,19 @@ def request(url, *, headers=None, method="GET", body=None, account_key="", timeo
             raise
 
 
-def _request(url, *, headers, method, body, account_key, timeout, envelope, read_attempts, stage):
-    # Only explicitly opted-in reads use the longer timeout/retry policy.
-    # Writes, CLI polling and catalog deadlines retain their existing owner.
-    if method.upper() != "GET" or read_attempts <= 1:
+def _request(url, *, headers, method, body, account_key, timeout, envelope, read_attempts, stage, total_timeout):
+    # Only opted-in reads retry here; bounded writes keep their caller's budget.
+    if total_timeout is None and (method.upper() != "GET" or read_attempts <= 1):
         return _request_once(url, headers=headers, method=method, body=body,
                              account_key=account_key, timeout=20 if timeout is None else timeout, envelope=envelope)
 
     trace = RequestTrace(url)
     async def read():
         try:
+            if total_timeout is not None:
+                return await asyncio.wait_for(_async_request_once(url, headers=headers, method=method, body=body,
+                    account_key=account_key, timeout=20 if timeout is None else timeout, envelope=envelope,
+                    trace=trace), timeout=total_timeout)
             return await asyncio.wait_for(_read_attempts(url, headers=headers, account_key=account_key,
                 timeout=READ_TIMEOUT if timeout is None else timeout, envelope=envelope,
                 attempts=min(3, read_attempts), stage=stage, trace=trace), timeout=READ_TOTAL_TIMEOUT)
@@ -185,8 +189,8 @@ async def _read_attempts(url, *, headers, account_key, timeout, envelope, attemp
         trace.routes.clear()
         trace.phase, trace.send_started = "", False
         try:
-            return await _read_once(url, headers=headers, account_key=account_key,
-                                    timeout=timeout, envelope=envelope, trace=trace)
+            return await _async_request_once(url, headers=headers, method="GET", body=None, account_key=account_key,
+                                             timeout=timeout, envelope=envelope, trace=trace)
         except ZhipuError as exc:
             if stage:
                 exc.stage = stage
@@ -257,13 +261,14 @@ def _decode_response(raw, status, envelope, url=""):
     return value.get("data")
 
 
-async def _read_once(url, *, headers, account_key, timeout, envelope, trace=None):
+async def _async_request_once(url, *, headers, method, body, account_key, timeout, envelope, trace=None):
     require_network()
     trace = trace or RequestTrace(url)
     try:
         async with network.async_client(timeout=timeout, follow_redirects=False, proxy_purpose="oauth_zhipu",
                 proxy_channel="oauth:" + account_key if account_key else "oauth:zhipu:login") as client:
-            async with client.stream("GET", url, headers=headers or {}, extensions=trace.extensions(asynchronous=True)) as response:
+            async with client.stream(method, url, headers=headers or {}, extensions=trace.extensions(asynchronous=True),
+                                     **({"json": body} if body is not None else {})) as response:
                 _check_status(response)
                 raw = bytearray()
                 async for chunk in response.aiter_bytes():

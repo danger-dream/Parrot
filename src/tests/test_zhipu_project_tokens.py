@@ -418,7 +418,7 @@ def test_pat_transient_retries_once_immediately_with_15s_timeout(monkeypatch, cl
     assert auth.resolve_model_key(account()) == pat(tag="recovered")
     pat_calls = [kw for url, kw in calls if url.endswith("/access_tokens")]
     assert len(pat_calls) == 2
-    assert all(kw["timeout"] == 15 for kw in pat_calls)
+    assert all(kw["timeout"] == kw["total_timeout"] == 15 for kw in pat_calls)
     assert sleeps == []
 
 
@@ -520,4 +520,50 @@ def test_pat_retry_stops_if_scope_invalidated_during_429_sleep(account_env, monk
     with pytest.raises(c.ZhipuError, match="scope_invalidated"):
         auth.resolve_model_key(snapshot, account_key=key)
     assert sum(url.endswith("/access_tokens") for url, _ in calls) == 1
+
+
+@pytest.mark.parametrize("first_transient", [False, True])
+@pytest.mark.parametrize("change", ["peer_rotation", "new_login", "delete"])
+def test_pat_401_preserves_peer_rotation_but_not_new_login(account_env, monkeypatch, first_transient, change):
+    a = account(site="zai", project_key_id="fixture", zhipu_oauth_token="source")
+    om.add_account(a)
+    key = om.get_account_key(a)
+    snapshot = copy.deepcopy(om.get_account(key))
+    calls = []
+    pat_calls = []
+    def wire(url, **kw):
+        calls.append(url.rsplit("/", 1)[-1])
+        authorization = kw.get("headers", {}).get("Authorization")
+        if url.endswith("/api/auth/z/login"):
+            return {"access_token": "renewed-business"}
+        if url.endswith("getCustomerInfo"):
+            if authorization == "fixture-biz":
+                raise c.ZhipuError("projects", status=401)
+            assert authorization == "renewed-business"
+            return {"organizations": []}
+        assert url.endswith("/access_tokens")
+        pat_calls.append(authorization)
+        if first_transient and len(pat_calls) == 1:
+            raise c.ZhipuError("project_token", status=503)
+        if authorization == "Bearer fixture-biz":
+            if change == "peer_rotation":
+                auth.project_choices(copy.deepcopy(snapshot), account_key=key)
+            elif change == "new_login":
+                assert om.mutate_account_if_unchanged(key, om.get_account(key),
+                    lambda value: value.update(access_token="renewed-business", zcode_token="new-login"))["status"] == "updated"
+            else:
+                om.delete_account(key)
+            raise c.ZhipuError("project_token", status=401)
+        assert authorization == "Bearer renewed-business" and change == "peer_rotation"
+        return envelope()
+    monkeypatch.setattr(c, "request", wire)
+    if change == "peer_rotation":
+        assert auth.resolve_model_key(snapshot, account_key=key) == pat()
+        assert pat_calls == ["Bearer fixture-biz"] * (1 + first_transient) + ["Bearer renewed-business"]
+        assert calls.count("login") == 1
+    else:
+        with pytest.raises(c.ZhipuError, match="scope_invalidated|stale_generation"):
+            auth.resolve_model_key(snapshot, account_key=key)
+        assert pat_calls == ["Bearer fixture-biz"] * (1 + first_transient)
+        assert "login" not in calls
 

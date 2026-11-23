@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import json
 import threading
 import time
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from . import common as c
 
@@ -102,6 +102,10 @@ def _parse_mapping_url(raw, label, *, allow_insecure=False):
     except ValueError:
         raise ValueError(f"agent_configs_invalid_{label}_url") from None
     scheme = parsed.scheme.lower()
+    path = unquote(parsed.path)
+    # Clients and gateways can resolve dot segments after decoding separators.
+    if "\\" in raw or "\\" in path or any(part in {".", ".."} for part in path.split("/")):
+        raise ValueError(f"agent_configs_unsafe_{label}_url")
     allowed_schemes = ("https", "http") if allow_insecure else ("https",)
     if (scheme not in allowed_schemes or not parsed.hostname
             or parsed.username is not None or parsed.password is not None
@@ -263,7 +267,7 @@ class EndpointRouter:
 
     async def _refresh(self):
         try:
-            raw = await self._fetch_raw()
+            raw = await asyncio.wait_for(self._fetch_raw(), timeout=self.request_timeout_s)
             mapping = parse_routing_mapping(raw, self.endpoint_origin, allow_insecure=self.allow_insecure)
             with self.lock:
                 self.snapshot = (time.monotonic() + self.success_ttl_s, mapping)

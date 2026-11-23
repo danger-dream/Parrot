@@ -31,6 +31,18 @@ def ensure_device_id(account_key, expected_account):
         return device_id
 
 
+def assert_request_current(account_key, expected_account, token):
+    from ... import oauth_manager
+    current = oauth_manager.get_account(account_key)
+    if (not current or c.fingerprint(current) != c.fingerprint(expected_account)
+            or not current.get("enabled", True) or current.get("disabled_reason")):
+        raise c.ZhipuError("model_request", "scope_invalidated")
+    bound_token = (current.get("model_key") if current.get("credential_mode") == "api_key"
+                   else project_tokens.cached_token(current))
+    if bound_token != token:
+        raise c.ZhipuError("model_request", "scope_invalidated")
+
+
 def key_patch(account):
     key_id = project_tokens.location_id(account)
     if not key_id:

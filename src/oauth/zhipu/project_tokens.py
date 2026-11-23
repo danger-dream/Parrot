@@ -85,12 +85,13 @@ def _is_pat_retryable(exc):
 def _request_with_pat_retry(url, *, headers, account_key, assert_current, **kwargs):
     for attempt in range(1, PAT_MAX_ATTEMPTS + 1):
         try:
-            return c.request(url, headers=headers, account_key=account_key, timeout=PAT_REQUEST_TIMEOUT_S, **kwargs)
+            return c.request(url, headers=headers, account_key=account_key, timeout=PAT_REQUEST_TIMEOUT_S,
+                             total_timeout=PAT_REQUEST_TIMEOUT_S, **kwargs)
         except c.ZhipuError as exc:
-            if assert_current is not None:
-                assert_current()
             if attempt >= PAT_MAX_ATTEMPTS or not _is_pat_retryable(exc):
                 raise
+            if assert_current is not None:
+                assert_current()
             if exc.status_code == 429:
                 ra_ms = _retry_after_ms(exc)
                 if ra_ms is not None and ra_ms > PAT_RETRY_MAX_WAIT_MS:

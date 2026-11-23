@@ -108,6 +108,47 @@ def test_parse_mapping_rejects_invalid_or_unsafe_snapshots(payload):
         er.parse_routing_mapping(payload, "https://zcode.z.ai")
 
 
+@pytest.mark.parametrize("label", ["from", "to"])
+@pytest.mark.parametrize("suffix", [
+    "../oauth/token", "%2e%2e/oauth/token", ".%2E/oauth/token", "%2E./oauth/token",
+    "%2e%2e%2foauth/token", "%2F..%2Foauth/token", "..\\oauth\\token", "%2e%2e%5Coauth/token",
+    "./anthropic/v1/messages", "%2e/anthropic/v1/messages",
+])
+def test_mapping_rejects_ambiguous_path_segments(label, suffix):
+    entry = {"from": "https://open.bigmodel.cn/api/anthropic/v1/messages",
+             "to": "https://zcode.z.ai/api/v1/ultra/anthropic/v1/messages",
+             "zcodeAuthorizationHeader": "X-ZCode-Authorization"}
+    entry[label] = "https://zcode.z.ai/api/v1/ultra/" + suffix
+    raw = json.dumps({"code": 0, "data": {"proxyEndpoint": {"mapping": [entry]}}}).encode()
+    with pytest.raises(ValueError, match=f"agent_configs_unsafe_{label}_url"):
+        er.parse_routing_mapping(raw, "https://zcode.z.ai")
+
+
+@pytest.mark.parametrize("cached", [False, True])
+async def test_ambiguous_mapping_never_dispatches_identity_outside_allowed_path(monkeypatch, cached):
+    source = "https://open.bigmodel.cn/api/anthropic/v1/messages"
+    target = "https://zcode.z.ai/api/v1/ultra/anthropic/v1/messages"
+    router = er.EndpointRouter(account_key="fixture", platform_origin="https://zcode.z.ai", app_version=common.VERSION)
+    if cached:
+        router.snapshot = (0, {"https://open.bigmodel.cn:443/api/anthropic/v1/messages": (True, target)})
+    snapshot = router.snapshot
+    async def fetch():
+        return json.dumps({"code": 0, "data": {"proxyEndpoint": {"mapping": [{
+            "from": source, "to": "https://zcode.z.ai/api/v1/ultra/../oauth/token",
+            "zcodeAuthorizationHeader": "X-ZCode-Authorization",
+        }]}}}).encode()
+    monkeypatch.setattr(router, "_fetch_raw", fetch)
+    route = await router.resolve(source, zcode_token="fixture-platform")
+    request = httpx.Request("POST", route.url, headers=route.headers)
+    assert router.snapshot is snapshot and router.retry_after > 0
+    if cached:
+        assert route.routed and str(request.url) == target
+        assert request.headers["x-zcode-authorization"] == "Bearer fixture-platform"
+    else:
+        assert not route.routed and str(request.url) == source
+        assert "x-zcode-authorization" not in request.headers
+
+
 def test_parse_mapping_rejects_over_256_entries():
     items = [{"from": f"https://a.test/{i}", "to": f"https://b.test/{i}"} for i in range(257)]
     with pytest.raises(ValueError):
