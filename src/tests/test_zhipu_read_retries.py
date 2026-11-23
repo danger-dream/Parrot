@@ -75,17 +75,18 @@ def test_retry_after_respected_and_excessive_delay_stops(wire):
     assert len(calls) == 2 and sleeps == [2]
 
 
-def test_key_list_retries_but_pat_post_never_replays(wire):
+def test_key_list_retries_and_pat_post_retries_bounded_to_two(wire):
     replies, calls, sleeps = wire
     replies.extend([httpx.Response(502), httpx.Response(200, json={"data": [{"apiKey": "id", "name": "zcode-api-key"}]}),
-                    httpx.ConnectError("temporary")])
+                    httpx.ConnectError("temporary"), httpx.ConnectError("temporary")])
     account = credential("oauth", organization_id="org", project_id="project")
     with pytest.raises(common.ZhipuError):
         auth.resolve_model_key(account)
-    assert len(calls) == 3 and sleeps == [0.5]
+    assert len(calls) == 4 and sleeps == [0.5]
+    assert set(calls[-1].extensions["timeout"].values()) == {15}
     replies.append(httpx.Response(200, json=envelope("id")))
     assert auth.resolve_model_key(account) == pat("id")
-    assert [request.method for request in calls] == ["GET", "GET", "POST", "POST"]
+    assert [request.method for request in calls] == ["GET", "GET", "POST", "POST", "POST"]
 
 
 def test_read_timeouts_20_connect_60_read_preserve_explicit_and_write_limits(wire):

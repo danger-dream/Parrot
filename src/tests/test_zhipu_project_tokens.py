@@ -63,7 +63,7 @@ def test_family_scope_wire_and_durable_callbacks(monkeypatch, site, team, create
         if url.endswith("/access_tokens"):
             assert url.endswith("/organization/org/projects/project/api_keys/id%2Fx/access_tokens")
             assert headers == {"Authorization": "Bearer fixture-biz", "Content-Type": "application/json"}
-            assert kw["method"] == "POST" and kw["body"] == {"clientType":"zcode", "clientVersion":"3.15.3"}
+            assert kw["method"] == "POST" and kw["body"] == {"clientType":"zcode", "clientVersion":"3.19.1"}
             return envelope("id/x")
         assert headers["Authorization"] == ("Bearer " if site == "zai" and not team else "") + "fixture-biz"
         assert (headers.get("bigmodel-organization"), headers.get("bigmodel-project")) == (("org", "project") if team else (None, None))
@@ -90,19 +90,20 @@ def test_cache_min_start_time_advance_refresh_and_five_second_deferral(monkeypat
     def delayed():
         clock[0] += 20
         return material(seconds=1000, expires=1900)
-    calls = install(monkeypatch, [delayed, c.ZhipuError("project_token", "timeout"), material("two")])
+    calls = install(monkeypatch, [delayed, c.ZhipuError("project_token", "timeout"),
+                                  c.ZhipuError("project_token", "timeout"), material("two")])
     assert auth.resolve_model_key(a) == pat(tag="one")
     value = pt._entries[pt.scope(a)]["value"]
     assert value["expires"] == 1900000 and value["refresh"] == 1750000
     clock[0] = 1749
     assert auth.resolve_model_key(a) == pat(tag="one") and len(calls) == 2
     clock[0] = 1750
-    assert auth.resolve_model_key(a) == pat(tag="one") and len(calls) == 3
+    assert auth.resolve_model_key(a) == pat(tag="one") and len(calls) == 4
     assert value["refresh"] == 1755000
     clock[0] = 1754
-    assert auth.resolve_model_key(a) == pat(tag="one") and len(calls) == 3
+    assert auth.resolve_model_key(a) == pat(tag="one") and len(calls) == 4
     clock[0] = 1755
-    assert auth.resolve_model_key(a) == pat(tag="two") and len(calls) == 4
+    assert auth.resolve_model_key(a) == pat(tag="two") and len(calls) == 5
 
 
 def test_relative_expiry_uses_request_start_not_delayed_response(monkeypatch, clock):
@@ -122,8 +123,12 @@ def test_never_fallback_expired_rejected_or_terminal(monkeypatch, clock, reason)
     install(monkeypatch, replies)
     token = auth.resolve_model_key(a)
     clock[0] = 1200 if reason == "expired" else 1050
-    replies.append(material(expires=0) if reason == "schema" else
-                   envelope(enable=False) if reason == "disabled" else c.ZhipuError("project_token", status=503))
+    if reason == "schema":
+        replies.append(material(expires=0))
+    elif reason == "disabled":
+        replies.append(envelope(enable=False))
+    else:
+        replies.extend([c.ZhipuError("project_token", status=503), c.ZhipuError("project_token", status=503)])
     with pytest.raises(c.ZhipuError):
         auth.resolve_model_key(a, rejected_fingerprint=pt.token_fingerprint(token) if reason == "rejected" else None)
     assert pt.scope(a) not in pt._entries
@@ -295,7 +300,7 @@ def test_rejection_during_pending_refresh_cannot_fallback_to_old_token(monkeypat
         entered.set()
         assert release.wait(3)
         raise c.ZhipuError("project_token", "timeout")
-    install(monkeypatch, [material(seconds=200), delayed_failure])
+    install(monkeypatch, [material(seconds=200), delayed_failure, c.ZhipuError("project_token", "timeout")])
     old = auth.resolve_model_key(a)
     clock[0] = 1050
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -398,3 +403,121 @@ async def test_no_refresh_switch_never_falls_back_to_oauth_legacy_key(account_en
     monkeypatch.setattr(c, "request", lambda *a, **kw: pytest.fail("operator forbids renewal"))
     with pytest.raises(c.ZhipuError, match="disabled"):
         await om.ensure_valid_token(key)
+
+
+@pytest.mark.parametrize("first_err", [
+    c.ZhipuError("project_token", "network"),
+    c.ZhipuError("project_token", "timeout"),
+    c.ZhipuError("project_token", status=500),
+    c.ZhipuError("project_token", status=503),
+])
+def test_pat_transient_retries_once_immediately_with_15s_timeout(monkeypatch, clock, first_err):
+    sleeps = []
+    monkeypatch.setattr(pt, "_sleep", sleeps.append)
+    calls = install(monkeypatch, [first_err, material("recovered")])
+    assert auth.resolve_model_key(account()) == pat(tag="recovered")
+    pat_calls = [kw for url, kw in calls if url.endswith("/access_tokens")]
+    assert len(pat_calls) == 2
+    assert all(kw["timeout"] == 15 for kw in pat_calls)
+    assert sleeps == []
+
+
+@pytest.mark.parametrize("ra_ms,expected_sleep_ms", [
+    (None, 625),   # floor=250, jitter=0.5 -> 250 + floor(750 * 0.5)
+    (0, 625),
+    (400, 700),    # floor=400, jitter=0.5 -> 400 + floor(600 * 0.5)
+    (1000, 1000),  # floor=1000 -> 1000 + 0
+])
+def test_pat_429_retry_after_within_1s_sleeps_and_retries(monkeypatch, clock, ra_ms, expected_sleep_ms):
+    sleeps = []
+    monkeypatch.setattr(pt, "_sleep", sleeps.append)
+    err = c.ZhipuError("project_token", status=429)
+    if ra_ms is not None:
+        err.retry_after_ms = ra_ms
+    calls = install(monkeypatch, [err, material("after429")])
+    assert auth.resolve_model_key(account()) == pat(tag="after429")
+    assert sum(url.endswith("/access_tokens") for url, _ in calls) == 2
+    assert sleeps == [expected_sleep_ms / 1000.0]
+
+
+def test_pat_429_retry_after_over_1s_fails_immediately_without_sleep(monkeypatch, clock):
+    sleeps = []
+    monkeypatch.setattr(pt, "_sleep", sleeps.append)
+    err = c.ZhipuError("project_token", status=429)
+    err.retry_after_ms = 1001
+    calls = install(monkeypatch, [err, material("must-not-run")])
+    with pytest.raises(c.ZhipuError) as failed:
+        auth.resolve_model_key(account())
+    assert failed.value.status_code == 429
+    assert sum(url.endswith("/access_tokens") for url, _ in calls) == 1
+    assert sleeps == []
+
+
+@pytest.mark.parametrize("status", [400, 403, 404, 408])
+def test_pat_non_retryable_status_never_retries(monkeypatch, clock, status):
+    sleeps = []
+    monkeypatch.setattr(pt, "_sleep", sleeps.append)
+    calls = install(monkeypatch, [c.ZhipuError("project_token", status=status), material("unused")])
+    with pytest.raises(c.ZhipuError) as failed:
+        auth.resolve_model_key(account())
+    assert failed.value.status_code == status
+    assert sum(url.endswith("/access_tokens") for url, _ in calls) == 1
+    assert sleeps == []
+
+
+def test_parse_retry_after_ms_supports_seconds_and_http_date():
+    assert c.parse_retry_after_ms("0") == 0
+    assert c.parse_retry_after_ms("0.5") == 500
+    assert c.parse_retry_after_ms("1") == 1000
+    assert c.parse_retry_after_ms("1.5") == 1500
+    assert c.parse_retry_after_ms("2") == 2000
+    assert c.parse_retry_after_ms("000000005") == 5000
+    assert c.parse_retry_after_ms("000000005.25") == 5250
+    assert c.parse_retry_after_ms("999999999") == 86400000
+    assert c.parse_retry_after_ms("  ") is None
+    assert c.parse_retry_after_ms("not-a-date") is None
+    # Thu, 01 Jan 1970 00:00:10 GMT == 10000ms epoch
+    assert c.parse_retry_after_ms("Thu, 01 Jan 1970 00:00:10 GMT", now_ms=9600) == 400
+    assert c.parse_retry_after_ms("Thu, 01 Jan 1970 00:00:10 GMT", now_ms=7000) == 3000
+    assert c.parse_retry_after_ms("Thu, 01 Jan 1970 00:00:10 GMT", now_ms=15000) == 0
+
+
+def test_zai_401_outer_loop_wraps_inner_pat_retry(monkeypatch, clock):
+    a = account(site="zai", zhipu_oauth_token="orig-oauth")
+    seen = []
+    step = [0]
+    def wire(url, **kw):
+        seen.append(url.rsplit("/", 1)[-1])
+        if url.endswith("/api_keys"):
+            return [{"apiKey": "fixture", "name": "zcode-api-key"}]
+        if url.endswith("/api/auth/z/login"):
+            return {"access_token": "renewed-biz"}
+        assert url.endswith("/access_tokens")
+        step[0] += 1
+        if step[0] == 1:
+            assert kw["headers"]["Authorization"] == "Bearer fixture-biz"
+            raise c.ZhipuError("project_token", status=401)
+        assert kw["headers"]["Authorization"] == "Bearer renewed-biz"
+        if step[0] == 2:
+            raise c.ZhipuError("project_token", status=503)
+        return material("outer-inner-ok")
+    monkeypatch.setattr(c, "request", wire)
+    assert auth.resolve_model_key(a) == pat(tag="outer-inner-ok")
+    assert seen == ["api_keys", "access_tokens", "login", "access_tokens", "access_tokens"]
+
+
+def test_pat_retry_stops_if_scope_invalidated_during_429_sleep(account_env, monkeypatch, clock):
+    a = account()
+    om.add_account(a)
+    key = om.get_account_key(a)
+    snapshot = copy.deepcopy(om.get_account(key))
+    def invalidate_during_sleep(_seconds):
+        pt.forget(key)
+    monkeypatch.setattr(pt, "_sleep", invalidate_during_sleep)
+    err = c.ZhipuError("project_token", status=429)
+    err.retry_after_ms = 300
+    calls = install(monkeypatch, [err, material("must-not-run")])
+    with pytest.raises(c.ZhipuError, match="scope_invalidated"):
+        auth.resolve_model_key(snapshot, account_key=key)
+    assert sum(url.endswith("/access_tokens") for url, _ in calls) == 1
+

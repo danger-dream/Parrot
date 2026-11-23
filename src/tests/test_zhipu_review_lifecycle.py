@@ -171,7 +171,7 @@ def test_peer_business_rotation_cannot_reauthorize_key_create_after_pause(ctl, m
 def test_created_key_then_pat_timeout_is_durably_resumed_without_duplicate(reset_env, monkeypatch):
     control, key, state, _ = reset_env
     wire = c.request
-    failures = [True]
+    failures = [True, True]
     monkeypatch.setattr(control, "_post_save_zhipu_effects", lambda *a, **kw: {})
     monkeypatch.setattr(control, "_zhipu_initialization_summary", lambda effects: {})
 

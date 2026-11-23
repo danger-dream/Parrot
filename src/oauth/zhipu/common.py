@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+from email.utils import parsedate_to_datetime
 import hashlib
 import json
+import math
 import os
 import platform
+import re
 import time
+from datetime import timezone
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -16,7 +20,7 @@ from ... import network
 from ...safe_diagnostics import inherit, report, scope
 from .diagnostics import RequestTrace, error_facts
 
-VERSION = "3.15.3"
+VERSION = "3.19.1"
 PLATFORM_ORIGIN = "https://zcode.z.ai"
 BIZ_ORIGINS = {"bigmodel": "https://bigmodel.cn", "zai": "https://api.z.ai"}
 MODEL_ORIGINS = {"bigmodel": "https://open.bigmodel.cn", "zai": "https://api.z.ai"}
@@ -200,12 +204,43 @@ def _timeout_phase(exc):
         (httpx.WriteTimeout, "write"), (httpx.PoolTimeout, "pool")) if isinstance(exc, cls)), "")
 
 
+_RETRY_AFTER_NUM = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
+
+
+def parse_retry_after_ms(raw, *, now_ms=None):
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    if _RETRY_AFTER_NUM.fullmatch(text):
+        whole, _, frac = text.partition(".")
+        digits = whole.lstrip("0") or "0"
+        if len(digits) > 8:
+            return 86400 * 1000
+        seconds = float(f"{digits}.{frac}" if frac else digits)
+        if not math.isfinite(seconds):
+            return None
+        return min(int(seconds * 1000), 86400 * 1000)
+    try:
+        dt = parsedate_to_datetime(text)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    now = time.time() * 1000 if now_ms is None else now_ms
+    return max(0, int(dt.timestamp() * 1000 - now))
+
+
 def _check_status(response):
     if not 200 <= response.status_code < 300:
         error = ZhipuError("request", status=response.status_code)
-        retry_after = response.headers.get("Retry-After", "")
-        if retry_after.isascii() and retry_after.isdecimal():
-            error.retry_after = min(int(retry_after[:8]), 86400)
+        retry_after_ms = parse_retry_after_ms(response.headers.get("Retry-After", ""))
+        if retry_after_ms is not None:
+            error.retry_after_ms = retry_after_ms
+            error.retry_after = min(retry_after_ms / 1000.0, 86400)
         raise error
 
 

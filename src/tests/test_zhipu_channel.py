@@ -60,7 +60,10 @@ async def test_six_real_ingress_paths(env, ingress, stream):
         assert str(req.url).endswith("/api/anthropic/v1/messages")
         assert req.headers["x-api-key"] == "fixture.secret"
         assert req.headers["authorization"] == "Bearer fixture.secret"
-        assert req.headers["user-agent"] == "ZCode/3.15.3 ai-sdk/provider-utils/4.0.27 runtime/node.js/24"
+        assert req.headers["user-agent"] == "ZCode/3.19.1 ai-sdk/provider-utils/4.0.27 runtime/node.js/24"
+        assert req.headers["x-zcode-session-type"] == "main"
+        assert req.headers["x-zcode-query-source"] == "main_turn"
+        assert "x-zcode-session-features" not in req.headers
         assert all(req.headers.get(k) for k in ("x-session-id", "x-query-id", "x-request-id", "x-zcode-trace-id"))
         assert str(uuid.UUID(req.headers["x-session-id"])) == req.headers["x-session-id"]
         assert "anthropic-beta" not in req.headers
@@ -155,7 +158,7 @@ async def test_beta_depends_on_final_messages_and_preserves_cache(env, mid_syste
     assert json.loads(sent["metadata"]["user_id"])["session_id"] == request.headers["x-session-id"]
     assert request.headers.get("anthropic-beta") == (request_context.MID_SYSTEM_BETA if mid_system else None)
     assert payload == original
-    assert common.identity_headers()["User-Agent"] == "ZCode/3.15.3"
+    assert common.identity_headers()["User-Agent"] == "ZCode/3.19.1"
 
 
 async def test_logical_retry_keeps_attribution_but_changes_request_id(env):

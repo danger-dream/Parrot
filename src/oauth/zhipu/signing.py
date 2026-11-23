@@ -216,13 +216,14 @@ class Signer:
                         "X-Client-Nonce": nonce, "X-App-Id": "zcode", "X-Client-Pow": pow_value})
         return headers
 
-    def wrap(self, request, factory):
-        return SignedContext(self, request, factory)
+    def wrap(self, request, factory, *, signing_url=None):
+        return SignedContext(self, request, factory, signing_url=signing_url)
 
 
 class SignedContext:
-    def __init__(self, signer, request, factory):
+    def __init__(self, signer, request, factory, *, signing_url=None):
         self.signer, self.request, self.factory = signer, request, factory
+        self.signing_url = signing_url or request.url
         self.ctx = None
 
     async def close(self, *args):
@@ -233,7 +234,7 @@ class SignedContext:
     async def __aenter__(self):
         signer, request = self.signer, self.request
         signer.check()
-        enabled = origin(request.url) == signer.origin and not signer.bypass
+        enabled = origin(self.signing_url) == signer.origin and not signer.bypass
         for attempt in range(3):
             signed = enabled and attempt < 2 and not signer.bypass
             headers = {k: v for k, v in request.headers.items() if k.lower() not in SIGNATURE_HEADERS}

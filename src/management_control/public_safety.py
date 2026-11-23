@@ -22,7 +22,7 @@ refresh-token refreshToken refresh_token secret session sessionSecret sessionTok
 session_secret session_token token upstreamSecret upstream_secret webhookCredential
 webhookKey webhookSecret webhookToken webhook_credential webhook_key webhook_secret
 webhook_token x-api-key xApiKey x_api_key model_key modelKey zcode_token zcodeToken zhipu_oauth_token zhipuOauthToken
-poll_token pollToken privateCipher secretKey X-Bigmodel-Authorization
+poll_token pollToken privateCipher secretKey X-Bigmodel-Authorization X-ZCode-Authorization
 device_token deviceToken device_refresh_token deviceRefreshToken qoder_pat qoderPat
 personal_token personalToken pat
 qoder_device_profile qoderDeviceProfile machineToken machineType machineCode machine_id machineId
@@ -31,7 +31,8 @@ Cosy-MachineToken Cosy-MachineCode Cosy-MachineType
 # HTTP header names are the sole case-insensitive names in the vocabulary.
 _HEADER_FIELDS = frozenset("""
 authorization proxy-authorization proxy_authorization proxyauthorization cookie
-set-cookie set_cookie setcookie cosy-machinetoken cosy-machinetype cosy-machinecode cosy-machineid
+set-cookie set_cookie setcookie x-bigmodel-authorization x-zcode-authorization
+cosy-machinetoken cosy-machinetype cosy-machinecode cosy-machineid
 """.split())
 
 

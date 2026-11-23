@@ -125,3 +125,84 @@ async def test_refresh_persists_live_membership_and_preserves_preferences(accoun
     assert (await om.refresh_account_models(key))['action'] == 'error'
     for field in ('models', 'account_model_catalog', 'disabledModels'):
         assert om.get_account(key)[field] == previous[field]
+
+
+def test_configured_record_fullmatch_prevents_glm5_rule_overwriting_glm54():
+    rules = {
+        'modelRules': [
+            {
+                'modelMatch': r'(?:.*/)?glm[^/]*',
+                'config': {
+                    'properties': {
+                        'contextWindow': 1000000,
+                        'inputFormat': {'supportsText': True, 'supportsImage': True, 'supportsVideo': True, 'supportsPdf': True},
+                    },
+                    'optionSpecs': {
+                        'reasoningLevel': {'values': ['low', 'high', 'max']},
+                        'maxOutputTokens': {'max': 128000},
+                    },
+                },
+            },
+            {
+                'modelMatch': r'(?:.*/)?glm-5(?:-[0-9]{6,8})?',
+                'config': {
+                    'properties': {
+                        'contextWindow': 200000,
+                        'inputFormat': {'supportsText': True, 'supportsImage': False, 'supportsVideo': False, 'supportsPdf': False},
+                    },
+                    'optionSpecs': {
+                        'reasoningLevel': {'values': ['disabled', 'enabled']},
+                        'maxOutputTokens': {'max': 64000},
+                    },
+                },
+            },
+            {
+                'modelMatch': r'.*glm-5\.3.*',
+                'config': {
+                    'properties': {
+                        'contextWindow': 1000000,
+                        'inputFormat': {'supportsText': True, 'supportsImage': False, 'supportsVideo': False, 'supportsPdf': False},
+                    },
+                    'optionSpecs': {
+                        'reasoningLevel': {'values': ['low', 'high', 'max']},
+                        'maxOutputTokens': {'max': 128000},
+                    },
+                },
+            },
+            {
+                'modelMatch': r'.*glm-5\.3-flash.*',
+                'config': {
+                    'properties': {
+                        'inputFormat': {'supportsImage': True, 'supportsVideo': True, 'supportsPdf': True},
+                    },
+                },
+            },
+        ],
+        'modelApiRules': [
+            {
+                'apiTypeMatch': 'anthropic',
+                'modelMatch': r'.*glm-5\.4.*',
+                'config': {'optionSpecs': {'reasoningLevel': {'values': ['wrong']}}},
+            },
+        ],
+    }
+
+    glm54 = catalog.configured_record('glm-5.4', rules)
+    assert glm54['contextWindow'] == 1000000
+    assert glm54['maxOutputTokens'] == 128000
+    assert glm54['reasoningEfforts'] == ['low', 'high', 'max']
+    assert glm54['supportsImages'] is True
+    assert glm54['inputModalities'] == ['text', 'image', 'video', 'pdf']
+
+    for old_glm5 in ('glm-5', 'glm-5-20260401'):
+        rec = catalog.configured_record(old_glm5, rules)
+        assert rec['contextWindow'] == 200000
+        assert rec['maxOutputTokens'] == 64000
+        assert rec['reasoningEfforts'] == ['disabled', 'enabled']
+        assert rec['supportsImages'] is False
+
+    glm53 = catalog.configured_record('glm-5.3', rules)
+    assert glm53['contextWindow'] == 1000000 and glm53['supportsImages'] is False
+    flashx = catalog.configured_record('glm-5.3-flashx', rules)
+    assert flashx['contextWindow'] == 1000000 and flashx['supportsImages'] is True
+

@@ -8,7 +8,7 @@ import json
 import uuid
 
 from .. import config, json_bytes, model_names, oauth_manager
-from ..oauth.zhipu import common as c, request_context, runtime, signing, project_tokens
+from ..oauth.zhipu import common as c, endpoint_routing, request_context, runtime, signing, project_tokens
 from ..oauth.zhipu.response import BusinessContext, BusinessStream
 from ..oauth_ids import account_key
 from ..openai import anthropic_reasoning_replay
@@ -108,21 +108,35 @@ class ZhipuOAuthChannel(ApiChannel):
         headers = {**c.model_headers(), "Content-Type": "application/json", "anthropic-version": "2023-06-01",
             "x-api-key": token, "Authorization": "Bearer " + token, "x-session-id": session,
             "x-zcode-trace-id": source["_parrot_zcode_trace"], "x-query-id": source["_parrot_zcode_query"],
-            "x-request-id": str(uuid.uuid4()), "x-zcode-session-type": "main"}
+            "x-request-id": str(uuid.uuid4()), "x-zcode-session-type": "main", "x-zcode-query-source": "main_turn"}
         if request_context.needs_mid_system_beta(payload):
             headers["anthropic-beta"] = request_context.MID_SYSTEM_BETA
         if current.get("plan_scope") == "team":
             headers.update(c.scope_headers(current))
         cfg = config.get()
         network_revision = hashlib.sha256(json.dumps({k: cfg.get(k) for k in ("network", "proxy", "proxies", "socks5")}, sort_keys=True).encode()).hexdigest()
+        logical_url = c.MODEL_ORIGINS[c.site_of(current)] + "/api/anthropic/v1/messages"
+        api_key_id = None
+        if current.get("credential_mode") == "oauth":
+            try:
+                api_key_id = signing.credential(token)[0]
+            except c.ZhipuError:
+                api_key_id = current.get("project_key_id") or None
+        router = endpoint_routing.for_account(
+            self.account_key, api_key_id=api_key_id, device_id=device_id, network_revision=network_revision,
+        )
+        route = await router.resolve(logical_url, zcode_token=current.get("zcode_token") or "")
+        final_url = route.url
+        if route.routed:
+            headers = endpoint_routing.apply_routed_headers(headers, route.headers)
         signer = signing.for_account(dict(current, model_key=token), self.account_key, network_revision=network_revision)
         observation = {"resolved": True, "scope": project_tokens.scope(current),
             "state_key": oauth_manager.account_state_key(current),
             "fingerprint": project_tokens.token_fingerprint(token), "mode": current.get("credential_mode")}
         ctx = {**(ctx or {}), "zhipu_stream": BusinessStream(), "zhipu_auth": observation}
         def wire_context(request, factory):
-            return BusinessContext(signer.wrap(request, factory), observation)
-        return UpstreamRequest(c.MODEL_ORIGINS[c.site_of(current)] + "/api/anthropic/v1/messages", headers,
+            return BusinessContext(signer.wrap(request, factory, signing_url=logical_url), observation)
+        return UpstreamRequest(final_url, headers,
             json_bytes.dumps_utf8(payload, separators=(",", ":")), translator_ctx=ctx,
             dispatch_metadata=build_dispatch_metadata(payload, "anthropic", headers), stream_context_hook=wire_context)
 

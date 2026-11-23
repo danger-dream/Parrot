@@ -17,6 +17,12 @@ from urllib.parse import quote
 
 from . import common as c
 
+PAT_REQUEST_TIMEOUT_S = 15
+PAT_MAX_ATTEMPTS = 2
+PAT_RETRY_MIN_WAIT_MS = 250
+PAT_RETRY_MAX_WAIT_MS = 1000
+
+_real_sleep = time.sleep
 _lock = threading.RLock()
 _entries = {}
 _locations = {}
@@ -54,7 +60,51 @@ def _save_business(account, account_key, token):
     account["access_token"] = token
 
 
-def business_request(account, url, *, account_key="", header_kind="business", recovery_budget=None, **kwargs):
+def _sleep(seconds):
+    getattr(time, "sleep", _real_sleep)(seconds)
+
+
+def _retry_after_ms(exc):
+    ms = getattr(exc, "retry_after_ms", None)
+    if isinstance(ms, (int, float)) and not isinstance(ms, bool) and math.isfinite(ms):
+        return ms
+    sec = getattr(exc, "retry_after", None)
+    if isinstance(sec, (int, float)) and not isinstance(sec, bool) and math.isfinite(sec):
+        return sec * 1000.0
+    return None
+
+
+def _is_pat_retryable(exc):
+    return isinstance(exc, c.ZhipuError) and (
+        exc.kind in {"network", "timeout"}
+        or exc.status_code == 429
+        or 500 <= exc.status_code < 600
+    )
+
+
+def _request_with_pat_retry(url, *, headers, account_key, assert_current, **kwargs):
+    for attempt in range(1, PAT_MAX_ATTEMPTS + 1):
+        try:
+            return c.request(url, headers=headers, account_key=account_key, timeout=PAT_REQUEST_TIMEOUT_S, **kwargs)
+        except c.ZhipuError as exc:
+            if assert_current is not None:
+                assert_current()
+            if attempt >= PAT_MAX_ATTEMPTS or not _is_pat_retryable(exc):
+                raise
+            if exc.status_code == 429:
+                ra_ms = _retry_after_ms(exc)
+                if ra_ms is not None and ra_ms > PAT_RETRY_MAX_WAIT_MS:
+                    raise
+                floor_ms = max(PAT_RETRY_MIN_WAIT_MS, ra_ms if ra_ms is not None else 0)
+                jitter = max(0.0, min(1.0, random.random()))
+                wait_ms = floor_ms + math.floor((PAT_RETRY_MAX_WAIT_MS - floor_ms) * jitter)
+                _sleep(wait_ms / 1000.0)
+                if assert_current is not None:
+                    assert_current()
+
+
+def business_request(account, url, *, account_key="", header_kind="business", recovery_budget=None,
+                     pat_retry=False, assert_current=None, **kwargs):
     """A confirmed biz 401 may exchange the saved OAuth source once, never a PAT/JWT.
 
     Reads with a stale business token share the saved replacement under a lock.
@@ -71,6 +121,9 @@ def business_request(account, url, *, account_key="", header_kind="business", re
             headers["Authorization"] = ("Bearer " if c.site_of(account) == "zai" and account.get("plan_scope") != "team" else "") + token
         elif header_kind == "pat":
             headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json"}
+        if pat_retry:
+            return _request_with_pat_retry(url, headers=headers, account_key=account_key,
+                                           assert_current=assert_current, **kwargs)
         return c.request(url, headers=headers, account_key=account_key, **kwargs)
 
     try:
@@ -235,11 +288,17 @@ def resolve(account, *, account_key, location, on_stage=None, on_key=None,
             on_stage("project_token")
         from .auth import key_path
         url = c.BIZ_ORIGINS[c.site_of(account)] + key_path(account) + "/" + quote(key_id, safe="") + "/access_tokens"
+        def assert_current():
+            assert_live(account, account_key, key_id)
+            with _lock:
+                if _entries.get(key) is not entry:
+                    raise c.ZhipuError("project_token", "scope_invalidated")
+
         started = time.time() * 1000
         try:
             data = business_request(account, url, account_key=account_key, header_kind="pat", method="POST",
                 body={"clientType": "zcode", "clientVersion": c.VERSION}, envelope=False, stage="project_token",
-                recovery_budget=recovery_budget)
+                recovery_budget=recovery_budget, pat_retry=True, assert_current=assert_current)
         except c.ZhipuError as exc:
             if exc.status_code == 404:
                 _drop_location(account, account_key, key)

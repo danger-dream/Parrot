@@ -8,7 +8,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from . import auth, common as c, signing, project_tokens
+from . import auth, common as c, endpoint_routing, signing, project_tokens
 from .. import add_context
 
 
@@ -74,6 +74,7 @@ def refresh_locked(account, account_key, force, *, rejected_fingerprint=None):
 def forget(account_key):
     signing.forget(account_key)
     project_tokens.forget(account_key)
+    endpoint_routing.forget(account_key)
 
 
 def recover_project_token(account_key, observation):

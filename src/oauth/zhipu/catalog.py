@@ -40,7 +40,8 @@ def _matches(pattern, value):
     if not isinstance(pattern, str):
         return False
     try:
-        return re.search(pattern, value, re.IGNORECASE) is not None
+        # Match ZCode's anchored full-string rule evaluation: new RegExp(`^(?:${pattern})$`, "i").
+        return re.fullmatch(f"(?:{pattern})", value, re.IGNORECASE) is not None
     except re.error:
         raise c.ZhipuError("catalog", "invalid_model_rule") from None
 

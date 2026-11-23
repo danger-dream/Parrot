@@ -41,7 +41,7 @@ def local_upstream(monkeypatch):
                 assert self.path == "/api/v1/agent/configs"
                 assert self.headers["x-api-key"] in {"fixture.secret", "single-key"}
                 assert self.headers["Authorization"] is None
-                assert self.headers["User-Agent"] == "ZCode/3.15.3"
+                assert self.headers["User-Agent"] == "ZCode/3.19.1"
                 self.reply(200, {"code": 0, "data": {"codingPlanSignature": {"enable": state["gate"]}}})
             except BaseException as exc:
                 state["errors"].append(exc); self.reply(500, {})
@@ -68,7 +68,7 @@ def local_upstream(monkeypatch):
                 if self.headers.get("X-Client-Sig"):
                     key_id, _ = signing.credential(state["key"])
                     ts, nonce, sid = (self.headers[k] for k in ("X-Client-Ts", "X-Client-Nonce", "X-Session-Id"))
-                    private.public_key().verify(base64.b64decode(self.headers["X-Client-Sig"]), f"{key_id}\n{ts}\n3.15.3\n{sid}\n{nonce}".encode())
+                    private.public_key().verify(base64.b64decode(self.headers["X-Client-Sig"]), f"{key_id}\n{ts}\n3.19.1\n{sid}\n{nonce}".encode())
                     seed = hashlib.sha256(f"{key_id}\nzcode\n{sid}\n{ts}".encode()).hexdigest()[:32]
                     assert hashlib.sha256((seed + "\n" + self.headers["X-Client-Pow"]).encode()).digest()[0] == 0
                 if state["delay"]:
@@ -94,7 +94,7 @@ def local_upstream(monkeypatch):
 
 def request(base):
     return HttpStreamRequest("POST", base + "/api/anthropic/v1/messages", {"x-api-key": "fixture.secret", "x-session-id": "session-fixture",
-        "x-request-id": "request-fixture", "x-zcode-trace-id": "trace-fixture", "X-ZCode-App-Version": "3.15.3"}, b'{"messages":[]}', 2, 5)
+        "x-request-id": "request-fixture", "x-zcode-trace-id": "trace-fixture", "X-ZCode-App-Version": "3.19.1"}, b'{"messages":[]}', 2, 5)
 
 
 @pytest.mark.parametrize("rejections,expected", [(0,1),(1,2),(2,3)])
