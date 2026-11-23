@@ -147,7 +147,7 @@ def request(url, *, headers=None, method="GET", body=None, account_key="", timeo
             raise
 
 
-def _request(url, *, headers, method, body, account_key, timeout, envelope, read_attempts, stage, total_timeout):
+def _request(url, *, headers, method, body, account_key, timeout, envelope, read_attempts, stage, total_timeout=None):
     # Only opted-in reads retry here; bounded writes keep their caller's budget.
     if total_timeout is None and (method.upper() != "GET" or read_attempts <= 1):
         return _request_once(url, headers=headers, method=method, body=body,
@@ -189,8 +189,8 @@ async def _read_attempts(url, *, headers, account_key, timeout, envelope, attemp
         trace.routes.clear()
         trace.phase, trace.send_started = "", False
         try:
-            return await _async_request_once(url, headers=headers, method="GET", body=None, account_key=account_key,
-                                             timeout=timeout, envelope=envelope, trace=trace)
+            return await _read_once(url, headers=headers, account_key=account_key,
+                                    timeout=timeout, envelope=envelope, trace=trace)
         except ZhipuError as exc:
             if stage:
                 exc.stage = stage
@@ -259,6 +259,11 @@ def _decode_response(raw, status, envelope, url=""):
         raise ZhipuError("response", "business", status=status, code=code,
                          unauthorized=str(code) == "401" and urlsplit(url).path.startswith("/api/biz/"))
     return value.get("data")
+
+
+async def _read_once(url, *, headers, account_key, timeout, envelope, trace=None):
+    return await _async_request_once(url, headers=headers, method="GET", body=None, account_key=account_key,
+                                     timeout=timeout, envelope=envelope, trace=trace)
 
 
 async def _async_request_once(url, *, headers, method, body, account_key, timeout, envelope, trace=None):
